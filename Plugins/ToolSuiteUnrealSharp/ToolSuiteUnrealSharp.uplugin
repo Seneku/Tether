@@ -1,0 +1,25 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "0.1.0",
+	"FriendlyName": "ToolSuite UnrealSharp Bridge",
+	"Description": "Lets coding agents drive UnrealSharp C# hot reload from Python/MCP without modal dialogs. Optional companion to the ToolSuite plugin.",
+	"Category": "Editor",
+	"CreatedBy": "ToolSuite",
+	"CanContainContent": false,
+	"IsBetaVersion": true,
+	"Installed": false,
+	"Modules": [
+		{
+			"Name": "ToolSuiteUnrealSharp",
+			"Type": "Editor",
+			"LoadingPhase": "PostEngineInit"
+		}
+	],
+	"Plugins": [
+		{
+			"Name": "UnrealSharp",
+			"Enabled": true
+		}
+	]
+}

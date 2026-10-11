@@ -1,0 +1,23 @@
+# Unreal generated
+Sandbox/Binaries/
+Sandbox/Intermediate/
+Sandbox/Saved/
+Sandbox/DerivedDataCache/
+Plugins/*/Binaries/
+Plugins/*/Intermediate/
+Sandbox/Plugins/*/Binaries/
+Sandbox/Plugins/*/Intermediate/
+
+# Editor-generated; holds an auto-generated Android File Server SecurityToken (regenerated on launch)
+Sandbox/Config/DefaultEngine.ini
+
+# Third-party clone (pinned commit documented in README / docs/DESIGN.md)
+Sandbox/Plugins/UnrealSharp/
+
+# C# build output
+Sandbox/Script/**/bin/
+Sandbox/Script/**/obj/
+
+# Python
+__pycache__/
+*.pyc
