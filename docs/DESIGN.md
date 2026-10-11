@@ -448,7 +448,7 @@ project's `Plugins/`, and updates hot-reload without restarting the editor.
 
 ### 6.3 Claude Code integration
 
-- **Skill `unreal-toolsuite`** (v0 in `skills/`, loaded on demand): command reference, the iteration decision table, and the
+- **Skill `unreal-toolsuite`** (v0 in `.claude/skills/`, loaded on demand): command reference, the iteration decision table, and the
   Python gotchas currently buried in IslandHorror's CLAUDE.md.
 - **Hooks:** SessionStart injects a two-line editor status; PostToolUse on `Source/**` classifies
   the edit as live-codable or restart-required; Stop nudges `ue build` if C++ changed since the

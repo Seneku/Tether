@@ -11,7 +11,12 @@ agent) quickly and with few tokens, instead of booting headless commandlets or r
 - `Plugins/ToolSuiteUnrealSharp`: optional, tiny C++ editor plugin for UnrealSharp projects. It
   makes C# hot reload callable from Python/MCP with modal dialogs suppressed, so `ue build`
   reloads C# in about 1 s.
-- `skills/unreal-toolsuite`: Claude Code skill that teaches the workflow.
+- `.claude/skills/unreal-toolsuite`: Claude Code skill that teaches the workflow. It loads
+  automatically in sessions started at this repo's root; copy it into another project's
+  `.claude/skills/` to use it there.
+- `.claude/settings.json`: a PreToolUse hook that blocks C# edits while the project's editor is in
+  PIE. It also enables Epic's official `unreal-engine-skills-for-claude-code` plugin for side-by-side
+  comparison, with its `unreal-mcp` connection to the sandbox editor configured in `.mcp.json`.
 - `Sandbox/`: scratch UE 5.8 project used for development.
 - `docs/DESIGN.md`: analysis, measurements, architecture and roadmap.
 

@@ -11,6 +11,9 @@ Sandbox/Plugins/*/Intermediate/
 # Editor-generated; holds an auto-generated Android File Server SecurityToken (regenerated on launch)
 Sandbox/Config/DefaultEngine.ini
 
+# Written by `ModelContextProtocol.GenerateClientConfig`; the repo-root .mcp.json is the tracked one
+Sandbox/.mcp.json
+
 # Third-party clone (pinned commit documented in README / docs/DESIGN.md)
 Sandbox/Plugins/UnrealSharp/
 
