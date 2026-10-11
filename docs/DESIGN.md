@@ -87,6 +87,54 @@ UnrealSharp gotchas for agents, and how ToolSuite handles them:
 - Each of these is a reasonable upstream contribution: an unattended-safe reload path, logged
   errors instead of a modal, and a scriptable reload.
 
+**C# gameplay feature, built and verified through the agent loop (2026-10-11).** Coin pickups in
+`Sandbox/Script/ManagedSandbox/Coins/`:
+- `ACoinPickup`: sphere trigger, mesh, spin, respawn timer;
+- `UCoinScoreSubsystem`: a world subsystem with a score delegate;
+- a combo multiplier (×1 to ×5 within 1.5 s);
+- a `[CustomLog]` category.
+
+Content placement (`Sandbox/Scripts/place_coins.py`) and the PIE smoke test
+(`Sandbox/Scripts/coin_smoke.py`) both run through `ue py -f`. Verification goes through
+`ue log --cat LogCoins`.
+
+| Step | Time |
+|---|---|
+| Pre-build catches a C# compile error before launch (`ue open`) | 3.8 s, 1 line + cascade |
+| Place 5 coins in the live editor (`ue py -f place_coins.py`) | 57 ms (a commandlet would take ~24 s) |
+| `ue pie start` / smoke test / `ue log` / `ue pie stop` | 0.8 s / 66 ms / 132 ms / 0.2 s |
+| C# fix → `ue build` hot reload | 0.5 s |
+| Full restart (`ue build --restart`: close, UBT, C#, headless boot) | 20.2 s |
+
+Agent testing found two gameplay bugs that reading the code had missed:
+- A coin respawning under a standing player was re-collected every 3 s, an endless score farm
+  (the score reached 230).
+- `Respawn()` logged after re-collection, so the log lied.
+
+Both were fixed and re-verified: combo 10+20+30+40+50 = 150, and the occupied coin waits until the
+player leaves.
+
+New UnrealSharp hazards found this way:
+- **Saving C# while PIE runs can kill PIE.** The file watcher reprocesses types even with reloads
+  deferred. The next `GetWorldSubsystem<T>()` returned null, and UnrealSharp turns an unhandled
+  managed exception in PIE into "Fatal error detected", which ends the session. Rule: stop PIE
+  before editing C#.
+- **Hot-reloading a structurally changed `UCSWorldSubsystem` corrupts its class default object.**
+  Every new world (PIE start, new map) then throws `InvalidCastException` in
+  `K2_DoesSupportWorldType`, and only a restart (20 s) clears it. `ue pie start` now detects this
+  and suggests `ue build --restart`.
+
+Tooling fixed along the way:
+- `ue pie start|stop|status`. Status says *why* a session died, with the user-code frame
+  (`@ CoinPickup.cs:61 (ACoinPickup.ActorBeginOverlap)`).
+- Error log lines carry their first user-code stack frame.
+- `ue log` / `exec` / `pie` flush the editor log first (`FLUSHLOG`), so just-logged lines are never
+  missed.
+- The beacon no longer spams `LogUtils` errors during PIE.
+- `console` targets the PIE world while PIE runs.
+- `close --discard` terminates instead of stalling on "Save Content?".
+- Headless editors pass `-AutoDeclinePackageRecovery`, so no restore prompt can block a boot.
+
 Lessons from the spike:
 - Hot reload re-executes modules in place, so state that must survive (beacon port, REPL
   namespace) lives on `sys`; the reload routine re-binds tick callbacks afterwards.
@@ -441,7 +489,7 @@ project's `Plugins/`, and updates hot-reload without restarting the editor.
 | 1 — Gap toolset | **done in spike:** `py`, `exec`, `props`, `actors`, `level_summary`, `reload`, beacon + heartbeat. **To do:** `get`/`set`, `shot`, `pie`, `test` | the `inspect_*.py` loop replaced; 24 s → sub-second |
 | 2 — Restart-free loop | **done in spike:** Live Coding orchestration, coarse change classifier, automated restart. **To do:** finer classifier (diff reflected declarations), hooks, `smoke` | edit C++ → verified in PIE with no human step |
 | 3 — Depth | Blueprint DSL ergonomics, DataTable/DataAsset round-trips, `api`, `job`, `watch` | Blueprint changes reviewed as text diffs |
-| 4 — Scripting | **UnrealSharp trial done in Sandbox:** headless project creation, C# pre-build in `ue open`, bridge-driven reload in `ue build` (0.6–1.2 s, structural changes included), one-line C# errors. **To do:** try it on a real gameplay feature; Angelscript in a later pass | C# features iterated with no restarts |
+| 4 — Scripting | **UnrealSharp trial done in Sandbox:** headless project creation, C# pre-build in `ue open`, bridge-driven reload in `ue build` (0.6–1.2 s, structural changes included), one-line C# errors. **Gameplay feature done** (coins + score subsystem + combo, verified in PIE through `ue`). **To do:** a PreToolUse hook that blocks C# edits while PIE runs, report the subsystem-reload bug upstream, Angelscript in a later pass | C# features iterated with no restarts |
 
 ## 9. Decisions
 
