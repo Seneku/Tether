@@ -110,13 +110,17 @@ UnrealSharp gotchas for agents, and how ToolSuite handles them:
     rejected the saved files", one line per error), and `ue open` lists any dialogs answered at boot.
 - **.NET is found only through a `PATH` entry containing `Program Files\dotnet\`, trailing backslash
   included.** Git Bash drops that backslash. The editor then shows "An installation of .NET 10.0.0 SDK
-  can't be found" once per module, which spams the desktop. ToolSuite handles it in `ue open`:
+  can't be found". The dialog comes back after every OK, because `FUnrealSharpCoreModule::StartupModule()`
+  calls itself whenever the check fails, with no exit condition. With dialogs suppressed, that recursion
+  would not wait at all. ToolSuite handles it in `ue open`:
   - it restores the backslash in the editor's environment;
   - it refuses to launch when no SDK exists;
   - on Windows, it kills a headless editor that stops on a native modal dialog during startup, and
     prints the dialog's text.
-- In the editor, `TSubclassOf<T>.IsValid` and `ToString()` compare against the skeleton class, so they
-  report "None" for valid UnrealSharp classes.
+- Filed upstream on 2026-10-11:
+  - [#774](https://github.com/UnrealSharp/UnrealSharp/issues/774): recompile on lookup;
+  - [#775](https://github.com/UnrealSharp/UnrealSharp/issues/775): .NET discovery and the `StartupModule` recursion;
+  - [#776](https://github.com/UnrealSharp/UnrealSharp/issues/776): reload under `-unattended`, logged errors, scriptable reload.
 - Each of these is a reasonable upstream contribution:
   - an unattended-safe reload path;
   - logged errors instead of modals, including the save-time syntax check;
@@ -531,7 +535,7 @@ project's `Plugins/`, and updates hot-reload without restarting the editor.
 | 1 — Gap toolset | **done in spike:** `py`, `exec`, `props`, `actors`, `level_summary`, `reload`, beacon + heartbeat. **To do:** `get`/`set`, `shot`, `pie`, `test` | the `inspect_*.py` loop replaced; 24 s → sub-second |
 | 2 — Restart-free loop | **done in spike:** Live Coding orchestration, coarse change classifier, automated restart. **To do:** finer classifier (diff reflected declarations), hooks, `smoke` | edit C++ → verified in PIE with no human step |
 | 3 — Depth | Blueprint DSL ergonomics, DataTable/DataAsset round-trips, `api`, `job`, `watch` | Blueprint changes reviewed as text diffs |
-| 4 — Scripting | **UnrealSharp trial done in Sandbox:** headless project creation, C# pre-build in `ue open`, bridge-driven reload in `ue build` (0.6–1.2 s, structural changes included), one-line C# errors. **Gameplay feature done** (coins + score subsystem + combo, verified in PIE through `ue`). **Since done:** PreToolUse hooks that block C# edits while PIE runs and Epic's `StartPIE` while C# is unreloaded; `ue pie start` reloads pending C# first (works around UnrealSharp's recompile-on-lookup, §2); headless editors log dialogs instead of hanging on them. **To do:** report the UnrealSharp issues in §2 upstream, Angelscript in a later pass | C# features iterated with no restarts |
+| 4 — Scripting | **UnrealSharp trial done in Sandbox:** headless project creation, C# pre-build in `ue open`, bridge-driven reload in `ue build` (0.6–1.2 s, structural changes included), one-line C# errors. **Gameplay feature done** (coins + score subsystem + combo, verified in PIE through `ue`). **Since done:** PreToolUse hooks that block C# edits while PIE runs and Epic's `StartPIE` while C# is unreloaded; `ue pie start` reloads pending C# first (works around UnrealSharp's recompile-on-lookup, §2); headless editors log dialogs instead of hanging on them. **Reported upstream:** [#774](https://github.com/UnrealSharp/UnrealSharp/issues/774) (recompile on lookup), [#775](https://github.com/UnrealSharp/UnrealSharp/issues/775) (.NET discovery + `StartupModule` recursion), [#776](https://github.com/UnrealSharp/UnrealSharp/issues/776) (headless reload). **To do:** Angelscript in a later pass | C# features iterated with no restarts |
 
 ## 9. Decisions
 
