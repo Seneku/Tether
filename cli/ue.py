@@ -394,6 +394,16 @@ def log_end(project):
     return os.path.getsize(path) if os.path.exists(path) else 0
 
 
+# FMessageDialog under -RUNNINGUNATTENDEDSCRIPT logs instead of blocking; the text runs to the next stamped line.
+DIALOG = re.compile(r"Message dialog closed, result: \w+, title: (?P<title>[^\r\n]*?), text: (?P<text>.*?)"
+                    r"(?=^\[\d{4}\.\d\d\.\d\d-|\Z)", re.S | re.M)
+
+
+def logged_dialogs(lines):
+    """(title, text) of every dialog the editor answered by itself in these log lines."""
+    return [(m.group("title"), m.group("text").strip()) for m in DIALOG.finditer("\n".join(lines))]
+
+
 FRAME = re.compile(r"^\s+at (?P<where>[\w.<>`+]+)\(.*\) in (?P<file>.+):line (?P<line>\d+)")
 
 
@@ -545,6 +555,57 @@ def managed_output(project):
     return os.path.join(os.path.dirname(project), "Binaries", "Managed", "net10.0")
 
 
+def editor_env(project):
+    """Environment for launching the editor.
+
+    UnrealSharp finds .NET only through a PATH entry containing 'Program Files\\dotnet\\', trailing
+    backslash included. Git Bash drops that backslash, and the editor then raises a modal "SDK can't be
+    found" dialog from several modules. So restore the backslash, and refuse to launch without an SDK.
+    """
+    env = dict(os.environ)
+    if os.name != "nt" or not csharp_layout(project):
+        return env
+    entries = [os.path.normpath(e) + "\\" if e and os.path.isfile(os.path.join(e, "dotnet.exe")) else e
+               for e in env.get("PATH", "").split(os.pathsep)]
+    if not any("program files\\dotnet\\" in e.lower() for e in entries):
+        default = os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "dotnet") + "\\"
+        if not os.path.isfile(default + "dotnet.exe"):
+            raise CliError("UnrealSharp needs the .NET 10 SDK in 'Program Files\\dotnet\\' (it only looks on PATH "
+                           "there); not found, and the editor would stop on modal dialogs. Install the SDK.", 2)
+        entries.insert(0, default)
+    env["PATH"] = os.pathsep.join(entries)
+    return env
+
+
+def modal_dialogs(pid):
+    """Text of the native modal dialogs (#32770 windows) a process is showing; Windows only."""
+    if os.name != "nt":
+        return []
+    import ctypes
+    from ctypes import wintypes
+    user32 = ctypes.windll.user32
+    callback = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+    def text(hwnd, getter=user32.GetWindowTextW, size=1024):
+        buf = ctypes.create_unicode_buffer(size)
+        getter(hwnd, buf, size)
+        return buf.value
+
+    found = []
+
+    def visit(hwnd, _):
+        owner = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner))
+        if owner.value == pid and user32.IsWindowVisible(hwnd) and text(hwnd, user32.GetClassNameW, 64) == "#32770":
+            parts = []
+            user32.EnumChildWindows(hwnd, callback(lambda child, _: parts.append(text(child)) or True), 0)
+            found.append(" ".join(p for p in parts if p and p not in ("OK", "Cancel", "&Yes", "&No")) or text(hwnd))
+        return True
+
+    user32.EnumWindows(callback(visit), 0)
+    return found
+
+
 def csharp_changes(project):
     """C# sources changed since the last green C# build; None if unknown or not an UnrealSharp project."""
     layout = csharp_layout(project)
@@ -601,6 +662,17 @@ def csharp_reload_build(ctx, args):
         time.sleep(0.15)
         chunk = new_log()
     done = re.search(r"C# Hot Reload completed in ([\d.]+) seconds", chunk)
+    if state == "nothing pending" and csharp_changes(ctx.project):
+        # Files changed but nothing is pending: UnrealSharp refused them at save time. A syntax error raises
+        # its "C# Hot Reload Error" dialog straight from the file watcher, before any reload.
+        session = read_new_log(ctx.project, from_start=True, advance=False)
+        last_ok = max((i for i, l in enumerate(session) if "C# Hot Reload completed" in l), default=-1)
+        rejected = [text for title, text in logged_dialogs(session[last_ok + 1:]) if title == "C# Hot Reload Error"]
+        if rejected:
+            errors, warnings, _ = compact_diagnostics(rejected[-1].splitlines(), os.path.dirname(ctx.project))
+            print(f"c# reload: FAILED (UnrealSharp rejected the saved files; {len(errors)} errors)")
+            print_diagnostics(errors or rejected[-1].splitlines()[:1], warnings, args.limit)
+            return 1
     if state in ("reloaded", "nothing pending"):
         print(f"c# reload: {'OK' if state == 'reloaded' else 'nothing pending'} in {time.time() - started:.1f}s"
               + (f" (UnrealSharp {done.group(1)}s)" if done else ""))
@@ -720,6 +792,7 @@ def cmd_open(ctx, args):
         print("already running")
         return cmd_status(ctx, args)
     has_csharp = csharp_layout(ctx.project) is not None
+    env = editor_env(ctx.project)  # fails fast, before the prebuild, when UnrealSharp could not start
     if not args.no_build:  # a stale module would raise the rebuild prompt (and quits headless editors)
         if os.path.isdir(os.path.join(os.path.dirname(ctx.project), "Source")):
             if ubt_build(ctx, argparse.Namespace(target=None, config="Development", limit=args.limit)):
@@ -736,13 +809,16 @@ def cmd_open(ctx, args):
     if args.headless:
         # Agent-only session: never block on the "restore unsaved packages?" prompt.
         cmd += ["-nullrhi", "-nosound", "-AutoDeclinePackageRecovery"]
+        if not unattended:
+            # Attended for UnrealSharp, but nobody can see a dialog: log each one and take its default.
+            cmd += ["-RUNNINGUNATTENDEDSCRIPT"]
     if unattended:
         cmd += ["-unattended"]
     write_json(os.path.join(state_dir(ctx.project), "launch.json"),
                {"headless": bool(args.headless), "unattended": unattended, "port": port})
     started = time.time()
     flags = (subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP) if os.name == "nt" else 0
-    proc = subprocess.Popen(cmd, creationflags=flags, stdin=subprocess.DEVNULL,
+    proc = subprocess.Popen(cmd, creationflags=flags, stdin=subprocess.DEVNULL, env=env,
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True)
     mode = ", ".join(m for m, on in (("headless", args.headless), ("unattended", unattended)) if on)
     print(f"launched pid {proc.pid} on mcp :{port}" + (f" ({mode})" if mode else ""))
@@ -751,16 +827,27 @@ def cmd_open(ctx, args):
     while time.time() - started < args.wait:
         beacon = ctx.beacon
         if beacon and beacon.get("pid") == proc.pid and beacon.get("heartbeat", 0) > started and port_open(port):
-            errors = filter_log(read_new_log(ctx.project, from_start=True), level="Error")
+            boot = read_new_log(ctx.project, from_start=True)
+            errors = filter_log(boot, level="Error")
             print(f"ready in {time.time() - started:.1f}s | map {beacon.get('map')} | "
                   f"{len(errors)} errors at boot" + (" (ue log --since start --level Error)" if errors else ""))
             for line in errors[:5]:
                 print("  " + line)
+            for title, text in logged_dialogs(boot):
+                print(f"  dialog answered by default: {title}: {text.splitlines()[0] if text else ''}")
             return 0
         if proc.poll() is not None:
             tail = filter_log(read_new_log(ctx.project, from_start=True), level="Error")[-5:]
             raise CliError(f"editor exited during startup (code {proc.returncode})"
                            + "".join("\n  " + l for l in tail))
+        dialogs = modal_dialogs(proc.pid)
+        if dialogs:
+            # A modal dialog stalls the boot; a headless editor has nobody to answer it.
+            if args.headless:
+                proc.kill()
+            raise CliError("editor stopped on a modal dialog during startup"
+                           + (" (killed it: headless)" if args.headless else "; answer it in the editor")
+                           + "".join(f"\n  {d}" for d in dialogs))
         time.sleep(0.5)
     raise CliError(f"not ready after {args.wait:.0f}s (still booting? ue status)", 4)
 
@@ -912,6 +999,14 @@ def cmd_pie(ctx, args):
     """Play-In-Editor through Epic's EditorAppToolset, reporting only what went wrong."""
     toolset, start = resolve_toolset(ctx, "editorapp"), log_end(ctx.project)
     started = time.time()
+    if args.action == "start" and csharp_layout(ctx.project):
+        # UnrealSharp recompiles a saved but unreloaded C# type in place on its first lookup, from the old
+        # reflection data. That drops the type's subsystems from every live world, PIE included, for the
+        # rest of the session. So PIE only ever starts on reloaded code.
+        if csharp_changes(ctx.project) or ctx.toolsuite("cs_state") == "pending":
+            if csharp_reload_build(ctx, argparse.Namespace(wait=120, limit=args.limit)):
+                raise CliError("PIE not started: the C# reload failed (errors above)")
+            start, started = log_end(ctx.project), time.time()
     if args.action == "start":
         options = {"bSimulate": args.simulate, "playMode": "PlayMode_InViewPort", "warmupSeconds": args.warmup}
         text, is_error = ctx.mcp.call(toolset, "StartPIE", {"options": options})
@@ -1083,9 +1178,11 @@ def main(argv=None):
     try:
         code = args.fn(Ctx(args), args)
     except CliError as exc:
+        sys.stdout.flush()  # keep the error after the output that explains it when both are piped
         print(f"error: {exc}", file=sys.stderr)
         code = exc.code
     if args.time:
+        sys.stdout.flush()
         print(f"({(time.perf_counter() - started) * 1000:.0f} ms)", file=sys.stderr)
     return code
 

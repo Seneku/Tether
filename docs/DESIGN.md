@@ -84,8 +84,45 @@ UnrealSharp gotchas for agents, and how ToolSuite handles them:
   reload once, on `ue build`.
 - C# types register as `/Script/UnrealSharp.<Name>_C`. Call new UFunctions via
   `cdo.call_method('Name', (args,))`. Reloads are deferred while PIE runs.
-- Each of these is a reasonable upstream contribution: an unattended-safe reload path, logged
-  errors instead of a modal, and a scriptable reload.
+- **A saved but unreloaded C# type is recompiled in place on its first lookup** (root-caused
+  2026-10-11).
+  - *Cause:* the file watcher parses each saved file and marks every type whose declaration changed as
+    structurally dirty (a constant change counts). `FCSManagedTypeDefinition::GetDefinition()` then
+    compiles dirty types on access, from the old reflection data. For a subsystem class, that compile
+    calls `DeactivateExternalSubsystem`, which deinitializes and removes its instance in every live
+    world, PIE included. It does not come back in that PIE session.
+  - *Symptom:* `GetWorldSubsystem<T>()` returns null even though begin-play ran. In the Epic comparison
+    every coin logged "no score subsystem in this world".
+  - *Reproduction:* save a C# change without reloading, start PIE, look the subsystem up. The same
+    on-access recompile is the likely cause of "saving C# during PIE crashes PIE".
+  - *ToolSuite's handling:* `ue pie start` hot-reloads pending C# first and refuses to start PIE if the
+    reload fails.
+  - *Gaps:* Epic's `StartPIE` and the editor's Play button skip that guard, and `AutomaticHotReloading=Off`
+    widens the window.
+- **A syntax error in a saved file raises a modal dialog at save time** ("C# Hot Reload Error", from
+  the file watcher). That happens outside any reload the bridge can guard.
+  - *Why it hangs:* in a `-nullrhi` editor the dialog is an invisible Slate modal. The engine tick and
+    the MCP server stop, while Slate, and so the beacon, keep ticking.
+  - *ToolSuite's handling:* `ue open --headless` starts UnrealSharp editors with `-RUNNINGUNATTENDEDSCRIPT`.
+    Every `FMessageDialog` then logs its text and takes its default answer, and hot reload stays
+    available, because UnrealSharp only checks `-unattended`.
+  - *Reporting:* `ue build` and `ue pie start` turn the logged text into a failed reload ("UnrealSharp
+    rejected the saved files", one line per error), and `ue open` lists any dialogs answered at boot.
+- **.NET is found only through a `PATH` entry containing `Program Files\dotnet\`, trailing backslash
+  included.** Git Bash drops that backslash. The editor then shows "An installation of .NET 10.0.0 SDK
+  can't be found" once per module, which spams the desktop. ToolSuite handles it in `ue open`:
+  - it restores the backslash in the editor's environment;
+  - it refuses to launch when no SDK exists;
+  - on Windows, it kills a headless editor that stops on a native modal dialog during startup, and
+    prints the dialog's text.
+- In the editor, `TSubclassOf<T>.IsValid` and `ToString()` compare against the skeleton class, so they
+  report "None" for valid UnrealSharp classes.
+- Each of these is a reasonable upstream contribution:
+  - an unattended-safe reload path;
+  - logged errors instead of modals, including the save-time syntax check;
+  - a scriptable reload;
+  - recompiling dirty types only on reload, not on lookup;
+  - `DOTNET_ROOT`-aware .NET discovery.
 
 **C# gameplay feature, built and verified through the agent loop (2026-10-11).** Coin pickups in
 `Sandbox/Script/ManagedSandbox/Coins/`:
@@ -489,7 +526,7 @@ project's `Plugins/`, and updates hot-reload without restarting the editor.
 | 1 — Gap toolset | **done in spike:** `py`, `exec`, `props`, `actors`, `level_summary`, `reload`, beacon + heartbeat. **To do:** `get`/`set`, `shot`, `pie`, `test` | the `inspect_*.py` loop replaced; 24 s → sub-second |
 | 2 — Restart-free loop | **done in spike:** Live Coding orchestration, coarse change classifier, automated restart. **To do:** finer classifier (diff reflected declarations), hooks, `smoke` | edit C++ → verified in PIE with no human step |
 | 3 — Depth | Blueprint DSL ergonomics, DataTable/DataAsset round-trips, `api`, `job`, `watch` | Blueprint changes reviewed as text diffs |
-| 4 — Scripting | **UnrealSharp trial done in Sandbox:** headless project creation, C# pre-build in `ue open`, bridge-driven reload in `ue build` (0.6–1.2 s, structural changes included), one-line C# errors. **Gameplay feature done** (coins + score subsystem + combo, verified in PIE through `ue`). **To do:** a PreToolUse hook that blocks C# edits while PIE runs, report the subsystem-reload bug upstream, Angelscript in a later pass | C# features iterated with no restarts |
+| 4 — Scripting | **UnrealSharp trial done in Sandbox:** headless project creation, C# pre-build in `ue open`, bridge-driven reload in `ue build` (0.6–1.2 s, structural changes included), one-line C# errors. **Gameplay feature done** (coins + score subsystem + combo, verified in PIE through `ue`). **Since done:** a PreToolUse hook that blocks C# edits while PIE runs; `ue pie start` reloads pending C# first (works around UnrealSharp's recompile-on-lookup, §2); headless editors log dialogs instead of hanging on them. **To do:** report the UnrealSharp issues in §2 upstream, Angelscript in a later pass | C# features iterated with no restarts |
 
 ## 9. Decisions
 

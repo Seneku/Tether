@@ -31,6 +31,10 @@
 			"Enabled": true
 		},
 		{
+			"Name": "LiveCodingToolset",
+			"Enabled": true
+		},
+		{
 			"Name": "ToolSuite",
 			"Enabled": true
 		},

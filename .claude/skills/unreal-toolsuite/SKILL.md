@@ -52,6 +52,12 @@ milliseconds. A `-run=pythonscript` commandlet takes ~25 s and floods the log.
   `cdo.call_method('MyFunc', (1, 2))` and `cdo.get_editor_property('MyProp')`.
 - **Stop PIE before editing C#** (`ue pie stop`). UnrealSharp reprocesses saved files at once, and
   running C# code can then crash PIE.
+- **Start PIE only with `ue pie start`, never Epic's `StartPIE`.** It hot-reloads pending C# first.
+  UnrealSharp recompiles a saved but unreloaded type on its first lookup, and that removes the type's
+  subsystems from the running world: `GetWorldSubsystem` returns null for the rest of the session.
+  If the reload fails, PIE does not start.
+- A syntax error is rejected at save time. `ue build` and `ue pie start` report it as "UnrealSharp
+  rejected the saved files", with the line. Fix the line, then rerun the command.
 - After structural changes to a C# **subsystem** (new members or signatures), test PIE straight away.
   If `ue pie start` reports `InvalidCastException`, run `ue build --restart` (about 20 s).
 - `ue call toolsuite.cs_state` reports idle, pending or reloading.
