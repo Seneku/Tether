@@ -55,7 +55,8 @@ milliseconds. A `-run=pythonscript` commandlet takes ~25 s and floods the log.
 - **Start PIE only with `ue pie start`, never Epic's `StartPIE`.** It hot-reloads pending C# first.
   UnrealSharp recompiles a saved but unreloaded type on its first lookup, and that removes the type's
   subsystems from the running world: `GetWorldSubsystem` returns null for the rest of the session.
-  If the reload fails, PIE does not start.
+  If the reload fails, PIE does not start. A project hook also denies Epic's `StartPIE` while C# is
+  unreloaded.
 - A syntax error is rejected at save time. `ue build` and `ue pie start` report it as "UnrealSharp
   rejected the saved files", with the line. Fix the line, then rerun the command.
 - After structural changes to a C# **subsystem** (new members or signatures), test PIE straight away.

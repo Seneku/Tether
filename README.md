@@ -14,8 +14,11 @@ agent) quickly and with few tokens, instead of booting headless commandlets or r
 - `.claude/skills/unreal-toolsuite`: Claude Code skill that teaches the workflow. It loads
   automatically in sessions started at this repo's root; copy it into another project's
   `.claude/skills/` to use it there.
-- `.claude/settings.json`: a PreToolUse hook that blocks C# edits while the project's editor is in
-  PIE. It also enables Epic's official `unreal-engine-skills-for-claude-code` plugin for side-by-side
+- `.claude/settings.json`: two PreToolUse hooks:
+  - one blocks C# edits while the project's editor is in PIE;
+  - one blocks Epic's `StartPIE` while saved C# has not been hot-reloaded.
+
+  It also enables Epic's official `unreal-engine-skills-for-claude-code` plugin for side-by-side
   comparison, with its `unreal-mcp` connection to the sandbox editor configured in `.mcp.json`.
 - `Sandbox/`: scratch UE 5.8 project used for development.
 - `docs/DESIGN.md`: analysis, measurements, architecture and roadmap.

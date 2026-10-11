@@ -10,6 +10,16 @@
             "timeout": 10
           }
         ]
+      },
+      {
+        "matcher": "mcp__unreal-mcp.*__call_tool|mcp__unreal-mcp.*StartPIE.*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python \"$CLAUDE_PROJECT_DIR/cli/ue.py\" hook pre-mcp",
+            "timeout": 10
+          }
+        ]
       }
     ]
   },

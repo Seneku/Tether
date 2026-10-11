@@ -97,8 +97,8 @@ UnrealSharp gotchas for agents, and how ToolSuite handles them:
     on-access recompile is the likely cause of "saving C# during PIE crashes PIE".
   - *ToolSuite's handling:* `ue pie start` hot-reloads pending C# first and refuses to start PIE if the
     reload fails.
-  - *Gaps:* Epic's `StartPIE` and the editor's Play button skip that guard, and `AutomaticHotReloading=Off`
-    widens the window.
+  - *Epic's `StartPIE`:* a PreToolUse hook (`ue hook pre-mcp`) denies it while C# is pending.
+  - *Gap:* the editor's Play button is not guarded, and `AutomaticHotReloading=Off` widens that window.
 - **A syntax error in a saved file raises a modal dialog at save time** ("C# Hot Reload Error", from
   the file watcher). That happens outside any reload the bridge can guard.
   - *Why it hangs:* in a `-nullrhi` editor the dialog is an invisible Slate modal. The engine tick and
@@ -487,7 +487,12 @@ project's `Plugins/`, and updates hot-reload without restarting the editor.
 
 - **Skill `unreal-toolsuite`** (v0 in `.claude/skills/`, loaded on demand): command reference, the iteration decision table, and the
   Python gotchas currently buried in IslandHorror's CLAUDE.md.
-- **Hooks:** SessionStart injects a two-line editor status; PostToolUse on `Source/**` classifies
+- **Hooks, done:** two PreToolUse hooks.
+  - `ue hook pre-edit` denies C# edits while PIE runs.
+  - `ue hook pre-mcp` denies Epic's `StartPIE` while saved C# has not been hot-reloaded (see §2). It
+    matches `call_tool` on the `unreal-mcp` connection and finds StartPIE in direct calls and in
+    batch scripts.
+- **Hooks, planned:** SessionStart injects a two-line editor status; PostToolUse on `Source/**` classifies
   the edit as live-codable or restart-required; Stop nudges `ue build` if C++ changed since the
   last green build.
 - **Context diet (measured):** five subsystem sections of IslandHorror's CLAUDE.md (Terrain &
@@ -526,7 +531,7 @@ project's `Plugins/`, and updates hot-reload without restarting the editor.
 | 1 — Gap toolset | **done in spike:** `py`, `exec`, `props`, `actors`, `level_summary`, `reload`, beacon + heartbeat. **To do:** `get`/`set`, `shot`, `pie`, `test` | the `inspect_*.py` loop replaced; 24 s → sub-second |
 | 2 — Restart-free loop | **done in spike:** Live Coding orchestration, coarse change classifier, automated restart. **To do:** finer classifier (diff reflected declarations), hooks, `smoke` | edit C++ → verified in PIE with no human step |
 | 3 — Depth | Blueprint DSL ergonomics, DataTable/DataAsset round-trips, `api`, `job`, `watch` | Blueprint changes reviewed as text diffs |
-| 4 — Scripting | **UnrealSharp trial done in Sandbox:** headless project creation, C# pre-build in `ue open`, bridge-driven reload in `ue build` (0.6–1.2 s, structural changes included), one-line C# errors. **Gameplay feature done** (coins + score subsystem + combo, verified in PIE through `ue`). **Since done:** a PreToolUse hook that blocks C# edits while PIE runs; `ue pie start` reloads pending C# first (works around UnrealSharp's recompile-on-lookup, §2); headless editors log dialogs instead of hanging on them. **To do:** report the UnrealSharp issues in §2 upstream, Angelscript in a later pass | C# features iterated with no restarts |
+| 4 — Scripting | **UnrealSharp trial done in Sandbox:** headless project creation, C# pre-build in `ue open`, bridge-driven reload in `ue build` (0.6–1.2 s, structural changes included), one-line C# errors. **Gameplay feature done** (coins + score subsystem + combo, verified in PIE through `ue`). **Since done:** PreToolUse hooks that block C# edits while PIE runs and Epic's `StartPIE` while C# is unreloaded; `ue pie start` reloads pending C# first (works around UnrealSharp's recompile-on-lookup, §2); headless editors log dialogs instead of hanging on them. **To do:** report the UnrealSharp issues in §2 upstream, Angelscript in a later pass | C# features iterated with no restarts |
 
 ## 9. Decisions
 

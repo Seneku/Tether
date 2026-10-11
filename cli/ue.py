@@ -1047,46 +1047,69 @@ def cmd_pie(ctx, args):
     return 0
 
 
-def cmd_hook(ctx, args):
-    """Claude Code hook entry point (hook JSON on stdin).
+def editor_live(project):
+    """The project's beacon if its editor is running and ticking, else None."""
+    beacon = read_json(os.path.join(state_dir(project), "editor.json")) or {}
+    alive = pid_alive(beacon.get("pid")) and time.time() - beacon.get("heartbeat", 0) < 15
+    return beacon if alive else None
 
-    pre-edit: deny edits to C# under an UnrealSharp project's Script/ while that project's editor is
-    in PIE; UnrealSharp reprocesses saved C# at once, which can crash the running session.
-    """
-    try:
-        payload = json.load(sys.stdin)
-        path = (payload.get("tool_input") or {}).get("file_path") or ""
-        if not path.lower().endswith(".cs"):
-            return 0
-        path, project = os.path.abspath(path), None
-        here = os.path.dirname(path)
-        for _ in range(12):  # nearest .uproject above the file (the file may not exist yet)
-            if os.path.isdir(here):
-                hits = [f for f in os.listdir(here) if f.endswith(".uproject")]
-                if hits:
-                    project = os.path.join(here, hits[0])
-                    break
-            parent = os.path.dirname(here)
-            if parent == here:
+
+def hook_pre_edit(payload):
+    """Deny edits to C# under an UnrealSharp project's Script/ while that project's editor is in PIE:
+    UnrealSharp reprocesses saved C# at once, which can crash the running session."""
+    path = (payload.get("tool_input") or {}).get("file_path") or ""
+    if not path.lower().endswith(".cs"):
+        return None
+    path, project = os.path.abspath(path), None
+    here = os.path.dirname(path)
+    for _ in range(12):  # nearest .uproject above the file (the file may not exist yet)
+        if os.path.isdir(here):
+            hits = [f for f in os.listdir(here) if f.endswith(".uproject")]
+            if hits:
+                project = os.path.join(here, hits[0])
                 break
-            here = parent
-        layout = csharp_layout(project) if project else None
-        if not layout or not os.path.normcase(path).startswith(os.path.normcase(layout[0]) + os.sep):
-            return 0
-        beacon = read_json(os.path.join(state_dir(project), "editor.json")) or {}
-        if not (beacon.get("pie") and pid_alive(beacon.get("pid")) and time.time() - beacon.get("heartbeat", 0) < 15):
-            return 0
-        name = os.path.splitext(os.path.basename(project))[0]
-        print(json.dumps({"hookSpecificOutput": {
-            "hookEventName": "PreToolUse",
-            "permissionDecision": "deny",
-            "permissionDecisionReason": (
-                f"{name}'s editor is in Play-In-Editor. UnrealSharp reprocesses saved C# files immediately, "
-                "which can crash the running PIE session. Run `ue pie stop` first, make the edit, then `ue build`."),
-        }}))
-        return 0
+        parent = os.path.dirname(here)
+        if parent == here:
+            break
+        here = parent
+    layout = csharp_layout(project) if project else None
+    if not layout or not os.path.normcase(path).startswith(os.path.normcase(layout[0]) + os.sep):
+        return None
+    if not (editor_live(project) or {}).get("pie"):
+        return None
+    name = os.path.splitext(os.path.basename(project))[0]
+    return (f"{name}'s editor is in Play-In-Editor. UnrealSharp reprocesses saved C# files immediately, "
+            "which can crash the running PIE session. Run `ue pie stop` first, make the edit, then `ue build`.")
+
+
+def hook_pre_mcp(payload):
+    """Deny Epic's StartPIE (called directly or from a batch script) while saved C# is not hot-reloaded:
+    UnrealSharp would recompile the stale type on its first lookup and drop its subsystems from PIE."""
+    if "StartPIE" not in (payload.get("tool_name") or "") + json.dumps(payload.get("tool_input") or {}):
+        return None
+    os.chdir(payload.get("cwd") or os.getcwd())
+    project = find_project(None)
+    if not editor_live(project):
+        return None
+    changed = csharp_changes(project)
+    if not changed:
+        return None
+    names = ", ".join(os.path.basename(p) for p in changed[:3]) + (f" +{len(changed) - 3} more" if len(changed) > 3 else "")
+    return (f"C# changed since the last reload ({names}). Starting PIE now breaks UnrealSharp subsystems for the "
+            "whole session: UnrealSharp recompiles the stale type on its first lookup and drops its subsystems "
+            "from the PIE world. Use `ue pie start` instead (it hot-reloads first), or run `ue build`, then retry.")
+
+
+def cmd_hook(ctx, args):
+    """Claude Code PreToolUse hook entry points (hook JSON on stdin); see hook_pre_edit / hook_pre_mcp."""
+    try:
+        reason = {"pre-edit": hook_pre_edit, "pre-mcp": hook_pre_mcp}[args.event](json.load(sys.stdin))
+        if reason:
+            print(json.dumps({"hookSpecificOutput": {
+                "hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": reason}}))
     except Exception:
-        return 0  # a broken guard must never block edits
+        pass  # a broken guard must never block a tool call
+    return 0
 
 
 def cmd_reload(ctx, args):
@@ -1167,7 +1190,7 @@ def main(argv=None):
     s.add_argument("--warmup", type=float, default=0.5, help="seconds to let BeginPlay settle (0.5)")
     add("reload", cmd_reload, "hot-reload the ToolSuite Python package in the editor")
     s = add("hook", cmd_hook, "Claude Code hook entry points (hook JSON on stdin)")
-    s.add_argument("event", choices=["pre-edit"])
+    s.add_argument("event", choices=["pre-edit", "pre-mcp"])
 
     args = p.parse_args(argv)
     for key, default in (("project", None), ("port", None), ("timeout", 120.0), ("json", False),
