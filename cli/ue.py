@@ -674,7 +674,8 @@ def cmd_status(ctx, args):
     dirty = beacon.get("dirty") if alive else None
     print(f"{name} | {state} | UE {beacon.get('engine', '?').split('+')[0]} | pid {beacon.get('pid')} | "
           f"map {beacon.get('map')} | {link} | heartbeat {age:.1f}s ago"
-          + (f" | {dirty} unsaved (ue changes)" if dirty else ""))
+          + (f" | {dirty} unsaved (ue changes)" if dirty else "")
+          + (f" | revision control {beacon['vcs']}" if alive and beacon.get("vcs") else ""))
     return 0 if alive and age <= 10 else 2
 
 
@@ -1846,8 +1847,10 @@ def cmd_changes(ctx, args):
 
 
 def cmd_save(ctx, args):
-    print(ctx.tether("save", paths=",".join(args.paths)))
-    return 0
+    out = ctx.tether("save", paths=",".join(args.paths))
+    print(out)
+    failed = out.startswith("save failed") or any(line.startswith("not saved (") for line in out.splitlines())
+    return 1 if failed else 0
 
 
 def cmd_undo(ctx, args):

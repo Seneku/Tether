@@ -802,6 +802,85 @@ def _find_section(query):
     return found[0]
 
 
+def _package_file(package, is_map=False):
+    """A package's file on disk (existing, or where a new one will be written)."""
+    base = unreal.PackageTools.package_name_to_filename(package)
+    for ext in (".umap", ".uasset"):
+        if base and os.path.isfile(base + ext):
+            return base + ext
+    return base + (".umap" if is_map else ".uasset") if base else ""
+
+
+class _Vcs:
+    """Check-outs through the editor's revision control provider (Perforce, Plastic, ...), silently: the
+    editor's own prompts are modal dialogs. Git needs no check-outs, and new files are left for the user to
+    stage. Without a provider, read-only files (an unconnected Perforce workspace) are refused up front,
+    because saving them would ask in a dialog."""
+
+    def __init__(self, sc=None):
+        self.sc = sc or getattr(unreal, "SourceControl", None)
+        try:
+            self.provider = str(self.sc.current_provider()) if self.sc and self.sc.is_enabled() and \
+                self.sc.is_available() else ""
+        except Exception:
+            self.provider = ""
+        self.checkouts = self.provider not in ("", "None", "Git")
+
+    def error(self):
+        return str(_try(lambda: self.sc.last_error_msg(), "")) or "see ue log"
+
+    def prepare(self, files):
+        """Make existing files writable (check them out). Returns (problems, new files, notes)."""
+        problems, new, notes = [], [], []
+        for path in files:
+            if not path:
+                continue
+            if not os.path.isfile(path):
+                new.append(path)
+                continue
+            if self.checkouts:
+                state = self.sc.query_file_state(path, True)
+                if getattr(state, "is_checked_out_other", False):
+                    problems.append(f"{os.path.basename(path)} is checked out by {state.checked_out_other or 'someone else'}")
+                    continue
+                if getattr(state, "is_source_controlled", False) and not getattr(state, "is_current", True):
+                    notes.append(f"{os.path.basename(path)} is not at the latest revision (sync it)")
+                if getattr(state, "can_check_out", False) and not getattr(state, "is_checked_out", False):
+                    if self.sc.check_out_file(path, True):
+                        notes.append(f"checked out {os.path.basename(path)}")
+                    else:
+                        problems.append(f"could not check out {os.path.basename(path)}: {self.error()}")
+                        continue
+            if not os.access(path, os.W_OK):
+                problems.append(f"{os.path.basename(path)} is read-only" + (
+                    "" if self.checkouts else " (not checked out? enable revision control in the editor, or check "
+                    "it out first)"))
+        return problems, new, notes
+
+    def added(self, files):
+        """Mark files created since prepare() for add (providers that need it)."""
+        if not self.checkouts:
+            return []
+        made = [f for f in files if os.path.isfile(f)]
+        if made and self.sc.mark_files_for_add(made, True):
+            return [f"marked for add: {', '.join(os.path.basename(f) for f in made)}"]
+        return [f"could not mark for add: {self.error()}"] if made else []
+
+    def deleted(self, files):
+        """Mark source-controlled files that are gone from disk for delete."""
+        if not self.checkouts:
+            return []
+        notes = []
+        for path in files:
+            state = self.sc.query_file_state(path, True)
+            if not os.path.isfile(path) and getattr(state, "is_source_controlled", False) and \
+                    not getattr(state, "is_deleted", False):
+                ok = self.sc.mark_file_for_delete(path, True)
+                notes.append(f"marked for delete: {os.path.basename(path)}" if ok else
+                             f"could not mark {os.path.basename(path)} for delete: {self.error()}")
+        return notes
+
+
 _reload = {"handle": None}
 
 
@@ -1318,15 +1397,20 @@ class TetherCore(_Base):
             raise RuntimeError(f"no asset at {source} (ue find)")
         if library.does_asset_exist(target):
             raise RuntimeError(f"{target} already exists")
+        vcs, source_file = _Vcs(), _package_file(source)
+        problems, _, notes = vcs.prepare([source_file])
+        if problems:
+            raise RuntimeError("; ".join(problems))
+        dirty_before = set(sum(_dirty_packages(), []))
         if not library.rename_asset(source, target):
             raise RuntimeError("the rename failed (see ue log)")
-        notes = []
         leftover = unreal.load_asset(source) if library.does_asset_exist(source) else None
         if leftover is not None and leftover.get_class().get_name() == "ObjectRedirector":
             unreal.AssetToolsHelpers.get_asset_tools().fixup_referencers([leftover])  # repoint, drop redirector
             notes.append("redirector fixed up")
+        notes += vcs.added([_package_file(target, source_file.endswith(".umap"))]) + vcs.deleted([source_file])
         maps, content = _dirty_packages()
-        touched = [p for p in maps + content if p != target]
+        touched = [p for p in maps + content if p != target and p not in dirty_before]
         if touched:
             notes.append(f"{len(touched)} referencing package(s) updated but unsaved: " + ", ".join(touched[:5])
                          + " (ue save)")
@@ -1360,9 +1444,15 @@ class TetherCore(_Base):
         if users and not force:
             raise RuntimeError(f"{len(users)} asset(s) still reference {package}: " + ", ".join(users[:8])
                                + (" ..." if len(users) > 8 else "") + " (ue refs; pass --force to delete anyway)")
+        vcs, file = _Vcs(), _package_file(package)
+        problems = [p for p in vcs.prepare([file])[0] if "checked out by" in p or not vcs.checkouts]
+        if problems:
+            raise RuntimeError("; ".join(problems))
         if not unreal.EditorAssetLibrary.delete_asset(package):
             raise RuntimeError("the delete failed (see ue log)")
-        return f"deleted {package}" + (f" ({len(users)} references now broken)" if users else "")
+        notes = vcs.deleted([file])
+        return f"deleted {package}" + (f" ({len(users)} references now broken)" if users else "") + \
+            (f"\n{vcs.provider}: " + "; ".join(notes) if notes else "")
 
     @_tool
     @staticmethod
@@ -1431,12 +1521,20 @@ class TetherCore(_Base):
         missing = [p for p in wanted if p not in dirty]
         temp = [p for p in wanted if p.startswith("/Temp/")]
         todo = [p for p in wanted if p in dirty and p not in temp]
+        # Check files out first (Perforce and co.): saving a read-only file would ask in a modal dialog.
+        vcs = _Vcs()
+        files = {p: _package_file(p, p in maps) for p in todo}
+        problems, new_files, notes = vcs.prepare(list(files.values()))
+        blocked = [p for p in todo if any(os.path.basename(files[p]) in problem for problem in problems)]
+        todo = [p for p in todo if p not in blocked]
         packages = [unreal.find_package(p) for p in todo]
         saved = bool(packages) and unreal.EditorLoadingAndSavingUtils.save_packages([p for p in packages if p], False)
+        if saved:
+            notes += vcs.added(new_files)
         if saved and any(p in maps for p in todo):
             snapshot_level()
         lines = [f"saved {len(todo)} package{'' if len(todo) == 1 else 's'}" if saved else
-                 ("nothing to save" if not todo else "save failed (see ue log)")]
+                 ("nothing saved" if blocked else "nothing to save" if not todo else "save failed (see ue log)")]
         if todo and saved:
             lines[0] += ": " + ", ".join(todo[:10]) + (f", +{len(todo) - 10} more" if len(todo) > 10 else "")
         if temp:
@@ -1444,6 +1542,10 @@ class TetherCore(_Base):
                          "(e.g. unreal.EditorLoadingAndSavingUtils.save_map(world, '/Game/Maps/Name'))")
         if missing:
             lines.append("not unsaved (nothing to do): " + ", ".join(missing[:10]))
+        if blocked:
+            lines.append(f"not saved ({len(blocked)}): " + "; ".join(problems[:10]))
+        if notes:
+            lines.append(f"{vcs.provider or 'files'}: " + "; ".join(notes[:10]))
         return "\n".join(lines)
 
     @_tool

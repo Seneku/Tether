@@ -108,3 +108,86 @@ class Compact(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FakeSourceControl:
+    """unreal.SourceControl stand-in: per-file states, check-outs make files writable."""
+
+    def __init__(self, provider, states=None):
+        self.provider, self.states, self.calls = provider, states or {}, []
+
+    def is_enabled(self):
+        return self.provider != "None"
+
+    def is_available(self):
+        return True
+
+    def current_provider(self):
+        return self.provider
+
+    def query_file_state(self, path, silent):
+        return types.SimpleNamespace(**dict({"is_source_controlled": True, "is_current": True, "can_check_out": True,
+                                             "is_checked_out": False, "is_checked_out_other": False,
+                                             "checked_out_other": "", "is_deleted": False},
+                                            **self.states.get(os.path.basename(path), {})))
+
+    def check_out_file(self, path, silent):
+        self.calls.append(("checkout", os.path.basename(path)))
+        os.chmod(path, 0o666)
+        return True
+
+    def mark_files_for_add(self, files, silent):
+        self.calls.append(("add", [os.path.basename(f) for f in files]))
+        return True
+
+    def mark_file_for_delete(self, path, silent):
+        self.calls.append(("delete", os.path.basename(path)))
+        return True
+
+    def last_error_msg(self):
+        return "error"
+
+
+class RevisionControl(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = lambda name: os.path.join(self.tmp.name, name)
+        for name in ("A.uasset", "B.uasset"):
+            with open(self.path(name), "w") as f:
+                f.write("x")
+            os.chmod(self.path(name), 0o444)  # what a Perforce workspace syncs
+
+    def tearDown(self):
+        for name in os.listdir(self.tmp.name):
+            os.chmod(self.path(name), 0o666)
+        self.tmp.cleanup()
+
+    def test_perforce_checks_out_refuses_files_locked_by_others_and_adds_new_ones(self):
+        sc = FakeSourceControl("Perforce", {"B.uasset": {"is_checked_out_other": True, "checked_out_other": "kim"}})
+        vcs = toolsets._Vcs(sc)
+        problems, new, notes = vcs.prepare([self.path("A.uasset"), self.path("B.uasset"), self.path("New.uasset")])
+        self.assertEqual(problems, ["B.uasset is checked out by kim"])
+        self.assertEqual(notes, ["checked out A.uasset"])
+        self.assertEqual(new, [self.path("New.uasset")])
+        self.assertTrue(os.access(self.path("A.uasset"), os.W_OK))
+        with open(self.path("New.uasset"), "w") as f:
+            f.write("x")
+        self.assertEqual(vcs.added(new), ["marked for add: New.uasset"])
+        os.chmod(self.path("A.uasset"), 0o666)
+        os.remove(self.path("A.uasset"))
+        self.assertEqual(vcs.deleted([self.path("A.uasset")]), ["marked for delete: A.uasset"])
+
+    def test_git_needs_no_checkouts_and_leaves_new_files_alone(self):
+        sc = FakeSourceControl("Git")
+        vcs = toolsets._Vcs(sc)
+        os.chmod(self.path("A.uasset"), 0o666)
+        self.assertEqual(vcs.prepare([self.path("A.uasset")]), ([], [], []))
+        self.assertEqual(vcs.added([self.path("A.uasset")]), [])
+        self.assertEqual(sc.calls, [])
+
+    def test_without_a_provider_read_only_files_are_refused_up_front(self):
+        vcs = toolsets._Vcs(FakeSourceControl("None"))
+        problems, _, _ = vcs.prepare([self.path("A.uasset")])
+        self.assertEqual(len(problems), 1)
+        self.assertIn("A.uasset is read-only (not checked out?", problems[0])

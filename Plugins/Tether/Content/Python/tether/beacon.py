@@ -56,8 +56,15 @@ def _snapshot():
         dirty = len(utils.get_dirty_content_packages()) + len(utils.get_dirty_map_packages())
     except Exception:
         dirty = None
+    try:
+        sc = unreal.SourceControl
+        vcs = str(sc.current_provider()) if sc.is_enabled() else None
+        vcs = None if vcs in ("None", "") else vcs + ("" if sc.is_available() else " (not connected)")
+    except Exception:
+        vcs = None
     return {
         "dirty": dirty,
+        "vcs": vcs,
         "pid": os.getpid(),
         "project": unreal.Paths.convert_relative_path_to_full(unreal.Paths.get_project_file_path()),
         "engine": unreal.SystemLibrary.get_engine_version(),

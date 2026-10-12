@@ -202,6 +202,21 @@ The plugin's hooks stay silent outside Unreal projects, and never block a tool c
 
 Exit codes: `0` ok, `1` tool or command failed, `2` editor unavailable, `3` restart required, `4` timeout.
 
+## Revision control (Perforce and others)
+
+`ue save`, `ue mv` and `ue rm` go through the revision control provider the editor is connected to
+(Perforce, Plastic/Unity Version Control, ...), silently, because the editor's own prompts are modal
+dialogs that would stall an agent:
+
+- files are checked out before they are written; a file checked out by someone else is refused, naming them;
+- new files (a saved new asset, the target of a move) are marked for add, and a moved or deleted file for delete;
+- without a connected provider, read-only files (an unconnected Perforce workspace) are refused up front
+  instead of raising the editor's "make writable?" dialog. `ue save` exits 1 when something was not saved.
+
+With Git nothing is checked out or staged. `ue status` names the provider. This was tested without a
+Perforce server (unit tests with a fake provider, and read-only files on a live editor); reports from
+Perforce users are welcome.
+
 ## C# with UnrealSharp (optional)
 
 1. Clone [UnrealSharp](https://github.com/UnrealSharp/UnrealSharp) into your project's

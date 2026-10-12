@@ -39,6 +39,9 @@ broken or unsupported.
   review what you changed, then `ue save` (or tell the user what is unsaved and why), then `ue validate`:
   data validation on the changed and unsaved assets plus Map Check of the open level, one line per
   problem (`ue validate /Game/Some/Folder` for a folder). Fix errors it reports before calling the task done.
+- In a Perforce (or other check-out) workspace, `ue save`/`mv`/`rm` check files out and mark new ones for add
+  themselves; if one is checked out by someone else, or read-only without a connection, it says so and
+  `ue save` exits 1: tell the user rather than making files writable yourself.
 - Level edits: `ue spawn PointLight --at 0,0,300 --label Lamp` (or an asset path), `ue duplicate Lamp --count 3`,
   `ue delete Lamp`. Asset moves: `ue mv /Game/A/X /Game/B/` (then `ue save`), `ue rm /Game/A/X` (refuses while
   referenced; check `ue refs` first). Prefer these to raw `ue py`: they are undoable and checked.
