@@ -87,6 +87,8 @@ broken or unsupported.
 - `ue bp /Game/Path/BP_X [graph]` prints Blueprint graphs as text. To change one: write the edited text to
   a file, `ue bp /Game/Path/BP_X EventGraph --apply file.dsl --save` (compiles, prints the diff).
   `ue bp ... --diff` shows only what changed since the last read; `ue bp --docs` is the syntax reference.
+- After renaming or removing C++ functions, properties or classes (and `ue build --restart`), run
+  `ue bp check` (or `ue bp check /Game/Some/Folder`): it lists only Blueprints that no longer compile, with why.
 - `ue table /Game/Path/DT_X` shows rows; `--export rows.json|.csv`, edit, then `--import rows.json
   --dry-run` to see the diff and `--import rows.json --save` to apply (upsert; `--prune` deletes missing
   rows).

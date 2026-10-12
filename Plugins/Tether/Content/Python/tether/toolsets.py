@@ -739,6 +739,35 @@ class TetherCore(_Base):
 
     @_tool
     @staticmethod
+    def bp_check(path: str = "/Game", warnings: bool = False) -> str:
+        """Compile every Blueprint under a content path and report the ones that do not compile cleanly.
+
+        Args:
+            path: Content folder to scan recursively, e.g. /Game or /Game/Characters.
+            warnings: Also report Blueprints that compile with warnings.
+
+        Returns:
+            JSON: {"checked": N, "problems": [{"path": ..., "status": "error"|"warnings"}]}.
+        """
+        registry = unreal.AssetRegistryHelpers.get_asset_registry()
+        assets = registry.get_assets_by_path(path.rstrip("/") or "/Game", recursive=True)
+        names = sorted({str(a.package_name) for a in assets
+                        if str(a.asset_class_path.asset_name).endswith("Blueprint")})
+        problems = []
+        for name in names:
+            bp = unreal.load_asset(name)
+            if not isinstance(bp, unreal.Blueprint):
+                continue
+            unreal.BlueprintEditorLibrary.compile_blueprint(bp)
+            status = bp.get_editor_property("status")
+            if status == unreal.BlueprintStatus.BS_ERROR:
+                problems.append({"path": name, "status": "error"})
+            elif warnings and status == unreal.BlueprintStatus.BS_UP_TO_DATE_WITH_WARNINGS:
+                problems.append({"path": name, "status": "warnings"})
+        return json.dumps({"checked": len(names), "problems": problems})
+
+    @_tool
+    @staticmethod
     def pie(action: str, simulate: bool = False) -> str:
         """Play-In-Editor through LevelEditorSubsystem (works on UE 5.x without Epic's EditorAppToolset).
 

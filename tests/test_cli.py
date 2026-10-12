@@ -393,6 +393,12 @@ class RemoteResults(unittest.TestCase):
 
 
 class Phase3(unittest.TestCase):
+    def test_compiler_line(self):
+        line = stamped(r"LogBlueprint: Error: [AssetLog] D:\P\Content\BP_X.uasset: [Compiler] Could not find a "
+                       "function named \"GetProbeCount\" in 'SandboxProbeLibrary'.")
+        self.assertEqual(ue.COMPILER_LINE.search(line).group(1), "Error")
+        self.assertIn("BP_X", ue.COMPILER_LINE.search(line).group(2))
+
     def test_asset_ref(self):
         self.assertEqual(ue.asset_ref("/Game/A/BP_X"), "/Game/A/BP_X.BP_X")
         self.assertEqual(ue.asset_ref("/Game/A/BP_X.BP_X"), "/Game/A/BP_X.BP_X")

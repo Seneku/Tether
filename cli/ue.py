@@ -1465,11 +1465,42 @@ def mcp_tool(ctx, toolset_query, tool, payload):
     return unwrap(text)
 
 
+COMPILER_LINE = re.compile(r"(?:LogBlueprint|LogK2Compiler|BlueprintLog)\w*: (Error|Warning): (.*)")
+
+
+def bp_check(ctx, path, args):
+    """Compile every Blueprint under `path`; print only the broken ones, with the compiler's messages."""
+    start, started = log_end(ctx.project), time.time()
+    if not args.timeout_given:
+        ctx.args.timeout = 1800.0  # big projects have hundreds of Blueprints
+    result = ctx.tether("bp_check", path=path, warnings=args.warnings)
+    result = json.loads(result) if isinstance(result, str) else result
+    flush_editor_log(ctx)
+    with open(log_path(ctx.project), "rb") as f:
+        f.seek(start)
+        lines = f.read().decode("utf-8", "replace").splitlines()
+    messages = [m.groups() for m in map(COMPILER_LINE.search, lines) if m]
+    problems = result.get("problems", [])
+    count = result.get("checked", 0)
+    print(f"{count} Blueprint{'' if count == 1 else 's'} under {path} compiled in {time.time() - started:.1f}s: "
+          + (f"{len(problems)} with problems" if problems else "all clean"))
+    for problem in problems[: args.limit]:
+        name = problem["path"].rsplit("/", 1)[-1]
+        print(f"{'ERROR' if problem['status'] == 'error' else 'WARN '} {problem['path']}")
+        mine = [f"  {sev[0]} " + re.sub(r"\s+", " ", re.sub(r"^\[AssetLog\] .*?: \[Compiler\] ", "", text.strip()))
+                for sev, text in messages if name in text]
+        for line in list(dict.fromkeys(mine))[:5] or ["  (no compiler message in the log; open it in the editor)"]:
+            print(line[:300])
+    return 1 if any(p["status"] == "error" for p in problems) else 0
+
+
 def cmd_bp(ctx, args):
     """Blueprint graphs as text (Epic's graph DSL): read, diff against the last read, apply edited text."""
     if args.docs:
         print(mcp_tool(ctx, "blueprint", "get_graph_dsl_docs", {}))
         return 0
+    if args.blueprint == "check":
+        return bp_check(ctx, args.graph or "/Game", args)
     if not args.blueprint:
         raise CliError("give a Blueprint: ue bp /Game/Path/BP_Name [graph]")
     bp = asset_ref(args.blueprint)
@@ -1485,7 +1516,12 @@ def cmd_bp(ctx, args):
             raise CliError("--apply needs one graph: ue bp <blueprint> <graph> --apply file.dsl")
         with open(args.apply, encoding="utf-8-sig") as f:
             code = f.read()
-        mcp_tool(ctx, "blueprint", "write_graph_dsl", {"graph": {"refPath": f"{bp}:{names[0]}"}, "code": code})
+        graph = {"graph": {"refPath": f"{bp}:{names[0]}"}}
+        previous = mcp_tool(ctx, "blueprint", "read_graph_dsl", graph)
+        mcp_tool(ctx, "blueprint", "write_graph_dsl", dict(graph, code=code))
+        deadline = time.time() + 5  # the write can land a tick later; reading at once may see the old graph
+        while mcp_tool(ctx, "blueprint", "read_graph_dsl", graph) == previous and time.time() < deadline:
+            time.sleep(0.25)
         print(f"applied {os.path.basename(args.apply)} to {names[0]} (compiled)")
     changed = 0
     for name in names:
@@ -1507,7 +1543,8 @@ def cmd_bp(ctx, args):
         with open(snap, "w", encoding="utf-8", newline="\n") as f:
             f.write(text)
     if (args.diff or args.apply) and not changed:
-        print("no changes since the last read" if args.diff else "graph unchanged")
+        print("no changes since the last read" if args.diff else
+              "graph unchanged: the text matched what was there, or did not apply (ue log --level Log --grep DSL)")
     if args.save:
         mcp_tool(ctx, "AssetTools", "save_assets", {"asset_paths": [bp.split(".")[0]]})
         print("saved")
@@ -2127,7 +2164,8 @@ def classify_edit(path, tool_input):
 
 
 EDIT_ADVICE = {
-    "restart": "needs `ue build --restart` (Live Coding cannot patch class layout or reflection); batch such changes",
+    "restart": "needs `ue build --restart` (Live Coding cannot patch class layout or reflection); batch such changes, "
+               "then `ue bp check` to find Blueprints that used what changed",
     "maybe-restart": "`ue build` (Live Coding) if only inline function bodies changed; `ue build --restart` if "
                      "members, UPROPERTYs, class layout or defaults changed",
     "live-ufunction": "`ue build` (Live Coding) makes it callable via reflection (cdo.call_method); Python and "
@@ -2441,12 +2479,13 @@ def main(argv=None):
     s.add_argument("--simulate", action="store_true", help="Simulate-In-Editor (no player pawn)")
     s.add_argument("--warmup", type=float, default=0.5, help="seconds to let BeginPlay settle (0.5)")
     s = add("bp", cmd_bp, "Blueprint graphs as text: read, --diff against the last read, --apply edited text")
-    s.add_argument("blueprint", nargs="?", help="/Game/Path/BP_Name")
+    s.add_argument("blueprint", nargs="?", help="/Game/Path/BP_Name, or `check [/Game/path]` to compile all and list the broken")
     s.add_argument("graph", nargs="?", help="graph name (default: all)")
     s.add_argument("--diff", action="store_true", help="show only what changed since the last ue bp read")
     s.add_argument("--apply", metavar="FILE", help="write this DSL into the graph (compiles), then show the diff")
     s.add_argument("--save", action="store_true", help="save the Blueprint afterwards")
     s.add_argument("--docs", action="store_true", help="print Epic's graph DSL syntax reference")
+    s.add_argument("--warnings", action="store_true", help="with check: also list Blueprints with warnings")
     s = add("table", cmd_table, "DataTable round-trips: show, --export JSON/CSV, --import with a row diff")
     s.add_argument("table", help="/Game/Path/DT_Name")
     s.add_argument("--export", metavar="FILE", help="write all rows to FILE (.json or .csv)")
