@@ -7,7 +7,7 @@ just as valuable as code.
 
 Use the [issue templates](https://github.com/Seneku/Tether/issues/new/choose). For bugs, include:
 
-- the exact `ue` command and its full output;
+- the exact `ue` command and its full output, and `ue selftest` output if the editor runs;
 - your UE version (`ue status` prints it), OS and shell (PowerShell, cmd or Git Bash);
 - whether the editor was headless (`ue open --headless`) or windowed;
 - whether the project uses UnrealSharp.
@@ -63,11 +63,8 @@ hooks, and the toolset's value parsing (with `unreal` stubbed). CI runs them on 
 (the version bundled with UE 5.8) and 3.13. Before opening a PR:
 
 1. `python -m unittest discover -s tests`, and add tests for new parsing or routing logic.
-2. Against the Sandbox editor, run the commands your change touches, plus a smoke pass:
-   `ue status`, `ue call tether.level_summary`, `ue actors light`,
-   `ue props DirectionalLight.LightComponent0 intensity`, `ue test ^Sandbox.`, `ue log --level Warning`.
-   For capture changes, open with `ue open --headless --render` and check `ue shot` both outside and
-   during PIE.
+2. Against the Sandbox editor (`ue open --headless --render`), run the commands your change touches, then
+   `ue selftest`. It should report 0 failed; skips must have a reason that fits your setup.
 3. If you touched build, lifecycle or PIE code, also run `ue build`, `ue build --restart`,
    `ue pie start` / `ue pie stop`, and `ue close`.
 4. For C# changes, `Sandbox/Scripts/coin_smoke.py` exercises the UnrealSharp coin feature during PIE.

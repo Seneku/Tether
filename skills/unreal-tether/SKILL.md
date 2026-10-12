@@ -12,6 +12,9 @@ start the editor with `ue open --headless` (`--render` if you need `ue shot`).
 Once the editor is running, talk to it; do not boot it again. Each `ue` call takes tens of
 milliseconds. A `-run=pythonscript` commandlet takes ~25 s and floods the log.
 
+If something behaves unexpectedly, `ue selftest` checks every capability in ~35 s and names what is
+broken or unsupported.
+
 ## First moves
 - `ue status`: is the editor up, which map, PIE on/off, heartbeat. Exit code 2 = not available.
 - `ue call tether.level_summary`: what is in the level (counts by class).

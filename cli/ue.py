@@ -1779,6 +1779,124 @@ def job_line(folder, job_id):
     return f"{job_id}  {meta.get('name', '?')}  {state}  {end - meta.get('started', end):.0f}s{last}"
 
 
+def tether_version():
+    plugin = read_json(os.path.join(tether_plugins_dir(), "Tether", "Tether.uplugin")) or {}
+    return plugin.get("VersionName", "?")
+
+
+FIRST_ASSET = """
+import unreal
+reg = unreal.AssetRegistryHelpers.get_asset_registry()
+hits = [str(a.package_name) for a in reg.get_assets_by_class(unreal.TopLevelAssetPath('/Script/Engine', '{cls}'))
+        if str(a.package_name).startswith('/Game/')]
+print(sorted(hits)[0] if hits else '')
+"""
+
+
+def cmd_selftest(ctx, args):
+    """Run every capability against the live editor, one CLI process per check, and report pass/fail/skip."""
+    import tempfile
+    project = ctx.project
+    base = [sys.executable, os.path.abspath(__file__), "--project", project]
+    results, notes = [], {}
+
+    def ue(*argv, timeout=180):
+        started = time.time()
+        proc = subprocess.run(base + list(argv), capture_output=True, text=True, encoding="utf-8",
+                              errors="replace", timeout=timeout)
+        return proc.returncode, (proc.stdout + proc.stderr).strip(), time.time() - started
+
+    def check(name, argv, ok=lambda code, out: code == 0, skip=None, timeout=180):
+        if skip:
+            results.append(("SKIP", name, skip, 0.0))
+            return None
+        try:
+            code, out, took = ue(*argv, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            results.append(("FAIL", name, f"no answer within {timeout}s", float(timeout)))
+            return None
+        passed = ok(code, out)
+        detail = "" if passed else (out.splitlines() or [f"exit {code}"])[-1][:160]
+        results.append(("PASS" if passed else "FAIL", name, detail, took))
+        return out if passed else None
+
+    beacon = ctx.beacon or {}
+    print(f"Tether {tether_version()} | {os.path.basename(project)} | UE {beacon.get('engine', '?').split('+')[0]} | "
+          f"{host_platform()} | Python {sys.version.split()[0]} | transport {ctx.transport}")
+    if not check("status", ["status"]):
+        for status, name, detail, _ in results:
+            print(f"{status} {name}: {detail}")
+        raise CliError("the editor is not running or not answering; start it with `ue open --headless --render`", 2)
+    remote = ctx.transport == "remote"
+    launch = read_json(os.path.join(state_dir(project), "launch.json")) or {}
+    check("py", ["py", "6*7"], ok=lambda c, o: c == 0 and o.endswith("42"))
+    check("exec", ["exec", "stat fps"], ok=lambda c, o: c == 0 and "ran in" in o)
+    check("actors", ["actors", "--limit", "3"], ok=lambda c, o: c == 0 and "actors" in o.splitlines()[0])
+    check("api", ["api", "Actor", "set_actor_location"], ok=lambda c, o: c == 0 and "set_actor_location" in o)
+    check("log", ["log", "--level", "Error"])
+    check("call tether.level_summary", ["call", "tether.level_summary", "limit=3"],
+          ok=lambda c, o: c == 0 and "actors" in o)
+
+    # A transient actor to read and edit; never saved, destroyed at the end.
+    spawned = check("spawn probe actor", ["py", "a = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)"
+                    ".spawn_actor_from_class(unreal.TargetPoint, unreal.Vector(0, 0, 100000), transient=True)\n"
+                    "a.set_actor_label('TetherSelftestProbe')\nprint(a.get_actor_label())"],
+                    ok=lambda c, o: c == 0 and "TetherSelftestProbe" in o)
+    probe_skip = None if spawned else "probe actor missing"
+    check("props", ["props", "TetherSelftestProbe", "hidden"], skip=probe_skip)
+    if remote:
+        check("set", [], skip="needs UE 5.8+ (ToolsetLibrary)")
+        check("set rollback", [], skip="needs UE 5.8+")
+    else:
+        check("set", ["set", "TetherSelftestProbe", "location+=0,0,50"], skip=probe_skip,
+              ok=lambda c, o: c == 0 and "-> (0, 0, 100050)" in o)
+        check("set rollback", ["set", "TetherSelftestProbe", "location=0,0,0", "no_such_property_xyz=1"],
+              skip=probe_skip, ok=lambda c, o: c != 0 and "no property" in o)
+    check("destroy probe actor", ["py", "w = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_editor_world()\n"
+          "found = [a for a in unreal.GameplayStatics.get_all_actors_of_class(w, unreal.Actor) "
+          "if a.get_actor_label() == 'TetherSelftestProbe']\n"
+          "print(len(found), unreal.get_editor_subsystem(unreal.EditorActorSubsystem).destroy_actors(found))"],
+          skip=probe_skip, ok=lambda c, o: c == 0 and o.endswith("1 True"))
+
+    rendering = launch.get("render", True) or not launch.get("headless")
+    shot_out = check("shot", ["shot", "-o", os.path.join(tempfile.gettempdir(), "tether-selftest.png")],
+                     skip="needs 5.8 (CaptureViewport)" if remote else None if rendering else
+                     "headless with -nullrhi; reopen with `ue open --headless --render`",
+                     ok=lambda c, o: c == 0 and ".png" in o)
+    if shot_out:
+        notes["shot"] = shot_out.split()[1] if len(shot_out.split()) > 1 else ""
+    tests_available = not remote and "AutomationTestToolset.AutomationTestToolset" in catalog(ctx)
+    check("test", ["test", "StartsWith:System.Core.Math.Evaluate"], timeout=600,
+          skip=None if tests_available else "needs Epic's AutomationTestToolset (UE 5.8+, `ue init` enables it)",
+          ok=lambda c, o: c == 0 and "passed" in o)
+    blueprint = None if remote else (ue("py", FIRST_ASSET.format(cls="Blueprint"))[1].splitlines() or [""])[-1]
+    check("bp", ["bp", blueprint or ""], skip="needs 5.8 (Epic's BlueprintTools)" if remote else
+          None if blueprint and blueprint.startswith("/Game/") else "no Blueprint under /Game",
+          ok=lambda c, o: c == 0 and "==" in o)
+    table = None if remote else (ue("py", FIRST_ASSET.format(cls="DataTable"))[1].splitlines() or [""])[-1]
+    check("table export", ["table", table or "", "--export", os.path.join(tempfile.gettempdir(), "tether-selftest.json")],
+          skip="needs 5.8 (Epic's DataTableTools)" if remote else
+          None if table and table.startswith("/Game/") else "no DataTable under /Game",
+          ok=lambda c, o: c == 0 and "exported" in o)
+    check("pie start", ["pie", "start"], ok=lambda c, o: c == 0 and "OK" in o, timeout=300)
+    check("pie status", ["pie", "status"], ok=lambda c, o: c == 0 and "running" in o)
+    check("actors --pie", ["actors", "--pie", "--limit", "1"])
+    check("pie stop", ["pie", "stop"], ok=lambda c, o: c == 0 and "OK" in o)
+    if args.reload:
+        check("reload", ["reload"])
+        time.sleep(1.5)
+        check("py after reload", ["py", "1+1"], ok=lambda c, o: c == 0 and o.endswith("2"))
+
+    width = max(len(name) for _, name, _, _ in results)
+    for status, name, detail, took in results:
+        print(f"{status}  {name.ljust(width)}  {took:5.1f}s" + (f"  {detail}" if detail else ""))
+    counts = {s: sum(1 for r in results if r[0] == s) for s in ("PASS", "FAIL", "SKIP")}
+    print(f"{counts['PASS']} passed, {counts['FAIL']} failed, {counts['SKIP']} skipped")
+    if args.json:
+        print(json.dumps([{"check": n, "status": s, "detail": d, "seconds": round(t, 2)} for s, n, d, t in results]))
+    return 1 if counts["FAIL"] else 0
+
+
 def cmd_actors(ctx, args):
     print(ctx.tether("actors", match=args.match or "", limit=args.limit, pie=args.pie))
     return 0
@@ -2346,6 +2464,8 @@ def main(argv=None):
     s.add_argument("--platform", help="with cook: target platform (default: this host)")
     s.add_argument("--wait", type=float, default=7200, help="with wait: seconds before giving up (7200)")
     s.add_argument("-v", "--verbose", action="store_true", help="with wait: also print warnings")
+    s = add("selftest", cmd_selftest, "check every capability against the running editor (pass/fail/skip)")
+    s.add_argument("--reload", action="store_true", help="also hot-reload the Tether package and re-check")
     s = add("init", cmd_init, "set up this project: enable the needed plugins, copy the Tether editor plugin in")
     s.add_argument("--unrealsharp", action="store_true", help="also install TetherUnrealSharp (auto if Script/ exists)")
     s.add_argument("--dry-run", action="store_true", help="show what would change")

@@ -87,11 +87,23 @@ class Deltas(unittest.TestCase):
             toolsets._add(True, "x", "flag") if False else toolsets._add("a", 1, "name")
 
 
+class ReadBack(unittest.TestCase):
+    def test_took(self):
+        self.assertTrue(toolsets._took(0.5, 0.502))  # 8-bit colour quantisation
+        self.assertFalse(toolsets._took(100050, 100000))  # a move that did not happen
+        self.assertFalse(toolsets._took(-5, 0))  # clamped
+        self.assertTrue(toolsets._took({"pitch": -30, "yaw": 270, "roll": 0}, {"pitch": -30, "yaw": -90, "roll": 0}))
+        self.assertFalse(toolsets._took(True, False))
+        self.assertTrue(toolsets._took("Movable", "MOVABLE"))  # names and paths are trusted
+        self.assertTrue(toolsets._took({"r": 1, "g": 0.5}, {"r": 1, "g": 0.502, "b": 0, "a": 1}))
+
+
 class Compact(unittest.TestCase):
     def test_numeric_structs_as_tuples_and_tiny_values_as_zero(self):
         self.assertEqual(toolsets._compact({"pitch": -45, "yaw": 30, "roll": 4.4e-15}), "(-45, 30, 0)")
         self.assertEqual(toolsets._compact({"refPath": "/Temp/L.L:PersistentLevel.Light"}), "Light")
-        self.assertEqual(toolsets._compact(6.123456), "6.123")
+        self.assertEqual(toolsets._compact(6.1234567), "6.12346")
+        self.assertEqual(toolsets._compact({"x": 0, "y": 0, "z": 100050}), "(0, 0, 100050)")
 
 
 if __name__ == "__main__":

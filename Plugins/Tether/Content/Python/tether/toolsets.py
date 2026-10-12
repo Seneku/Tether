@@ -91,9 +91,18 @@ def _actors(pie=False):
 
 def _match_actors(ref, pie=False):
     key = ref.lower()
-    actors = _actors(pie)
-    exact = [a for a in actors if key in (a.get_actor_label().lower(), a.get_name().lower())]
-    return exact or [a for a in actors if key in a.get_actor_label().lower()]
+
+    def find(actors):
+        exact = [a for a in actors if key in (a.get_actor_label().lower(), a.get_name().lower())]
+        return exact or [a for a in actors if key in a.get_actor_label().lower()]
+
+    found = find(_actors(pie))
+    if not found and not pie and _game_world() is None:
+        # get_all_level_actors() leaves out transient actors (spawned with transient=True); look wider.
+        world = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_editor_world()
+        if world is not None:
+            found = find(unreal.GameplayStatics.get_all_actors_of_class(world, unreal.Actor))
+    return found
 
 
 def _resolve(ref, pie=False):
@@ -148,7 +157,7 @@ def _type_name(entry):
 
 def _round(value):
     if isinstance(value, float):
-        return float(f"{value:.4g}")
+        return float(f"{value:.6g}")  # 6 digits: 4 hid a 50-unit move at 100000 (100050 -> 1.000e5)
     if isinstance(value, list):
         return [_round(v) for v in value]
     if isinstance(value, dict):
@@ -252,6 +261,21 @@ def _add(old, delta, name):
     if isinstance(old, dict) and isinstance(delta, dict):
         return {k: (v + delta[k] if k in delta and isinstance(v, (int, float)) else v) for k, v in old.items()}
     raise ValueError(f"'{name}' does not support += (not a number or numeric struct)")
+
+
+def _took(wanted, actual):
+    """Whether a written value reads back (numbers, bools and numeric structs; other kinds are trusted,
+    since the engine may normalise names and paths)."""
+    if isinstance(wanted, bool) or isinstance(actual, bool):
+        return not isinstance(wanted, bool) or wanted == actual
+    if isinstance(wanted, (int, float)):  # 0.01 absorbs 8-bit colour (1/255) and float32 at 1e5 (~0.008)
+        return isinstance(actual, (int, float)) and abs(actual - wanted) <= max(0.01, 1e-7 * abs(wanted))
+    if isinstance(wanted, dict) and isinstance(actual, dict):
+        if {"pitch", "yaw", "roll"} <= set(wanted):  # rotators read back normalised (270 -> -90)
+            return all(isinstance(actual.get(k), (int, float)) and abs((actual[k] - wanted[k] + 180) % 360 - 180) < 0.01
+                       for k in ("pitch", "yaw", "roll"))
+        return all(_took(v, actual.get(k)) for k, v in wanted.items() if isinstance(v, (int, float, bool)))
+    return True
 
 
 def _compact(value):
@@ -554,6 +578,14 @@ class TetherCore(_Base):
         after = json.loads(unreal.ToolsetLibrary.get_object_properties(obj, reflected)) if reflected else {}
         if is_actor:
             after.update(_actor_pose(obj))
+        ignored = [n for n in new if not _took(new[n], after.get(n))]
+        if ignored:  # e.g. location on an actor without a root component: report it rather than "succeed"
+            if not pie and unreal.ToolsetLibrary.get_active_undo_count() > before:
+                unreal.ToolsetLibrary.undo_transaction(False)
+            hint = " (the actor has no root component)" if is_actor and not obj.root_component and \
+                any(n in _ACTOR_POSE for n in ignored) else ""
+            raise RuntimeError("did not take: " + ", ".join(f"{n} stayed {_compact(after.get(n))}" for n in ignored)
+                               + hint + ("" if pie else " (rolled back)"))
         rows = [f"{n}: {_compact(old.get(n))} -> {_compact(after.get(n))}" for n in new]
         return "\n".join([_label(obj) + (" (PIE)" if pie else "")] + rows)
 

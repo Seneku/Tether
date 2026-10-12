@@ -151,6 +151,7 @@ The plugin's hooks stay silent outside Unreal projects, and never block a tool c
 |---|---|
 | `ue status` | Editor state from the beacon: map, PIE, PID, port, heartbeat. No HTTP. Names the dialog a hung windowed editor is waiting on. |
 | `ue init [--dry-run]` | Set up the project: enable the engine plugins Tether needs, copy the Tether editor plugin into `Plugins/`. |
+| `ue selftest` | Check every capability against the running editor: one line of pass/fail/skip per feature (~35 s). Leaves nothing behind. Paste its output into bug reports. |
 | `ue open [--headless [--render]] [--map M]` | Launch on a per-project port and wait until ready. Prints boot errors, de-duplicated. `--headless` has no window and no renderer (`-nullrhi`); add `--render` to render offscreen for `ue shot`. |
 | `ue close [--save\|--discard\|--force]` | Quit gracefully. Refuses to drop unsaved work unless told to. |
 | `ue build [--restart]` | Uses Live Coding if the editor is up and UBT if not, plus C# hot reload. `--restart` covers reflection and `Build.cs` changes: save, close, build, reopen the same map. |
@@ -221,7 +222,8 @@ switches it on for the session anyway).
 Each call costs about 0.5 s more (UDP discovery), and the token gate adds nothing here: remote execution
 itself runs any Python sent to it, so keep its bind address at the default `127.0.0.1`.
 
-**Tested** by forcing this route on a 5.8 editor (`UE_TRANSPORT=remote`, plus `TETHER_LEGACY=1` in the
+If you have a 5.4–5.7 project, `ue selftest` there tells us whether it works; please paste its output into
+an issue. **Tested** so far only by forcing this route on a 5.8 editor (`UE_TRANSPORT=remote`, plus `TETHER_LEGACY=1` in the
 editor's environment to use the pre-5.8 code paths). It has not run on an actual 5.4–5.7 install yet;
 reports welcome.
 
