@@ -29,7 +29,7 @@ class _Lazy:
 socket, subprocess, zlib = _Lazy("socket"), _Lazy("subprocess"), _Lazy("zlib")
 
 TETHER = "tether.toolsets.TetherCore"
-GATED = {"py", "console", "set_props", "undo"}  # tools that need the session token (see beacon.session_token)
+GATED = {"py", "console", "set_props", "undo", "save"}  # tools that need the session token (see beacon.session_token)
 LEVELS = {"Fatal": 0, "Error": 1, "Warning": 2, "Display": 3, "Log": 4, "Verbose": 5, "VeryVerbose": 6}
 NOISE = {"LogModelContextProtocol", "LogToolsetRegistry"}  # our own transport chatter
 # Epic logs this whenever a schema is generated for a class with delegates (props, set, describe_toolset).
@@ -668,8 +668,10 @@ def cmd_status(ctx, args):
         link = "via python remote execution"
     else:
         link = f"mcp :{port} " + ("up" if alive and port and port_open(port) else "down")
+    dirty = beacon.get("dirty") if alive else None
     print(f"{name} | {state} | UE {beacon.get('engine', '?').split('+')[0]} | pid {beacon.get('pid')} | "
-          f"map {beacon.get('map')} | {link} | heartbeat {age:.1f}s ago")
+          f"map {beacon.get('map')} | {link} | heartbeat {age:.1f}s ago"
+          + (f" | {dirty} unsaved (ue changes)" if dirty else ""))
     return 0 if alive and age <= 10 else 2
 
 
@@ -1708,6 +1710,16 @@ def cmd_table(ctx, args):
     return 0
 
 
+def cmd_changes(ctx, args):
+    print(ctx.tether("changes", limit=args.limit))
+    return 0
+
+
+def cmd_save(ctx, args):
+    print(ctx.tether("save", paths=",".join(args.paths)))
+    return 0
+
+
 def cmd_undo(ctx, args):
     print(ctx.tether("undo"))
     return 0
@@ -1979,6 +1991,7 @@ def cmd_selftest(ctx, args):
     check("refs", ["refs", "/Engine/BasicShapes/BasicShapeMaterial", "--limit", "3"],
           ok=lambda c, o: c == 0 and "reference" in o)
     check("log", ["log", "--level", "Error"])
+    check("changes", ["changes"], ok=lambda c, o: c == 0 and "unsaved package" in o)
     check("call tether.level_summary", ["call", "tether.level_summary", "limit=3"],
           ok=lambda c, o: c == 0 and "actors" in o)
 
@@ -2732,6 +2745,9 @@ def main(argv=None):
     s.add_argument("--from", dest="from_file", metavar="FILE", help="apply the values in FILE (JSON) that differ")
     s.add_argument("--dry-run", action="store_true", help="with --from: show what would change")
     add("undo", cmd_undo, "undo Tether's last `ue set` (only if nothing else changed since)")
+    add("changes", cmd_changes, "unsaved work: dirty packages and the level's actors added/removed/moved since load")
+    s = add("save", cmd_save, "save unsaved packages (all, or the given ones); untitled /Temp maps are skipped")
+    s.add_argument("paths", nargs="*", help="package paths (default: everything unsaved)")
     s = add("watch", cmd_watch, "wait for a log line, or for a property value (exit 4 on timeout)")
     s.add_argument("pattern", nargs="?", help="log regex to wait for")
     s.add_argument("--prop", nargs=2, metavar=("TARGET", "NAME"), help="watch this property instead")

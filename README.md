@@ -165,6 +165,7 @@ The plugin's hooks stay silent outside Unreal projects, and never block a tool c
 | `ue actors [regex] [--pie]` | Actors in the level (or the PIE world): label, class, location. |
 | `ue props <target> [regex] [--pie]` | Reflected properties with **values**, for an actor, a component or a `/Game/...` asset. |
 | `ue set <target> name=value [name+=delta ...] [--pie]` | Write properties as one undoable transaction and print `old -> new`. Takes numbers, booleans, enum names, object paths, JSON, or tuples for structs (`location+=0,0,200`). Actors also take `location`, `rotation` and `scale`. All-or-nothing: if one value fails, nothing changes. |
+| `ue changes` / `ue save [paths]` | Review unsaved work (dirty packages; the level's actors added, removed, moved or changed since it was loaded or saved), then save it. Untitled `/Temp` maps are skipped. `ue status` shows the unsaved count. |
 | `ue undo` | Undo Tether's last `ue set`, only if nothing else entered the editor's undo history since (it never undoes your edits). |
 | `ue watch <regex>` / `ue watch --prop <target> <name> --until <regex>` | Wait for a log line or a property value, up to `--seconds` (exit 4 on timeout). |
 | `ue props <target> --export F` / `ue set <target> --from F [--dry-run]` | Round-trip any object or asset (e.g. a DataAsset) through JSON; `--from` applies only what differs. |

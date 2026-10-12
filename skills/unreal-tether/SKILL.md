@@ -35,6 +35,8 @@ broken or unsupported.
   Actors also take `location`, `rotation` (pitch,yaw,roll) and `scale`. If one value fails, nothing
   changes. `--pie` edits the running game instead (not undoable, not saved). Prefer this over `ue py`
   for property edits.
+- Your edits stay unsaved until saved. Before finishing a task that changed content, run `ue changes` to
+  review what you changed, then `ue save` (or tell the user what is unsaved and why).
 - `ue undo` reverts your last `ue set` (it refuses if anything else changed since). `ue props X --export f.json`
   then `ue set X --from f.json` round-trips any object or asset, e.g. a DataAsset.
 - `ue watch '<log regex>'` or `ue watch --prop <target> <name> --until <regex>` waits for something to happen.

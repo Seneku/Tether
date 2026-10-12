@@ -42,8 +42,21 @@ def _snapshot():
         level = world.get_path_name().split(".")[0] if world else None
     else:
         level = _state.get("map")  # keep the edited map's name while PIE runs
+    if level and level != _state.get("snapshot_map") and game is None:
+        _state["snapshot_map"] = level  # a map was loaded: baseline for `ue changes`
+        try:
+            from tether import toolsets
+            toolsets.snapshot_level(level)
+        except Exception:
+            pass
     _state["map"] = level
+    try:
+        utils = unreal.EditorLoadingAndSavingUtils
+        dirty = len(utils.get_dirty_content_packages()) + len(utils.get_dirty_map_packages())
+    except Exception:
+        dirty = None
     return {
+        "dirty": dirty,
         "pid": os.getpid(),
         "project": unreal.Paths.convert_relative_path_to_full(unreal.Paths.get_project_file_path()),
         "engine": unreal.SystemLibrary.get_engine_version(),

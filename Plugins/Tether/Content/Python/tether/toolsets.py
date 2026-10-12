@@ -365,6 +365,32 @@ def _legacy_props(obj, match, limit):
     return _capped(head, rows, limit)
 
 
+_LEVELS = getattr(sys, "_tether_levels", None) or {}  # map -> {actor path: (label, class, pose)} at load/save
+sys._tether_levels = _LEVELS
+
+
+def _pose_key(actor):
+    loc, rot, scl = actor.get_actor_location(), actor.get_actor_rotation(), actor.get_actor_scale3d()
+    return tuple(round(v, 1) for v in (loc.x, loc.y, loc.z, rot.pitch, rot.yaw, rot.roll, scl.x, scl.y, scl.z))
+
+
+def snapshot_level(level=None):
+    """Remember the edited level's actors, as the baseline `changes` compares with (at map load and save)."""
+    world = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_editor_world()
+    if world is None:
+        return
+    level = level or world.get_path_name().split(".")[0]
+    _LEVELS[level] = {a.get_path_name(): (a.get_actor_label(), a.get_class().get_name(), _pose_key(a))
+                      for a in unreal.get_editor_subsystem(unreal.EditorActorSubsystem).get_all_level_actors()}
+
+
+def _dirty_packages():
+    utils = unreal.EditorLoadingAndSavingUtils
+    maps = [p.get_name() for p in utils.get_dirty_map_packages()]
+    content = [p.get_name() for p in utils.get_dirty_content_packages()]
+    return maps, content
+
+
 _reload = {"handle": None}
 
 
@@ -750,6 +776,88 @@ class TetherCore(_Base):
             if not rx or rx.search(prop):
                 rows.append(f"  {prop}: {kind}")
         return _capped(rows[0], rows[1:], limit)
+
+    @_tool
+    @staticmethod
+    def changes(limit: int = 20) -> str:
+        """Unsaved work: dirty packages, and the edited level's actors added, removed, moved or changed since
+        it was loaded or last saved.
+
+        Args:
+            limit: Maximum names listed per group.
+
+        Returns:
+            A few summary lines.
+        """
+        if _game_world() is not None:
+            raise RuntimeError("PIE is running; stop it first (changes are about the edited level)")
+        maps, content = _dirty_packages()
+        # World Partition saves actors as their own packages; group those under their level.
+        actor_packages = [p for p in content if "/__ExternalActors__/" in p]
+        assets = [p for p in content if p not in actor_packages]
+        world = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_editor_world()
+        level = world.get_path_name().split(".")[0] if world else None
+        cap = lambda names: ", ".join(names[:limit]) + (f", +{len(names) - limit} more" if len(names) > limit else "")
+        lines = []
+        total = len(maps) + len(assets) + len(actor_packages)
+        lines.append(f"{total} unsaved package{'' if total == 1 else 's'}" + (":" if total else " (nothing to save)"))
+        if maps:
+            lines.append("  maps: " + cap(maps))
+        if assets:
+            lines.append("  assets: " + cap(assets))
+        if actor_packages:
+            lines.append(f"  {len(actor_packages)} World Partition actor package(s)")
+        base = _LEVELS.get(level)
+        if level and base is not None and (maps or actor_packages):
+            now = {a.get_path_name(): a for a in unreal.get_editor_subsystem(unreal.EditorActorSubsystem).get_all_level_actors()}
+            added = [now[p].get_actor_label() for p in now if p not in base]
+            removed = [base[p][0] for p in base if p not in now]
+            moved = [now[p].get_actor_label() for p in now if p in base and _pose_key(now[p]) != base[p][2]]
+            dirty_actor = {p.rsplit("/", 1)[-1] for p in actor_packages}
+            changed = [now[p].get_actor_label() for p in now if p in base and now[p].get_actor_label() not in moved
+                       and now[p].get_outermost().get_name().rsplit("/", 1)[-1] in dirty_actor]
+            parts = [f"{n} {kind} ({cap(names)})" for kind, names in
+                     (("added", added), ("removed", removed), ("moved", moved), ("changed", changed)) for n in [len(names)] if n]
+            lines.append(f"  level {level} since load/save: " + ("; ".join(parts) if parts else
+                         "no actors added, removed or moved (other edits: see the map package)"))
+        elif level and base is None:
+            lines.append(f"  level {level}: no baseline yet (it is taken when a map loads)")
+        return "\n".join(lines)
+
+    @_tool
+    @staticmethod
+    def save(paths: str = "", token: str = "") -> str:
+        """Save unsaved packages: the given ones, or all of them. Untitled /Temp maps are skipped (saving them
+        would open a Save As dialog).
+
+        Args:
+            paths: Comma-separated package paths ('' saves every unsaved package).
+            token: Session token from Saved/Tether/session.json (the ue CLI sends it).
+
+        Returns:
+            What was saved and what was skipped.
+        """
+        _authorize(token)
+        maps, content = _dirty_packages()
+        dirty = maps + content
+        wanted = [p.strip().split(".")[0] for p in paths.split(",") if p.strip()] or dirty
+        missing = [p for p in wanted if p not in dirty]
+        temp = [p for p in wanted if p.startswith("/Temp/")]
+        todo = [p for p in wanted if p in dirty and p not in temp]
+        packages = [unreal.find_package(p) for p in todo]
+        saved = bool(packages) and unreal.EditorLoadingAndSavingUtils.save_packages([p for p in packages if p], False)
+        if saved and any(p in maps for p in todo):
+            snapshot_level()
+        lines = [f"saved {len(todo)} package{'' if len(todo) == 1 else 's'}" if saved else
+                 ("nothing to save" if not todo else "save failed (see ue log)")]
+        if todo and saved:
+            lines[0] += ": " + ", ".join(todo[:10]) + (f", +{len(todo) - 10} more" if len(todo) > 10 else "")
+        if temp:
+            lines.append(f"skipped untitled {', '.join(temp)}: save it under /Game with a name first "
+                         "(e.g. unreal.EditorLoadingAndSavingUtils.save_map(world, '/Game/Maps/Name'))")
+        if missing:
+            lines.append("not unsaved (nothing to do): " + ", ".join(missing[:10]))
+        return "\n".join(lines)
 
     @_tool
     @staticmethod
