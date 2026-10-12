@@ -71,7 +71,8 @@ and a private mid-size C++/Blueprint game. Methodology is in [docs/DESIGN.md](do
 
 ## Requirements
 
-- Unreal Engine 5.8 or later. A launcher install is fine; no source build needed.
+- Unreal Engine 5.8 or later for everything; 5.4–5.7 for a subset (see [Older engines](#older-engines-ue-54-57)).
+  A launcher install is fine; no source build needed.
 - Python 3 on `PATH`, for the CLI. It uses the standard library only.
 - Windows. This is the only platform tested so far: build routing uses `Build.bat` and Live Coding.
 - Optional: the .NET 10 SDK and UnrealSharp, for C#.
@@ -198,6 +199,24 @@ Details are in [docs/DESIGN.md](docs/DESIGN.md) §2. Upstream reports:
 [#774](https://github.com/UnrealSharp/UnrealSharp/issues/774),
 [#775](https://github.com/UnrealSharp/UnrealSharp/issues/775),
 [#776](https://github.com/UnrealSharp/UnrealSharp/issues/776).
+
+## Older engines (UE 5.4–5.7)
+
+Before 5.8 there is no MCP server or ToolsetRegistry. `ue` then talks to the editor through the Python
+plugin's remote execution protocol, using the engine's own client, and picks this route from the
+project's engine version. `ue init` enables remote execution in `Config/DefaultEngine.ini` (and `ue open`
+switches it on for the session anyway).
+
+| Works | Needs 5.8 |
+|---|---|
+| `status`, `open`, `close`, `build` (UBT and Live Coding), `log`, `py`, `exec`, `actors`, `props` (from the Python wrappers' property lists), `call tether.*`, `pie start/stop/status`, `reload`, `init`, hooks | `set`, `shot`, `test`, `tools`, and `call` for Epic's toolsets |
+
+Each call costs about 0.5 s more (UDP discovery), and the token gate adds nothing here: remote execution
+itself runs any Python sent to it, so keep its bind address at the default `127.0.0.1`.
+
+**Tested** by forcing this route on a 5.8 editor (`UE_TRANSPORT=remote`, plus `TETHER_LEGACY=1` in the
+editor's environment to use the pre-5.8 code paths). It has not run on an actual 5.4–5.7 install yet;
+reports welcome.
 
 ## Repository layout
 

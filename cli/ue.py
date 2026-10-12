@@ -203,12 +203,92 @@ class Mcp:
         return text, bool(res.get("isError"))
 
 
+class RemoteExec:
+    """Transport for editors without Epic's MCP server (UE 5.4-5.7): the Python plugin's remote execution
+    protocol (UDP discovery, then a TCP command channel), through the engine's own stdlib-only client.
+
+    Only Tether's own tools are reachable this way; Epic's toolsets need 5.8's MCP server."""
+
+    def __init__(self, project, timeout):
+        self.project, self.timeout, self.rex = project, timeout, None
+
+    def connect(self):
+        root = engine_root(self.project)
+        here = os.path.join(root, "Engine", "Plugins", "Experimental", "PythonScriptPlugin", "Content", "Python")
+        if not os.path.isfile(os.path.join(here, "remote_execution.py")):
+            raise CliError(f"no remote_execution.py under {root}; is the PythonScriptPlugin installed?", 2)
+        sys.path.insert(0, here)
+        import remote_execution as rex_module
+        with socket.socket() as probe:  # a free port for the command channel, so concurrent calls don't collide
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]
+        config = rex_module.RemoteExecutionConfig()
+        config.command_endpoint = ("127.0.0.1", port)
+        self.rex = rex_module.RemoteExecution(config)
+        self.mode = rex_module.MODE_EXEC_FILE
+        self.rex.start()
+        want = os.path.normcase(os.path.normpath(os.path.dirname(self.project)))
+        deadline = time.time() + 6
+        while time.time() < deadline:
+            for node in self.rex.remote_nodes:
+                if os.path.normcase(os.path.normpath(node.get("project_root", ""))) == want:
+                    self.rex.open_command_connection(node["node_id"])
+                    return self
+            time.sleep(0.05)
+        self.rex.stop()
+        raise CliError("no editor answered Python remote execution for this project; enable it in Project "
+                       "Settings > Python > Remote Execution (`ue init` does this), or start it with `ue open`", 2)
+
+    def run(self, code):
+        """(output, ok): what the code printed, or the error's last line."""
+        data = self.rex.run_command(code, unattended=True, exec_mode=self.mode)
+        output = "".join(o.get("output", "") + "\n" for o in data.get("output", []) if o.get("output"))
+        if data.get("success"):
+            return output, True
+        lines = [l for l in str(data.get("result", "")).strip().splitlines() if l.strip()]
+        return (lines[-1] if lines else "remote command failed"), False
+
+    def tether(self, tool, kwargs):
+        code = ("import json\nfrom tether import toolsets as _t\n"
+                f"_f = getattr(_t, '_RAW', {{}}).get({tool!r}) or getattr(_t.TetherCore, {tool!r})\n"
+                f"print('\\x1eTETHER' + json.dumps(_f(**json.loads({json.dumps(json.dumps(kwargs))}))))")
+        output, ok = self.run(code)
+        if not ok:
+            raise CliError(re.sub(r"^\w+(Error|Exception): ", "", output))
+        marker = output.rfind("\x1eTETHER")
+        if marker < 0:
+            raise CliError("no result from the editor: " + output[-300:])
+        return json.loads(output[marker + 7:].splitlines()[0])
+
+    def close(self):
+        if self.rex:
+            self.rex.stop()
+
+
+def transport(project):
+    """'mcp' for UE 5.8+ (Epic's MCP server), 'remote' for older editors (Python remote execution).
+    UE_TRANSPORT=mcp|remote overrides, e.g. to try the remote path on a 5.8 editor."""
+    forced = os.environ.get("UE_TRANSPORT", "").lower()
+    if forced in ("mcp", "remote"):
+        return forced
+    beacon = read_json(os.path.join(state_dir(project), "editor.json")) or {}
+    version = beacon.get("engine", "")
+    if not version:
+        try:
+            with open(project, encoding="utf-8-sig") as f:
+                version = json.load(f).get("EngineAssociation", "")
+        except (OSError, ValueError):
+            version = ""
+    match = re.match(r"(\d+)\.(\d+)", version)
+    return "remote" if match and (int(match.group(1)), int(match.group(2))) < (5, 8) else "mcp"
+
+
 class Ctx:
     """Lazily resolved project, beacon and MCP connection."""
 
     def __init__(self, args):
         self.args = args
-        self._project = self._mcp = None
+        self._project = self._mcp = self._rex = self._transport = None
 
     @property
     def project(self):
@@ -232,22 +312,44 @@ class Ctx:
         return port_from_log(self.project) or 8000
 
     @property
+    def transport(self):
+        if self._transport is None:
+            self._transport = transport(self.project)
+        return self._transport
+
+    def _check_modal(self):
+        # A modal dialog freezes the game thread, and every call would hang until the timeout.
+        report = stall_report(self.project)
+        if report and report.startswith("blocked by modal"):
+            raise CliError(f"editor {report}; answer it in the editor, then retry", 4)
+
+    @property
     def mcp(self):
+        if self.transport == "remote":
+            raise CliError("this needs Epic's MCP server (UE 5.8+). This editor is reached through Python remote "
+                           "execution, which covers ue py, exec, actors, props, level_summary, pie, build and log")
         if self._mcp is None:
-            # A modal dialog freezes the game thread, and every MCP call would hang until the timeout.
-            report = stall_report(self.project)
-            if report and report.startswith("blocked by modal"):
-                raise CliError(f"editor {report}; answer it in the editor, then retry", 4)
+            self._check_modal()
             self._mcp = Mcp(self.port, self.args.timeout).connect()
         return self._mcp
 
     def tether(self, tool, **kwargs):
         if tool in GATED:  # the editor writes a per-session token next to the beacon
             kwargs["token"] = (read_json(os.path.join(state_dir(self.project), "session.json")) or {}).get("token", "")
+        if self.transport == "remote":
+            if self._rex is None:
+                self._check_modal()
+                self._rex = RemoteExec(self.project, self.args.timeout).connect()
+            value = self._rex.tether(tool, kwargs)
+            return unwrap(json.dumps({"returnValue": value}))
         text, is_error = self.mcp.call(TETHER, tool, kwargs)
         if is_error:
             raise CliError(compact_error(text))
         return unwrap(text)
+
+    def close(self):
+        if self._rex is not None:
+            self._rex.close()
 
 
 # ---------------------------------------------------------------- rendering
@@ -481,9 +583,12 @@ def cmd_status(ctx, args):
         state = f"HUNG? (no heartbeat for {age:.0f}s" + (f"; blocked by modal: \"{dialogs[0][:80]}\")" if dialogs else ")")
     else:
         state = "pie" if beacon.get("pie") else "ready"
-    mcp = "up" if alive and port and port_open(port) else "down"
+    if ctx.transport == "remote":
+        link = "via python remote execution"
+    else:
+        link = f"mcp :{port} " + ("up" if alive and port and port_open(port) else "down")
     print(f"{name} | {state} | UE {beacon.get('engine', '?').split('+')[0]} | pid {beacon.get('pid')} | "
-          f"map {beacon.get('map')} | mcp :{port} {mcp} | heartbeat {age:.1f}s ago")
+          f"map {beacon.get('map')} | {link} | heartbeat {age:.1f}s ago")
     return 0 if alive and age <= 10 else 2
 
 
@@ -897,6 +1002,9 @@ def cmd_open(ctx, args):
             cmd += ["-RUNNINGUNATTENDEDSCRIPT"]
     if unattended:
         cmd += ["-unattended"]
+    remote = ctx.transport == "remote"
+    if remote:  # no MCP server before 5.8: switch on the Python plugin's remote execution for this run
+        cmd += ["-ini:Engine:[/Script/PythonScriptPlugin.PythonScriptPluginSettings]:bRemoteExecution=True"]
     write_json(os.path.join(state_dir(ctx.project), "launch.json"),
                {"headless": bool(args.headless), "render": bool(args.render or not args.headless),
                 "unattended": unattended, "port": port})
@@ -906,12 +1014,14 @@ def cmd_open(ctx, args):
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True)
     mode = ", ".join(m for m, on in (("headless", args.headless), ("offscreen render", args.headless and args.render),
                                      ("unattended", unattended)) if on)
-    print(f"launched pid {proc.pid} on mcp :{port}" + (f" ({mode})" if mode else ""))
+    print(f"launched pid {proc.pid} " + ("(python remote execution)" if remote else f"on mcp :{port}")
+          + (f" ({mode})" if mode else ""))
     if args.no_wait:
         return 0
     while time.time() - started < args.wait:
         beacon = ctx.beacon
-        if beacon and beacon.get("pid") == proc.pid and beacon.get("heartbeat", 0) > started and port_open(port):
+        if beacon and beacon.get("pid") == proc.pid and beacon.get("heartbeat", 0) > started and (
+                remote or port_open(port)):
             boot = read_new_log(ctx.project, from_start=True)
             errors = filter_log(boot, level="Error")
             print(f"ready in {time.time() - started:.1f}s | map {beacon.get('map')} | "
@@ -1006,6 +1116,16 @@ def cmd_call(ctx, args):
     toolset_q, _, tool_name = args.target.rpartition(".")
     if not toolset_q:
         raise CliError("target must be <toolset>.<tool>, e.g. scene.find_actors")
+    if ctx.transport == "remote" and toolset_q.lower() in ("tether", TETHER.lower()):
+        given = {}
+        for pair in args.kv:  # no schema without MCP: JSON values, else strings
+            key, _, raw = pair.partition("=")
+            try:
+                given[key] = json.loads(raw)
+            except ValueError:
+                given[key] = raw
+        emit(args, ctx.tether(tool_name, **given))
+        return 0
     toolset = resolve_toolset(ctx, toolset_q)
     tools = schema(ctx, toolset)
     tool = tools.get(tool_name) or next((t for k, t in tools.items() if k.lower() == tool_name.lower()), None)
@@ -1248,7 +1368,11 @@ def cmd_exec(ctx, args):
 def flush_editor_log(ctx):
     """The editor writes its log asynchronously; ask it to flush so just-logged lines are on disk."""
     beacon = ctx.beacon
-    if beacon and pid_alive(beacon.get("pid")) and beacon.get("mcp_port") and port_open(beacon["mcp_port"]):
+    if getattr(ctx, "transport", "mcp") == "remote":
+        reachable = ctx._rex is not None  # a fresh remote connection costs ~1 s of discovery; skip it
+    else:
+        reachable = beacon and pid_alive(beacon.get("pid")) and beacon.get("mcp_port") and port_open(beacon["mcp_port"])
+    if reachable:
         try:
             ctx.tether("console", command="FLUSHLOG")
         except CliError:
@@ -1269,7 +1393,8 @@ def cmd_log(ctx, args):
 
 def cmd_pie(ctx, args):
     """Play-In-Editor through Epic's EditorAppToolset, reporting only what went wrong."""
-    toolset, start = resolve_toolset(ctx, "editorapp"), log_end(ctx.project)
+    toolset = None if ctx.transport == "remote" else resolve_toolset(ctx, "editorapp")
+    start = log_end(ctx.project)
     started = time.time()
     if args.action == "start" and csharp_layout(ctx.project):
         # UnrealSharp recompiles a saved but unreloaded C# type in place on its first lookup, from the old
@@ -1279,7 +1404,19 @@ def cmd_pie(ctx, args):
             if csharp_reload_build(ctx, argparse.Namespace(wait=120, limit=args.limit)):
                 raise CliError("PIE not started: the C# reload failed (errors above)")
             start, started = log_end(ctx.project), time.time()
-    if args.action == "start":
+    if ctx.transport == "remote":  # no EditorAppToolset before 5.8: LevelEditorSubsystem requests instead
+        if args.action == "status":
+            print("pie: " + ctx.tether("pie", action="status"))
+            return 0
+        ctx.tether("pie", action=args.action, simulate=args.simulate)
+        want, deadline = ("running" if args.action == "start" else "not running"), time.time() + 60
+        while ctx.tether("pie", action="status") != want:  # the request takes effect on a later tick
+            if time.time() > deadline:
+                raise CliError(f"PIE still not {want} after 60 s (ue log --level Warning)", 4)
+            time.sleep(0.25)
+        time.sleep(args.warmup if args.action == "start" else 0)
+        text, is_error = "", False
+    elif args.action == "start":
         options = {"bSimulate": args.simulate, "playMode": "PlayMode_InViewPort", "warmupSeconds": args.warmup}
         text, is_error = ctx.mcp.call(toolset, "StartPIE", {"options": options})
         if is_error and unwrap(ctx.mcp.call(toolset, "IsPIERunning", {})[0]) is True:
@@ -1560,7 +1697,9 @@ def cmd_init(ctx, args):
     with open(project, encoding="utf-8-sig", newline="") as f:  # newline="": keep CRLF files CRLF
         text = f.read()
     data = json.loads(text)
-    wanted = REQUIRED_PLUGINS + (["TetherUnrealSharp"] if args.unrealsharp or csharp_layout(project) else [])
+    remote = ctx.transport == "remote"
+    base = ["PythonScriptPlugin", "Tether"] if remote else REQUIRED_PLUGINS  # MCP and toolsets are 5.8+
+    wanted = base + (["TetherUnrealSharp"] if args.unrealsharp or csharp_layout(project) else [])
     entries = data.setdefault("Plugins", [])
     if any(e.get("Name") == "AllToolsets" and e.get("Enabled") for e in entries):
         wanted = [n for n in wanted if n not in ("EditorToolset", "AutomationTestToolset")]  # AllToolsets has them
@@ -1587,6 +1726,16 @@ def cmd_init(ctx, args):
         if found and tree_digest(source) == tree_digest(target):
             continue  # the project's copy is current
         copies.append((name, source, target, bool(found)))
+    ini = os.path.join(os.path.dirname(project), "Config", "DefaultEngine.ini")
+    ini_section = "[/Script/PythonScriptPlugin.PythonScriptPluginSettings]"
+    ini_text = ""
+    if os.path.isfile(ini):
+        with open(ini, encoding="utf-8-sig", newline="") as f:
+            ini_text = f.read()
+    if remote and not re.search(r"^bRemoteExecution\s*=\s*True", ini_text, re.M | re.I):
+        changes.append("enable Python remote execution in Config/DefaultEngine.ini (how ue reaches UE < 5.8)")
+    else:
+        ini = None
     if not changes and not copies:
         print("already set up: plugins enabled, Tether reachable")
         return 0
@@ -1597,7 +1746,17 @@ def cmd_init(ctx, args):
               + os.path.relpath(target, os.path.dirname(project)))
     if args.dry_run:
         return 0
-    if changes:
+    if ini:
+        newline = "\r\n" if "\r\n" in ini_text else "\n"
+        if ini_section in ini_text:
+            ini_text = ini_text.replace(ini_section, ini_section + newline + "bRemoteExecution=True", 1)
+        else:
+            ini_text += ("" if not ini_text or ini_text.endswith("\n") else newline) + newline + ini_section \
+                + newline + "bRemoteExecution=True" + newline
+        os.makedirs(os.path.dirname(ini), exist_ok=True)
+        with open(ini, "w", encoding="utf-8", newline="") as f:
+            f.write(ini_text)
+    if any(not c.startswith("enable Python remote") for c in changes):
         newline = "\r\n" if "\r\n" in text else "\n"
         out = json.dumps(data, indent="\t") + (newline if text.endswith(("\n", "\r\n")) else "")
         with open(project, "w", encoding="utf-8", newline="") as f:
@@ -1723,7 +1882,11 @@ def main(argv=None):
             setattr(args, key, default)
     started = time.perf_counter()
     try:
-        code = args.fn(Ctx(args), args)
+        ctx = Ctx(args)
+        try:
+            code = args.fn(ctx, args)
+        finally:
+            ctx.close()
     except CliError as exc:
         sys.stdout.flush()  # keep the error after the output that explains it when both are piped
         message = str(exc)

@@ -5,6 +5,7 @@ import os
 import sys
 import tempfile
 import time
+import types
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "cli"))
@@ -268,10 +269,22 @@ class Init(unittest.TestCase):
         with open(self.project.uproject, "w", encoding="utf-8", newline="") as f:
             f.write('{\r\n\t"FileVersion": 3,\r\n\t"Plugins": [\r\n\t\t{\r\n\t\t\t"Name": "PythonScriptPlugin",'
                     '\r\n\t\t\t"Enabled": false\r\n\t\t}\r\n\t]\r\n}\r\n')
-        self.ctx = argparse.Namespace(project=self.project.uproject)
+        self.ctx = argparse.Namespace(project=self.project.uproject, transport="mcp")
 
     def tearDown(self):
         self.project.close()
+
+    def test_older_engine_gets_remote_execution_not_mcp_plugins(self):
+        self.ctx.transport = "remote"
+        self.project.write("Config/DefaultEngine.ini", "[/Script/EngineSettings.GameMapsSettings]\nGameDefaultMap=/Game/M\n")
+        out = self.run_init()
+        self.assertIn("enable Python remote execution in Config/DefaultEngine.ini (how ue reaches UE < 5.8)", out)
+        self.assertEqual(self.plugins(), {"PythonScriptPlugin": True, "Tether": True})
+        with open(os.path.join(self.project.root, "Config", "DefaultEngine.ini"), encoding="utf-8") as f:
+            ini = f.read()
+        self.assertIn("GameDefaultMap=/Game/M", ini)
+        self.assertIn("[/Script/PythonScriptPlugin.PythonScriptPluginSettings]\nbRemoteExecution=True\n", ini)
+        self.assertEqual(self.run_init(), ["already set up: plugins enabled, Tether reachable"])
 
     def run_init(self, **kw):
         out = []
@@ -308,6 +321,44 @@ class Init(unittest.TestCase):
         out = self.run_init()
         self.assertNotIn("enable EditorToolset", out)
         self.assertNotIn("EditorToolset", self.plugins())
+
+
+class RemoteResults(unittest.TestCase):
+    """RemoteExec.tether against canned command_result payloads (the protocol's shape)."""
+
+    def remote(self, data):
+        rex = ue.RemoteExec("Game.uproject", 5)
+        rex.mode = "ExecuteFile"
+        rex.rex = types.SimpleNamespace(run_command=lambda code, **kw: dict(data, command=code))
+        return rex
+
+    def test_value_after_marker(self):
+        rex = self.remote({"success": True, "output": [{"type": "Info", "output": "noise"},
+                                                      {"type": "Info", "output": '\x1eTETHER"2 actors"\r'}]})
+        self.assertEqual(rex.tether("actors", {"match": "light"}), "2 actors")
+
+    def test_error_keeps_message_without_exception_type(self):
+        rex = self.remote({"success": False, "output": [],
+                           "result": 'Traceback (most recent call last):\n  File "<string>"\nRuntimeError: not found: X\n'})
+        with self.assertRaises(ue.CliError) as caught:
+            rex.tether("props", {"target": "X"})
+        self.assertEqual(str(caught.exception), "not found: X")
+
+
+class Transport(unittest.TestCase):
+    def test_choice_by_engine_version_and_override(self):
+        project = Project()
+        try:
+            self.assertEqual(ue.transport(project.uproject), "mcp")  # EngineAssociation 5.8
+            with open(project.uproject, "w") as f:
+                f.write('{"EngineAssociation": "5.6"}')
+            self.assertEqual(ue.transport(project.uproject), "remote")
+            ue.write_json(os.path.join(ue.state_dir(project.uproject), "editor.json"), {"engine": "5.8.3-1+++UE5"})
+            self.assertEqual(ue.transport(project.uproject), "mcp")  # the running editor wins
+            with unittest.mock.patch.dict(os.environ, {"UE_TRANSPORT": "remote"}):
+                self.assertEqual(ue.transport(project.uproject), "remote")
+        finally:
+            project.close()
 
 
 class EditClassifier(unittest.TestCase):

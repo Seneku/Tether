@@ -3,18 +3,42 @@
 Fills what Epic's 5.8 toolsets leave out for coding agents: unrestricted editor
 Python, console commands, and compact (token-frugal) reads. Pure Python, so
 `reload` picks up edits without restarting the editor.
+
+On UE 5.4-5.7 there is no ToolsetRegistry: the same functions load as a plain class
+and the ue CLI calls them over Python remote execution instead of MCP.
 """
 import ast
 import contextlib
 import io
 import json
+import os
 import re
 import sys
 import traceback
 
 import unreal
-import toolset_registry
-from toolset_registry.registration import Registration
+
+try:
+    import toolset_registry
+    from toolset_registry.registration import Registration
+except ImportError:  # before UE 5.8
+    toolset_registry = None
+
+# Without Epic's ToolsetLibrary (pre-5.8), props read reflection through the Python wrappers instead,
+# and set_props is unavailable. TETHER_LEGACY=1 in the editor's environment forces this path on 5.8.
+_LEGACY = not hasattr(unreal, "ToolsetLibrary") or bool(os.environ.get("TETHER_LEGACY"))
+
+
+_RAW = {}  # tool name -> plain Python function, for callers outside MCP (Python remote execution)
+
+
+def _tool(fn):
+    # The registry turns tools into native bindings that report exceptions as script warnings and return
+    # an empty value, so remote execution calls the plain function from _RAW to see errors.
+    raw = fn.__func__ if isinstance(fn, staticmethod) else fn
+    _RAW[raw.__name__] = raw
+    return toolset_registry.tool_call(fn) if toolset_registry else fn
+
 
 _MAX_OUT = 20000
 
@@ -277,6 +301,40 @@ def _point(ref, pie):
     return _point_and_extent(ref, pie)[0]
 
 
+_DOC_PROPERTY = re.compile(r"^- ``(\w+)`` \(([^)]*)\)", re.M)
+
+
+def _legacy_props(obj, match, limit):
+    """props without ToolsetLibrary (UE < 5.8): names and types from the Python wrapper's docstring, which
+    lists every editor property (inherited ones included), and values through get_editor_property."""
+    schema = dict(_DOC_PROPERTY.findall(type(obj).__doc__ or ""))
+    names = list(schema)
+    if match:
+        rx = re.compile(match, re.I)
+        names = [n for n in names if rx.search(n) or rx.search(schema[n])]
+
+    def text(value):
+        if isinstance(value, unreal.StructBase):
+            return value.export_text()
+        if isinstance(value, unreal.EnumBase):
+            return value.name
+        if isinstance(value, unreal.Object):
+            return _short_path(value.get_path_name())
+        if isinstance(value, (unreal.Array, list, tuple)):
+            return "[" + ", ".join(str(text(v)) for v in list(value)[:8]) + (", ..." if len(value) > 8 else "") + "]"
+        return _short(_round(value))
+
+    rows = []
+    for name in names:
+        try:
+            rows.append(f"{name}: {schema[name]} = {_short(text(obj.get_editor_property(name)))}")
+        except Exception:  # write-only or unreadable in this context
+            rows.append(f"{name}: {schema[name]} = ?")
+    cls = obj if isinstance(obj, unreal.Struct) else obj.get_class()
+    head = f"{_label(obj)} ({cls.get_name()}, {len(schema)} props" + (f", {len(names)} match" if match else "") + ")"
+    return _capped(head, rows, limit)
+
+
 _reload = {"handle": None}
 
 
@@ -289,20 +347,33 @@ def _schedule_reload():
         _reload["handle"] = None
         import tether
         from tether import beacon
-        toolset_registry.reload_module(tether)
+        if toolset_registry:
+            toolset_registry.reload_module(tether)
+        else:  # before UE 5.8: plain module reload (the CLI imports the functions per call)
+            import importlib
+            from tether import toolsets
+            importlib.reload(beacon)
+            importlib.reload(toolsets)
         beacon.start()  # re-bind the tick callback to the reloaded module
         unreal.log("Tether: reloaded")
 
     _reload["handle"] = unreal.register_slate_post_tick_callback(_do)
 
 
-@unreal.uclass()
-class TetherCore(unreal.ToolsetDefinition):
+_Base = getattr(unreal, "ToolsetDefinition", object)
+
+
+def _uclass(cls):
+    return unreal.uclass()(cls) if _Base is not object else cls  # plain class before UE 5.8
+
+
+@_uclass
+class TetherCore(_Base):
     """Tether core tools for coding agents: unrestricted editor Python with a
     persistent namespace, console commands, compact property and actor reads,
     and hot reload of the Tether package. Output is compact text by design."""
 
-    @toolset_registry.tool_call
+    @_tool
     @staticmethod
     def py(code: str, token: str = "") -> str:
         """Execute Python in the editor interpreter.
@@ -321,7 +392,7 @@ class TetherCore(unreal.ToolsetDefinition):
         _authorize(token)
         return _run_python(code)
 
-    @toolset_registry.tool_call
+    @_tool
     @staticmethod
     def console(command: str, pie: bool = False, token: str = "") -> str:
         """Run a console command, e.g. a cheat or 'stat unit'. Its output goes to the log.
@@ -347,7 +418,7 @@ class TetherCore(unreal.ToolsetDefinition):
         unreal.SystemLibrary.execute_console_command(world, command)
         return ("PIE world " if game is not None else "editor world ") + world.get_name()
 
-    @toolset_registry.tool_call
+    @_tool
     @staticmethod
     def props(target: str, match: str = "", limit: int = 80, pie: bool = False) -> str:
         """List an object's reflected properties as 'name: Type = value' lines.
@@ -362,6 +433,8 @@ class TetherCore(unreal.ToolsetDefinition):
             A header naming the resolved object, then one line per property.
         """
         obj = _resolve(target, pie)
+        if _LEGACY:
+            return _legacy_props(obj, match, limit)
         cls = obj if isinstance(obj, unreal.Struct) else obj.get_class()
         schema = json.loads(unreal.ToolsetLibrary.list_struct_properties(cls))
         names = list(schema)
@@ -373,7 +446,7 @@ class TetherCore(unreal.ToolsetDefinition):
         rows = [f"{n}: {_type_name(schema[n])} = {_short(_round(values.get(n)))}" for n in names]
         return _capped(head, rows, limit)
 
-    @toolset_registry.tool_call
+    @_tool
     @staticmethod
     def set_props(target: str, values: str, pie: bool = False, token: str = "") -> str:
         """Set reflected properties from compact text, as one undoable editor transaction.
@@ -393,6 +466,9 @@ class TetherCore(unreal.ToolsetDefinition):
             One 'name: old -> new' line per property.
         """
         _authorize(token)
+        if _LEGACY:
+            raise RuntimeError("ue set needs UE 5.8+ (Epic's ToolsetLibrary); on older engines use ue py with "
+                               "obj.set_editor_property(name, value) inside unreal.ScopedEditorTransaction")
         obj = _resolve(target, pie)
         cls = obj if isinstance(obj, unreal.Struct) else obj.get_class()
         schema = json.loads(unreal.ToolsetLibrary.list_struct_properties(cls))
@@ -481,7 +557,7 @@ class TetherCore(unreal.ToolsetDefinition):
         rows = [f"{n}: {_compact(old.get(n))} -> {_compact(after.get(n))}" for n in new]
         return "\n".join([_label(obj) + (" (PIE)" if pie else "")] + rows)
 
-    @toolset_registry.tool_call
+    @_tool
     @staticmethod
     def shot_pose(actor: str = "", at: str = "", look_at: str = "", rot: str = "") -> str:
         """Camera pose for a viewport capture, as ToolsetTransform JSON.
@@ -531,7 +607,7 @@ class TetherCore(unreal.ToolsetDefinition):
                            "simulate": pie and (cam is None or isinstance(
                                unreal.GameplayStatics.get_player_pawn(game, 0), unreal.SpectatorPawn))})
 
-    @toolset_registry.tool_call
+    @_tool
     @staticmethod
     def actors(match: str = "", limit: int = 60, pie: bool = False) -> str:
         """List actors in the editor level as 'label  Class  (x, y, z)' lines.
@@ -554,7 +630,7 @@ class TetherCore(unreal.ToolsetDefinition):
             rows.append(f"{label}  {cls}  ({loc.x:.0f}, {loc.y:.0f}, {loc.z:.0f})")
         return _capped(f"{len(rows)} actors" + (f" matching /{match}/" if match else ""), rows, limit)
 
-    @toolset_registry.tool_call
+    @_tool
     @staticmethod
     def level_summary(limit: int = 12) -> str:
         """One-call overview of the open level: actor count, most common classes, PIE state.
@@ -577,7 +653,32 @@ class TetherCore(unreal.ToolsetDefinition):
         tail = f", +{len(top) - limit} more" if len(top) > limit else ""
         return head + "\n" + ", ".join(f"{n} x{c}" for n, c in top[:limit]) + tail
 
-    @toolset_registry.tool_call
+    @_tool
+    @staticmethod
+    def pie(action: str, simulate: bool = False) -> str:
+        """Play-In-Editor through LevelEditorSubsystem (works on UE 5.x without Epic's EditorAppToolset).
+
+        Start and stop are requests that take effect on a later tick; poll with action 'status'.
+
+        Args:
+            action: start, stop or status.
+            simulate: With start, Simulate-In-Editor instead of play.
+
+        Returns:
+            'running' or 'not running' for status; 'requested' otherwise.
+        """
+        level = unreal.get_editor_subsystem(unreal.LevelEditorSubsystem)
+        if action == "status":
+            return "running" if level.is_in_play_in_editor() else "not running"
+        if action == "start":
+            level.editor_play_simulate() if simulate else level.editor_request_begin_play()
+        elif action == "stop":
+            level.editor_request_end_play()
+        else:
+            raise RuntimeError("action must be start, stop or status")
+        return "requested"
+
+    @_tool
     @staticmethod
     def cs_reload() -> str:
         """Reload pending UnrealSharp C# changes now, with modal dialogs suppressed.
@@ -587,7 +688,7 @@ class TetherCore(unreal.ToolsetDefinition):
         """
         return _csharp().reload_csharp()
 
-    @toolset_registry.tool_call
+    @_tool
     @staticmethod
     def cs_state() -> str:
         """UnrealSharp C# hot-reload state.
@@ -597,7 +698,7 @@ class TetherCore(unreal.ToolsetDefinition):
         """
         return _csharp().csharp_reload_state()
 
-    @toolset_registry.tool_call
+    @_tool
     @staticmethod
     def reload() -> str:
         """Hot-reload the tether Python package and re-register its toolsets on the next editor tick.
@@ -609,4 +710,4 @@ class TetherCore(unreal.ToolsetDefinition):
         return "reload scheduled"
 
 
-registration = Registration([TetherCore])
+registration = Registration([TetherCore]) if toolset_registry else None

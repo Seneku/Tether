@@ -99,6 +99,9 @@ milliseconds. A `-run=pythonscript` commandlet takes ~25 s and floods the log.
 ## Output and exit codes
 Output is compact text, capped at 30 rows (`--limit N`; `--json` for raw). Exit codes: 0 ok, 1 tool
 error (one-line message), 2 editor unavailable, 3 restart required, 4 timeout.
+- On UE 5.4–5.7 (`ue status` says "via python remote execution"), only `py`, `exec`, `actors`, `props`,
+  `pie`, `build`, `log` and `call tether.*` work; for property writes use `ue py` with
+  `set_editor_property` inside `unreal.ScopedEditorTransaction`.
 - Exit 4 with `blocked by modal: "<title>"` means a dialog is open in a windowed editor and the editor
   cannot answer until someone closes it. Ask the user to deal with it; do not retry in a loop.
 - `unauthorized` from `py`, `exec` or `set` means the call bypassed `ue` (the session token in

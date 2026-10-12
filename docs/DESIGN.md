@@ -635,7 +635,13 @@ The options as they were laid out:
 1. **Foundation:** build on Epic's 5.8 MCP + ToolsetRegistry (recommended; 5.8+ only and still
    Experimental) or a standalone bridge that also covers older engines. A middle path keeps the
    CLI engine-agnostic and adds a Python remote-execution transport for 5.4–5.7, with no plugin
-   needed.
+   needed. **Done 2026-10-12 (#10):** `transport()` picks MCP or remote execution from the engine
+   version (`UE_TRANSPORT` overrides). The remote path drives Epic's own `remote_execution.py` client
+   from the engine install (free command port per call), and calls the toolset's plain functions
+   (`_RAW`: the 5.8 registry wraps tools into native bindings that turn exceptions into empty
+   results). Pre-5.8 code paths: `props` parses the Python wrappers' docstrings, `pie` uses
+   `LevelEditorSubsystem`, `set` refuses. Validated on 5.8 with the route and the legacy paths forced;
+   not yet on a real 5.4–5.7 install.
 2. **CLI language:** stdlib-only Python (recommended: same language as the in-editor toolset,
    zero dependencies, can even run on the Python bundled with UE) vs TypeScript compiled with Bun
    vs Rust. Startup is a non-issue either way (measured 17–81 ms vs a 24,000 ms commandlet).
