@@ -1081,6 +1081,9 @@ def cmd_test(ctx, args):
     if not args.timeout_given:
         ctx.args.timeout = 3600.0  # a run blocks until every selected test has finished
     toolset = "AutomationTestToolset.AutomationTestToolset"
+    if toolset not in catalog(ctx):
+        raise CliError("Epic's AutomationTestToolset plugin is not enabled; add {\"Name\": \"AutomationTestToolset\", "
+                       "\"Enabled\": true} to the .uproject's Plugins (or use AllToolsets), then `ue build --restart`")
 
     def call(tool, payload):
         text, is_error = ctx.mcp.call(toolset, tool, payload)

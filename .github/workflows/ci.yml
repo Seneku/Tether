@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    # Tether targets Windows (Live Coding, Build.bat), so the tests run there. 3.11 is the Python
+    # bundled with UE 5.8, which runs the in-editor toolset.
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Syntax check
+        run: python -W error -m compileall -q cli Plugins/Tether/Content/Python tests
+      - name: Unit tests
+        run: python -m unittest discover -s tests -v

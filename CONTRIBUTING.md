@@ -52,9 +52,11 @@ Close the editor with `ue close` when you're done.
 
 ## Testing
 
-There is no automated test suite yet. Before opening a PR:
+Unit tests cover the parts that need no editor: log filtering, diagnostics, change classification,
+hooks, and the toolset's value parsing (with `unreal` stubbed). CI runs them on Windows for Python 3.11
+(the version bundled with UE 5.8) and 3.13. Before opening a PR:
 
-1. `python -m compileall -q cli Plugins/Tether/Content/Python` (syntax check)
+1. `python -m unittest discover -s tests`, and add tests for new parsing or routing logic.
 2. Against the Sandbox editor, run the commands your change touches, plus a smoke pass:
    `ue status`, `ue call tether.level_summary`, `ue actors light`,
    `ue props DirectionalLight.LightComponent0 intensity`, `ue test ^Sandbox.`, `ue log --level Warning`.
