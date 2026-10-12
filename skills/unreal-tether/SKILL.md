@@ -126,6 +126,8 @@ broken or unsupported.
   before each read, so lines from the last action are always there.
 
 ## Output and exit codes
+- If the editor dies (`ue status` says "crashed", or a call reports "the editor crashed"), run `ue crash`
+  before restarting: it shows the error, whether your modules were on the stack, and what ran last.
 Output is compact text, capped at 30 rows (`--limit N`; `--json` for raw). Exit codes: 0 ok, 1 tool
 error (one-line message), 2 editor unavailable, 3 restart required, 4 timeout.
 - On UE 5.4–5.7 (`ue status` says "via python remote execution"), only `py`, `exec`, `actors`, `props`,

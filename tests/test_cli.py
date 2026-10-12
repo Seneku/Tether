@@ -484,6 +484,39 @@ class Phase3(unittest.TestCase):
             project.close()
 
 
+class Crashes(unittest.TestCase):
+    def test_parse_describe_and_recent(self):
+        project = Project()
+        try:
+            folder = os.path.join(project.root, "Saved", "Crashes", "UECC-Windows-ABC_0000")
+            os.makedirs(folder)
+            when = 1791800000  # epoch seconds, written as .NET ticks
+            with open(os.path.join(folder, "CrashContext.runtime-xml"), "w") as f:
+                f.write(f"<FGenericCrashContext><RuntimeProperties><CrashType>Crash</CrashType>"
+                        f"<ErrorMessage>Unhandled Exception: EXCEPTION_ACCESS_VIOLATION [File:D:\\x.cpp] [Line: 12] bad</ErrorMessage>"
+                        f"<TimeOfCrash>{when * 10000000 + 621355968000000000}</TimeOfCrash>"
+                        f"<CallStack>UnrealEditor_Engine\nUnrealEditor_Engine\nUnrealEditor_Game\nUnrealEditor_Core\n</CallStack>"
+                        f"</RuntimeProperties></FGenericCrashContext>")
+            with open(os.path.join(folder, "Game.log"), "w") as f:
+                f.write("[2026.10.12-10.00.00:000][  0]LogTemp: doing the thing\n"
+                        "[2026.10.12-10.00.00:000][  0]LogTemp: doing the thing\n"
+                        "[2026.10.12-10.00.00:000][  0]LogModuleManager: noise\n"
+                        "[2026.10.12-10.00.01:000][  0]LogWindows: Error: appError called\n")
+            os.makedirs(os.path.join(project.root, "Source", "Game"))
+            report = ue.crash_reports(project.uproject)[0]
+            self.assertAlmostEqual(report["time"], when, delta=1)
+            self.assertEqual(ue.crash_summary(report), "Unhandled Exception: EXCEPTION_ACCESS_VIOLATION bad")
+            text = ue.describe_crash(project.uproject, report)
+            self.assertIn("modules (innermost first): Engine <- Game <- Core", text)
+            self.assertIn("your modules on the stack: Game", text)
+            self.assertEqual(text.count("doing the thing"), 1)
+            self.assertNotIn("noise", text)
+            self.assertIsNotNone(ue.recent_crash(project.uproject, when - 60))
+            self.assertIsNone(ue.recent_crash(project.uproject, when + 60))
+        finally:
+            project.close()
+
+
 class Transport(unittest.TestCase):
     def test_choice_by_engine_version_and_override(self):
         project = Project()

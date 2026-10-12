@@ -659,6 +659,9 @@ def cmd_status(ctx, args):
     port = beacon.get("mcp_port")
     if not alive:
         state = "not running"
+        crash = recent_crash(ctx.project, beacon.get("heartbeat", 0) - 120)
+        if crash:
+            state += f" (crashed {time.strftime('%H:%M', time.localtime(crash['time']))}: {crash_summary(crash, 100)}; ue crash)"
     elif age > 10:
         dialogs = blocking_dialogs(beacon.get("pid"))
         state = f"HUNG? (no heartbeat for {age:.0f}s" + (f"; blocked by modal: \"{dialogs[0][:80]}\")" if dialogs else ")")
@@ -1072,6 +1075,11 @@ def cmd_open(ctx, args):
         print("already running")
         return cmd_status(ctx, args)
     has_csharp = csharp_layout(ctx.project) is not None
+    last = (beacon or {}).get("heartbeat", 0)
+    crash = recent_crash(ctx.project, last - 120) if last else None
+    if crash:  # the previous session ended in a crash: say so before starting a new one
+        print(f"note: the last session crashed {time.strftime('%H:%M', time.localtime(crash['time']))}: "
+              f"{crash_summary(crash)} (ue crash)")
     env = editor_env(ctx.project)  # fails fast, before the prebuild, when UnrealSharp could not start
     if not args.no_build:  # a stale module would raise the rebuild prompt (and quits headless editors)
         if os.path.isdir(os.path.join(os.path.dirname(ctx.project), "Source")):
@@ -1707,6 +1715,83 @@ def cmd_table(ctx, args):
     if args.save:
         mcp_tool(ctx, "AssetTools", "save_assets", {"asset_paths": [dt.split(".")[0]]})
     print("applied" + (" and saved" if args.save else " (unsaved; --save, or save in the editor)"))
+    return 0
+
+
+CRASH_NOISE = re.compile(r"^\[[^\]]*\]\[[^\]]*\](LogModuleManager|LogPython: Display: Running start-up|LogUObjectHash|"
+                         r"LogStreaming|LogCsvProfiler|LogEOSSDK|LogInit: Display: Engine is initialized)")
+
+
+def crash_reports(project):
+    """Crash folders under Saved/Crashes, newest first, as dicts parsed from CrashContext.runtime-xml."""
+    root = os.path.join(os.path.dirname(project), "Saved", "Crashes")
+    reports = []
+    for name in os.listdir(root) if os.path.isdir(root) else []:
+        folder = os.path.join(root, name)
+        context = os.path.join(folder, "CrashContext.runtime-xml")
+        if not os.path.isfile(context):
+            continue
+        with open(context, encoding="utf-8", errors="replace") as f:
+            xml = f.read()
+        tag = lambda t: (re.search(rf"<{t}>(.*?)</{t}>", xml, re.S) or [None, ""])[1].strip()
+        ticks = tag("TimeOfCrash")  # .NET ticks (100 ns since 0001-01-01, UTC)
+        when = (int(ticks) - 621355968000000000) / 1e7 if ticks.isdigit() else os.path.getmtime(context)
+        reports.append({"folder": folder, "time": when, "type": tag("CrashType"),
+                        "error": re.sub(r"\s+", " ", tag("ErrorMessage")), "stack": tag("CallStack").splitlines()})
+    return sorted(reports, key=lambda r: -r["time"])
+
+
+def describe_crash(project, report, lines=8):
+    """A short account: when, what, the module chain, project modules involved, and what the log said last."""
+    when = time.strftime("%Y-%m-%d %H:%M", time.localtime(report["time"]))
+    out = [f"crash {when} ({report['type'] or 'unknown'}): {report['error'][:300]}"]
+    chain = []  # each module once, in the order it first appears from the innermost frame
+    for frame in report["stack"]:
+        module = frame.strip().replace("UnrealEditor_", "").replace("UnrealEditor-", "")
+        if module and module not in chain:
+            chain.append(module)
+    if chain:
+        out.append("  modules (innermost first): " + " <- ".join(chain[:10]) + (" ..." if len(chain) > 10 else ""))
+    source = os.path.join(os.path.dirname(project), "Source")
+    mine = sorted({d for d in (os.listdir(source) if os.path.isdir(source) else [])
+                   if os.path.isdir(os.path.join(source, d))} & set(chain))
+    if mine:
+        out.append("  your modules on the stack: " + ", ".join(mine))
+    logs = [f for f in os.listdir(report["folder"]) if f.endswith(".log")]
+    if logs:
+        with open(os.path.join(report["folder"], logs[0]), encoding="utf-8", errors="replace") as f:
+            tail = [l.split("]", 2)[-1].strip() for l in f.read().splitlines()
+                    if l.strip() and not CRASH_NOISE.match(l) and "GetLastError" not in l]
+        tail = [l for i, l in enumerate(tail) if l and (i == 0 or l != tail[i - 1])]  # Python logs some lines twice
+        out.append(f"  last log lines ({logs[0]}):")
+        out += ["    " + l[:180] for l in tail[-lines:]]
+    out.append(f"  folder: {report['folder']}")
+    return "\n".join(out)
+
+
+def crash_summary(report, width=120):
+    """One line: the error without the engine-source '[File:...] [Line: N]' noise."""
+    text = re.sub(r"\s*\[File:[^\]]*\]\s*\[Line:\s*\d+\]\s*", " ", report["error"]).strip()
+    return text[:width]
+
+
+def recent_crash(project, since):
+    """The newest crash after `since` (epoch seconds), or None."""
+    reports = crash_reports(project)
+    return reports[0] if reports and reports[0]["time"] >= since else None
+
+
+def cmd_crash(ctx, args):
+    reports = crash_reports(ctx.project)
+    if not reports:
+        print("no crash reports in Saved/Crashes")
+        return 0
+    if args.list:
+        for report in reports[: args.limit]:
+            print(time.strftime("%Y-%m-%d %H:%M", time.localtime(report["time"])) + f"  {report['type']:<9} "
+                  f"{crash_summary(report, 110)}  ({os.path.basename(report['folder'])})")
+        return 0
+    print(describe_crash(ctx.project, reports[min(args.index, len(reports) - 1)]))
     return 0
 
 
@@ -2745,6 +2830,9 @@ def main(argv=None):
     s.add_argument("--from", dest="from_file", metavar="FILE", help="apply the values in FILE (JSON) that differ")
     s.add_argument("--dry-run", action="store_true", help="with --from: show what would change")
     add("undo", cmd_undo, "undo Tether's last `ue set` (only if nothing else changed since)")
+    s = add("crash", cmd_crash, "why the editor died: the last crash's error, module chain and last log lines")
+    s.add_argument("index", nargs="?", type=int, default=0, help="0 = newest (default), 1 = the one before, ...")
+    s.add_argument("--list", action="store_true", help="list recent crashes instead")
     add("changes", cmd_changes, "unsaved work: dirty packages and the level's actors added/removed/moved since load")
     s = add("save", cmd_save, "save unsaved packages (all, or the given ones); untitled /Temp maps are skipped")
     s.add_argument("paths", nargs="*", help="package paths (default: everything unsaved)")
@@ -2844,7 +2932,7 @@ def main(argv=None):
                          ("limit", 30), ("time", False)):
         if not hasattr(args, key):
             setattr(args, key, default)
-    started = time.perf_counter()
+    started, started_wall = time.perf_counter(), time.time()
     try:
         ctx = Ctx(args)
         try:
@@ -2854,6 +2942,12 @@ def main(argv=None):
     except CliError as exc:
         sys.stdout.flush()  # keep the error after the output that explains it when both are piped
         message = str(exc)
+        if exc.code in (2, 4) and ("not reachable" in message or "timed out" in message):
+            try:  # the editor may have died during this very call
+                crash = recent_crash(find_project(args.project), started_wall - 5)
+                message += f"; the editor crashed: {crash_summary(crash)} (ue crash)" if crash else ""
+            except CliError:
+                pass
         if exc.code == 4 and "blocked by modal" not in message:
             try:  # say why the editor stopped answering, if it is a dialog or a stalled game thread
                 report = stall_report(find_project(args.project))
