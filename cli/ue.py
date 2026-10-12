@@ -1628,9 +1628,13 @@ def cmd_job(ctx, args):
     if args.action == "_run":  # internal: the detached runner that owns the child and records its exit
         meta = read_json(os.path.join(folder, f"{args.id}.json"))
         child = None
+        try:  # the editor's environment: UAT starts editors (cooks), and UnrealSharp needs the .NET PATH fix
+            env = editor_env(ctx.project)
+        except CliError:
+            env = None
         with open(os.path.join(folder, f"{args.id}.log"), "w", encoding="utf-8", errors="replace") as log:
             try:
-                proc = subprocess.Popen(meta["command"], stdout=log, stderr=subprocess.STDOUT,
+                proc = subprocess.Popen(meta["command"], stdout=log, stderr=subprocess.STDOUT, env=env,
                                         stdin=subprocess.DEVNULL, cwd=os.path.dirname(ctx.project))
                 child = proc.pid
                 write_json(os.path.join(folder, f"{args.id}.json"), dict(meta, child=child))
@@ -1676,6 +1680,25 @@ def cmd_job(ctx, args):
         raise CliError(f"no job '{args.id}' (ue job status)")
     if args.action == "status":
         print(job_line(folder, job_id))
+        stuck = job_stuck(folder, job_id) if "running" in job_line(folder, job_id) else None
+        if stuck:
+            print(f"  warning: {stuck}; `ue job stop {job_id}`")
+        return 0
+    if args.action == "stop":
+        meta = read_json(os.path.join(folder, f"{job_id}.json")) or {}
+        for pid in (meta.get("child"), meta.get("runner")):  # the child's tree first (UAT -> editor -> ...)
+            if pid and pid_alive(pid):
+                if os.name == "nt":
+                    subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True)
+                else:
+                    import signal
+                    try:
+                        os.killpg(os.getpgid(pid), signal.SIGKILL)
+                    except OSError:
+                        pass
+        if "exit" not in meta:
+            write_json(os.path.join(folder, f"{job_id}.json"), dict(meta, exit=-1, ended=time.time(), stopped=True))
+        print(f"job {job_id} stopped")
         return 0
     if args.action == "log":
         with open(os.path.join(folder, f"{job_id}.log"), encoding="utf-8", errors="replace") as f:
@@ -1688,6 +1711,10 @@ def cmd_job(ctx, args):
         while "exit" not in (read_json(os.path.join(folder, f"{job_id}.json")) or {}):
             if job_line(folder, job_id).split("  ")[2] == "lost":
                 raise CliError(f"job {job_id} stopped without recording an exit code (ue job log {job_id})")
+            stuck = job_stuck(folder, job_id)
+            if stuck:  # nothing will answer it: stop the job rather than let its log fill the disk
+                cmd_job(ctx, argparse.Namespace(action="stop", id=job_id, limit=args.limit, project=args.project))
+                raise CliError(f"job {job_id} was {stuck}; stopped it")
             if time.time() > deadline:
                 raise CliError(f"job {job_id} still running after {args.wait:.0f}s ({job_line(folder, job_id)})", 4)
             time.sleep(1)
@@ -1695,7 +1722,8 @@ def cmd_job(ctx, args):
         with open(os.path.join(folder, f"{job_id}.log"), encoding="utf-8", errors="replace") as f:
             lines = f.read().splitlines()
         errors, warnings, _ = compact_diagnostics(lines, os.path.dirname(ctx.project))
-        errors += [l.strip() for l in lines if re.search(r"\bError:", l) and l.strip() not in errors][:10]
+        errors += [l.strip() for l in lines if re.search(r"\bError:", l) and l.strip() not in errors
+                   and not l.startswith("LogInit: Display:")][:10]  # skip the commandlet's own error summary
         print(job_line(folder, job_id))
         print_diagnostics(errors, warnings if args.verbose else [], args.limit)
         if meta["exit"] and not errors:
@@ -1703,6 +1731,34 @@ def cmd_job(ctx, args):
                 print("  " + line)
         return 0 if meta["exit"] == 0 else 1
     raise CliError(f"unknown job action {args.action}")
+
+
+COMMANDLET_LOG = re.compile(r"Commandlet log file is (.+)$", re.M)
+
+
+def job_stuck(folder, job_id):
+    """Why a running job looks stuck, or None. UAT runs commandlets (cooks) with their own log; a dialog
+    that keeps coming back there (answered by -unattended, raised again) never ends and the log grows
+    without bound, so read that log's tail too."""
+    log = os.path.join(folder, f"{job_id}.log")
+    if not os.path.isfile(log):
+        return None
+    with open(log, encoding="utf-8", errors="replace") as f:
+        match = COMMANDLET_LOG.search(f.read(200000))
+    paths = [match.group(1).strip()] if match else []
+    for path in paths + [log]:
+        if not os.path.isfile(path):
+            continue
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            f.seek(max(0, size - 65536))
+            tail = f.read().decode("utf-8", "replace")
+        dialogs = re.findall(r"Message dialog closed, result: \w+, title: [^,]*, text: ([^\r\n]{0,160})", tail)
+        if len(dialogs) >= 10 and len(set(dialogs)) <= 2:
+            return f"stuck on a repeating dialog ({len(dialogs)}x in the last 64 KB of its log): {dialogs[-1]}"
+        if size > 2 * 1024 ** 3:
+            return f"its log is {size / 1024 ** 3:.1f} GB ({path})"
+    return None
 
 
 def job_line(folder, job_id):
@@ -2284,7 +2340,7 @@ def main(argv=None):
     s.add_argument("name", help="class or class.member, e.g. EditorActorSubsystem or Actor.set_actor_location")
     s.add_argument("match", nargs="?", help="regex filter on member names")
     s = add("job", cmd_job, "background jobs for long work: start -- <cmd>, cook, status, wait, log")
-    s.add_argument("action", choices=["start", "cook", "status", "wait", "log", "_run"])
+    s.add_argument("action", choices=["start", "cook", "status", "wait", "log", "stop", "_run"])
     s.add_argument("id", nargs="?", help="job id (default: the latest)")
     s.add_argument("--name", help="label for a started job")
     s.add_argument("--platform", help="with cook: target platform (default: this host)")

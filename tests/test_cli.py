@@ -417,6 +417,19 @@ class Phase3(unittest.TestCase):
         self.assertIn("-(event A)", diff)
         self.assertIn("+  (Print))", diff)
 
+    def test_job_stuck_on_a_repeating_dialog_in_the_commandlet_log(self):
+        with tempfile.TemporaryDirectory() as folder:
+            cook_log = os.path.join(folder, "Cook.txt")
+            with open(os.path.join(folder, "1.log"), "w") as f:
+                f.write(f"Running UAT\nCommandlet log file is {cook_log}\n")
+            with open(cook_log, "w") as f:
+                f.write("LogInit: starting\n")
+            self.assertIsNone(ue.job_stuck(folder, "1"))
+            with open(cook_log, "a") as f:
+                for _ in range(12):
+                    f.write("Message dialog closed, result: Ok, title: Message, text: UnrealSharp can't be initialized.\n")
+            self.assertIn("stuck on a repeating dialog (12x", ue.job_stuck(folder, "1"))
+
     def test_job_runs_in_background_and_records_exit(self):
         project = Project()
         out = []
