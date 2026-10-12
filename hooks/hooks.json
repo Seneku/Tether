@@ -1,0 +1,42 @@
+{
+  "description": "Tether: editor status at session start, guards for C# edits and Epic's StartPIE, build routing after C++/C# edits, and a build nudge at the end of a turn. Every hook is silent outside Unreal projects and never blocks on its own failure.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear|compact",
+        "hooks": [
+          {"type": "command", "command": "python", "args": ["-I", "-S", "${CLAUDE_PLUGIN_ROOT}/cli/ue.py", "hook", "session-start"], "timeout": 10}
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          {"type": "command", "command": "python", "args": ["-I", "-S", "${CLAUDE_PLUGIN_ROOT}/cli/ue.py", "hook", "pre-edit"], "timeout": 10}
+        ]
+      },
+      {
+        "matcher": "mcp__unreal-mcp.*__call_tool|mcp__unreal-mcp.*StartPIE.*",
+        "hooks": [
+          {"type": "command", "command": "python", "args": ["-I", "-S", "${CLAUDE_PLUGIN_ROOT}/cli/ue.py", "hook", "pre-mcp"], "timeout": 10}
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          {"type": "command", "command": "python", "args": ["-I", "-S", "${CLAUDE_PLUGIN_ROOT}/cli/ue.py", "hook", "post-edit"], "timeout": 10}
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {"type": "command", "command": "python", "args": ["-I", "-S", "${CLAUDE_PLUGIN_ROOT}/cli/ue.py", "hook", "stop"], "timeout": 10}
+        ]
+      }
+    ]
+  }
+}

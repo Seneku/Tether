@@ -31,6 +31,12 @@ You need:
 `Sandbox/` is the development project. It loads the plugins from `../Plugins` through
 `AdditionalPluginDirectories`, so edits to the plugins take effect without copying anything.
 
+To work on the Claude Code plugin (skill, hooks, `bin/`), load it from your checkout instead of the
+published copy: `claude --plugin-dir .` for one session, or `claude plugin marketplace add . --scope local`
+then `claude plugin install tether@tether --scope local`. Check it with `claude plugin validate . --strict`.
+Users only receive a new plugin release when `version` in `.claude-plugin/plugin.json` changes, so bump it
+(and `VersionName` in `Plugins/Tether/Tether.uplugin`) when releasing.
+
 ```
 cd Sandbox
 python ../cli/ue.py build            # first build (UBT)
@@ -91,7 +97,7 @@ These keep Tether cheap for agents. [docs/DESIGN.md](docs/DESIGN.md) §7 has the
 ## Pull requests
 
 - Keep each PR to one focused change, and explain what it does and why.
-- Update `README.md`, the skill (`.claude/skills/unreal-tether/SKILL.md`) and `docs/DESIGN.md` when
+- Update `README.md`, the skill (`skills/unreal-tether/SKILL.md`) and `docs/DESIGN.md` when
   behaviour or commands change. The skill is what agents read, so keep it accurate and short.
 - Match the style of the surrounding code.
 

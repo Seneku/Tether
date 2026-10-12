@@ -72,8 +72,31 @@ def _tick(_delta):
             unreal.log_warning(f"Tether beacon: {exc}")
 
 
+def session_token():
+    """Random per-editor-process secret that gates the tools able to run code or change state.
+
+    Epic's MCP server only binds to localhost and checks Origin; anything else that can reach the port
+    could run editor Python. The token lives in Saved/Tether/session.json, which the ue CLI reads, so
+    callers must be able to read the project folder. It survives hot reloads (stashed on sys)."""
+    token = getattr(sys, "_tether_token", None)
+    if token is None:
+        import secrets
+        token = sys._tether_token = secrets.token_hex(16)
+    return token
+
+
+def _write_session():
+    path = os.path.join(os.path.dirname(_path()), "session.json")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"pid": os.getpid(), "token": session_token()}, f)
+    os.replace(tmp, path)
+
+
 def start():
     """(Re)start the beacon; safe to call again after a hot reload."""
+    _write_session()
     _state["port"] = _mcp_port()
     previous = getattr(sys, "_tether_beacon", None)
     if previous is not None:

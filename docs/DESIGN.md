@@ -536,16 +536,29 @@ project's `Plugins/`, and updates hot-reload without restarting the editor.
 
 ### 6.3 Claude Code integration
 
-- **Skill `unreal-tether`** (v0 in `.claude/skills/`, loaded on demand): command reference, the iteration decision table, and the
-  Python gotchas currently buried in IslandHorror's CLAUDE.md.
-- **Hooks, done:** two PreToolUse hooks.
-  - `ue hook pre-edit` denies C# edits while PIE runs.
-  - `ue hook pre-mcp` denies Epic's `StartPIE` while saved C# has not been hot-reloaded (see §2). It
-    matches `call_tool` on the `unreal-mcp` connection and finds StartPIE in direct calls and in
-    batch scripts.
-- **Hooks, planned:** SessionStart injects a two-line editor status; PostToolUse on `Source/**` classifies
-  the edit as live-codable or restart-required; Stop nudges `ue build` if C++ changed since the
-  last green build.
+- **Packaging (done 2026-10-12):** the repo is a Claude Code plugin and its own marketplace
+  (`/plugin marketplace add Seneku/Tether`, `/plugin install tether@tether`). `bin/` puts `ue` on the
+  agent's PATH; `ue init` enables the engine plugins in a project's `.uproject` and copies the Tether
+  editor plugin into its `Plugins/`, because the plugin cache path changes with each version.
+- **Skill `unreal-tether`** (`skills/`, loaded on demand): command reference, the iteration decision
+  table, and the UE Python gotchas.
+- **Hooks (`hooks/hooks.json`, all done):**
+  - `ue hook pre-edit` (PreToolUse) denies C# edits while PIE runs.
+  - `ue hook pre-mcp` (PreToolUse) denies Epic's `StartPIE` while saved C# has not been hot-reloaded
+    (see §2). It matches `call_tool` on the `unreal-mcp` connection and finds StartPIE in direct calls
+    and in batch scripts.
+  - `ue hook session-start` adds two lines of editor state.
+  - `ue hook post-edit` (PostToolUse) classifies a C++/C# edit: Live Coding, a new UFUNCTION (live via
+    reflection, wrappers stale), maybe-restart (header edits), restart (reflected declarations,
+    `Build.cs`), or C# reload.
+  - `ue hook stop` asks once (`stop_hook_active` guard) for `ue build` when code changed in the last
+    hour since the last green build and the editor is running.
+  - Each hook costs ~190 ms, mostly Python start-up; the CLI imports sockets and subprocess lazily
+    for this.
+- **Safety (done 2026-10-12):** a per-editor-process token (`Saved/Tether/session.json`) gates `py`,
+  `console` and `set_props`. A modal watchdog names the dialog a windowed editor is blocked on
+  (native `#32770` boxes, and Slate modals detected as an enabled window beside a disabled main
+  frame) before a call and after a timeout, instead of a blind 120 s wait.
 - **Context diet (done 2026-10-12, §3; it saves about 9.5k tokens per session):** five subsystem sections of IslandHorror's CLAUDE.md (Terrain &
   water 10.3 KB, Player systems 8.5 KB, Adaptive cult 6.1 KB, Developer tooling 5.7 KB, Editor
   tooling 4.5 KB) are 73% of its 48 KB. Moving them to `docs/systems/*.md`, linked from a ~13 KB

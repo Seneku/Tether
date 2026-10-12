@@ -1,0 +1,8 @@
+#!/bin/sh
+# `ue` for bash shells. Claude Code puts the plugin's bin/ on the agent's PATH.
+here="$(dirname "$0")"
+for py in python python3; do
+  command -v "$py" >/dev/null 2>&1 && exec "$py" "$here/../cli/ue.py" "$@"
+done
+echo "ue: Python 3 not found on PATH" >&2
+exit 2

@@ -1,0 +1,15 @@
+{
+  "name": "tether",
+  "owner": {
+    "name": "Seneku",
+    "url": "https://github.com/Seneku"
+  },
+  "description": "Agent-native tooling for Unreal Engine 5.8+",
+  "plugins": [
+    {
+      "name": "tether",
+      "source": ".",
+      "description": "Drive a running Unreal Editor from Claude Code: the ue CLI, the unreal-tether skill and safety hooks."
+    }
+  ]
+}

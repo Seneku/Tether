@@ -9,3 +9,4 @@
 *.sln text eol=crlf
 *.uasset binary
 *.umap binary
+bin/ue text eol=lf

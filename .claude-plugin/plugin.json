@@ -1,0 +1,20 @@
+{
+  "name": "tether",
+  "version": "0.2.0",
+  "description": "Drive a running Unreal Editor (UE 5.8+) from Claude Code: the `ue` CLI on PATH, the unreal-tether skill, and hooks that guard C# edits, report editor state and route builds.",
+  "author": {
+    "name": "Seneku",
+    "url": "https://github.com/Seneku"
+  },
+  "homepage": "https://github.com/Seneku/Tether",
+  "repository": "https://github.com/Seneku/Tether",
+  "license": "MIT",
+  "keywords": [
+    "unreal",
+    "unreal-engine",
+    "ue5",
+    "mcp",
+    "editor",
+    "gamedev"
+  ]
+}

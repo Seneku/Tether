@@ -1,11 +1,15 @@
 ---
 name: unreal-tether
-description: Drive a running Unreal Editor (UE 5.8+) through the `ue` CLI. Use it to query actors and properties, run editor Python and console commands, call Epic's ~870 editor tools, and read logs, all without headless commandlets or editor restarts. Use when working in an Unreal project whose editor runs with the Tether plugin and Epic's ModelContextProtocol server.
+description: Drive a running Unreal Editor (UE 5.8+) through the `ue` CLI. Use it to query and set actor and asset properties, take viewport screenshots, run automation tests, editor Python and console commands, call Epic's ~830 editor tools, build C++/C# without restarts, and read logs. Use when working in an Unreal project whose editor runs with the Tether plugin and Epic's ModelContextProtocol server.
 ---
 
 # Unreal via `ue`
 
-The editor is already running. Talk to it; do not boot it again. Each `ue` call takes tens of
+Run `ue` from the project folder (or set `UE_PROJECT`). The Tether Claude Code plugin puts it on PATH;
+if `ue` is not found, use `python "${CLAUDE_PLUGIN_ROOT}/cli/ue.py"` instead. If `ue status` exits 2,
+start the editor with `ue open --headless` (`--render` if you need `ue shot`).
+
+Once the editor is running, talk to it; do not boot it again. Each `ue` call takes tens of
 milliseconds. A `-run=pythonscript` commandlet takes ~25 s and floods the log.
 
 ## First moves
@@ -95,6 +99,12 @@ milliseconds. A `-run=pythonscript` commandlet takes ~25 s and floods the log.
 ## Output and exit codes
 Output is compact text, capped at 30 rows (`--limit N`; `--json` for raw). Exit codes: 0 ok, 1 tool
 error (one-line message), 2 editor unavailable, 3 restart required, 4 timeout.
+- Exit 4 with `blocked by modal: "<title>"` means a dialog is open in a windowed editor and the editor
+  cannot answer until someone closes it. Ask the user to deal with it; do not retry in a loop.
+- `unauthorized` from `py`, `exec` or `set` means the call bypassed `ue` (the session token in
+  `Saved/Tether/session.json` is missing). Use the `ue` commands, or `ue reload` after updating Tether.
+- With the plugin's hooks, editor status arrives at session start, and each C++/C# edit gets a one-line
+  note saying whether `ue build` (Live Coding) or `ue build --restart` will be needed.
 
 ## Python gotchas (UE 5.8)
 - `unreal.Rotator(roll, pitch, yaw)` positional order: always pass keywords.

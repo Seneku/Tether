@@ -258,6 +258,180 @@ class Hooks(unittest.TestCase):
         printed.assert_not_called()
 
 
+class Init(unittest.TestCase):
+    def setUp(self):
+        self.project = Project()
+        with open(self.project.uproject, "w", encoding="utf-8", newline="") as f:
+            f.write('{\r\n\t"FileVersion": 3,\r\n\t"Plugins": [\r\n\t\t{\r\n\t\t\t"Name": "PythonScriptPlugin",'
+                    '\r\n\t\t\t"Enabled": false\r\n\t\t}\r\n\t]\r\n}\r\n')
+        self.ctx = argparse.Namespace(project=self.project.uproject)
+
+    def tearDown(self):
+        self.project.close()
+
+    def run_init(self, **kw):
+        out = []
+        with unittest.mock.patch("builtins.print", side_effect=lambda *a: out.append(" ".join(map(str, a)))):
+            ue.cmd_init(self.ctx, argparse.Namespace(**dict({"unrealsharp": False, "dry_run": False}, **kw)))
+        return out
+
+    def raw(self):
+        with open(self.project.uproject, "rb") as f:
+            return f.read()
+
+    def plugins(self):
+        with open(self.project.uproject, encoding="utf-8") as f:
+            return {e["Name"]: e["Enabled"] for e in json.load(f)["Plugins"]}
+
+    def test_dry_run_changes_nothing(self):
+        before = self.raw()
+        out = self.run_init(dry_run=True)
+        self.assertIn("would re-enable PythonScriptPlugin (was disabled)", out)
+        self.assertEqual(self.raw(), before)
+
+    def test_enables_plugins_copies_tether_keeps_crlf_and_is_idempotent(self):
+        self.run_init()
+        self.assertEqual(self.plugins(), dict.fromkeys(ue.REQUIRED_PLUGINS, True))
+        self.assertTrue(os.path.isfile(os.path.join(self.project.root, "Plugins", "Tether", "Tether.uplugin")))
+        self.assertFalse(os.path.exists(os.path.join(self.project.root, "Plugins", "TetherUnrealSharp")))
+        self.assertIn(b"\r\n\t\"FileVersion\": 3", self.raw())
+        self.assertEqual(self.run_init(), ["already set up: plugins enabled, Tether reachable"])
+
+    def test_all_toolsets_covers_epic_toolsets(self):
+        with open(self.project.uproject, "w", encoding="utf-8") as f:
+            json.dump({"Plugins": [{"Name": "AllToolsets", "Enabled": True}]}, f)
+        self.run_init(dry_run=True)
+        out = self.run_init()
+        self.assertNotIn("enable EditorToolset", out)
+        self.assertNotIn("EditorToolset", self.plugins())
+
+
+class EditClassifier(unittest.TestCase):
+    def test_routes(self):
+        cases = [
+            ("Game.Build.cs", {"old_string": "a", "new_string": "b"}, "restart"),
+            ("Thing.h", {"old_string": "int32 X;", "new_string": "UPROPERTY()\nint32 X;"}, "restart"),
+            ("Thing.h", {"old_string": "UPROPERTY() int32 X = 1;", "new_string": "UPROPERTY() int32 X = 2;"}, "restart"),
+            ("Thing.h", {"old_string": "", "new_string": "UFUNCTION()\nvoid Go();"}, "live-ufunction"),
+            ("Thing.h", {"old_string": "int f() { return 1; }", "new_string": "int f() { return 2; }"}, "maybe-restart"),
+            ("Thing.cpp", {"old_string": "return 1;", "new_string": "return 2;"}, "live"),
+            ("Thing.h", {"content": "UCLASS()\nclass UThing : public UObject { GENERATED_BODY() };"}, "maybe-restart"),
+            ("Thing.cpp", {"content": "int f() { return 3; }"}, "live"),
+            ("Coin.cs", {"old_string": "a", "new_string": "b"}, "csharp"),
+        ]
+        for name, tool_input, route in cases:
+            with self.subTest(name=name, tool_input=tool_input):
+                self.assertEqual(ue.classify_edit(name, tool_input)[0], route)
+
+
+class LifecycleHooks(unittest.TestCase):
+    def setUp(self):
+        self.project = Project()
+        self.cpp = self.project.write("Source/Game/Thing.cpp", "int f() { return 1; }")
+
+    def tearDown(self):
+        self.project.close()
+
+    def live(self, **fields):
+        ue.write_json(os.path.join(ue.state_dir(self.project.uproject), "editor.json"),
+                      dict({"pid": os.getpid(), "heartbeat": time.time(), "map": "/Game/L", "engine": "5.8.3-1+x",
+                            "mcp_port": 18000}, **fields))
+
+    def test_session_start(self):
+        self.assertIn("editor not running", ue.hook_session_start({"cwd": self.project.root}))
+        self.live()
+        text = ue.hook_session_start({"cwd": self.project.root})
+        self.assertTrue(text.startswith("Unreal project Game: editor ready | map /Game/L | UE 5.8.3-1 | mcp :18000"))
+        self.assertEqual(len(text.splitlines()), 2)
+        with tempfile.TemporaryDirectory() as elsewhere:
+            self.assertIsNone(ue.hook_session_start({"cwd": elsewhere}))
+
+    def test_post_edit_only_for_project_source(self):
+        payload = {"tool_input": {"file_path": self.cpp, "old_string": "1", "new_string": "2"}}
+        self.assertIn("editor not running", ue.hook_post_edit(payload))
+        self.live()
+        self.assertIn("Live Coding", ue.hook_post_edit(payload))
+        readme = self.project.write("README.md", "")
+        self.assertIsNone(ue.hook_post_edit({"tool_input": {"file_path": readme}}))
+        loose = self.project.write("Tools/x.cpp", "")
+        self.assertIsNone(ue.hook_post_edit({"tool_input": {"file_path": loose}}))
+
+    def test_stop_nudges_once_for_recent_unbuilt_code(self):
+        old = time.time() - 100
+        os.utime(self.cpp, (old, old))
+        os.utime(self.project.uproject, (old, old))
+        ue.mark_green(self.project.uproject)
+        self.live()
+        payload = {"cwd": self.project.root, "stop_hook_active": False}
+        self.assertIsNone(ue.hook_stop(payload))  # nothing changed since the green build
+        future = time.time() + 5
+        os.utime(self.cpp, (future, future))
+        self.assertIn("`ue build`", ue.hook_stop(payload))
+        self.assertIsNone(ue.hook_stop(dict(payload, stop_hook_active=True)))
+        ue.write_json(os.path.join(ue.state_dir(self.project.uproject), "editor.json"), {"pid": 0})
+        self.assertIsNone(ue.hook_stop(payload))  # editor not running: no nudge
+
+
+@unittest.skipUnless(os.name == "nt", "Win32 window enumeration")
+class Watchdog(unittest.TestCase):
+    """Real top-level windows in this process, off-screen tool windows so nothing shows on the desktop."""
+
+    def setUp(self):
+        import ctypes
+        from ctypes import wintypes
+        self.user32 = user32 = ctypes.windll.user32
+        user32.DefWindowProcW.restype = ctypes.c_ssize_t
+        user32.DefWindowProcW.argtypes = (wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
+        user32.CreateWindowExW.restype = wintypes.HWND
+        user32.CreateWindowExW.argtypes = (wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD,
+                                           ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                           wintypes.HWND, wintypes.HMENU, wintypes.HINSTANCE, wintypes.LPVOID)
+        proc_type = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
+        self.proc = proc_type(lambda h, m, w, l: user32.DefWindowProcW(h, m, w, l))
+
+        class WNDCLASSW(ctypes.Structure):
+            _fields_ = [("style", wintypes.UINT), ("lpfnWndProc", proc_type), ("cbClsExtra", ctypes.c_int),
+                        ("cbWndExtra", ctypes.c_int), ("hInstance", wintypes.HINSTANCE), ("hIcon", wintypes.HICON),
+                        ("hCursor", wintypes.HANDLE), ("hbrBackground", wintypes.HBRUSH),
+                        ("lpszMenuName", wintypes.LPCWSTR), ("lpszClassName", wintypes.LPCWSTR)]
+
+        wc = WNDCLASSW(lpfnWndProc=self.proc, lpszClassName="UnrealWindow")
+        user32.RegisterClassW(ctypes.byref(wc))  # fails harmlessly if a previous test registered it
+        self.windows = []
+
+    def window(self, title, enabled=True):
+        hwnd = self.user32.CreateWindowExW(0x80 | 0x08000000, "UnrealWindow", title, 0x80000000 | 0x10000000,
+                                           -32000, -32000, 10, 10, None, None, None, None)  # TOOLWINDOW|NOACTIVATE, POPUP|VISIBLE
+        self.assertTrue(hwnd)
+        self.user32.EnableWindow(hwnd, enabled)
+        self.windows.append(hwnd)
+        return hwnd
+
+    def tearDown(self):
+        for hwnd in self.windows:
+            self.user32.DestroyWindow(hwnd)
+
+    def test_slate_modal_found_only_while_main_frame_is_disabled(self):
+        main = self.window("Game - Unreal Editor")
+        self.window("Output Log")
+        self.assertEqual(ue.blocking_dialogs(os.getpid()), [])  # floating tab, nothing modal
+        self.user32.EnableWindow(main, False)
+        self.window("Save Content")
+        self.assertEqual(sorted(ue.blocking_dialogs(os.getpid())), ["Output Log", "Save Content"])
+
+    def test_stall_report_names_the_dialog(self):
+        project = Project()
+        try:
+            ue.write_json(os.path.join(ue.state_dir(project.uproject), "editor.json"),
+                          {"pid": os.getpid(), "heartbeat": time.time() - 60})
+            self.assertEqual(ue.stall_report(project.uproject), "no heartbeat for 60s (game thread busy or hung)")
+            self.window("Game - Unreal Editor", enabled=False)
+            self.window("Save Content")
+            self.assertEqual(ue.stall_report(project.uproject), 'blocked by modal: "Save Content"')
+        finally:
+            project.close()
+
+
 import unittest.mock  # noqa: E402  (used above; kept at module level for Python 3.11)
 
 if __name__ == "__main__":

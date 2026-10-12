@@ -149,6 +149,15 @@ def _capped(head, rows, limit):
     return "\n".join([head] + body)
 
 
+def _authorize(token):
+    """Gate for tools that run code or change state; see beacon.session_token."""
+    import hmac
+    from tether import beacon
+    if not hmac.compare_digest(str(token), beacon.session_token()):
+        raise RuntimeError("unauthorized: pass the session token from Saved/Tether/session.json "
+                           "(the ue CLI does this automatically)")
+
+
 def _csharp():
     lib = getattr(unreal, "TetherCSharpLibrary", None)
     if lib is None:
@@ -295,7 +304,7 @@ class TetherCore(unreal.ToolsetDefinition):
 
     @toolset_registry.tool_call
     @staticmethod
-    def py(code: str) -> str:
+    def py(code: str, token: str = "") -> str:
         """Execute Python in the editor interpreter.
 
         The namespace persists between calls (like a REPL) and `unreal` is
@@ -304,15 +313,17 @@ class TetherCore(unreal.ToolsetDefinition):
 
         Args:
             code: Python source to execute.
+            token: Session token from Saved/Tether/session.json (the ue CLI sends it).
 
         Returns:
             Captured output and the trailing expression value.
         """
+        _authorize(token)
         return _run_python(code)
 
     @toolset_registry.tool_call
     @staticmethod
-    def console(command: str, pie: bool = False) -> str:
+    def console(command: str, pie: bool = False, token: str = "") -> str:
         """Run a console command, e.g. a cheat or 'stat unit'. Its output goes to the log.
 
         While PIE runs, commands go to the PIE world.
@@ -320,10 +331,12 @@ class TetherCore(unreal.ToolsetDefinition):
         Args:
             command: The console command line.
             pie: Require a PIE world (error if PIE is not running).
+            token: Session token from Saved/Tether/session.json (the ue CLI sends it).
 
         Returns:
             Which world the command ran in.
         """
+        _authorize(token)
         editor = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem)
         game = editor.get_game_world()  # checked first: get_editor_world() logs an error during PIE
         if pie and game is None:
@@ -362,7 +375,7 @@ class TetherCore(unreal.ToolsetDefinition):
 
     @toolset_registry.tool_call
     @staticmethod
-    def set_props(target: str, values: str, pie: bool = False) -> str:
+    def set_props(target: str, values: str, pie: bool = False, token: str = "") -> str:
         """Set reflected properties from compact text, as one undoable editor transaction.
 
         Values are JSON, true/false, numbers, enum names, object paths, or positional tuples for
@@ -374,10 +387,12 @@ class TetherCore(unreal.ToolsetDefinition):
             target: Object or asset path, actor label or name, or 'ActorLabel.ComponentName'.
             values: JSON object of property name to value text, e.g. {"Intensity": "10", "location+": "0,0,200"}.
             pie: Change the PIE world instead of the editor level (not undoable, not saved).
+            token: Session token from Saved/Tether/session.json (the ue CLI sends it).
 
         Returns:
             One 'name: old -> new' line per property.
         """
+        _authorize(token)
         obj = _resolve(target, pie)
         cls = obj if isinstance(obj, unreal.Struct) else obj.get_class()
         schema = json.loads(unreal.ToolsetLibrary.list_struct_properties(cls))

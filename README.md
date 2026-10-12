@@ -66,8 +66,8 @@ and a private mid-size C++/Blueprint game. Methodology is in [docs/DESIGN.md](do
   C# reload state. It also writes a heartbeat beacon. It hot-reloads with `ue reload`.
 - **`Plugins/TetherUnrealSharp`** is optional. It's a small C++ editor plugin that makes UnrealSharp's C#
   hot reload callable from Python with modal dialogs suppressed.
-- **`.claude/`** holds a Claude Code skill (`unreal-tether`) that teaches the workflow, plus two safety
-  hooks.
+- **The Claude Code plugin** (`.claude-plugin/`, `skills/`, `hooks/`, `bin/`) puts `ue` on the agent's
+  PATH, adds the `unreal-tether` skill that teaches the workflow, and installs hooks (see below).
 
 ## Requirements
 
@@ -76,7 +76,39 @@ and a private mid-size C++/Blueprint game. Methodology is in [docs/DESIGN.md](do
 - Windows. This is the only platform tested so far: build routing uses `Build.bat` and Live Coding.
 - Optional: the .NET 10 SDK and UnrealSharp, for C#.
 
-## Quickstart
+## Install
+
+### With Claude Code (recommended)
+
+1. Add the plugin. In Claude Code:
+
+   ```
+   /plugin marketplace add Seneku/Tether
+   /plugin install tether@tether
+   ```
+
+   Or from a shell: `claude plugin marketplace add Seneku/Tether`, then
+   `claude plugin install tether@tether` (add `--scope project` to share it with a repo's other users).
+2. In your Unreal project folder, run `ue init`. It enables the engine plugins Tether needs in the
+   `.uproject` (`PythonScriptPlugin`, `ModelContextProtocol`, `EditorToolset`, `AutomationTestToolset`,
+   `Tether`, plus `TetherUnrealSharp` for UnrealSharp projects), and copies the Tether editor plugin into
+   the project's `Plugins/`. `ue init --dry-run` shows the changes first. Run it again after updating
+   the plugin to refresh the copy.
+3. `ue open --headless` (or `--headless --render` for screenshots), then `ue status`.
+
+### Hooks
+
+The plugin's hooks stay silent outside Unreal projects, and never block a tool call because they failed.
+
+- **Session start:** two lines of editor state (running or not, map, engine, port).
+- **Before an edit:** blocks C# edits while PIE runs (UnrealSharp would reprocess them mid-session).
+- **Before Epic's `StartPIE`:** blocks it while saved C# has not been hot-reloaded.
+- **After a C++/C# edit:** one line saying whether `ue build` (Live Coding or C# reload) will pick it
+  up, or a restart is needed (reflected declarations, `Build.cs`).
+- **End of a turn:** if project code changed in the last hour since the last green build and the
+  editor is running, Claude is asked once to run `ue build` or say why not.
+
+### Manual (any agent)
 
 1. **Enable the plugins** in your `.uproject`. Add `ModelContextProtocol`, `EditorToolset` and `Tether`,
    and point Unreal at this repo's plugins:
@@ -97,8 +129,8 @@ and a private mid-size C++/Blueprint game. Methodology is in [docs/DESIGN.md](do
    - `AllToolsets` instead of `EditorToolset` enables all of Epic's toolsets, but it also pulls in side
      plugins such as GameFeatures.
 
-2. **Put `cli/` on your `PATH`** (it holds `ue.cmd` for PowerShell/cmd). Then run commands from your project
-   folder, or set `UE_PROJECT`:
+2. **Put `bin/` on your `PATH`** (`ue` for bash shells, `ue.cmd` for PowerShell/cmd). Then run commands
+   from your project folder, or set `UE_PROJECT`:
 
    ```
    ue open --headless      # launch with the MCP server and wait until ready (~10-25 s warm)
@@ -106,14 +138,15 @@ and a private mid-size C++/Blueprint game. Methodology is in [docs/DESIGN.md](do
    ue call tether.level_summary
    ```
 
-3. **For Claude Code:** copy `.claude/skills/unreal-tether` into your project's `.claude/skills/`. If you
-   want the hooks, copy them from `.claude/settings.json` too.
+3. **For other agents:** `skills/unreal-tether/SKILL.md` is a plain-Markdown guide to the workflow;
+   point your agent at it.
 
 ## Commands
 
 | Command | What it does |
 |---|---|
-| `ue status` | Editor state from the beacon: map, PIE, PID, port, heartbeat. No HTTP. |
+| `ue status` | Editor state from the beacon: map, PIE, PID, port, heartbeat. No HTTP. Names the dialog a hung windowed editor is waiting on. |
+| `ue init [--dry-run]` | Set up the project: enable the engine plugins Tether needs, copy the Tether editor plugin into `Plugins/`. |
 | `ue open [--headless [--render]] [--map M]` | Launch on a per-project port and wait until ready. Prints boot errors, de-duplicated. `--headless` has no window and no renderer (`-nullrhi`); add `--render` to render offscreen for `ue shot`. |
 | `ue close [--save\|--discard\|--force]` | Quit gracefully. Refuses to drop unsaved work unless told to. |
 | `ue build [--restart]` | Uses Live Coding if the editor is up and UBT if not, plus C# hot reload. `--restart` covers reflection and `Build.cs` changes: save, close, build, reopen the same map. |
@@ -170,10 +203,13 @@ Details are in [docs/DESIGN.md](docs/DESIGN.md) §2. Upstream reports:
 
 | Path | Contents |
 |---|---|
-| `cli/` | `ue.py` (the CLI) and `ue.cmd` (Windows launcher) |
+| `cli/` | `ue.py`, the CLI (one stdlib-only file) |
+| `bin/` | `ue` and `ue.cmd` launchers; the Claude Code plugin puts this folder on the agent's PATH |
+| `.claude-plugin/`, `skills/`, `hooks/` | Claude Code plugin manifest (the repo is also its own marketplace), the `unreal-tether` skill, and the hooks |
+| `tests/` | Unit tests for the editor-free parts; CI runs them on every push |
 | `Plugins/Tether/` | Python toolset plugin |
 | `Plugins/TetherUnrealSharp/` | Optional C++ bridge for UnrealSharp hot reload |
-| `.claude/` | Claude Code skill and hooks. `.mcp.json` wires Epic's plugin to the sandbox editor, for comparison runs. |
+| `.claude/`, `.mcp.json` | This repo's own Claude Code settings: Epic's plugin, wired to the sandbox editor for comparison runs |
 | `Sandbox/` | Scratch UE 5.8 project used for development and measurements (includes a small C# coin feature) |
 | `docs/DESIGN.md` | Analysis, measurements, architecture, roadmap |
 | `docs/COMPARISON.md` | Head-to-head against Epic's official Claude Code plugin |
@@ -186,9 +222,13 @@ design decisions are in [docs/DESIGN.md](docs/DESIGN.md) §8–9.
 
 ## Notes
 
-- Epic's MCP server binds to `127.0.0.1` only, but it has no auth token, so any local process can call it,
-  including unrestricted editor Python through Tether. Be careful on shared machines. A per-session token
-  is on the roadmap.
+- Epic's MCP server binds to `127.0.0.1` only and has no auth token, so any local process can call it.
+  Tether's tools that run code or change state (`py`, `console`, `set_props`) also require a random
+  per-session token, which the editor writes to `Saved/Tether/session.json` and `ue` sends automatically.
+  So a caller must be able to read the project folder. Epic's own tools are not covered by the token.
+- A modal dialog in a windowed editor freezes every call. `ue` detects it (Windows) and fails at once
+  with `blocked by modal: "<title>"` instead of waiting for a timeout. Headless editors log dialogs and
+  answer them with their default.
 - Epic's MCP plugin sends analytics by default. To turn them off, run `ModelContextProtocol.EnableAnalytics 0`
   in the editor console.
 - Tether is not affiliated with or endorsed by Epic Games. Unreal Engine is a trademark of Epic Games, Inc.
