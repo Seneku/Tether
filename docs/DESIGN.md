@@ -193,6 +193,27 @@ Lessons from the spike:
 | Verify behaviour | a human plays in PIE | minutes | invisible to the agent |
 | Load project knowledge | `CLAUDE.md` | — | 49 KB ≈ 12k tokens every session |
 
+**With ToolSuite (IslandHorror, measured 2026-10-12).** The editor runs headless under `ue open`.
+
+| Loop | Before | With ToolSuite |
+|---|---|---|
+| Read state: `inspect_uds_fog_exposure.py`, unmodified | ~24 s, ~1,940 log lines | **0.85 s** with `ue py -f`; only the script's report reaches the agent |
+| Find a property's real name | guesses (`MISS 'Fog Amount'`) | `ue props Ultra_Dynamic_Sky fog`: **78 ms**, 102 real names (see below) |
+| Level overview | — | `level_summary`: 103 ms (836 actors, 22 classes) |
+| Restart for a reflection change | ~53 s boot plus clicks, manual | **27.7 s**, automated: `ue build --restart` = close, UBT 1.2 s, headless boot 23.1 s |
+| First boot after enabling the plugins | — | 434 s, once (the editor had been closed since July) |
+
+Notes on these results:
+- **Property names:** the "fog amount" turned out to be named `fog`, and one name carries UDS's own typo,
+  `Mutliplier`. Neither would have been guessed.
+- **Setup:** IslandHorror's `.uproject` gains `AdditionalPluginDirectories: ["../ToolSuite/Plugins"]` and
+  four plugins: `PythonScriptPlugin`, `ModelContextProtocol`, `EditorToolset`, `ToolSuite`.
+  `EditorToolset` is used instead of `AllToolsets` to avoid side plugins.
+- **Agent onboarding:** the skill is copied into its `.claude/skills/` with the `ue` path, and its
+  `CLAUDE.md` gains one bullet pointing scripts at `ue py`.
+- **Not yet exercised there:** the C++ Live Coding loop, PIE checks, mutating scripts, and the
+  `CLAUDE.md` context diet.
+
 ## 4. Why Unreal is harder for agents than Unity
 
 1. **State is binary.** `.uasset` / `.umap` / Blueprints are only legible through a running engine.
@@ -531,8 +552,8 @@ project's `Plugins/`, and updates hot-reload without restarting the editor.
 
 | Phase | Scope | Exit criterion |
 |---|---|---|
-| 0 — CLI spine | **done in spike:** `status`, `open`, `close`, `build` (Live Coding / UBT routing, compact diagnostics, `--restart`), `tools`, `call`, `log`, per-project port, skill v0. **To do:** harden, then dogfood on IslandHorror | Sandbox and IslandHorror driven end-to-end without a manual editor step |
-| 1 — Gap toolset | **done in spike:** `py`, `exec`, `props`, `actors`, `level_summary`, `reload`, beacon + heartbeat. **To do:** `get`/`set`, `shot`, `pie`, `test` | the `inspect_*.py` loop replaced; 24 s → sub-second |
+| 0 — CLI spine | **done in spike:** `status`, `open`, `close`, `build` (Live Coding / UBT routing, compact diagnostics, `--restart`), `tools`, `call`, `log`, per-project port, skill v0. **Dogfooding on IslandHorror since 2026-10-12** (§3): reads 0.85 s instead of ~24 s, automated restart 27.7 s. **To do:** C++ Live Coding and PIE loops there | Sandbox and IslandHorror driven end-to-end without a manual editor step |
+| 1 — Gap toolset | **done in spike:** `py`, `exec`, `props`, `actors`, `level_summary`, `reload`, `pie`, beacon + heartbeat. **Exit criterion met on IslandHorror** (unmodified `inspect_*.py` in 0.85 s). **To do:** `get`/`set`, `shot`, `test` | the `inspect_*.py` loop replaced; 24 s → sub-second |
 | 2 — Restart-free loop | **done in spike:** Live Coding orchestration, coarse change classifier, automated restart. **To do:** finer classifier (diff reflected declarations), hooks, `smoke` | edit C++ → verified in PIE with no human step |
 | 3 — Depth | Blueprint DSL ergonomics, DataTable/DataAsset round-trips, `api`, `job`, `watch` | Blueprint changes reviewed as text diffs |
 | 4 — Scripting | **UnrealSharp trial done in Sandbox:** headless project creation, C# pre-build in `ue open`, bridge-driven reload in `ue build` (0.6–1.2 s, structural changes included), one-line C# errors. **Gameplay feature done** (coins + score subsystem + combo, verified in PIE through `ue`). **Since done:** PreToolUse hooks that block C# edits while PIE runs and Epic's `StartPIE` while C# is unreloaded; `ue pie start` reloads pending C# first (works around UnrealSharp's recompile-on-lookup, §2); headless editors log dialogs instead of hanging on them. **Reported upstream:** [#774](https://github.com/UnrealSharp/UnrealSharp/issues/774) (recompile on lookup), [#775](https://github.com/UnrealSharp/UnrealSharp/issues/775) (.NET discovery + `StartupModule` recursion), [#776](https://github.com/UnrealSharp/UnrealSharp/issues/776) (headless reload). **To do:** Angelscript in a later pass | C# features iterated with no restarts |

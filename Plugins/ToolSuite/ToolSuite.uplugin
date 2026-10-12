@@ -9,6 +9,7 @@
 	"CanContainContent": true,
 	"IsBetaVersion": true,
 	"Installed": false,
+	"EnabledByDefault": false,
 	"Plugins": [
 		{
 			"Name": "PythonScriptPlugin",

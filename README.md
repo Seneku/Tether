@@ -27,9 +27,14 @@ Status: working spike (Phase 0/1). See `docs/DESIGN.md` §2a for measured result
 
 ## Quickstart (any UE 5.8 project)
 
-1. Enable plugins in the `.uproject`: `ModelContextProtocol`, `AllToolsets` (or just `EditorToolset`)
-   and `ToolSuite`. For `ToolSuite`, either copy `Plugins/ToolSuite` into the project's `Plugins/`, or add
-   `"AdditionalPluginDirectories": ["<path to this repo>/Plugins"]`.
+1. Enable plugins in the `.uproject`: `ModelContextProtocol`, `EditorToolset` (or all of Epic's
+   toolsets via `AllToolsets`, which also pulls in plugins such as GameFeatures) and `ToolSuite`.
+   - To get `ToolSuite`, either copy `Plugins/ToolSuite` into the project's `Plugins/`, or add
+     `"AdditionalPluginDirectories": ["<path to this repo>/Plugins"]`.
+   - The entry must point at `Plugins`, not at a plugin folder: UnrealBuildTool only searches subfolders.
+   - Both ToolSuite plugins are opt-in (`EnabledByDefault: false`), so list `ToolSuite` explicitly.
+     Projects without UnrealSharp simply leave `ToolSuiteUnrealSharp` out. IslandHorror's setup is the
+     example.
 2. Put this repo's `cli/` folder on `PATH` (or call `<repo>\cli\ue.cmd`). Then run these from the project folder, or with `UE_PROJECT` set:
 
 ```
