@@ -1541,6 +1541,10 @@ def cmd_bp(ctx, args):
     bp = asset_ref(args.blueprint)
     graphs = mcp_tool(ctx, "blueprint", "list_graphs", {"blueprint": {"refPath": bp}})
     names = [g["refPath"].rsplit(":", 1)[-1] if isinstance(g, dict) else str(g) for g in graphs or []]
+    if not names:
+        print(f"{bp}: no graphs (a data-only Blueprint; `ue props {bp.split('.')[0]}_C` shows its class, "
+              f"`ue props {bp.split('.')[0]}.Default__{bp.rsplit('.', 1)[-1]}_C` its defaults)")
+        return 0
     if args.graph:
         match = [n for n in names if n.lower() == args.graph.lower()]
         if not match:
@@ -1595,6 +1599,25 @@ def table_rows(ctx, dt):
     return json.loads(rows) if isinstance(rows, str) else rows
 
 
+LOCTEXT = re.compile(r'^NSLOCTEXT\("[^"]*", "[^"]*", "(.*)"\)$', re.S)
+
+
+def flat_row(row):
+    """One row for display: nested structs flattened one level (item.MaxStack=5), localized text as its
+    string, empty values ('', None, 'None') dropped."""
+    out = {}
+    for key, value in row.items():
+        pairs = [(f"{key}.{k}", v) for k, v in value.items()] if isinstance(value, dict) else [(key, value)]
+        for name, item in pairs:
+            if isinstance(item, str):
+                match = LOCTEXT.match(item)
+                item = match.group(1) if match else item
+            if item in ("", None, "None"):
+                continue
+            out[name] = item
+    return out
+
+
 def read_table_file(path):
     if path.lower().endswith(".csv"):
         import csv
@@ -1641,7 +1664,7 @@ def cmd_table(ctx, args):
     if not args.import_file:
         print(f"{dt}: {len(current)} rows")
         for name, row in list(current.items())[: args.limit]:
-            print(f"  {name}: " + ", ".join(f"{k}={short(v, 40)}" for k, v in row.items()))
+            print(f"  {name}: " + short(", ".join(f"{k}={short(v, 40)}" for k, v in flat_row(row).items()), 220))
         if len(current) > args.limit:
             print(f"... +{len(current) - args.limit} more (--limit, or --export)")
         return 0
@@ -1995,13 +2018,13 @@ def cmd_selftest(ctx, args):
     blueprint = None if remote else (ue("py", FIRST_ASSET.format(cls="Blueprint"))[1].splitlines() or [""])[-1]
     check("bp", ["bp", blueprint or ""], skip="needs 5.8 (Epic's BlueprintTools)" if remote else
           None if blueprint and blueprint.startswith("/Game/") else "no Blueprint under /Game",
-          ok=lambda c, o: c == 0 and "==" in o)
+          ok=lambda c, o: c == 0 and ("==" in o or "no graphs" in o))
     table = None if remote else (ue("py", FIRST_ASSET.format(cls="DataTable"))[1].splitlines() or [""])[-1]
     check("table export", ["table", table or "", "--export", os.path.join(tempfile.gettempdir(), "tether-selftest.json")],
           skip="needs 5.8 (Epic's DataTableTools)" if remote else
           None if table and table.startswith("/Game/") else "no DataTable under /Game",
           ok=lambda c, o: c == 0 and "exported" in o)
-    check("perf", ["perf", "--seconds", "2"], timeout=300, skip="needs 5.8" if remote else None,
+    check("perf", ["perf", "--seconds", "2", "--no-record"], timeout=300, skip="needs 5.8" if remote else None,
           ok=lambda c, o: c == 0 and "frames in" in o)
     check("pie start", ["pie", "start"], ok=lambda c, o: c == 0 and "OK" in o, timeout=300)
     check("pie status", ["pie", "status"], ok=lambda c, o: c == 0 and "running" in o)
@@ -2173,7 +2196,8 @@ def cmd_perf(ctx, args):
     if last:
         print(f"  (+/- vs last capture, {time.strftime('%H:%M', time.localtime(last.get('time', 0)))})")
     print(f"  csv: {path}")
-    write_json(last_file, dict(stats, time=time.time(), csv=path))
+    if not args.no_record:  # the baseline the next capture compares with
+        write_json(last_file, dict(stats, time=time.time(), csv=path))
     return 0
 
 
@@ -2765,6 +2789,7 @@ def main(argv=None):
     s = add("perf", cmd_perf, "frame-time capture in PIE: frame/game/render/GPU ms, hitches, change vs last capture")
     s.add_argument("--seconds", type=float, default=10, help="capture length (10)")
     s.add_argument("--editor", action="store_true", help="measure the editor as is, without starting PIE")
+    s.add_argument("--no-record", action="store_true", help="do not make this capture the comparison baseline")
     s = add("find", cmd_find, "search assets by name and/or class (asset registry)")
     s.add_argument("query", nargs="?", help="regex on the asset name")
     s.add_argument("--class", dest="cls", help="regex on the class name, e.g. StaticMesh or 'Material$'")

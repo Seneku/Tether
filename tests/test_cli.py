@@ -394,6 +394,12 @@ class RemoteResults(unittest.TestCase):
 
 
 class Phase3(unittest.TestCase):
+    def test_flat_row(self):
+        row = {"item": {"ItemId": "Battery", "DisplayName": 'NSLOCTEXT("DT_Items [F7]", "Battery_Name", "Battery")',
+                        "Icon": "None", "MaxStack": 5}, "weight": 1.5}
+        self.assertEqual(ue.flat_row(row), {"item.ItemId": "Battery", "item.DisplayName": "Battery",
+                                            "item.MaxStack": 5, "weight": 1.5})
+
     def test_same_value(self):
         self.assertTrue(ue.same_value({"r": 1, "g": 0.8}, {"r": 1, "g": 0.8000001}))
         self.assertFalse(ue.same_value({"r": 1, "g": 0.8}, {"r": 1, "g": 0.9}))

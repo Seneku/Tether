@@ -142,6 +142,8 @@ def _short_path(path):
 
 
 def _label(obj):
+    if obj.get_name().startswith("Default__"):  # a class default object: its "actor label" is meaningless
+        return _short_path(obj.get_path_name())
     if isinstance(obj, unreal.Actor):
         return obj.get_actor_label()
     if isinstance(obj, unreal.ActorComponent) and obj.get_owner():
