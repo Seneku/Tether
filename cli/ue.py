@@ -1929,6 +1929,8 @@ def cmd_selftest(ctx, args):
           skip="needs 5.8 (Epic's DataTableTools)" if remote else
           None if table and table.startswith("/Game/") else "no DataTable under /Game",
           ok=lambda c, o: c == 0 and "exported" in o)
+    check("perf", ["perf", "--seconds", "2"], timeout=300, skip="needs 5.8" if remote else None,
+          ok=lambda c, o: c == 0 and "frames in" in o)
     check("pie start", ["pie", "start"], ok=lambda c, o: c == 0 and "OK" in o, timeout=300)
     check("pie status", ["pie", "status"], ok=lambda c, o: c == 0 and "running" in o)
     check("actors --pie", ["actors", "--pie", "--limit", "1"])
@@ -1990,6 +1992,116 @@ def cmd_log(ctx, args):
         print(line)
     if len(shown) > args.limit:
         print(f"... +{len(shown) - args.limit} more (--limit)")
+    return 0
+
+
+def read_profile_csv(path):
+    """{column: [floats per frame]} from a CsvProfiler capture (the header repeats at the end)."""
+    import csv
+    with open(path, encoding="utf-8", errors="replace", newline="") as f:
+        rows = list(csv.reader(f))
+    header, columns = rows[0], {}
+    for row in rows[1:]:
+        if row and row[0] == header[0] and row[1:3] == header[1:3]:
+            break  # repeated header: metadata follows
+        for name, cell in zip(header, row):
+            try:
+                columns.setdefault(name, []).append(float(cell))
+            except ValueError:
+                pass
+    return columns
+
+
+def frame_stats(values):
+    ordered = sorted(values)
+    pick = lambda q: ordered[min(len(ordered) - 1, int(q * len(ordered)))]
+    return {"avg": sum(values) / len(values), "p50": pick(0.5), "p95": pick(0.95), "max": ordered[-1]}
+
+
+def cmd_perf(ctx, args):
+    """Frame-time capture through the CSV profiler: frame/game/render/GPU, hitches, change vs last capture."""
+    if ctx.transport == "remote":
+        raise CliError("ue perf needs UE 5.8+ in this version")
+    toolset = resolve_toolset(ctx, "editorapp")
+    started_pie = False
+    if unwrap(ctx.mcp.call(toolset, "IsPIERunning", {})[0]) is not True and not args.editor:
+        if cmd_pie(ctx, argparse.Namespace(action="start", simulate=False, warmup=1.0, limit=0, script=None)):
+            raise CliError("could not start PIE to measure (or pass --editor to measure the editor itself)")
+        started_pie = True
+    folder = os.path.join(os.path.dirname(ctx.project), "Saved", "Profiling", "CSV")
+    before = set(os.listdir(folder)) if os.path.isdir(folder) else set()
+    # A world context routes the command to the PIE world, where CsvProfile does nothing; None reaches it.
+    path, complete = None, False
+    # A headless or background editor throttles itself to a few fps ("Use Less CPU when in Background"),
+    # which makes frame time meaningless; lift that for the capture and restore it afterwards.
+    perf_settings = "/Script/UnrealEd.Default__EditorPerformanceSettings"
+    throttled = "= True" in ctx.tether("props", target=perf_settings, match="^bThrottleCPUWhenNotForeground$",
+                                       limit=5, pie=False)
+    try:
+        if throttled:
+            ctx.tether("set_props", target=perf_settings, values=json.dumps({"bThrottleCPUWhenNotForeground": "false"}))
+        ctx.tether("py", code="unreal.SystemLibrary.execute_console_command(None, 'CsvProfile Start')")
+        time.sleep(args.seconds)
+        ctx.tether("py", code="unreal.SystemLibrary.execute_console_command(None, 'CsvProfile Stop')")
+        deadline = time.time() + 30
+        while time.time() < deadline and not complete:  # the writer finishes the file with a metadata footer
+            new = [f for f in (os.listdir(folder) if os.path.isdir(folder) else [])
+                   if f.endswith(".csv") and f not in before]
+            if new:
+                path = os.path.join(folder, max(new, key=lambda f: os.path.getmtime(os.path.join(folder, f))))
+                try:
+                    with open(path, "rb") as f:
+                        f.seek(max(0, os.path.getsize(path) - 4096))
+                        complete = b"[HasHeaderRowAtEnd]" in f.read()
+                except PermissionError:  # still open for writing (Windows locks it)
+                    pass
+            time.sleep(0.5)
+    finally:
+        if throttled:
+            ctx.tether("set_props", target=perf_settings, values=json.dumps({"bThrottleCPUWhenNotForeground": "true"}))
+        if started_pie:
+            cmd_pie(ctx, argparse.Namespace(action="stop", simulate=False, warmup=0, limit=0, script=None))
+    if not path or not complete:
+        raise CliError("the CSV profiler wrote no capture (ue log --grep Csv)", 4)
+    columns = read_profile_csv(path)
+    frames = columns.get("FrameTime", [])
+    if not frames:
+        raise CliError(f"no FrameTime column in {path}")
+    stats = {name: frame_stats(columns[name]) for name in ("FrameTime", "GameThreadTime", "RenderThreadTime", "GPUTime")
+             if columns.get(name)}
+    ft = stats["FrameTime"]
+    threads = {n.replace("ThreadTime", "").replace("Time", ""): s["avg"] for n, s in stats.items() if n != "FrameTime"}
+    timed = {k: v for k, v in threads.items() if v > 0}  # -nullrhi records no thread or GPU timings
+    bound = max(timed, key=timed.get) if timed else None
+    capped = bool(timed) and max(timed.values()) < 0.85 * ft["p50"]  # the frame waits on a cap, not on work
+    hitch_limit = max(2 * ft["p50"], 33.3)
+    hitches = [(i, t) for i, t in enumerate(frames) if t > hitch_limit]
+    last_file = os.path.join(state_dir(ctx.project), "perf", "last.json")
+    last = read_json(last_file)
+    delta = lambda key: (f" ({ft[key] - last['FrameTime'][key]:+.1f})" if last and last.get("FrameTime") else "")
+    print(f"{len(frames)} frames in {args.seconds:g}s{' of PIE' if not args.editor else ''}: frame avg "
+          f"{ft['avg']:.1f} ms{delta('avg')} ({1000 / ft['avg']:.0f} fps), p95 {ft['p95']:.1f}{delta('p95')}, "
+          f"max {ft['max']:.1f}")
+    if timed:
+        column = {"Game": "GameThreadTime", "Render": "RenderThreadTime", "GPU": "GPUTime"}
+        moved = lambda k, v: (f" ({v - last[column[k]]['avg']:+.1f})" if last and last.get(column.get(k, ""), {}).get("avg")
+                              else "")
+        print("  per frame: " + ", ".join(f"{k} {v:.1f} ms{moved(k, v)}" for k, v in timed.items()) + f" | bound by {bound}"
+              + (f" | frame rate capped at ~{1000 / ft['p50']:.0f} fps, so compare the per-frame work" if capped else ""))
+    else:
+        print("  no game/render/GPU timings: the editor runs with -nullrhi (`ue open --headless --render` for them)")
+    if hitches:
+        worst = sorted(hitches, key=lambda h: -h[1])[:3]
+        print(f"  {len(hitches)} hitches over {hitch_limit:.0f} ms; worst: "
+              + ", ".join(f"frame {i} {t:.0f} ms" for i, t in worst))
+    else:
+        print(f"  no hitches over {hitch_limit:.0f} ms")
+    if columns.get("PhysicalUsedMB"):
+        print(f"  memory {columns['PhysicalUsedMB'][-1]:.0f} MB used")
+    if last:
+        print(f"  (+/- vs last capture, {time.strftime('%H:%M', time.localtime(last.get('time', 0)))})")
+    print(f"  csv: {path}")
+    write_json(last_file, dict(stats, time=time.time(), csv=path))
     return 0
 
 
@@ -2568,6 +2680,9 @@ def main(argv=None):
     s.add_argument("--prune", action="store_true", help="with --import: remove rows missing from FILE")
     s.add_argument("--dry-run", action="store_true", help="with --import: show the diff only")
     s.add_argument("--save", action="store_true", help="save the DataTable afterwards")
+    s = add("perf", cmd_perf, "frame-time capture in PIE: frame/game/render/GPU ms, hitches, change vs last capture")
+    s.add_argument("--seconds", type=float, default=10, help="capture length (10)")
+    s.add_argument("--editor", action="store_true", help="measure the editor as is, without starting PIE")
     s = add("find", cmd_find, "search assets by name and/or class (asset registry)")
     s.add_argument("query", nargs="?", help="regex on the asset name")
     s.add_argument("--class", dest="cls", help="regex on the class name, e.g. StaticMesh or 'Material$'")

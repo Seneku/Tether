@@ -107,6 +107,8 @@ broken or unsupported.
 - New tests compiled with `ue build` are picked up automatically.
 
 ## Play testing
+- Performance: `ue perf` before and after a change; each run prints the difference from the previous one.
+  When it says the frame rate is capped, compare the per-frame game/render/GPU work, not the fps.
 - Prefer `ue pie run check.py --expect '<log regex>' --reject 'Error|no subsystem'` for verifying gameplay:
   it starts PIE, runs the script in the PIE world, waits for the log lines, stops PIE and exits 0/1.
   Write the script once and rerun it after every change.

@@ -393,6 +393,20 @@ class RemoteResults(unittest.TestCase):
 
 
 class Phase3(unittest.TestCase):
+    def test_profile_csv_and_stats(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "Profile.csv")
+            with open(path, "w", newline="") as f:
+                f.write("EVENTS,FrameTime,GameThreadTime,GPUTime\n")
+                for ms in (8, 8, 9, 40, 8):
+                    f.write(f",{ms},5.5,2.0\n")
+                f.write("EVENTS,FrameTime,GameThreadTime,GPUTime\n[HasHeaderRowAtEnd],1,[platform],Windows\n")
+            columns = ue.read_profile_csv(path)
+        self.assertEqual(columns["FrameTime"], [8, 8, 9, 40, 8])
+        stats = ue.frame_stats(columns["FrameTime"])
+        self.assertEqual((stats["p50"], stats["max"]), (8, 40))
+        self.assertAlmostEqual(stats["avg"], 14.6)
+
     def test_compiler_line(self):
         line = stamped(r"LogBlueprint: Error: [AssetLog] D:\P\Content\BP_X.uasset: [Compiler] Could not find a "
                        "function named \"GetProbeCount\" in 'SandboxProbeLibrary'.")
