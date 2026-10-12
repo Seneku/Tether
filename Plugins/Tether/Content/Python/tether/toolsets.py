@@ -112,6 +112,8 @@ def _match_actors(ref, pie=False):
 def _resolve(ref, pie=False):
     """Find an object by object/asset path, actor label or name, or 'ActorLabel.ComponentName'."""
     if "/" in ref:
+        if "." not in ref.rsplit("/", 1)[-1]:  # a package path names its asset: /Game/X/A -> /Game/X/A.A
+            ref = f"{ref}.{ref.rsplit('/', 1)[-1]}"
         obj = unreal.find_object(None, ref)
         if obj is None:
             with contextlib.suppress(Exception):
@@ -384,6 +386,24 @@ def snapshot_level(level=None):
                       for a in unreal.get_editor_subsystem(unreal.EditorActorSubsystem).get_all_level_actors()}
 
 
+def _record_undo(before, label):
+    """Note an editor-transacted change of ours for `ue undo`, if the editor recorded it."""
+    if _LEGACY:
+        return
+    count = unreal.ToolsetLibrary.get_active_undo_count()
+    if count > before:
+        _UNDO.append({"count": count, "label": label})
+
+
+def _reflect(text, obj):
+    """Parse ToolsetLibrary JSON; it returns '' for an object in a transient state (e.g. just after a rename)."""
+    try:
+        return json.loads(text)
+    except ValueError:
+        raise RuntimeError(f"the editor returned no property data for {_label(obj)} (it may be mid-load or "
+                           "mid-rename; retry, or save and reload it)") from None
+
+
 def _dirty_packages():
     utils = unreal.EditorLoadingAndSavingUtils
     maps = [p.get_name() for p in utils.get_dirty_map_packages()]
@@ -492,12 +512,12 @@ class TetherCore(_Base):
         if _LEGACY:
             return _legacy_props(obj, match, limit)
         cls = obj if isinstance(obj, unreal.Struct) else obj.get_class()
-        schema = json.loads(unreal.ToolsetLibrary.list_struct_properties(cls))
+        schema = _reflect(unreal.ToolsetLibrary.list_struct_properties(cls), obj)
         names = list(schema)
         if match:
             rx = re.compile(match, re.I)
             names = [n for n in names if rx.search(n) or rx.search(_type_name(schema[n]))]
-        values = json.loads(unreal.ToolsetLibrary.get_object_properties(obj, names)) if names else {}
+        values = _reflect(unreal.ToolsetLibrary.get_object_properties(obj, names), obj) if names else {}
         head = f"{_label(obj)} ({cls.get_name()}, {len(schema)} props" + (f", {len(names)} match" if match else "") + ")"
         rows = [f"{n}: {_type_name(schema[n])} = {_short(_round(values.get(n)))}" for n in names]
         return _capped(head, rows, limit)
@@ -527,7 +547,7 @@ class TetherCore(_Base):
                                "obj.set_editor_property(name, value) inside unreal.ScopedEditorTransaction")
         obj = _resolve(target, pie)
         cls = obj if isinstance(obj, unreal.Struct) else obj.get_class()
-        schema = json.loads(unreal.ToolsetLibrary.list_struct_properties(cls))
+        schema = _reflect(unreal.ToolsetLibrary.list_struct_properties(cls), obj)
         by_lower = {n.lower(): n for n in schema}
         is_actor = isinstance(obj, unreal.Actor)
         requested = json.loads(values)
@@ -776,6 +796,182 @@ class TetherCore(_Base):
             if not rx or rx.search(prop):
                 rows.append(f"  {prop}: {kind}")
         return _capped(rows[0], rows[1:], limit)
+
+    @_tool
+    @staticmethod
+    def spawn(what: str, at: str = "0,0,0", rot: str = "", label: str = "", token: str = "") -> str:
+        """Place an actor in the edited level (undoable): from a class (PointLight, /Script/Engine.TargetPoint,
+        a Blueprint's generated class) or an asset (a StaticMesh, a Blueprint, ...).
+
+        Args:
+            what: Class name, /Script/... class path, or /Game/... asset path.
+            at: Location 'x,y,z'.
+            rot: Rotation 'pitch,yaw,roll'.
+            label: Actor label to give it.
+            token: Session token from Saved/Tether/session.json (the ue CLI sends it).
+
+        Returns:
+            The new actor's label, class and location.
+        """
+        _authorize(token)
+        subsystem = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
+        nums = _numbers(at) or [0, 0, 0]
+        if len(nums) != 3:
+            raise RuntimeError(f"at: expected x,y,z, got '{at}'")
+        location = unreal.Vector(*nums)
+        r = _numbers(rot) if rot else [0, 0, 0]
+        rotation = unreal.Rotator(roll=r[2], pitch=r[0], yaw=r[1])
+        before = unreal.ToolsetLibrary.get_active_undo_count() if not _LEGACY else 0
+        if what.startswith(("/Game/", "/Engine/")):  # an asset: mesh, Blueprint, ...
+            asset, cls = unreal.load_asset(what), None
+            if asset is None:
+                raise RuntimeError(f"no asset at {what} (ue find)")
+        else:
+            asset = None
+            cls = unreal.load_class(None, what) if what.startswith("/Script/") else getattr(unreal, what, None)
+            if cls is None:
+                raise RuntimeError(f"no class '{what}' (try ue api {what}, or a /Script/Module.Class path)")
+        with unreal.ScopedEditorTransaction(f"ue spawn {label or what}"):  # spawn + label = one undo step
+            actor = (subsystem.spawn_actor_from_object(asset, location, rotation) if asset is not None
+                     else subsystem.spawn_actor_from_class(cls, location, rotation))
+            if actor is not None and label:
+                actor.set_actor_label(label)
+        if actor is None:
+            raise RuntimeError(f"could not spawn {what} (see ue log)")
+        _record_undo(before, f"spawn {actor.get_actor_label()}")
+        loc = actor.get_actor_location()
+        return f"spawned {actor.get_actor_label()} ({actor.get_class().get_name()}) at ({loc.x:g}, {loc.y:g}, {loc.z:g})"
+
+    @_tool
+    @staticmethod
+    def delete(targets: str, token: str = "") -> str:
+        """Delete actors from the edited level (undoable).
+
+        Args:
+            targets: Comma-separated actor labels or names.
+            token: Session token from Saved/Tether/session.json (the ue CLI sends it).
+
+        Returns:
+            What was deleted.
+        """
+        _authorize(token)
+        actors = []
+        for ref in [t.strip() for t in targets.split(",") if t.strip()]:
+            obj = _resolve(ref)
+            if not isinstance(obj, unreal.Actor):
+                raise RuntimeError(f"'{ref}' is not an actor")
+            actors.append(obj)
+        labels = [a.get_actor_label() for a in actors]
+        before = unreal.ToolsetLibrary.get_active_undo_count() if not _LEGACY else 0
+        with unreal.ScopedEditorTransaction("ue delete"):
+            ok = unreal.get_editor_subsystem(unreal.EditorActorSubsystem).destroy_actors(actors)
+        if not ok:
+            raise RuntimeError("the editor refused to delete them")
+        _record_undo(before, "delete " + ", ".join(labels))
+        return "deleted " + ", ".join(labels)
+
+    @_tool
+    @staticmethod
+    def duplicate(target: str, offset: str = "100,0,0", count: int = 1, token: str = "") -> str:
+        """Duplicate an actor (undoable), each copy shifted by `offset` from the previous one.
+
+        Args:
+            target: Actor label or name.
+            offset: Shift per copy 'x,y,z'.
+            count: Number of copies.
+            token: Session token from Saved/Tether/session.json (the ue CLI sends it).
+
+        Returns:
+            The copies' labels and locations.
+        """
+        _authorize(token)
+        source = _resolve(target)
+        if not isinstance(source, unreal.Actor):
+            raise RuntimeError(f"'{target}' is not an actor")
+        nums = _numbers(offset) or [100, 0, 0]
+        step = unreal.Vector(*nums)
+        subsystem = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
+        before = unreal.ToolsetLibrary.get_active_undo_count() if not _LEGACY else 0
+        copies, previous = [], source
+        with unreal.ScopedEditorTransaction(f"ue duplicate {source.get_actor_label()}"):  # all copies, one undo step
+            for _ in range(max(1, count)):
+                copy = subsystem.duplicate_actor(previous, None, step)
+                if copy is None:
+                    break
+                copies.append(copy)
+                previous = copy
+        if not copies:
+            raise RuntimeError("the editor refused to duplicate it")
+        _record_undo(before, f"duplicate {source.get_actor_label()} x{len(copies)}")
+        return "\n".join(f"{c.get_actor_label()} at ({c.get_actor_location().x:g}, {c.get_actor_location().y:g}, "
+                         f"{c.get_actor_location().z:g})" for c in copies)
+
+    @_tool
+    @staticmethod
+    def mv(asset: str, dest: str, token: str = "") -> str:
+        """Move or rename an asset and fix up what referenced it (not undoable; version control is the undo).
+
+        Args:
+            asset: /Game/... asset path.
+            dest: New /Game/... path (folder/Name), or a folder ending in '/' to keep the name.
+            token: Session token from Saved/Tether/session.json (the ue CLI sends it).
+
+        Returns:
+            Old and new paths, and how many referencers were fixed up.
+        """
+        _authorize(token)
+        source = asset.split(".")[0]
+        target = (dest.rstrip("/") + "/" + source.rsplit("/", 1)[-1]) if dest.endswith("/") else dest.split(".")[0]
+        library = unreal.EditorAssetLibrary
+        if not library.does_asset_exist(source):
+            raise RuntimeError(f"no asset at {source} (ue find)")
+        if library.does_asset_exist(target):
+            raise RuntimeError(f"{target} already exists")
+        if not library.rename_asset(source, target):
+            raise RuntimeError("the rename failed (see ue log)")
+        notes = []
+        leftover = unreal.load_asset(source) if library.does_asset_exist(source) else None
+        if leftover is not None and leftover.get_class().get_name() == "ObjectRedirector":
+            unreal.AssetToolsHelpers.get_asset_tools().fixup_referencers([leftover])  # repoint, drop redirector
+            notes.append("redirector fixed up")
+        maps, content = _dirty_packages()
+        touched = [p for p in maps + content if p != target]
+        if touched:
+            notes.append(f"{len(touched)} referencing package(s) updated but unsaved: " + ", ".join(touched[:5])
+                         + " (ue save)")
+        return f"moved {source} -> {target}" + (" (" + "; ".join(notes) + ")" if notes else "")
+
+    @_tool
+    @staticmethod
+    def rm(asset: str, force: bool = False, token: str = "") -> str:
+        """Delete an asset, refusing while anything references it (not undoable; version control is the undo).
+
+        Args:
+            asset: /Game/... asset path.
+            force: Delete even if referenced (the references break).
+            token: Session token from Saved/Tether/session.json (the ue CLI sends it).
+
+        Returns:
+            What was deleted.
+        """
+        _authorize(token)
+        package = asset.split(".")[0]
+        if not package.startswith("/Game/"):
+            raise RuntimeError("only assets under /Game can be deleted")
+        if not unreal.EditorAssetLibrary.does_asset_exist(package):
+            raise RuntimeError(f"no asset at {package} (ue find)")
+        registry = unreal.AssetRegistryHelpers.get_asset_registry()
+        options = unreal.AssetRegistryDependencyOptions(
+            include_soft_package_references=True, include_hard_package_references=True,
+            include_searchable_names=False, include_soft_management_references=False,
+            include_hard_management_references=False)
+        users = sorted({str(n) for n in registry.get_referencers(package, options) or []} - {package})
+        if users and not force:
+            raise RuntimeError(f"{len(users)} asset(s) still reference {package}: " + ", ".join(users[:8])
+                               + (" ..." if len(users) > 8 else "") + " (ue refs; pass --force to delete anyway)")
+        if not unreal.EditorAssetLibrary.delete_asset(package):
+            raise RuntimeError("the delete failed (see ue log)")
+        return f"deleted {package}" + (f" ({len(users)} references now broken)" if users else "")
 
     @_tool
     @staticmethod

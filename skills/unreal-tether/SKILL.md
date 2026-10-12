@@ -37,7 +37,10 @@ broken or unsupported.
   for property edits.
 - Your edits stay unsaved until saved. Before finishing a task that changed content, run `ue changes` to
   review what you changed, then `ue save` (or tell the user what is unsaved and why).
-- `ue undo` reverts your last `ue set` (it refuses if anything else changed since). `ue props X --export f.json`
+- Level edits: `ue spawn PointLight --at 0,0,300 --label Lamp` (or an asset path), `ue duplicate Lamp --count 3`,
+  `ue delete Lamp`. Asset moves: `ue mv /Game/A/X /Game/B/` (then `ue save`), `ue rm /Game/A/X` (refuses while
+  referenced; check `ue refs` first). Prefer these to raw `ue py`: they are undoable and checked.
+- `ue undo` reverts your last `set`/`spawn`/`duplicate`/`delete` (it refuses if anything else changed since). `ue props X --export f.json`
   then `ue set X --from f.json` round-trips any object or asset, e.g. a DataAsset.
 - `ue watch '<log regex>'` or `ue watch --prop <target> <name> --until <regex>` waits for something to happen.
 - `ue exec "<console command>" [--pie]`: runs the command and prints the log lines it produced.

@@ -29,7 +29,7 @@ class _Lazy:
 socket, subprocess, zlib = _Lazy("socket"), _Lazy("subprocess"), _Lazy("zlib")
 
 TETHER = "tether.toolsets.TetherCore"
-GATED = {"py", "console", "set_props", "undo", "save"}  # tools that need the session token (see beacon.session_token)
+GATED = {"py", "console", "set_props", "undo", "save", "spawn", "delete", "duplicate", "mv", "rm"}  # tools that need the session token (see beacon.session_token)
 LEVELS = {"Fatal": 0, "Error": 1, "Warning": 2, "Display": 3, "Log": 4, "Verbose": 5, "VeryVerbose": 6}
 NOISE = {"LogModelContextProtocol", "LogToolsetRegistry"}  # our own transport chatter
 # Epic logs this whenever a schema is generated for a class with delegates (props, set, describe_toolset).
@@ -1795,6 +1795,31 @@ def cmd_crash(ctx, args):
     return 0
 
 
+def cmd_spawn(ctx, args):
+    print(ctx.tether("spawn", what=args.what, at=args.at, rot=args.rot or "", label=args.label or ""))
+    return 0
+
+
+def cmd_delete(ctx, args):
+    print(ctx.tether("delete", targets=",".join(args.actors)))
+    return 0
+
+
+def cmd_duplicate(ctx, args):
+    print(ctx.tether("duplicate", target=args.actor, offset=args.offset, count=args.count))
+    return 0
+
+
+def cmd_mv(ctx, args):
+    print(ctx.tether("mv", asset=args.asset, dest=args.dest))
+    return 0
+
+
+def cmd_rm(ctx, args):
+    print(ctx.tether("rm", asset=args.asset, force=args.force))
+    return 0
+
+
 def cmd_changes(ctx, args):
     print(ctx.tether("changes", limit=args.limit))
     return 0
@@ -2830,6 +2855,23 @@ def main(argv=None):
     s.add_argument("--from", dest="from_file", metavar="FILE", help="apply the values in FILE (JSON) that differ")
     s.add_argument("--dry-run", action="store_true", help="with --from: show what would change")
     add("undo", cmd_undo, "undo Tether's last `ue set` (only if nothing else changed since)")
+    s = add("spawn", cmd_spawn, "place an actor from a class or asset (undoable)")
+    s.add_argument("what", help="class (PointLight, /Script/Module.Class) or asset (/Game/Meshes/SM_Rock)")
+    s.add_argument("--at", default="0,0,0", help="location x,y,z")
+    s.add_argument("--rot", help="rotation pitch,yaw,roll")
+    s.add_argument("--label", help="actor label")
+    s = add("delete", cmd_delete, "delete actors from the level (undoable)")
+    s.add_argument("actors", nargs="+", help="actor labels or names")
+    s = add("duplicate", cmd_duplicate, "duplicate an actor (undoable)")
+    s.add_argument("actor")
+    s.add_argument("--offset", default="100,0,0", help="shift per copy x,y,z (100,0,0)")
+    s.add_argument("--count", type=int, default=1)
+    s = add("mv", cmd_mv, "move/rename an asset and fix up references (not undoable)")
+    s.add_argument("asset")
+    s.add_argument("dest", help="new path, or a folder ending in /")
+    s = add("rm", cmd_rm, "delete an asset; refuses while referenced (not undoable)")
+    s.add_argument("asset")
+    s.add_argument("--force", action="store_true", help="delete even if referenced")
     s = add("crash", cmd_crash, "why the editor died: the last crash's error, module chain and last log lines")
     s.add_argument("index", nargs="?", type=int, default=0, help="0 = newest (default), 1 = the one before, ...")
     s.add_argument("--list", action="store_true", help="list recent crashes instead")

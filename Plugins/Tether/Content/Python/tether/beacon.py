@@ -47,6 +47,7 @@ def _snapshot():
         try:
             from tether import toolsets
             toolsets.snapshot_level(level)
+            toolsets._UNDO.clear()  # loading a map resets the editor's undo history too
         except Exception:
             pass
     _state["map"] = level
