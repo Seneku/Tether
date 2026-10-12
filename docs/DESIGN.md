@@ -202,6 +202,7 @@ Lessons from the spike:
 | Level overview | — | `level_summary`: 103 ms (836 actors, 22 classes) |
 | Restart for a reflection change | ~53 s boot plus clicks, manual | **27.7 s**, automated: `ue build --restart` = close, UBT 1.2 s, headless boot 23.1 s |
 | First boot after enabling the plugins | — | 434 s, once (the editor had been closed since July) |
+| Load project knowledge | `CLAUDE.md`, 49.4 KB ≈ 12.3k tokens every session | **11.2 KB ≈ 2.8k tokens** of core; eight system docs in `docs/systems/` read only when needed |
 
 Notes on these results:
 - **Property names:** the "fog amount" turned out to be named `fog`, and one name carries UDS's own typo,
@@ -211,8 +212,15 @@ Notes on these results:
   `EditorToolset` is used instead of `AllToolsets` to avoid side plugins.
 - **Agent onboarding:** the skill is copied into its `.claude/skills/` with the `ue` path, and its
   `CLAUDE.md` gains one bullet pointing scripts at `ue py`.
-- **Not yet exercised there:** the C++ Live Coding loop, PIE checks, mutating scripts, and the
-  `CLAUDE.md` context diet.
+- **Context diet (2026-10-12):** the eight system sections of `CLAUDE.md` moved word for word into
+  `docs/systems/*.md`. A systems index in the core says which file to read before touching which
+  folders. A script checked that every original line survived; one "see above" was repointed.
+  - *Folder stubs:* fifteen small `CLAUDE.md` files in the source folders import the matching docs, so
+    the right notes load as soon as an agent opens code there.
+  - *Verified:* Claude Code loads a nested `CLAUDE.md` when a file in its folder is read, and resolves
+    `@imports` relative to the importing file, not the session root.
+  - *Scripts:* `Scripts/CLAUDE.md` maps all 35 scripts to their docs.
+- **Not yet exercised there:** the C++ Live Coding loop, PIE checks, and mutating scripts.
 
 ## 4. Why Unreal is harder for agents than Unity
 
@@ -520,7 +528,7 @@ project's `Plugins/`, and updates hot-reload without restarting the editor.
 - **Hooks, planned:** SessionStart injects a two-line editor status; PostToolUse on `Source/**` classifies
   the edit as live-codable or restart-required; Stop nudges `ue build` if C++ changed since the
   last green build.
-- **Context diet (measured):** five subsystem sections of IslandHorror's CLAUDE.md (Terrain &
+- **Context diet (done 2026-10-12, §3; it saves about 9.5k tokens per session):** five subsystem sections of IslandHorror's CLAUDE.md (Terrain &
   water 10.3 KB, Player systems 8.5 KB, Adaptive cult 6.1 KB, Developer tooling 5.7 KB, Editor
   tooling 4.5 KB) are 73% of its 48 KB. Moving them to `docs/systems/*.md`, linked from a ~13 KB
   core, saves ~9k tokens in every session without losing any knowledge.
