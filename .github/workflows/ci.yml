@@ -10,13 +10,17 @@ permissions:
 
 jobs:
   test:
-    # Tether targets Windows (Live Coding, Build.bat), so the tests run there. 3.11 is the Python
-    # bundled with UE 5.8, which runs the in-editor toolset.
-    runs-on: windows-latest
+    # Windows is the primary platform (Live Coding, Build.bat); 3.11 is the Python bundled with UE 5.8,
+    # which runs the in-editor toolset. Linux and macOS cover the CLI's platform layer.
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        python: ["3.11", "3.13"]
+        include:
+          - {os: windows-latest, python: "3.11"}
+          - {os: windows-latest, python: "3.13"}
+          - {os: ubuntu-latest, python: "3.13"}
+          - {os: macos-latest, python: "3.13"}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -26,3 +30,6 @@ jobs:
         run: python -W error -m compileall -q cli Plugins/Tether/Content/Python tests
       - name: Unit tests
         run: python -m unittest discover -s tests -v
+      - name: Launcher script
+        if: runner.os != 'Windows'
+        run: sh bin/ue --help

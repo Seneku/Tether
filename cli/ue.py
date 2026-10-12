@@ -105,6 +105,76 @@ def pid_alive(pid):
         return False
 
 
+# ---------------------------------------------------------------- platform (Windows is the tested one)
+
+def host_platform():
+    """UE's name for this host: Win64, Mac or Linux."""
+    return {"win32": "Win64", "darwin": "Mac"}.get(sys.platform, "Linux")
+
+
+def epic_settings_dir():
+    """Where the launcher and UnrealBuildTool keep per-user state on this host."""
+    if os.name == "nt":
+        return os.environ.get("LOCALAPPDATA", "")
+    if sys.platform == "darwin":
+        return os.path.expanduser("~/Library/Application Support/Epic")
+    return os.path.expanduser("~/.config/Epic")
+
+
+def launcher_manifest():
+    if os.name == "nt":
+        path = os.path.join(os.environ.get("PROGRAMDATA", r"C:\ProgramData"), "Epic", "UnrealEngineLauncher",
+                            "LauncherInstalled.dat")
+    else:  # the Mac launcher keeps it per user; Linux has no launcher
+        path = os.path.join(epic_settings_dir(), "UnrealEngineLauncher", "LauncherInstalled.dat")
+    return read_json(path) or {}
+
+
+def registered_builds():
+    """Source builds registered with the engine's own registration tool: {association: path}."""
+    if os.name == "nt":
+        import winreg
+        builds = {}
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Epic Games\Unreal Engine\Builds") as key:
+                for i in range(winreg.QueryInfoKey(key)[1]):
+                    name, value, _ = winreg.EnumValue(key, i)
+                    builds[name] = value
+        except OSError:
+            pass
+        return builds
+    import configparser
+    ini = configparser.ConfigParser(strict=False)
+    ini.optionxform = str
+    ini.read(os.path.join(epic_settings_dir(), "UnrealEngine", "Install.ini"))
+    return dict(ini["Installations"]) if ini.has_section("Installations") else {}
+
+
+def editor_executable(root):
+    binaries = os.path.join(root, "Engine", "Binaries", host_platform())
+    if os.name == "nt":
+        return os.path.join(binaries, "UnrealEditor.exe")
+    if sys.platform == "darwin":
+        return os.path.join(binaries, "UnrealEditor.app", "Contents", "MacOS", "UnrealEditor")
+    return os.path.join(binaries, "UnrealEditor")
+
+
+def ubt_command(root):
+    """The command that runs UnrealBuildTool on this host (arguments follow: target platform config ...)."""
+    if os.name == "nt":
+        return [os.path.join(root, "Engine", "Binaries", "DotNET", "UnrealBuildTool", "UnrealBuildTool.exe")]
+    return ["sh", os.path.join(root, "Engine", "Build", "BatchFiles", host_platform(), "Build.sh")]
+
+
+def uat_command(root):
+    batch = os.path.join(root, "Engine", "Build", "BatchFiles")
+    return [os.path.join(batch, "RunUAT.bat")] if os.name == "nt" else ["sh", os.path.join(batch, "RunUAT.sh")]
+
+
+def live_coding_available():
+    return os.name == "nt"  # Live Coding is Windows-only in UE 5
+
+
 def engine_root(project):
     """Engine dir from UE_ROOT, the launcher manifest, or registered source builds."""
     if os.environ.get("UE_ROOT"):
@@ -112,17 +182,18 @@ def engine_root(project):
     with open(project, encoding="utf-8") as f:
         match = re.search(r'"EngineAssociation"\s*:\s*"([^"]*)"', f.read())
     assoc = match.group(1) if match else ""
-    manifest = read_json(r"C:\ProgramData\Epic\UnrealEngineLauncher\LauncherInstalled.dat") or {}
-    for item in manifest.get("InstallationList", []):
+    for item in launcher_manifest().get("InstallationList", []):
         if item.get("AppName") == f"UE_{assoc}":
             return item["InstallLocation"]
-    if os.name == "nt":
-        import winreg
-        try:
-            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Epic Games\Unreal Engine\Builds") as key:
-                return winreg.QueryValueEx(key, assoc)[0]
-        except OSError:
-            pass
+    builds = registered_builds()
+    if assoc in builds:
+        return builds[assoc]
+    if not assoc:  # a project inside an engine tree (e.g. a source build checkout)
+        here = os.path.dirname(os.path.abspath(project))
+        while os.path.dirname(here) != here:
+            if os.path.isdir(os.path.join(here, "Engine", "Binaries")):
+                return here
+            here = os.path.dirname(here)
     raise CliError(f"cannot find engine '{assoc}'; set UE_ROOT", 2)
 
 
@@ -492,6 +563,12 @@ def log_path(project):
                         os.path.splitext(os.path.basename(project))[0] + ".log")
 
 
+def log_identity(stat):
+    """Changes when UE rotates the log (renames it, starts a new file). st_ctime is the creation time on
+    Windows but the last metadata change on POSIX, where it moves on every write; use the inode there."""
+    return stat.st_ctime if os.name == "nt" else stat.st_ino
+
+
 def read_new_log(project, from_start=False, advance=True):
     path = log_path(project)
     cursor_file = os.path.join(state_dir(project), "log-cursor.json")
@@ -500,14 +577,14 @@ def read_new_log(project, from_start=False, advance=True):
     stat = os.stat(path)
     cursor = read_json(cursor_file) or {}
     offset = cursor.get("offset", 0)
-    if from_start or cursor.get("ctime") != stat.st_ctime or offset > stat.st_size:
+    if from_start or cursor.get("id") != log_identity(stat) or offset > stat.st_size:
         offset = 0
     with open(path, "rb") as f:
         f.seek(offset)
         data = f.read()
     end = data.rfind(b"\n") + 1  # keep a partial trailing line for next time
     if advance:
-        write_json(cursor_file, {"ctime": stat.st_ctime, "offset": offset + end})
+        write_json(cursor_file, {"id": log_identity(stat), "offset": offset + end})
     return data[:end].decode("utf-8", "replace").lstrip("﻿").splitlines()
 
 
@@ -537,7 +614,8 @@ def user_frame(lines, start):
         m = FRAME.match(line)
         if m and "/plugins/unrealsharp/" not in m.group("file").replace("\\", "/").lower():  # skip glue
             method = ".".join(m.group("where").split(".")[-2:])
-            return f" @ {os.path.basename(m.group('file'))}:{m.group('line')} ({method})"
+            name = re.split(r"[/\\]", m.group("file"))[-1]  # Windows paths in the log, on any host
+            return f" @ {name}:{m.group('line')} ({method})"
     return ""
 
 
@@ -598,19 +676,23 @@ def cmd_status(ctx, args):
 DIAG = re.compile(r"^\s*(?:\[[^\]]*\]\s*)?(?P<file>(?:[A-Za-z]:)?[^(:\[]+)\((?P<line>\d+)(?:,\d+)?\)\s*:\s*"
                   r"(?P<sev>fatal error|error|warning)\s*(?P<code>[A-Z]+\d+)?\s*:?\s*(?P<msg>.*?)(?:\s+\[[^\]]+\])?$", re.I)
 LINK = re.compile(r"\b(error|warning) (LNK\d+): (.*)")
+# clang (Mac/Linux): "/path/File.cpp:12:5: error: message [-Wflag]"; linkers: "ld.lld: error: ..."
+CLANG = re.compile(r"^\s*(?P<file>/[^:]+|[A-Za-z]:[^:]+):(?P<line>\d+):(?:\d+:)?\s*(?P<sev>fatal error|error|warning):"
+                   r"\s*(?P<msg>.*?)(?:\s+\[(?P<code>-W[\w-]+)\])?$")
+POSIX_LINK = re.compile(r"\b(ld(?:\.lld)?|ld64(?:\.lld)?): (error|warning): (.*)")
 REFLECT = re.compile(r"\b(UCLASS|USTRUCT|UENUM|UINTERFACE|UPROPERTY|UFUNCTION|GENERATED_BODY)\b")
 
 
 def ubt_log_path():
-    return os.path.join(os.environ.get("LOCALAPPDATA", ""), "UnrealBuildTool", "Log.txt")
+    return os.path.join(epic_settings_dir(), "UnrealBuildTool", "Log.txt")
 
 
 def compact_diagnostics(lines, project_dir):
-    """MSVC/UHT/linker output -> unique project-relative lines; engine-header warnings only counted."""
+    """MSVC/clang/UHT/linker output -> unique project-relative lines; engine-header warnings only counted."""
     root = os.path.normcase(os.path.abspath(project_dir))
     seen, errors, warnings, hidden = set(), [], [], 0
     for line in lines:
-        m = DIAG.match(line)
+        m = DIAG.match(line) or CLANG.match(line)
         if m:
             path = os.path.abspath(m.group("file").strip())
             mine = os.path.normcase(path).startswith(root)
@@ -622,9 +704,13 @@ def compact_diagnostics(lines, project_dir):
             text = f"{where}:{m.group('line')}: {(m.group('code') or '').strip()} {m.group('msg').strip()}".replace("  ", " ")
         else:
             m = LINK.search(line)
-            if not m:
-                continue
-            is_error, text = m.group(1) == "error", f"{m.group(2)} {m.group(3).strip()}"
+            if m:
+                is_error, text = m.group(1) == "error", f"{m.group(2)} {m.group(3).strip()}"
+            else:
+                m = POSIX_LINK.search(line)
+                if not m:
+                    continue
+                is_error, text = m.group(2) == "error", f"{m.group(1)}: {m.group(3).strip()}"
         if text not in seen:
             seen.add(text)
             (errors if is_error else warnings).append(text)
@@ -799,9 +885,9 @@ def csharp_changes(project):
 def uat_user_solution(ctx, limit):
     """Out-of-editor C# build through UnrealSharp's own UAT action (also emits the load-order manifest)."""
     _, plugin = csharp_layout(ctx.project)
-    uat = os.path.join(engine_root(ctx.project), "Engine", "Build", "BatchFiles", "RunUAT.bat")
+    uat = uat_command(engine_root(ctx.project))
     started = time.time()
-    proc = subprocess.run([uat, "BuildUserSolution", "-ScriptDir=" + os.path.join(plugin, "Build", "Scripts"),
+    proc = subprocess.run(uat + ["BuildUserSolution", "-ScriptDir=" + os.path.join(plugin, "Build", "Scripts"),
                            "-Project=" + ctx.project, "-OutputPath=" + managed_output(ctx.project),
                            "-TargetConfiguration=Development", "-clp=ErrorsOnly"],
                           capture_output=True, text=True, errors="replace")
@@ -867,9 +953,8 @@ def ubt_build(ctx, args):
     root = engine_root(ctx.project)
     name = os.path.splitext(os.path.basename(ctx.project))[0]
     target = args.target or f"{name}Editor"
-    exe = os.path.join(root, "Engine", "Binaries", "DotNET", "UnrealBuildTool", "UnrealBuildTool.exe")
     started = time.time()
-    proc = subprocess.run([exe, target, "Win64", args.config, f"-Project={ctx.project}", "-WaitMutex"],
+    proc = subprocess.run(ubt_command(root) + [target, host_platform(), args.config, f"-Project={ctx.project}", "-WaitMutex"],
                           capture_output=True, text=True, errors="replace")
     lines = (proc.stdout + proc.stderr).splitlines()
     errors, warnings, hidden = compact_diagnostics(lines, os.path.dirname(ctx.project))
@@ -942,6 +1027,10 @@ def cmd_build(ctx, args):
             print(f"restart required: module/project files changed ({names}); run `ue build --restart`")
             return 3
         did = False
+        if (changes is None or changes[0]) and not live_coding_available():
+            print("restart required: Live Coding is Windows-only, so C++ changes on this host need "
+                  "`ue build --restart`")
+            return 3
         if changes is None or changes[0]:  # C++ changed, or no baseline yet
             code = live_coding_build(ctx, args, changes)
             if code:
@@ -985,7 +1074,7 @@ def cmd_open(ctx, args):
                 raise CliError("C++ build failed; not launching (fix the errors above, or pass --no-build)")
         if has_csharp and uat_user_solution(ctx, args.limit):
             raise CliError("C# build failed; not launching (fix the errors above, or pass --no-build)")
-    exe = os.path.join(engine_root(ctx.project), "Engine", "Binaries", "Win64", "UnrealEditor.exe")
+    exe = editor_executable(engine_root(ctx.project))
     port = pick_port(ctx.project)
     cmd = [exe, ctx.project] + ([args.map] if args.map else []) + [
         "-nosplash", "-ModelContextProtocolStartServer", f"-ModelContextProtocolPort={port}"]
@@ -1009,9 +1098,10 @@ def cmd_open(ctx, args):
                {"headless": bool(args.headless), "render": bool(args.render or not args.headless),
                 "unattended": unattended, "port": port})
     started = time.time()
-    flags = (subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP) if os.name == "nt" else 0
-    proc = subprocess.Popen(cmd, creationflags=flags, stdin=subprocess.DEVNULL, env=env,
-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True)
+    detach = ({"creationflags": subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt"
+              else {"start_new_session": True})  # outlive this CLI process either way
+    proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, env=env, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL, close_fds=True, **detach)
     mode = ", ".join(m for m, on in (("headless", args.headless), ("offscreen render", args.headless and args.render),
                                      ("unattended", unattended)) if on)
     print(f"launched pid {proc.pid} " + ("(python remote execution)" if remote else f"on mcp :{port}")
@@ -1596,7 +1686,8 @@ def hook_post_edit(payload):
     if not project:
         return None
     root = os.path.normcase(os.path.dirname(project)) + os.sep
-    rel = os.path.normcase(os.path.abspath(path))[len(root):] if os.path.normcase(os.path.abspath(path)).startswith(root) else ""
+    full = os.path.normcase(os.path.abspath(path))
+    rel = full[len(root):].lower() if full.startswith(root) else ""  # normcase lowercases only on Windows
     if not (rel.startswith(("source" + os.sep, "plugins" + os.sep, "script" + os.sep)) or rel.endswith(".uproject")):
         return None
     if rel.endswith(".cs") and not rel.endswith((".build.cs", ".target.cs")) and not csharp_layout(project):

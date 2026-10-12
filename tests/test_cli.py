@@ -146,6 +146,38 @@ class Builds(unittest.TestCase):
         finally:
             project.close()
 
+    def test_clang_and_posix_linker_diagnostics(self):
+        project = Project()
+        try:
+            mine = os.path.join(project.root, "Source", "Game", "Thing.cpp")
+            lines = [f"{mine}:12:5: error: use of undeclared identifier 'Foo'",
+                     f"{mine}:30:9: warning: unused variable 'x' [-Wunused-variable]",
+                     "/Engine/Source/Runtime/Core.h:5:1: warning: deprecated [-Wdeprecated-declarations]",
+                     "ld.lld: error: undefined symbol: Bar"]
+            errors, warnings, hidden = ue.compact_diagnostics(lines, project.root)
+            rel = os.path.join("Source", "Game", "Thing.cpp")
+            self.assertEqual(errors, [f"{rel}:12: use of undeclared identifier 'Foo'", "ld.lld: undefined symbol: Bar"])
+            self.assertEqual(warnings, [f"{rel}:30: -Wunused-variable unused variable 'x'"])
+            self.assertEqual(hidden, 1)
+        finally:
+            project.close()
+
+    def test_platform_paths(self):
+        root = os.path.join(os.sep, "UE")
+        cases = {"win32": ("Win64", "UnrealEditor.exe"), "darwin": ("Mac", "UnrealEditor"), "linux": ("Linux", "UnrealEditor")}
+        for platform, (name, exe) in cases.items():
+            with self.subTest(platform=platform), unittest.mock.patch.object(ue.sys, "platform", platform), \
+                    unittest.mock.patch.object(ue.os, "name", "nt" if platform == "win32" else "posix"):
+                self.assertEqual(ue.host_platform(), name)
+                self.assertTrue(ue.editor_executable(root).endswith(exe))
+                self.assertEqual(ue.live_coding_available(), platform == "win32")
+                command = ue.ubt_command(root)
+                if platform == "win32":
+                    self.assertTrue(command[0].endswith("UnrealBuildTool.exe"))
+                else:
+                    self.assertEqual((command[0], os.path.basename(command[1])), ("sh", "Build.sh"))
+                    self.assertIn(name, command[1])
+
     def test_unity_compile_detection(self):
         log = "[1/2] Compile [x64] Cheats.cpp\n[2/2] Compile [x64] Module.Game.cpp\n[1/1] Compile [x64] Module.Game.2.cpp"
         self.assertEqual(ue.UNITY_COMPILE.findall(log), ["Module.Game.cpp", "Module.Game.2.cpp"])

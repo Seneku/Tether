@@ -622,6 +622,16 @@ project's `Plugins/`, and updates hot-reload without restarting the editor.
 | 3 — Depth | Blueprint DSL ergonomics, DataTable/DataAsset round-trips, `api`, `job`, `watch` | Blueprint changes reviewed as text diffs |
 | 4 — Scripting | **UnrealSharp trial done in Sandbox:** headless project creation, C# pre-build in `ue open`, bridge-driven reload in `ue build` (0.6–1.2 s, structural changes included), one-line C# errors. **Gameplay feature done** (coins + score subsystem + combo, verified in PIE through `ue`). **Since done:** PreToolUse hooks that block C# edits while PIE runs and Epic's `StartPIE` while C# is unreloaded; `ue pie start` reloads pending C# first (works around UnrealSharp's recompile-on-lookup, §2); headless editors log dialogs instead of hanging on them. **Reported upstream:** [#774](https://github.com/UnrealSharp/UnrealSharp/issues/774) (recompile on lookup), [#775](https://github.com/UnrealSharp/UnrealSharp/issues/775) (.NET discovery + `StartupModule` recursion), [#776](https://github.com/UnrealSharp/UnrealSharp/issues/776) (headless reload). **To do:** Angelscript in a later pass | C# features iterated with no restarts |
 
+**Platforms (#11, 2026-10-12).** The CLI's platform layer covers macOS and Linux: launcher manifest
+(per user on Mac) and `Install.ini` source-build registrations, `Build.sh`/`RunUAT.sh` under `sh`, the
+editor binary inside `UnrealEditor.app` on Mac, clang and `ld` diagnostics, `start_new_session` launches,
+and the UBT log under `~/Library/Application Support/Epic` or `~/.config/Epic`. Live Coding is
+Windows-only, so `ue build` asks for `--restart` there. Running the suite on Linux (WSL) found three
+real bugs: the log cursor keyed on `st_ctime` (it changes on every write on POSIX; the inode is used
+there now), C# frame file names taken with `basename` (Windows paths in the log), and a
+case-sensitive `Source/` check in the post-edit hook. CI now runs the tests on Windows, Linux and macOS.
+Not yet driven against a real Mac or Linux editor.
+
 ## 9. Decisions
 
 Decided 2026-10-11:

@@ -74,7 +74,10 @@ and a private mid-size C++/Blueprint game. Methodology is in [docs/DESIGN.md](do
 - Unreal Engine 5.8 or later for everything; 5.4–5.7 for a subset (see [Older engines](#older-engines-ue-54-57)).
   A launcher install is fine; no source build needed.
 - Python 3 on `PATH`, for the CLI. It uses the standard library only.
-- Windows. This is the only platform tested so far: build routing uses `Build.bat` and Live Coding.
+- Windows is the tested platform. macOS and Linux are supported by the CLI (engine discovery,
+  `Build.sh`/`RunUAT.sh`, the editor binary, clang diagnostics, detached launch), and CI runs the unit
+  tests there, but they have not been driven against a real Mac or Linux editor yet. Live Coding is
+  Windows-only in UE, so C++ changes there go through `ue build --restart`.
 - Optional: the .NET 10 SDK and UnrealSharp, for C#.
 
 ## Install
