@@ -2246,6 +2246,195 @@ def cmd_nav(ctx, args):
     return 0
 
 
+PACKAGE_EXTS = (".uasset", ".umap", ".uexp", ".ubulk", ".uptnl")
+
+
+def human_bytes(n):
+    for unit, size in (("GB", 1024 ** 3), ("MB", 1024 ** 2), ("KB", 1024)):
+        if n >= size:
+            return f"{n / size:.1f} {unit}" if n < 100 * size else f"{n / size:.0f} {unit}"
+    return f"{n} B"
+
+
+def package_bytes(project, package):
+    """Disk size of a package (all its files), or None if it is not one of this project's files."""
+    file = package_file(project, package) if package.startswith("/") else None
+    if not file or not os.path.isfile(file):
+        return None
+    stem = os.path.splitext(file)[0]
+    return sum(os.path.getsize(stem + ext) for ext in PACKAGE_EXTS if os.path.isfile(stem + ext))
+
+
+def folder_packages(project, folder):
+    """{package: bytes} for every package file under a content folder, from disk (no editor needed)."""
+    root = package_file(project, folder.rstrip("/") + "/_")
+    if root is None:
+        raise CliError(f"{folder}: not a content folder of this project")
+    base = os.path.dirname(root)
+    if not os.path.isdir(base):
+        raise CliError(f"{folder}: no such folder ({base})")
+    sizes = {}
+    for dirpath, _, files in os.walk(base):
+        for name in files:
+            stem, ext = os.path.splitext(name)
+            if ext.lower() in PACKAGE_EXTS:
+                package = folder.rstrip("/") + "/" + os.path.relpath(os.path.join(dirpath, stem), base).replace("\\", "/")
+                sizes[package] = sizes.get(package, 0) + os.path.getsize(os.path.join(dirpath, name))
+    return sizes
+
+
+def size_groups(sizes, depth):
+    """Totals per folder `depth` levels below the mount (/Game/Megascans at depth 1): {folder: (bytes, count)}."""
+    groups = {}
+    for package, size in sizes.items():
+        parts = package.strip("/").split("/")
+        key = "/" + "/".join(parts[: depth + 1]) if len(parts) > depth + 1 else "/" + "/".join(parts[:-1]) or "/"
+        total, count = groups.get(key, (0, 0))
+        groups[key] = (total + size, count + 1)
+    return groups
+
+
+def cmd_size(ctx, args):
+    """Biggest assets on disk under a folder, or what an asset pulls in with it (--deps)."""
+    project, target = ctx.project, (args.path or "/Game").rstrip("/") or "/Game"
+    top = args.top
+    single = package_file(project, target)
+    single = single if single and os.path.isfile(single) else None
+    classes = {}
+    if single and args.deps:
+        graph = ctx.tether("package_graph", packages=target, deps=True)
+        graph = json.loads(graph) if isinstance(graph, str) else graph
+        classes = graph["classes"]
+        sizes, outside = {}, 0
+        for package in [target] + graph["deps"]:
+            size = package_bytes(project, package)
+            if size is None:
+                outside += 1
+            else:
+                sizes[package] = size
+        total = sum(sizes.values())
+        print(f"{target} loads {len(graph['deps'])} packages with it: {human_bytes(total)} on disk"
+              + (f" (+{outside} engine/plugin packages not counted)" if outside else ""))
+        depth = 2
+    elif single:
+        size = package_bytes(project, target)
+        print(f"{target}: {human_bytes(size)} on disk (--deps: with everything it loads)")
+        return 0
+    else:
+        sizes = folder_packages(project, target)
+        total = sum(sizes.values())
+        print(f"{target}: {len(sizes)} packages, {human_bytes(total)} on disk")
+        depth = len(target.strip("/").split("/"))
+    groups = sorted(size_groups(sizes, depth).items(), key=lambda kv: -kv[1][0])
+    prefix = target + "/" if not (single and args.deps) else ""
+    if len(groups) > 1:
+        print("by folder: " + ", ".join(f"{k[len(prefix):] if prefix and k.startswith(prefix) else k} {human_bytes(b)} ({n})"
+                                        for k, (b, n) in groups[:top]))
+    biggest = sorted(sizes.items(), key=lambda kv: -kv[1])[:top]
+    if not classes and editor_live(project):
+        try:
+            graph = ctx.tether("package_graph", packages=",".join(p for p, _ in biggest))
+            classes = (json.loads(graph) if isinstance(graph, str) else graph)["classes"]
+        except CliError:
+            pass
+    print("biggest:")
+    for package, size in biggest:
+        kind = classes.get(package)
+        print(f"  {human_bytes(size):>8}  {package}" + (f"  ({kind})" if kind else ""))
+    return 0
+
+
+MEMREPORT_CLASS = re.compile(r"^\s*(\w+)\s+(\d+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s")
+MEMREPORT_OBJECT = re.compile(r"^\s*(\w+) (/\S+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s")
+MEMREPORT_TEXTURE = re.compile(r"^\d+x\d+ \(\d+ KB[^)]*\), (\d+)x(\d+) \((\d+) KB\), (\w+), (\w+), (/\S+),")
+
+
+def memreport_summary(text, top=8):
+    """The few numbers that matter from a memreport file."""
+    sections, current = {}, None
+    for line in text.splitlines():
+        begin = re.match(r'MemReport: Begin command "(.*)"', line)
+        if begin:
+            current = begin.group(1)
+            sections[current] = []
+        elif line.startswith("MemReport: End command"):
+            current = None
+        elif current is not None:
+            sections[current].append(line)
+    out = []
+    head = "\n".join(sections.get("Mem FromReport", []))
+    process = re.search(r"Process Physical Memory: ([\d.]+) MB used, ([\d.]+) MB peak", head)
+    if process:
+        line = f"process: {float(process.group(1)) / 1024:.1f} GB used, {float(process.group(2)) / 1024:.1f} GB peak"
+        extras = [f"{name} {float(m.group(1)):.0f} MB" for name, rx in
+                  (("asset registry", r"AssetRegistry memory usage = ([\d.]+) MB"), ("names", r"Nametable memory usage = ([\d.]+) MB"))
+                  for m in [re.search(rx, head)] if m]
+        out.append(line + (f" (of which {', '.join(extras)})" if extras else ""))
+    rows = []
+    for line in sections.get("obj list -resourcesizesort", []):
+        m = MEMREPORT_CLASS.match(line)
+        if m and m.group(1) != "Class":
+            rows.append((float(m.group(3)) + float(m.group(5)), m.group(1), int(m.group(2))))
+    if rows:
+        rows.sort(reverse=True)
+        out.append("by class (object + resource memory): " + ", ".join(
+            f"{name} x{count} {human_bytes(int(kb * 1024))}" for kb, name, count in rows[:top]))
+    for cls in ("SkeletalMesh", "StaticMesh"):
+        objects = []
+        for line in sections.get(f"obj list class={cls} -resourcesizesort", []):
+            m = MEMREPORT_OBJECT.match(line)
+            if m:
+                objects.append((float(m.group(3)) + float(m.group(5)), m.group(2).split(".")[0]))
+        if objects:
+            objects.sort(reverse=True)
+            out.append(f"biggest {cls}es: " + ", ".join(f"{p.rsplit('/', 1)[-1]} {human_bytes(int(kb * 1024))}"
+                                                      for kb, p in objects[:5]))
+    textures = sections.get("ListTextures", [])
+    total = next((re.search(r"InMem= ([\d.]+) MB", l) for l in textures if l.startswith("Total size:")), None)
+    listed = []
+    for line in textures:
+        m = MEMREPORT_TEXTURE.match(line)
+        if m:
+            listed.append((int(m.group(3)), m.group(6).split(".")[0], m.group(5).replace("TEXTUREGROUP_", "")))
+    if total:
+        listed.sort(reverse=True)
+        out.append(f"textures: {len(listed)} loaded, {float(total.group(1)):.0f} MB in memory" +
+                   (("; biggest " + ", ".join(f"{p.rsplit('/', 1)[-1]} {kb / 1024:.1f} MB ({g})" for kb, p, g in listed[:5]))
+                    if listed and listed[0][0] else ""))
+    return out
+
+
+def cmd_mem(ctx, args):
+    """Memory of the running editor (and PIE), from a memreport, in a few lines."""
+    folder = os.path.join(os.path.dirname(ctx.project), "Saved", "Profiling", "MemReports")
+
+    def reports():
+        found = set()
+        for dirpath, _, files in os.walk(folder):
+            found |= {os.path.join(dirpath, f) for f in files if f.endswith(".memreport")}
+        return found
+
+    before = reports()
+    ctx.tether("console", command="memreport" + (" -full" if args.full else ""))
+    # The report is written on a later frame; a call answers once the game thread is free again (~20 s).
+    deadline, new = time.time() + max(args.timeout, 120), []
+    while not new and time.time() < deadline:
+        ctx.tether("py", code="1")
+        new = sorted(reports() - before, key=os.path.getmtime)
+        time.sleep(0.5 if not new else 0)
+    if not new:
+        raise CliError("memreport wrote no file (ue log --grep MemReport)")
+    with open(new[-1], encoding="utf-8", errors="replace") as f:
+        lines = memreport_summary(f.read(), args.top)
+    beacon = ctx.beacon or {}
+    if beacon.get("pie"):
+        lines.insert(0, "(PIE is running: the numbers include the play session)")
+    for line in lines:
+        print(line)
+    print(f"full report: {os.path.relpath(new[-1], os.path.dirname(ctx.project))}")
+    return 0
+
+
 def cmd_find(ctx, args):
     print(ctx.tether("find", query=args.query or "", cls=args.cls or "", under=args.under, limit=args.limit))
     return 0
@@ -2508,6 +2697,8 @@ def cmd_selftest(ctx, args):
     check("asset", ["asset", "/Engine/BasicShapes/Cube"], ok=lambda c, o: c == 0 and "triangles" in o)
     check("log", ["log", "--level", "Error"])
     check("changes", ["changes"], ok=lambda c, o: c == 0 and "unsaved package" in o)
+    check("size", ["size", "--top", "3"], ok=lambda c, o: c == 0 and "packages" in o)
+    check("mem", ["mem", "--top", "3"], timeout=300, ok=lambda c, o: c == 0 and "process:" in o)
     check("nav", ["nav"], ok=lambda c, o: c == 0 and ("bounds" in o or "NavMeshBoundsVolume" in o))
     check("call tether.level_summary", ["call", "tether.level_summary", "limit=3"],
           ok=lambda c, o: c == 0 and "actors" in o)
@@ -3596,6 +3787,13 @@ def main(argv=None):
     s.add_argument("action", nargs="?", choices=["status", "path", "check"])
     s.add_argument("points", nargs="*", help="path: start end (x,y,z or actor); check: actor regex")
     s.add_argument("--pie", action="store_true", help="the PIE world's (runtime-generated) navmesh")
+    s = add("size", cmd_size, "biggest assets on disk under a folder, or what an asset loads with it (--deps)")
+    s.add_argument("path", nargs="?", help="content folder (default /Game) or an asset")
+    s.add_argument("--deps", action="store_true", help="with an asset: total it with everything it loads")
+    s.add_argument("--top", type=int, default=10, help="rows per list (10)")
+    s = add("mem", cmd_mem, "memory of the running editor/PIE from a memreport: process, classes, meshes, textures")
+    s.add_argument("--full", action="store_true", help="memreport -full: adds the texture list (slower)")
+    s.add_argument("--top", type=int, default=8, help="rows per list (8)")
     s = add("find", cmd_find, "search assets by name and/or class (asset registry)")
     s.add_argument("query", nargs="?", help="regex on the asset name")
     s.add_argument("--class", dest="cls", help="regex on the class name, e.g. StaticMesh or 'Material$'")

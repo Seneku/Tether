@@ -2008,6 +2008,50 @@ class TetherCore(_Base):
 
     @_tool
     @staticmethod
+    def package_graph(packages: str, deps: bool = False) -> str:
+        """Asset classes of packages and, with deps, everything they load with them: hard package
+        dependencies, recursively (for a World Partition map, its actor packages too).
+
+        Args:
+            packages: Comma-separated package paths.
+            deps: Also return the recursive hard dependencies.
+
+        Returns:
+            JSON {"classes": {package: class}, "deps": [package, ...]}.
+        """
+        registry = unreal.AssetRegistryHelpers.get_asset_registry()
+        roots = [p.strip().split(".")[0] for p in packages.split(",") if p.strip()]
+        classes = {}
+        for package in roots:
+            found = registry.get_assets_by_package_name(package)
+            classes[package] = str(found[0].asset_class_path.asset_name) if found else ""
+        if not deps:
+            return json.dumps({"classes": classes, "deps": []})
+        options = unreal.AssetRegistryDependencyOptions(
+            include_soft_package_references=False, include_hard_package_references=True,
+            include_searchable_names=False, include_soft_management_references=False,
+            include_hard_management_references=False)
+        queue = list(roots)
+        for package in roots:
+            if classes.get(package) == "World":  # World Partition actors live in their own packages
+                root, rest = package.split("/", 2)[1], package.split("/", 2)[2]
+                queue += [str(a.package_name) for a in
+                          registry.get_assets_by_path(f"/{root}/__ExternalActors__/{rest}", recursive=True)]
+        seen = set(queue)
+        while queue:
+            for dep in registry.get_dependencies(queue.pop(), options) or []:
+                name = str(dep)
+                if name not in seen and not name.startswith("/Script/"):
+                    seen.add(name)
+                    queue.append(name)
+        found = sorted(seen - set(roots))
+        for package in found:
+            data = registry.get_assets_by_package_name(package)
+            classes[package] = str(data[0].asset_class_path.asset_name) if data else ""
+        return json.dumps({"classes": classes, "deps": found})
+
+    @_tool
+    @staticmethod
     def find(query: str = "", cls: str = "", under: str = "/Game", limit: int = 50) -> str:
         """Search the asset registry by name and/or class.
 

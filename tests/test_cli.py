@@ -670,6 +670,52 @@ class PieDo(unittest.TestCase):
         self.assertEqual([kw["step"] for tool, kw in calls if tool == "pie_step"], ["at 0,0,0", "expect fail.x = 1"])
 
 
+class Sizes(unittest.TestCase):
+    def test_human_bytes_and_groups(self):
+        self.assertEqual(ue.human_bytes(512), "512 B")
+        self.assertEqual(ue.human_bytes(1536), "1.5 KB")
+        self.assertEqual(ue.human_bytes(250 * 1024 ** 2), "250 MB")
+        groups = ue.size_groups({"/Game/A/x": 10, "/Game/A/B/y": 5, "/Game/z": 1}, 1)
+        self.assertEqual(groups, {"/Game/A": (15, 2), "/Game": (1, 1)})
+
+    def test_folder_packages_counts_every_file_of_a_package(self):
+        project = Project()
+        try:
+            project.write("Content/Props/SM_Rock.uasset", "x" * 100)
+            project.write("Content/Props/SM_Rock.ubulk", "x" * 50)
+            project.write("Content/Maps/L.umap", "x" * 10)
+            project.write("Content/Props/readme.txt", "x" * 999)
+            sizes = ue.folder_packages(project.uproject, "/Game")
+            self.assertEqual(sizes, {"/Game/Props/SM_Rock": 150, "/Game/Maps/L": 10})
+            self.assertEqual(ue.package_bytes(project.uproject, "/Game/Props/SM_Rock"), 150)
+        finally:
+            project.close()
+
+    def test_memreport_summary(self):
+        report = "\n".join([
+            'MemReport: Begin command "Mem FromReport"',
+            "Process Physical Memory: 4096.00 MB used, 8192.00 MB peak",
+            "AssetRegistry memory usage = 256.62 MB",
+            'MemReport: End command "Mem FromReport"',
+            'MemReport: Begin command "obj list -resourcesizesort"',
+            "    Class    Count      NumKB      MaxKB   ResExcKB  ResExcDedSysKB  ResExcDedVidKB     ResExcUnkKB",
+            "    SkeletalMesh      2 1024.00 1024.00 1024.00 0.00 0.00 0.00",
+            "    StaticMesh      3    10.00    10.00   10.00 0.00 0.00 0.00",
+            'MemReport: End command "obj list -resourcesizesort"',
+            'MemReport: Begin command "obj list class=SkeletalMesh -resourcesizesort"',
+            "    SkeletalMesh /Game/Trees/SKM_Pine.SKM_Pine   1000.00    1000.00  2048.00  0.00 0.00 0.00",
+            'MemReport: End command "obj list class=SkeletalMesh -resourcesizesort"',
+            'MemReport: Begin command "ListTextures"',
+            "2048x2048 (5461 KB, 0), 1024x1024 (1365 KB), PF_DXT5, TEXTUREGROUP_World, /Game/T_Bark.T_Bark, YES, NO, NO, 1, 12, NO",
+            "Total size: InMem= 1.33 MB  OnDisk= 5.33 MB  Count=1, CountApplicableToMin=0",
+            'MemReport: End command "ListTextures"'])
+        lines = ue.memreport_summary(report)
+        self.assertEqual(lines[0], "process: 4.0 GB used, 8.0 GB peak (of which asset registry 257 MB)")
+        self.assertEqual(lines[1], "by class (object + resource memory): SkeletalMesh x2 2.0 MB, StaticMesh x3 20.0 KB")
+        self.assertEqual(lines[2], "biggest SkeletalMeshes: SKM_Pine 3.0 MB")
+        self.assertEqual(lines[3], "textures: 1 loaded, 1 MB in memory; biggest T_Bark 1.3 MB (World)")
+
+
 class Validate(unittest.TestCase):
     def setUp(self):
         self.project = Project()

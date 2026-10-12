@@ -98,6 +98,8 @@ broken or unsupported.
   `ue mat MI_X Roughness=0.3 Tint=1,0,0 UseDetail=true` sets them (undoable); `ue mat <actor>` shows which
   material is on each slot; `ue mat M_X --compile` lists shader compile errors. Prefer it over `ue props`
   on materials, which shows parameter arrays raw.
+- Budgets: `ue size [folder]` (biggest assets on disk), `ue size /Game/Maps/L --deps` (what a level pulls in,
+  by folder), `ue mem` (what the editor or PIE holds in memory, by class and mesh; ~20 s).
 - `ue diff /Game/Path/Asset [rev]` shows what changed in a binary asset since a git revision (default HEAD,
   compared with the editor's current version) or between two (`--to rev2`): Blueprint variables, components,
   defaults and graph text, DataTable rows, map actors. Use it to review your own asset edits before
