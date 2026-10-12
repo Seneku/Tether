@@ -1872,6 +1872,145 @@ def cmd_asset(ctx, args):
     return 0
 
 
+def content_package(project, path):
+    """A content file's package path (Content/X/Y.uasset -> /Game/X/Y, a plugin's -> /Plugin/X), or None."""
+    rel = os.path.relpath(os.path.abspath(path), os.path.dirname(project)).replace("\\", "/")
+    stem, ext = os.path.splitext(rel)
+    if ext.lower() not in (".uasset", ".umap"):
+        return None
+    parts = stem.split("/")
+    if parts[0] == "Content":
+        return "/Game/" + "/".join(parts[1:])
+    if parts[0] == "Plugins" and "Content" in parts[1:]:
+        i = parts.index("Content", 1)
+        folder = os.path.join(os.path.dirname(project), *parts[:i])
+        uplugin = [f for f in (os.listdir(folder) if os.path.isdir(folder) else []) if f.endswith(".uplugin")]
+        mount = os.path.splitext(uplugin[0])[0] if uplugin else parts[i - 1]
+        return f"/{mount}/" + "/".join(parts[i + 1:])
+    return None
+
+
+def git_changes(project, rev=None):
+    """(changed, deleted) files under the project folder: uncommitted and untracked work, plus, with rev,
+    everything committed since rev. Absolute paths."""
+    root = os.path.dirname(project)
+
+    def git(*argv):
+        try:
+            proc = subprocess.run(["git", "-C", root, *argv], capture_output=True, text=True, encoding="utf-8",
+                                  errors="replace")
+        except OSError:
+            raise CliError("git is not installed; pass asset paths or folders instead") from None
+        if proc.returncode:
+            raise CliError(f"git {argv[0]}: {proc.stderr.strip().splitlines()[-1] if proc.stderr.strip() else 'failed'}"
+                           " (not a git repository? pass asset paths or folders instead)")
+        return proc.stdout
+
+    top = git("rev-parse", "--show-toplevel").strip()
+    changed, deleted = set(), set()
+    entries = git("status", "--porcelain", "-z", "-uall", "--", ".").split("\0")
+    i = 0
+    while i < len(entries):
+        entry = entries[i]
+        i += 1
+        if len(entry) < 4:
+            continue
+        status, path = entry[:2], entry[3:]
+        if "R" in status or "C" in status:  # -z puts the original path in the next entry
+            if "R" in status and i < len(entries):
+                deleted.add(entries[i])
+            i += 1
+        (deleted if "D" in status else changed).add(path)
+    if rev:
+        fields = git("diff", "--name-status", "-z", "--no-renames", rev, "--", ".").split("\0")
+        for status, path in zip(fields[0::2], fields[1::2]):
+            if status:
+                (deleted if status.startswith("D") else changed).add(path)
+    deleted -= changed
+    absolute = lambda paths: sorted(os.path.normpath(os.path.join(top, p)) for p in paths)
+    return absolute(changed), absolute(deleted)
+
+
+MAP_CHECK = re.compile(r"Map check complete: (\d+) Error\(s\), (\d+) Warning\(s\)")
+
+
+def cmd_validate(ctx, args):
+    """Data validation on assets (the given ones, or those changed in git plus unsaved ones), then Map Check."""
+    paths, deleted, dirty = list(args.paths), [], False
+    if args.changed is not None or not paths:
+        files, gone = git_changes(ctx.project, args.changed or None)
+        paths += sorted({p for p in (content_package(ctx.project, f) for f in files) if p})
+        deleted = sorted({p for p in (content_package(ctx.project, f) for f in gone) if p})
+        dirty = True
+    map_check = args.map_check or not args.paths
+    start = log_end(ctx.project)
+    report = ctx.tether("validate", paths=",".join(paths), dirty=dirty, deleted=",".join(deleted))
+    report = json.loads(report) if isinstance(report, str) else report
+    beacon = ctx.beacon or {}
+    if map_check and beacon.get("pie"):
+        map_check = None  # Map Check would run on the PIE world
+    elif map_check:
+        ctx.tether("console", command="MAP CHECK DONTDISPLAYDIALOG")  # the dialog variant logs nothing headless
+    flush_editor_log(ctx)
+    with open(log_path(ctx.project), "rb") as f:
+        f.seek(start)
+        lines = f.read().decode("utf-8", "replace").splitlines()
+
+    errors = 0
+    problems = report["problems"]
+    invalid = sum(1 for p in problems if p["result"] == "invalid")
+    scope = "changed and unsaved assets" if dirty else "assets"
+    if not report["checked"] and dirty:
+        print("no changed or unsaved assets (git status" + (f" + commits since {args.changed}" if args.changed else "") + ")")
+    else:
+        print(f"validated {report['checked']} {scope}" +
+              (f" ({report['not_validated']} not covered by any validator)" if report["not_validated"] else "") +
+              (f": {invalid} invalid, {len(problems) - invalid} with warnings" if problems else ": all valid"))
+    reported = set()
+    for problem in problems[: args.limit]:
+        for kind, messages in (("E", problem["errors"]), ("W", problem["warnings"])):
+            for message in messages[:5]:
+                reported.add(message.strip())
+                print(f"  {kind} {problem['path']}: {short(message.strip(), 200)}")
+        if problem["result"] == "invalid" and not problem["errors"]:
+            print(f"  E {problem['path']}: invalid (no message; see ue log)")
+    errors += invalid
+    for broken in report["broken_refs"]:
+        errors += 1
+        print(f"  E deleted {broken['path']} is still referenced by: " + ", ".join(broken["referencers"][:6])
+              + (" ..." if len(broken["referencers"]) > 6 else ""))
+
+    map_lines, other = [], []
+    for line in lines:
+        match = LOG_LINE.match(line)
+        if not match:
+            continue
+        cat, level, message = match.group(1), match.group(2) or "Log", match.group(3).strip()
+        if cat == "MapCheck":
+            map_lines.append((level, message))
+        elif LEVELS.get(level, 4) <= LEVELS["Warning"] and cat not in NOISE and not NOISE_MESSAGE.match(message) \
+                and not any(message in r or r in message for r in reported):
+            other.append(f"{level[0]} {cat}: {message}")
+    if map_check:
+        summary = next((MAP_CHECK.search(m) for _, m in reversed(map_lines) if MAP_CHECK.search(m)), None)
+        found = [(lvl, m) for lvl, m in map_lines if lvl in ("Error", "Warning")]
+        map_errors = int(summary.group(1)) if summary else sum(1 for lvl, _ in found if lvl == "Error")
+        errors += map_errors
+        print(f"map check {beacon.get('map', '?')}: " + (f"{map_errors} error(s), {int(summary.group(2))} warning(s)"
+                                                       if summary else "no result in the log"))
+        for lvl, message in found[: args.limit]:
+            print(f"  {lvl[0]} {short(message, 200)}")
+    elif map_check is None:
+        print("map check skipped: PIE is running")
+    if other:
+        print(f"logged during validation: {len(other)} warning/error line(s)")
+        for line in other[: min(args.limit, 10)]:
+            print(f"  {short(line, 200)}")
+    warnings = len(problems) - invalid
+    write_json(os.path.join(state_dir(ctx.project), "validated.json"), {"time": time.time(), "errors": errors})
+    return 1 if errors or (args.strict and (warnings or other)) else 0
+
+
 def cmd_find(ctx, args):
     print(ctx.tether("find", query=args.query or "", cls=args.cls or "", under=args.under, limit=args.limit))
     return 0
@@ -1920,7 +2059,7 @@ def cmd_job(ctx, args):
                 "-clientconfig=Development", "-cook", "-skipstage", "-unattended", "-utf8output", "-nocompileeditor"]
             name = f"cook {args.platform or host_platform()}"
         else:
-            command = args.command  # everything after `--` (split off before argparse)
+            command = args.job_command  # everything after `--` (split off before argparse)
             if not command:
                 raise CliError("give the command after --: ue job start -- <program> <args...>")
             name = args.name or os.path.basename(command[0])
@@ -2062,6 +2201,31 @@ print(sorted(hits)[0] if hits else '')
 """
 
 
+PLANT_VALIDATOR = """
+import sys
+if not hasattr(sys, '_tether_validator_cls'):  # a Python uclass can be defined once per editor session
+    @unreal.uclass()
+    class TetherSelftestValidator(unreal.EditorValidatorBase):
+        @unreal.ufunction(override=True)
+        def k2_can_validate_asset(self, asset):
+            return asset.get_outermost().get_name() == getattr(sys, '_tether_validator_target', '')
+        @unreal.ufunction(override=True)
+        def k2_validate_loaded_asset(self, asset):
+            self.asset_fails(asset, 'tether selftest: planted failure')
+            return unreal.DataValidationResult.INVALID
+    sys._tether_validator_cls = TetherSelftestValidator
+subsystem = unreal.get_editor_subsystem(unreal.EditorValidatorSubsystem)
+if {plant}:
+    sys._tether_validator_target = '{target}'
+    sys._tether_validator = sys._tether_validator_cls()
+    subsystem.add_validator(sys._tether_validator)
+elif getattr(sys, '_tether_validator', None):
+    subsystem.remove_validator(sys._tether_validator)
+    sys._tether_validator = None
+print('ok')
+"""
+
+
 def cmd_selftest(ctx, args):
     """Run every capability against the live editor, one CLI process per check, and report pass/fail/skip."""
     import tempfile
@@ -2099,7 +2263,7 @@ def cmd_selftest(ctx, args):
     remote = ctx.transport == "remote"
     launch = read_json(os.path.join(state_dir(project), "launch.json")) or {}
     check("py", ["py", "6*7"], ok=lambda c, o: c == 0 and o.endswith("42"))
-    check("exec", ["exec", "stat fps"], ok=lambda c, o: c == 0 and "ran in" in o)
+    check("exec", ["exec", "stat fps"], ok=lambda c, o: c == 0 and "Cmd: stat fps" in o)
     check("actors", ["actors", "--limit", "3"], ok=lambda c, o: c == 0 and "actors" in o.splitlines()[0])
     check("api", ["api", "Actor", "set_actor_location"], ok=lambda c, o: c == 0 and "set_actor_location" in o)
     check("find", ["find", "Cube", "--class", "StaticMesh", "--under", "/Engine/BasicShapes"],
@@ -2145,10 +2309,19 @@ def cmd_selftest(ctx, args):
     check("test", ["test", "StartsWith:System.Core.Math.Evaluate"], timeout=600,
           skip=None if tests_available else "needs Epic's AutomationTestToolset (UE 5.8+, `ue init` enables it)",
           ok=lambda c, o: c == 0 and "passed" in o)
-    blueprint = None if remote else (ue("py", FIRST_ASSET.format(cls="Blueprint"))[1].splitlines() or [""])[-1]
+    blueprint = (ue("py", FIRST_ASSET.format(cls="Blueprint"))[1].splitlines() or [""])[-1]
     check("bp", ["bp", blueprint or ""], skip="needs 5.8 (Epic's BlueprintTools)" if remote else
           None if blueprint and blueprint.startswith("/Game/") else "no Blueprint under /Game",
           ok=lambda c, o: c == 0 and ("==" in o or "no graphs" in o))
+    if blueprint and blueprint.startswith("/Game/"):
+        planted = check("validate: plant", ["py", PLANT_VALIDATOR.format(plant=True, target=blueprint)],
+                        ok=lambda c, o: c == 0 and o.endswith("ok"))
+        check("validate", ["validate", blueprint], skip=None if planted else "could not plant a validator",
+              ok=lambda c, o: c == 1 and "planted failure" in o)
+        check("validate: unplant", ["py", PLANT_VALIDATOR.format(plant=False, target="")],
+              ok=lambda c, o: c == 0 and o.endswith("ok"))
+    else:
+        check("validate", [], skip="no Blueprint under /Game")
     table = None if remote else (ue("py", FIRST_ASSET.format(cls="DataTable"))[1].splitlines() or [""])[-1]
     check("table export", ["table", table or "", "--export", os.path.join(tempfile.gettempdir(), "tether-selftest.json")],
           skip="needs 5.8 (Epic's DataTableTools)" if remote else
@@ -2213,6 +2386,8 @@ def cmd_ci(ctx, args):
         else:
             print(f"SKIP  tests        no tests match {test_filter}" + (" (--tests to choose)" if not args.tests else ""))
         step("blueprints", ["bp", "check", args.bp or "/Game"])
+        if args.validate:
+            step("validate", ["validate", args.validate, "--map-check"])
         if args.cook:
             if step("cook start", ["job", "cook"], timeout=120):
                 step("cook", ["job", "wait", "--wait", str(args.cook_timeout)], timeout=args.cook_timeout + 60)
@@ -2674,12 +2849,41 @@ def hook_stop(payload):
     changed = [p for p in (cpp[0] if cpp else []) if p.endswith((".h", ".hpp", ".cpp", ".inl", ".cs"))
                and os.path.getmtime(p) > recent]
     changed += [p for p in (csharp_changes(project) or []) if os.path.getmtime(p) > recent]
-    if not changed:
+    advice = []
+    if changed:
+        names = ", ".join(os.path.basename(p) for p in changed[:3]) + (f" +{len(changed) - 3} more" if len(changed) > 3 else "")
+        restart = cpp and (cpp[1] or cpp[2])
+        advice.append(f"Project code changed since the last green build ({names}) and the editor is running. Run "
+                      f"`ue build{' --restart' if restart else ''}` to compile and check it")
+    # Assets saved since the last `ue validate` (or the last nudge about them): suggest validating once.
+    marker_path = os.path.join(state_dir(project), "validated.json")
+    marker = read_json(marker_path) or {}
+    saved = assets_saved_since(project, max(recent, marker.get("time", 0), marker.get("nudged", 0)))
+    if saved:
+        names = ", ".join(os.path.basename(p) for p in saved[:3]) + (f" +{len(saved) - 3} more" if len(saved) > 3 else "")
+        advice.append(f"{len(saved)} asset(s) were saved since the last validation ({names}). Run `ue validate` "
+                      "(data validation + Map Check on changed and unsaved assets)")
+        marker["nudged"] = time.time()
+        write_json(marker_path, marker)
+    if not advice:
         return None
-    names = ", ".join(os.path.basename(p) for p in changed[:3]) + (f" +{len(changed) - 3} more" if len(changed) > 3 else "")
-    restart = cpp and (cpp[1] or cpp[2])
-    return (f"Project code changed since the last green build ({names}) and the editor is running. Run "
-            f"`ue build{' --restart' if restart else ''}` to compile and check it, or tell the user why it should wait.")
+    return "; ".join(advice) + ", or tell the user why it should wait."
+
+
+def assets_saved_since(project, since):
+    """.uasset/.umap files under the project's Content modified after `since` (a scandir walk; ~0.2 s per 3k)."""
+    found, stack = [], [os.path.join(os.path.dirname(project), "Content")]
+    while stack:
+        try:
+            entries = list(os.scandir(stack.pop()))
+        except OSError:
+            continue
+        for entry in entries:
+            if entry.is_dir(follow_symlinks=False):
+                stack.append(entry.path)
+            elif entry.name.endswith((".uasset", ".umap")) and entry.stat().st_mtime > since:
+                found.append(entry.path)
+    return sorted(found)
 
 
 def cmd_hook(ctx, args):
@@ -2840,7 +3044,7 @@ UNREAL_ROOTS = ("Game", "Script", "Engine", "Temp", "Memory")
 def undo_msys_paths(argv):
     """Git Bash (MSYS) rewrites arguments that look like POSIX paths when it starts a Windows program, so
     `/Game/Maps/L` arrives as `C:/Program Files/Git/Game/Maps/L` (also after `key=`). Undo that for
-    Unreal package roots. bin/ue disables the rewrite; this covers `python ue.py` called directly."""
+    Unreal package roots, bare (`/Game`) or with a path."""
     if os.name != "nt" or not os.environ.get("MSYSTEM"):
         return argv
     import shutil
@@ -2848,7 +3052,7 @@ def undo_msys_paths(argv):
     if not bash:
         return argv
     root = os.path.dirname(os.path.dirname(os.path.dirname(bash))).replace("\\", "/")  # ...\Git\usr\bin\bash
-    rx = re.compile("(^|=)" + re.escape(root) + "(?=/(?:" + "|".join(UNREAL_ROOTS) + ")/)", re.I)
+    rx = re.compile("(^|=)" + re.escape(root) + "(?=/(?:" + "|".join(UNREAL_ROOTS) + r")(?:[/,]|$))", re.I)
     return [rx.sub(r"\1", a) for a in argv]
 
 
@@ -3002,6 +3206,12 @@ def main(argv=None):
     s.add_argument("--no-record", action="store_true", help="do not make this capture the comparison baseline")
     s = add("asset", cmd_asset, "a few lines about assets, by type (mesh, texture, material, Blueprint, ...)")
     s.add_argument("paths", nargs="+", help="/Game/... asset paths")
+    s = add("validate", cmd_validate, "data validation + Map Check; default: assets changed in git or unsaved")
+    s.add_argument("paths", nargs="*", help="assets or content folders (default: changed and unsaved assets)")
+    s.add_argument("--changed", nargs="?", const="", metavar="REV",
+                   help="also the assets changed in git (uncommitted, plus committed since REV if given)")
+    s.add_argument("--map-check", action="store_true", help="also Map Check the open level (default without paths)")
+    s.add_argument("--strict", action="store_true", help="fail on warnings too")
     s = add("find", cmd_find, "search assets by name and/or class (asset registry)")
     s.add_argument("query", nargs="?", help="regex on the asset name")
     s.add_argument("--class", dest="cls", help="regex on the class name, e.g. StaticMesh or 'Material$'")
@@ -3019,9 +3229,11 @@ def main(argv=None):
     s.add_argument("--platform", help="with cook: target platform (default: this host)")
     s.add_argument("--wait", type=float, default=7200, help="with wait: seconds before giving up (7200)")
     s.add_argument("-v", "--verbose", action="store_true", help="with wait: also print warnings")
-    s = add("ci", cmd_ci, "project checks in one pass/fail: open if needed, tests, Blueprint compile, cook, close")
+    s = add("ci", cmd_ci, "project checks in one pass/fail: open if needed, tests, Blueprint compile, validation, cook, close")
     s.add_argument("--tests", help="test filter (default ^<Project>.)")
     s.add_argument("--bp", help="content path for the Blueprint check (default /Game)")
+    s.add_argument("--validate", nargs="?", const="/Game", metavar="PATH",
+                   help="also run data validation on PATH (default /Game; ~0.1 s per asset) and Map Check")
     s.add_argument("--cook", action="store_true", help="also cook for this platform")
     s.add_argument("--cook-timeout", type=float, default=3600, help="seconds to allow the cook (3600)")
     s.add_argument("--report", metavar="FILE", help="write a JSON report (for CI artifacts)")
@@ -3041,7 +3253,7 @@ def main(argv=None):
         cut = raw.index("--", raw.index("job"))
         raw, command = raw[:cut], raw[cut + 1:]
     args = p.parse_args(raw)
-    args.command = command
+    args.job_command = command
     args.timeout_given = hasattr(args, "timeout")
     for key, default in (("project", None), ("port", None), ("timeout", 120.0), ("json", False),
                          ("limit", 30), ("time", False)):

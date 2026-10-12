@@ -36,7 +36,9 @@ broken or unsupported.
   changes. `--pie` edits the running game instead (not undoable, not saved). Prefer this over `ue py`
   for property edits.
 - Your edits stay unsaved until saved. Before finishing a task that changed content, run `ue changes` to
-  review what you changed, then `ue save` (or tell the user what is unsaved and why).
+  review what you changed, then `ue save` (or tell the user what is unsaved and why), then `ue validate`:
+  data validation on the changed and unsaved assets plus Map Check of the open level, one line per
+  problem (`ue validate /Game/Some/Folder` for a folder). Fix errors it reports before calling the task done.
 - Level edits: `ue spawn PointLight --at 0,0,300 --label Lamp` (or an asset path), `ue duplicate Lamp --count 3`,
   `ue delete Lamp`. Asset moves: `ue mv /Game/A/X /Game/B/` (then `ue save`), `ue rm /Game/A/X` (refuses while
   referenced; check `ue refs` first). Prefer these to raw `ue py`: they are undoable and checked.

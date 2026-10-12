@@ -91,9 +91,10 @@ class ToolSchemas(unittest.TestCase):
             self.skipTest("Git Bash rewriting only happens on Windows")
         with unittest.mock.patch("shutil.which", return_value=r"C:\Program Files\Git\usr\bin\bash.EXE"):
             out = ue.undo_msys_paths(["props", "C:/Program Files/Git/Game/Maps/L.L", "graph=C:/Program Files/Git/Game/BP.BP:G",
-                                      "D:/Projects/Game/Source", "C:/Program Files/Git/usr/bin"])
+                                      "D:/Projects/Game/Source", "C:/Program Files/Git/usr/bin", "C:/Program Files/Git/Game",
+                                      "under=C:/Program Files/Git/Engine", "C:/Program Files/Git/Gameplay"])
         self.assertEqual(out, ["props", "/Game/Maps/L.L", "graph=/Game/BP.BP:G", "D:/Projects/Game/Source",
-                               "C:/Program Files/Git/usr/bin"])
+                               "C:/Program Files/Git/usr/bin", "/Game", "under=/Engine", "C:/Program Files/Git/Gameplay"])
 
 
 class Logs(unittest.TestCase):
@@ -485,7 +486,7 @@ class Phase3(unittest.TestCase):
 
 
 class Ci(unittest.TestCase):
-    def run_ci(self, codes, report):
+    def run_ci(self, codes, report, validate=None):
         """cmd_ci against a running editor, with each step's exit code scripted by subcommand."""
         def fake_run(argv, **kw):
             sub = argv[argv.index("--project") + 2:]
@@ -495,7 +496,7 @@ class Ci(unittest.TestCase):
             return types.SimpleNamespace(returncode=code, stdout=out, stderr="")
         project = Project()
         try:
-            args = argparse.Namespace(tests=None, bp=None, cook=False, cook_timeout=60, report=report, verbose=False)
+            args = argparse.Namespace(tests=None, bp=None, validate=validate, cook=False, cook_timeout=60, report=report, verbose=False)
             ctx = argparse.Namespace(project=project.uproject)
             with unittest.mock.patch.object(ue, "editor_live", return_value={"pid": 1}), \
                     unittest.mock.patch.object(ue.subprocess, "run", side_effect=fake_run), \
@@ -512,6 +513,8 @@ class Ci(unittest.TestCase):
             self.assertEqual((data["passed"], data["failed"]), (False, ["blueprints"]))
             self.assertEqual(self.run_ci({"log": (1, "log unreadable")}, report), 0)  # informational only
             self.assertTrue(ue.read_json(report)["passed"])
+            self.assertEqual(self.run_ci({"validate": (1, "1 invalid")}, report, validate="/Game"), 1)
+            self.assertEqual(ue.read_json(report)["failed"], ["validate"])
 
 
 class Crashes(unittest.TestCase):
@@ -627,6 +630,64 @@ class LifecycleHooks(unittest.TestCase):
         self.assertIsNone(ue.hook_stop(dict(payload, stop_hook_active=True)))
         ue.write_json(os.path.join(ue.state_dir(self.project.uproject), "editor.json"), {"pid": 0})
         self.assertIsNone(ue.hook_stop(payload))  # editor not running: no nudge
+
+    def test_stop_nudges_once_for_assets_saved_since_validation(self):
+        self.live()
+        payload = {"cwd": self.project.root, "stop_hook_active": False}
+        ue.write_json(os.path.join(ue.state_dir(self.project.uproject), "validated.json"), {"time": time.time() - 100})
+        self.project.write("Content/Maps/Old.umap", "x", mtime=time.time() - 200)  # validated already
+        self.project.write("Content/Maps/L.umap", "x", mtime=time.time() - 50)
+        self.project.write("Content/Notes.txt", "x", mtime=time.time() - 50)
+        text = ue.hook_stop(payload)
+        self.assertIn("1 asset(s) were saved since the last validation (L.umap)", text)
+        self.assertNotIn("ue build", text)
+        self.assertIsNone(ue.hook_stop(payload))  # nudged once for this change
+
+
+class Validate(unittest.TestCase):
+    def setUp(self):
+        self.project = Project()
+
+    def tearDown(self):
+        self.project.close()
+
+    def test_content_package(self):
+        root = self.project.root
+        self.project.write("Plugins/Feature/Stuff/Feature.uplugin", "{}")
+        self.assertEqual(ue.content_package(self.project.uproject, os.path.join(root, "Content", "Maps", "L.umap")),
+                         "/Game/Maps/L")
+        self.assertEqual(ue.content_package(self.project.uproject,
+                                            os.path.join(root, "Plugins", "Feature", "Stuff", "Content", "M.uasset")),
+                         "/Feature/M")
+        self.assertIsNone(ue.content_package(self.project.uproject, os.path.join(root, "Content", "readme.txt")))
+        self.assertIsNone(ue.content_package(self.project.uproject, os.path.join(root, "Source", "A.uasset")))
+
+    @unittest.skipUnless(__import__("shutil").which("git"), "git not installed")
+    def test_git_changes(self):
+        root = self.project.root
+        run = lambda *a: __import__("subprocess").run(["git", "-C", root, *a], check=True, capture_output=True)
+        run("init", "-q")
+        run("config", "user.email", "t@example.com")
+        run("config", "user.name", "t")
+        self.project.write("Content/A.uasset", "a")
+        self.project.write("Content/B.uasset", "b")
+        self.project.write("Content/Old Name.uasset", "c")
+        run("add", "-A")
+        run("commit", "-qm", "base")
+        self.project.write("Content/A.uasset", "a2")  # modified
+        self.project.write("Content/New.uasset", "n")  # untracked
+        os.remove(os.path.join(root, "Content", "B.uasset"))  # deleted
+        run("mv", "Content/Old Name.uasset", "Content/Renamed.uasset")  # renamed, path with a space
+        changed, deleted = ue.git_changes(self.project.uproject)
+        names = lambda paths: sorted(os.path.relpath(p, root).replace(os.sep, "/") for p in paths)
+        self.assertEqual(names(changed), ["Content/A.uasset", "Content/New.uasset", "Content/Renamed.uasset"])
+        self.assertEqual(names(deleted), ["Content/B.uasset", "Content/Old Name.uasset"])
+        run("add", "-A")
+        run("commit", "-qm", "work")
+        self.assertEqual(ue.git_changes(self.project.uproject), ([], []))
+        changed, deleted = ue.git_changes(self.project.uproject, "HEAD~1")
+        self.assertEqual(names(changed), ["Content/A.uasset", "Content/New.uasset", "Content/Renamed.uasset"])
+        self.assertEqual(names(deleted), ["Content/B.uasset", "Content/Old Name.uasset"])
 
 
 @unittest.skipUnless(os.name == "nt", "Win32 window enumeration")

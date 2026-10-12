@@ -1226,6 +1226,71 @@ class TetherCore(_Base):
 
     @_tool
     @staticmethod
+    def validate(paths: str = "", dirty: bool = False, deleted: str = "") -> str:
+        """Run the editor's data validation (the validators plus each asset's IsDataValid), as the Validate
+        Assets menu does, on assets and folders; optionally also on unsaved packages.
+
+        Args:
+            paths: Comma-separated package paths or content folders (folders are searched recursively).
+                World Partition actor packages are validated through their level.
+            dirty: Also validate every unsaved package (untitled /Temp maps excluded).
+            deleted: Comma-separated package paths deleted on disk: report what still references them.
+
+        Returns:
+            JSON: {"checked": N, "not_validated": N, "problems": [{"path", "result", "errors", "warnings"}],
+            "broken_refs": [{"path", "referencers"}]}.
+        """
+        registry = unreal.AssetRegistryHelpers.get_asset_registry()
+        wanted = []
+        for ref in [p.strip() for p in paths.split(",") if p.strip()]:
+            package = ref.split(".")[0].rstrip("/")
+            match = re.match(r"^(/[^/]+)/__ExternalActors__/(.+)/[^/]+/[^/]+/[^/]+$", package)
+            if match:  # a World Partition actor: validate its level
+                package = f"{match.group(1)}/{match.group(2)}"
+            found = registry.get_assets_by_package_name(package)
+            if not found:
+                found = registry.get_assets_by_path(package, recursive=True)
+                if not found and not unreal.EditorAssetLibrary.does_directory_exist(package):
+                    raise RuntimeError(f"no asset or folder at {package} (ue find)")
+            wanted.extend(found)
+        if dirty:
+            maps, content = _dirty_packages()
+            for package in maps + content:
+                if not package.startswith("/Temp/") and "/__ExternalActors__/" not in package:
+                    wanted.extend(registry.get_assets_by_package_name(package))
+        seen, unique = set(), []
+        for data in wanted:
+            key = str(data.package_name)
+            if key not in seen and not key.startswith("/Script/"):
+                seen.add(key)
+                unique.append(data)
+        subsystem = unreal.get_editor_subsystem(unreal.EditorValidatorSubsystem)
+        problems, skipped = [], 0
+        for data in unique:
+            result, errors, warnings = subsystem.is_asset_valid(data, unreal.DataValidationUsecase.MANUAL)
+            errors, warnings = [str(e) for e in errors], [str(w) for w in warnings]
+            if result == unreal.DataValidationResult.NOT_VALIDATED and not errors and not warnings:
+                skipped += 1
+            elif result == unreal.DataValidationResult.INVALID or errors or warnings:
+                problems.append({"path": str(data.package_name),
+                                 "result": "invalid" if result == unreal.DataValidationResult.INVALID else "warnings",
+                                 "errors": errors, "warnings": warnings})
+        options = unreal.AssetRegistryDependencyOptions(
+            include_soft_package_references=True, include_hard_package_references=True,
+            include_searchable_names=False, include_soft_management_references=False,
+            include_hard_management_references=False)
+        broken = []
+        for package in [p.strip().split(".")[0] for p in deleted.split(",") if p.strip()]:
+            if registry.get_assets_by_package_name(package):
+                continue  # still there (the registry has not caught up, or it was restored)
+            users = sorted({str(n) for n in registry.get_referencers(package, options) or []} - {package})
+            if users:
+                broken.append({"path": package, "referencers": users[:20]})
+        return json.dumps({"checked": len(unique), "not_validated": skipped, "problems": problems,
+                           "broken_refs": broken})
+
+    @_tool
+    @staticmethod
     def find(query: str = "", cls: str = "", under: str = "/Game", limit: int = 50) -> str:
         """Search the asset registry by name and/or class.
 
