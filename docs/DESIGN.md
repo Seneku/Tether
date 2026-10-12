@@ -207,7 +207,7 @@ Lessons from the spike:
 Notes on these results:
 - **Property names:** the "fog amount" turned out to be named `fog`, and one name carries UDS's own typo,
   `Mutliplier`. Neither would have been guessed.
-- **Setup:** IslandHorror's `.uproject` gains `AdditionalPluginDirectories: ["../ToolSuite/Plugins"]` and
+- **Setup:** IslandHorror's `.uproject` gains `AdditionalPluginDirectories: ["../Tether/Plugins"]` and
   four plugins: `PythonScriptPlugin`, `ModelContextProtocol`, `EditorToolset`, `Tether`.
   `EditorToolset` is used instead of `AllToolsets` to avoid side plugins.
 - **Agent onboarding:** the skill is copied into its `.claude/skills/` with the `ue` path, and its

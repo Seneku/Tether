@@ -3,8 +3,7 @@
 Agent-native tooling for Unreal Engine 5.8+: drive a **running** editor from Claude Code (or any
 agent) quickly and with few tokens, instead of booting headless commandlets or restarting the editor.
 
-Formerly named ToolSuite (until 2026-10-12). The repo folder may still be called `ToolSuite`, and the
-command is still `ue`.
+Formerly named ToolSuite (until 2026-10-12). The command is still `ue`.
 
 - `cli/ue.py`: token-frugal CLI (stdlib-only Python). It talks to Epic's in-editor MCP server
   and reads the editor beacon and logs directly.
