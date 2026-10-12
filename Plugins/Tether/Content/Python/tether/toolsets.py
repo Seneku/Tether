@@ -739,6 +739,73 @@ class TetherCore(_Base):
 
     @_tool
     @staticmethod
+    def find(query: str = "", cls: str = "", under: str = "/Game", limit: int = 50) -> str:
+        """Search the asset registry by name and/or class.
+
+        Args:
+            query: Case-insensitive regex on the asset name ('' for any).
+            cls: Case-insensitive regex on the asset class name, e.g. 'StaticMesh|Material$'.
+            under: Content folder to search recursively.
+            limit: Maximum number of rows.
+
+        Returns:
+            A count header, then 'path  Class' rows.
+        """
+        registry = unreal.AssetRegistryHelpers.get_asset_registry()
+        name_rx, cls_rx = re.compile(query or ".", re.I), re.compile(cls or ".", re.I)
+        rows = []
+        for data in registry.get_assets_by_path(under.rstrip("/") or "/Game", recursive=True):
+            name, kind = str(data.asset_name), str(data.asset_class_path.asset_name)
+            if name_rx.search(name) and cls_rx.search(kind):
+                rows.append((str(data.package_name), kind))
+        rows.sort()
+        what = " ".join(p for p in (f"/{query}/" if query else "", f"class /{cls}/" if cls else "") if p)
+        return _capped(f"{len(rows)} assets under {under}" + (f" matching {what}" if what else ""),
+                       [f"{p}  {k}" for p, k in rows], limit)
+
+    @_tool
+    @staticmethod
+    def refs(asset: str, deps: bool = False, limit: int = 50) -> str:
+        """What references an asset (or, with deps, what it depends on), from the asset registry.
+
+        Args:
+            asset: Package path, e.g. /Game/Props/SM_Rock (an object path also works).
+            deps: List dependencies instead of referencers.
+            limit: Maximum number of rows.
+
+        Returns:
+            A header, then one package per line (/Script modules counted, not listed).
+        """
+        package = asset.split(".")[0]
+        registry = unreal.AssetRegistryHelpers.get_asset_registry()
+        options = unreal.AssetRegistryDependencyOptions(
+            include_soft_package_references=True, include_hard_package_references=True,
+            include_searchable_names=False, include_soft_management_references=False,
+            include_hard_management_references=False)
+        if not registry.get_assets_by_package_name(package):
+            raise RuntimeError(f"no asset at {package} (ue find)")
+        found = (registry.get_dependencies if deps else registry.get_referencers)(package, options) or []
+        names = sorted({str(n) for n in found} - {package})
+        assets = [n for n in names if not n.startswith("/Script/")]
+        scripts = len(names) - len(assets)
+        # World Partition saves each placed actor as its own package under __ExternalActors__; report those
+        # per level ("/Game/Maps/L: 12 placed actors") instead of as dozens of opaque ids.
+        levels, rows = {}, []
+        for name in assets:
+            match = re.match(r"^(/[^/]+)/__ExternalActors__/(.+)/[^/]+/[^/]+/[^/]+$", name)
+            if match:
+                level = f"{match.group(1)}/{match.group(2)}"
+                levels[level] = levels.get(level, 0) + 1
+            else:
+                rows.append(name)
+        rows += [f"{level}: {count} placed actor{'' if count == 1 else 's'}" for level, count in sorted(levels.items())]
+        head = (f"{package} depends on {len(assets)} assets" if deps else f"{len(assets)} assets reference {package}")
+        if scripts:
+            head += f" (+{scripts} /Script modules)"
+        return _capped(head, rows, limit)
+
+    @_tool
+    @staticmethod
     def bp_check(path: str = "/Game", warnings: bool = False) -> str:
         """Compile every Blueprint under a content path and report the ones that do not compile cleanly.
 

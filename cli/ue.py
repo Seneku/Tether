@@ -1650,6 +1650,16 @@ def cmd_table(ctx, args):
     return 0
 
 
+def cmd_find(ctx, args):
+    print(ctx.tether("find", query=args.query or "", cls=args.cls or "", under=args.under, limit=args.limit))
+    return 0
+
+
+def cmd_refs(ctx, args):
+    print(ctx.tether("refs", asset=args.asset, deps=args.deps, limit=args.limit))
+    return 0
+
+
 def cmd_api(ctx, args):
     print(ctx.tether("api", name=args.name, match=args.match or "", limit=args.limit))
     return 0
@@ -1870,6 +1880,10 @@ def cmd_selftest(ctx, args):
     check("exec", ["exec", "stat fps"], ok=lambda c, o: c == 0 and "ran in" in o)
     check("actors", ["actors", "--limit", "3"], ok=lambda c, o: c == 0 and "actors" in o.splitlines()[0])
     check("api", ["api", "Actor", "set_actor_location"], ok=lambda c, o: c == 0 and "set_actor_location" in o)
+    check("find", ["find", "Cube", "--class", "StaticMesh", "--under", "/Engine/BasicShapes"],
+          ok=lambda c, o: c == 0 and "/Engine/BasicShapes/Cube" in o)
+    check("refs", ["refs", "/Engine/BasicShapes/BasicShapeMaterial", "--limit", "3"],
+          ok=lambda c, o: c == 0 and "reference" in o)
     check("log", ["log", "--level", "Error"])
     check("call tether.level_summary", ["call", "tether.level_summary", "limit=3"],
           ok=lambda c, o: c == 0 and "actors" in o)
@@ -2493,6 +2507,13 @@ def main(argv=None):
     s.add_argument("--prune", action="store_true", help="with --import: remove rows missing from FILE")
     s.add_argument("--dry-run", action="store_true", help="with --import: show the diff only")
     s.add_argument("--save", action="store_true", help="save the DataTable afterwards")
+    s = add("find", cmd_find, "search assets by name and/or class (asset registry)")
+    s.add_argument("query", nargs="?", help="regex on the asset name")
+    s.add_argument("--class", dest="cls", help="regex on the class name, e.g. StaticMesh or 'Material$'")
+    s.add_argument("--under", default="/Game", help="content folder to search (default /Game)")
+    s = add("refs", cmd_refs, "what references an asset (--deps: what it depends on)")
+    s.add_argument("asset", help="/Game/Path/Asset")
+    s.add_argument("--deps", action="store_true", help="list dependencies instead of referencers")
     s = add("api", cmd_api, "the unreal Python API: a class's methods and properties, or one member's doc")
     s.add_argument("name", help="class or class.member, e.g. EditorActorSubsystem or Actor.set_actor_location")
     s.add_argument("match", nargs="?", help="regex filter on member names")

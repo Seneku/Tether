@@ -169,6 +169,8 @@ The plugin's hooks stay silent outside Unreal projects, and never block a tool c
 | `ue bp <blueprint> [graph] [--diff] [--apply FILE] [--save]` | Blueprint graphs as text (Epic's graph DSL). `--diff` shows only what changed since the last read; `--apply` writes edited text back, compiles, and prints the diff. |
 | `ue bp check [/Game/path] [--warnings]` | Compile every Blueprint under a path and list only the broken ones, with the compiler's reason (e.g. a C++ function that was renamed). Exit 1 if any fail. |
 | `ue table <datatable> [--export F] [--import F [--prune] [--dry-run]] [--save]` | DataTable round-trips through JSON or CSV. Import shows a row-level diff (`+ Row`, `~ Row.col: old -> new`) and upserts; `--prune` also removes rows missing from the file. |
+| `ue find [regex] [--class C] [--under /Game/x]` | Search assets by name and class through the asset registry. |
+| `ue refs <asset> [--deps]` | What references an asset (or what it depends on); World Partition actors are grouped per level. Check before deleting or renaming. |
 | `ue api <Class[.member]> [regex]` | The `unreal` Python API in a few lines: method signatures, editor properties with types, enum values, or one member's docs. |
 | `ue job start -- <cmd>` / `cook` / `status` / `wait` / `log` | Long work (cooks, commandlets, any command) in the background, with a log and exit code; `wait` prints only the errors. |
 | `ue reload` | Hot-reload the Tether Python package in the running editor. |

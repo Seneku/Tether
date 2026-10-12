@@ -82,6 +82,8 @@ broken or unsupported.
 - `ue call tether.cs_state` reports idle, pending or reloading.
 
 ## Blueprints, DataTables, API lookups, long jobs
+- `ue find <regex> [--class StaticMesh] [--under /Game/x]` to locate assets; `ue refs <asset>` before deleting
+  or renaming one (what uses it), `--deps` for what it uses.
 - `ue api <Class> [regex]` before writing editor Python: real method signatures and property names in a
   few lines (`ue api Actor.set_actor_location` for one member). Cheaper than guessing.
 - `ue bp /Game/Path/BP_X [graph]` prints Blueprint graphs as text. To change one: write the edited text to
