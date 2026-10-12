@@ -2235,6 +2235,17 @@ def cmd_mat(ctx, args):
     return 0
 
 
+def cmd_nav(ctx, args):
+    """Navmesh state, path queries and actors off the navmesh."""
+    action = args.action or "status"
+    if action == "path" and len(args.points) != 2:
+        raise CliError("ue nav path <start> <end>   (x,y,z or actor)")
+    start, end = (args.points + ["", ""])[:2] if action == "path" else ("", "")
+    match = " ".join(args.points) if action == "check" else ""
+    print(ctx.tether("nav", action=action, start=start, end=end, match=match, pie=args.pie, limit=args.limit))
+    return 0
+
+
 def cmd_find(ctx, args):
     print(ctx.tether("find", query=args.query or "", cls=args.cls or "", under=args.under, limit=args.limit))
     return 0
@@ -2497,6 +2508,7 @@ def cmd_selftest(ctx, args):
     check("asset", ["asset", "/Engine/BasicShapes/Cube"], ok=lambda c, o: c == 0 and "triangles" in o)
     check("log", ["log", "--level", "Error"])
     check("changes", ["changes"], ok=lambda c, o: c == 0 and "unsaved package" in o)
+    check("nav", ["nav"], ok=lambda c, o: c == 0 and ("bounds" in o or "NavMeshBoundsVolume" in o))
     check("call tether.level_summary", ["call", "tether.level_summary", "limit=3"],
           ok=lambda c, o: c == 0 and "actors" in o)
 
@@ -3580,6 +3592,10 @@ def main(argv=None):
     s.add_argument("assignments", nargs="*", metavar="Name=value", help="scalar, r,g,b[,a], true/false, texture path")
     s.add_argument("--reset", action="append", metavar="NAME", help="stop overriding NAME (instances; repeatable)")
     s.add_argument("--compile", action="store_true", help="recompile the base material and list compile errors")
+    s = add("nav", cmd_nav, "navmesh: status (and why it is missing), path <a> <b>, check [actor regex]")
+    s.add_argument("action", nargs="?", choices=["status", "path", "check"])
+    s.add_argument("points", nargs="*", help="path: start end (x,y,z or actor); check: actor regex")
+    s.add_argument("--pie", action="store_true", help="the PIE world's (runtime-generated) navmesh")
     s = add("find", cmd_find, "search assets by name and/or class (asset registry)")
     s.add_argument("query", nargs="?", help="regex on the asset name")
     s.add_argument("--class", dest="cls", help="regex on the class name, e.g. StaticMesh or 'Material$'")

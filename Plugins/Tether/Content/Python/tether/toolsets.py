@@ -1863,8 +1863,12 @@ class TetherCore(_Base):
             controller.set_control_rotation(rotation)
             detail = f"looking pitch {rotation.pitch:.0f} yaw {rotation.yaw:.0f}"
         elif verb == "move":
-            unreal.AIHelperLibrary.simple_move_to_location(controller, _pie_point(rest, pawn, controller))
-            detail = "moving"
+            goal = _pie_point(rest, pawn, controller)
+            path = unreal.NavigationSystemV1.find_path_to_location_synchronously(game, pawn.get_actor_location(), goal)
+            if path is None or not path.is_valid() or not path.path_points:
+                raise RuntimeError("no navmesh path from the player to there (ue nav --pie says why)")
+            unreal.AIHelperLibrary.simple_move_to_location(controller, goal)
+            detail = f"moving along {path.get_path_length():.0f} cm" + (" (partial path)" if path.is_partial() else "")
         elif verb == "near":
             where, _, radius = rest.partition(" ")
             distance = pawn.get_actor_location().distance(_pie_point(where, pawn, controller))
@@ -1909,6 +1913,98 @@ class TetherCore(_Base):
             raise RuntimeError(f"unknown step '{verb}' (at, look, move, near, tap, hold, release, call, expect, "
                                "exists, gone, exec; the CLI adds wait, until, press, log, shot)")
         return json.dumps({"ok": ok, "detail": detail})
+
+    @_tool
+    @staticmethod
+    def nav(action: str = "status", start: str = "", end: str = "", match: str = "", pie: bool = False,
+            limit: int = 40) -> str:
+        """Navigation: whether the level has a usable navmesh (and why not), paths between points, and which
+        actors stand off the navmesh.
+
+        Args:
+            action: status, path (start -> end) or check (actors matching `match`).
+            start: Path start: 'x,y,z' or an actor.
+            end: Path end: 'x,y,z' or an actor.
+            match: With check: regex on actor label and class (default: player starts, spawns, patrol points).
+            pie: Use the PIE world (runtime-generated navmesh) instead of the editor level.
+            limit: Maximum number of actor lines for check.
+
+        Returns:
+            A few lines.
+        """
+        world = _game_world() if pie else unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_editor_world()
+        if world is None:
+            raise RuntimeError("PIE is not running" if pie else "no editor world")
+        navsys = unreal.NavigationSystemV1
+        actors = unreal.GameplayStatics.get_all_actors_of_class
+        if action == "status":
+            out = [f"{world.get_path_name().split('.')[0]}" + (" (PIE)" if pie else "")]
+            settings = unreal.GameplayStatics.get_all_actors_of_class(world, unreal.WorldSettings)
+            enabled = _try(lambda: settings[0].get_editor_property("enable_navigation_system"), True) if settings else True
+            if not enabled:
+                out.append("  navigation is OFF in World Settings (Enable Navigation System): nothing can path here")
+            data = [d for d in actors(world, unreal.NavigationData) if not isinstance(d, unreal.AbstractNavData)]
+            for nav_data in data:
+                prop = lambda n, d=None: _try(lambda: nav_data.get_editor_property(n), d)
+                generation = str(prop("runtime_generation", "?")).split(".")[-1].split(":")[0].title()
+                agent = f", agent radius {prop('agent_radius', 0):g} height {prop('agent_height', 0):g}" \
+                    if isinstance(nav_data, unreal.RecastNavMesh) else ""
+                out.append(f"  nav data {nav_data.get_actor_label()} ({nav_data.get_class().get_name()}, "
+                           f"runtime generation {generation}{agent})")
+            if not data:
+                out.append("  no navigation data actor (a NavMeshBoundsVolume creates RecastNavMesh-Default)")
+            volumes = list(actors(world, unreal.NavMeshBoundsVolume))
+            empty = 0
+            for volume in volumes:
+                centre, extent = volume.get_actor_bounds(False)
+                found = navsys.get_random_point_in_navigable_radius(world, centre, max(extent.x, extent.y))
+                empty += found is None
+                out.append(f"  bounds {volume.get_actor_label()}: {extent.x * 2 / 100:.0f} x {extent.y * 2 / 100:.0f} x "
+                           f"{extent.z * 2 / 100:.0f} m, " + ("navmesh present" if found is not None else "NO navmesh inside"))
+            if not volumes:
+                out.append("  no NavMeshBoundsVolume: no navmesh is generated")
+            if navsys.is_navigation_being_built(world):
+                out.append("  navigation is being built right now; results may be incomplete")
+            elif volumes and empty and enabled:
+                out.append("  hint: build it (Build > Build Paths), or check the volume covers the floor; with runtime "
+                           "generation Dynamic it is built in PIE (ue nav --pie)")
+            return "\n".join(out)
+        if action == "path":
+            if not start or not end:
+                raise RuntimeError("path needs a start and an end (x,y,z or actor)")
+            a, b = _point(start, pie), _point(end, pie)
+            straight = a.distance(b)
+            path = navsys.find_path_to_location_synchronously(world, a, b)
+            if path is None or not path.is_valid() or not path.path_points:
+                notes = []
+                for label, point in (("start", a), ("end", b)):
+                    if navsys.project_point_to_navigation(world, point, None, None, unreal.Vector(50, 50, 250)) is None:
+                        near = navsys.project_point_to_navigation(world, point, None, None, unreal.Vector(1000, 1000, 1000))
+                        notes.append(f"{label} is off the navmesh" +
+                                     (f" ({point.distance(near):.0f} cm from it)" if near is not None else " (none within 10 m)"))
+                return f"no path ({straight:.0f} cm straight line)" + (": " + "; ".join(notes) if notes else "")
+            length = path.get_path_length()
+            return (f"{'partial path' if path.is_partial() else 'path'}: {length:.0f} cm over {len(path.path_points)} "
+                    f"points (straight line {straight:.0f} cm)" +
+                    (f"; it ends {path.path_points[-1].distance(b):.0f} cm short" if path.is_partial() else ""))
+        if action == "check":
+            rx = re.compile(match or r"PlayerStart|Spawn|Patrol|Waypoint|TargetPoint", re.I)
+            rows, off = [], 0
+            for actor in actors(world, unreal.Actor):
+                label = actor.get_actor_label()
+                if not (rx.search(label) or rx.search(actor.get_class().get_name())):
+                    continue
+                loc = actor.get_actor_location()
+                if navsys.project_point_to_navigation(world, loc, None, None, unreal.Vector(50, 50, 250)) is not None:
+                    rows.append(f"ok   {label}")
+                    continue
+                off += 1
+                near = navsys.project_point_to_navigation(world, loc, None, None, unreal.Vector(1000, 1000, 1000))
+                rows.append(f"OFF  {label} at ({loc.x:.0f}, {loc.y:.0f}, {loc.z:.0f})" +
+                            (f": navmesh {loc.distance(near):.0f} cm away" if near is not None else ": no navmesh within 10 m"))
+            rows.sort(key=lambda r: not r.startswith("OFF"))
+            return _capped(f"{len(rows)} actors checked, {off} off the navmesh", rows, limit)
+        raise RuntimeError("action must be status, path or check")
 
     @_tool
     @staticmethod

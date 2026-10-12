@@ -137,6 +137,8 @@ broken or unsupported.
 - Prefer `ue pie run check.py --expect '<log regex>' --reject 'Error|no subsystem'` for verifying gameplay:
   it starts PIE, runs the script in the PIE world, waits for the log lines, stops PIE and exits 0/1.
   Write the script once and rerun it after every change.
+- AI that does not move: `ue nav` (is there a navmesh, and if not why), `ue nav check` (spawn/patrol points
+  off the navmesh), `ue nav path <a> <b>` (reachable? how long?); add `--pie` for runtime-generated navmeshes.
 - `ue pie start` / `ue pie stop` / `ue pie status`. Status explains a session that died (fatal error
   plus your source line).
 - Drive the test from Python: in PIE, `w = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_game_world()`,
