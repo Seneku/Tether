@@ -78,6 +78,18 @@ milliseconds. A `-run=pythonscript` commandlet takes ~25 s and floods the log.
   If `ue pie start` reports `InvalidCastException`, run `ue build --restart` (about 20 s).
 - `ue call tether.cs_state` reports idle, pending or reloading.
 
+## Blueprints, DataTables, API lookups, long jobs
+- `ue api <Class> [regex]` before writing editor Python: real method signatures and property names in a
+  few lines (`ue api Actor.set_actor_location` for one member). Cheaper than guessing.
+- `ue bp /Game/Path/BP_X [graph]` prints Blueprint graphs as text. To change one: write the edited text to
+  a file, `ue bp /Game/Path/BP_X EventGraph --apply file.dsl --save` (compiles, prints the diff).
+  `ue bp ... --diff` shows only what changed since the last read; `ue bp --docs` is the syntax reference.
+- `ue table /Game/Path/DT_X` shows rows; `--export rows.json|.csv`, edit, then `--import rows.json
+  --dry-run` to see the diff and `--import rows.json --save` to apply (upsert; `--prune` deletes missing
+  rows).
+- Cooks and other long commands: `ue job cook` or `ue job start -- <cmd>`, then `ue job wait` (errors only)
+  or `ue job status`. Do not block a shell on them.
+
 ## Automated tests
 - `ue test <filter>` runs automation tests in the live editor and prints one summary line plus each
   failure with its source line; exit code 1 if any failed. Filter syntax is Epic's: a substring,

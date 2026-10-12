@@ -655,6 +655,58 @@ class TetherCore(_Base):
 
     @_tool
     @staticmethod
+    def api(name: str, match: str = "", limit: int = 60) -> str:
+        """Compact reference for the `unreal` Python API: a class's methods and editor properties, an enum's
+        values, or one member's documentation.
+
+        Args:
+            name: Class or Class.member, e.g. EditorActorSubsystem or Actor.set_actor_location.
+            match: Case-insensitive regex on member names.
+            limit: Maximum number of lines.
+
+        Returns:
+            One line per member ('name(args) -> result' or 'name: Type'), or the member's docstring.
+        """
+        cls_name, _, member = name[7:].partition(".") if name.startswith("unreal.") else name.partition(".")
+        target = getattr(unreal, cls_name, None)
+        if target is None:
+            import difflib
+            close = difflib.get_close_matches(cls_name, [n for n in dir(unreal) if not n.startswith("_")], n=5)
+            raise RuntimeError(f"unreal has no '{cls_name}'" + (f" (did you mean: {', '.join(close)})" if close else ""))
+        if member:
+            properties = dict(_DOC_PROPERTY.findall(getattr(target, "__doc__", "") or ""))
+            if not hasattr(target, member) and member in properties:
+                line = next(l for l in (target.__doc__ or "").splitlines() if l.startswith(f"- ``{member}``"))
+                return re.sub(r"^- ``(\w+)``", r"\1", line)
+            attr = getattr(target, member, None)
+            if attr is None:
+                raise RuntimeError(f"unreal.{cls_name} has no member '{member}'")
+            lines = [l.rstrip() for l in (attr.__doc__ or "(no documentation)").strip().splitlines()]
+            return "\n".join(lines[:limit])
+        rx = re.compile(match, re.I) if match else None
+        doc = (getattr(target, "__doc__", "") or "").strip().splitlines()
+        head = f"unreal.{cls_name}"
+        if isinstance(target, type):
+            bases = [b.__name__ for b in target.__mro__[1:5] if b.__name__ not in ("object", "_ObjectBase", "_WrapperBase")]
+            head += f" ({' < '.join(bases)})" if bases else ""
+        rows = [head + (": " + doc[0][:120] if doc else "")]
+        if isinstance(target, type) and issubclass(target, unreal.EnumBase):
+            values = [n for n in dir(target) if n.isupper() and (not rx or rx.search(n))]
+            return _capped(rows[0], ["  " + ", ".join(values)], limit)
+        for attr_name in sorted(n for n in dir(target) if not n.startswith("_")):
+            if rx and not rx.search(attr_name):
+                continue
+            attr = getattr(target, attr_name, None)
+            if callable(attr) and not isinstance(attr, type):
+                first = ((attr.__doc__ or "").strip().splitlines() or [attr_name + "(...)"])[0]
+                rows.append("  " + re.sub(r"^\w+\.", "", first)[:140])
+        for prop, kind in _DOC_PROPERTY.findall(getattr(target, "__doc__", "") or ""):
+            if not rx or rx.search(prop):
+                rows.append(f"  {prop}: {kind}")
+        return _capped(rows[0], rows[1:], limit)
+
+    @_tool
+    @staticmethod
     def pie(action: str, simulate: bool = False) -> str:
         """Play-In-Editor through LevelEditorSubsystem (works on UE 5.x without Epic's EditorAppToolset).
 

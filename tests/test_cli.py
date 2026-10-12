@@ -392,6 +392,50 @@ class RemoteResults(unittest.TestCase):
         self.assertEqual(str(caught.exception), "not found: X")
 
 
+class Phase3(unittest.TestCase):
+    def test_asset_ref(self):
+        self.assertEqual(ue.asset_ref("/Game/A/BP_X"), "/Game/A/BP_X.BP_X")
+        self.assertEqual(ue.asset_ref("/Game/A/BP_X.BP_X"), "/Game/A/BP_X.BP_X")
+        self.assertEqual(ue.asset_ref("/Game/A/BP_X:EventGraph"), "/Game/A/BP_X.BP_X:EventGraph")
+
+    def test_read_table_file_formats(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            as_dict, as_list, as_csv = (os.path.join(tmp, n) for n in ("a.json", "b.json", "c.csv"))
+            with open(as_dict, "w") as f:
+                json.dump({"Health": {"maxValue": 100}}, f)
+            with open(as_list, "w") as f:
+                json.dump([{"Name": "Health", "maxValue": 100}], f)
+            with open(as_csv, "w", newline="") as f:
+                f.write('Name,maxValue,tag,nested\nHealth,100,boss,"{""x"": 1}"\n')
+            expected = {"Health": {"maxValue": 100}}
+            self.assertEqual(ue.read_table_file(as_dict), expected)
+            self.assertEqual(ue.read_table_file(as_list), expected)
+            self.assertEqual(ue.read_table_file(as_csv), {"Health": {"maxValue": 100, "tag": "boss", "nested": {"x": 1}}})
+
+    def test_text_diff(self):
+        diff = ue.text_diff("(event A)\n", "(event A\n  (Print))\n", "EventGraph")
+        self.assertIn("-(event A)", diff)
+        self.assertIn("+  (Print))", diff)
+
+    def test_job_runs_in_background_and_records_exit(self):
+        project = Project()
+        out = []
+        try:
+            def run(*argv):
+                with unittest.mock.patch("builtins.print", side_effect=lambda *a, **k: out.append(" ".join(map(str, a)))):
+                    return ue.main(["--project", project.uproject, "job", *argv])
+            self.assertEqual(run("start", "--name", "ok", "--", sys.executable, "-c", "print('hello')"), 0)
+            self.assertEqual(run("wait", "--wait", "60"), 0)
+            self.assertIn("  ok  done", out[-1])
+            self.assertEqual(run("start", "--", sys.executable, "-c", "import sys; print('Error: bad'); sys.exit(4)"), 0)
+            time.sleep(1.1)  # job ids have one-second resolution
+            self.assertEqual(run("wait", "--wait", "60"), 1)
+            self.assertTrue(any("FAILED (exit 4)" in line for line in out))
+        finally:
+            time.sleep(0.5)  # let the detached runner close its files before cleanup
+            project.close()
+
+
 class Transport(unittest.TestCase):
     def test_choice_by_engine_version_and_override(self):
         project = Project()

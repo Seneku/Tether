@@ -1,7 +1,7 @@
 #!/bin/sh
 # `ue` for bash shells. Claude Code puts the plugin's bin/ on the agent's PATH.
-# Git Bash would rewrite Unreal paths such as /Game/Maps/L into C:/Program Files/Git/Game/Maps/L.
-export MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*'
+# (Git Bash rewrites /Game/... arguments into Windows paths; ue.py undoes that for Unreal roots and
+# keeps the conversion for real file paths such as /c/Users/...)
 here="$(dirname "$0")"
 for py in python python3; do
   command -v "$py" >/dev/null 2>&1 && exec "$py" "$here/../cli/ue.py" "$@"

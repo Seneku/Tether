@@ -1439,6 +1439,290 @@ def cmd_test(ctx, args):
     return 1 if failed else 0
 
 
+def asset_ref(path):
+    """'/Game/X/BP_Y' -> '/Game/X/BP_Y.BP_Y' (object path), leaving full object paths alone."""
+    base = path.split(":", 1)[0]
+    if "." in base.rsplit("/", 1)[-1]:
+        return path
+    return base + "." + base.rsplit("/", 1)[-1] + (":" + path.split(":", 1)[1] if ":" in path else "")
+
+
+def snapshot_path(ctx, kind, asset, name):
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", asset.strip("/"))
+    return os.path.join(state_dir(ctx.project), kind, safe, re.sub(r"[^A-Za-z0-9_.-]+", "_", name))
+
+
+def text_diff(before, after, label):
+    import difflib
+    return "".join(difflib.unified_diff(before.splitlines(True), after.splitlines(True),
+                                        f"{label} (before)", f"{label} (now)", n=2))
+
+
+def mcp_tool(ctx, toolset_query, tool, payload):
+    text, is_error = ctx.mcp.call(resolve_toolset(ctx, toolset_query), tool, payload)
+    if is_error:
+        raise CliError(compact_error(text))
+    return unwrap(text)
+
+
+def cmd_bp(ctx, args):
+    """Blueprint graphs as text (Epic's graph DSL): read, diff against the last read, apply edited text."""
+    if args.docs:
+        print(mcp_tool(ctx, "blueprint", "get_graph_dsl_docs", {}))
+        return 0
+    if not args.blueprint:
+        raise CliError("give a Blueprint: ue bp /Game/Path/BP_Name [graph]")
+    bp = asset_ref(args.blueprint)
+    graphs = mcp_tool(ctx, "blueprint", "list_graphs", {"blueprint": {"refPath": bp}})
+    names = [g["refPath"].rsplit(":", 1)[-1] if isinstance(g, dict) else str(g) for g in graphs or []]
+    if args.graph:
+        match = [n for n in names if n.lower() == args.graph.lower()]
+        if not match:
+            raise CliError(f"{bp} has no graph '{args.graph}' (graphs: {', '.join(names)})")
+        names = match
+    if args.apply:
+        if len(names) != 1:
+            raise CliError("--apply needs one graph: ue bp <blueprint> <graph> --apply file.dsl")
+        with open(args.apply, encoding="utf-8-sig") as f:
+            code = f.read()
+        mcp_tool(ctx, "blueprint", "write_graph_dsl", {"graph": {"refPath": f"{bp}:{names[0]}"}, "code": code})
+        print(f"applied {os.path.basename(args.apply)} to {names[0]} (compiled)")
+    changed = 0
+    for name in names:
+        text = mcp_tool(ctx, "blueprint", "read_graph_dsl", {"graph": {"refPath": f"{bp}:{name}"}})
+        text = text if isinstance(text, str) else json.dumps(text)
+        snap = snapshot_path(ctx, "bp", bp, name + ".dsl")
+        before = open(snap, encoding="utf-8").read() if os.path.isfile(snap) else None
+        if args.diff or args.apply:
+            if before is None:
+                print(f"== {name}: no earlier read to compare with; showing it in full")
+                print(text.rstrip())
+            elif before != text:
+                changed += 1
+                print(text_diff(before, text, name).rstrip())
+        else:
+            print(f"== {name}")
+            print(text.rstrip() or "(empty)")
+        os.makedirs(os.path.dirname(snap), exist_ok=True)
+        with open(snap, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text)
+    if (args.diff or args.apply) and not changed:
+        print("no changes since the last read" if args.diff else "graph unchanged")
+    if args.save:
+        mcp_tool(ctx, "AssetTools", "save_assets", {"asset_paths": [bp.split(".")[0]]})
+        print("saved")
+    return 0
+
+
+def table_rows(ctx, dt):
+    names = mcp_tool(ctx, "data_table", "list_rows", {"data_table": {"refPath": dt}}) or []
+    names = [n if isinstance(n, str) else str(n) for n in names]
+    if not names:
+        return {}
+    rows = mcp_tool(ctx, "data_table", "get_rows", {"data_table": {"refPath": dt}, "row_names": names})
+    return json.loads(rows) if isinstance(rows, str) else rows
+
+
+def read_table_file(path):
+    if path.lower().endswith(".csv"):
+        import csv
+        with open(path, encoding="utf-8-sig", newline="") as f:
+            reader = csv.DictReader(f)
+            key = reader.fieldnames[0]
+            rows = {}
+            for record in reader:
+                name = record.pop(key)
+                values = {}
+                for col, cell in record.items():
+                    try:
+                        values[col] = json.loads(cell)
+                    except (ValueError, TypeError):
+                        values[col] = cell
+                rows[name] = values
+            return rows
+    with open(path, encoding="utf-8-sig") as f:
+        data = json.load(f)
+    if isinstance(data, list):  # UE's own export: [{"Name": ..., col: ...}, ...]
+        data = {r.pop("Name"): r for r in data}
+    return data
+
+
+def cmd_table(ctx, args):
+    """DataTable round-trips: show, export to JSON/CSV, import with a row-level diff (upsert by default)."""
+    dt = asset_ref(args.table)
+    current = table_rows(ctx, dt)
+    if args.export:
+        if args.export.lower().endswith(".csv"):
+            import csv
+            columns = sorted({c for r in current.values() for c in r})
+            with open(args.export, "w", encoding="utf-8", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(["Name"] + columns)
+                for name, row in current.items():
+                    writer.writerow([name] + [v if isinstance(v := row.get(c), str) else json.dumps(v) for c in columns])
+        else:
+            with open(args.export, "w", encoding="utf-8", newline="\n") as f:
+                json.dump(current, f, indent=2)
+                f.write("\n")
+        print(f"exported {len(current)} rows to {args.export}")
+        return 0
+    if not args.import_file:
+        print(f"{dt}: {len(current)} rows")
+        for name, row in list(current.items())[: args.limit]:
+            print(f"  {name}: " + ", ".join(f"{k}={short(v, 40)}" for k, v in row.items()))
+        if len(current) > args.limit:
+            print(f"... +{len(current) - args.limit} more (--limit, or --export)")
+        return 0
+    wanted = read_table_file(args.import_file)
+    added = [n for n in wanted if n not in current]
+    removed = [n for n in current if n not in wanted] if args.prune else []
+    updates, lines = {}, []
+    for name, row in wanted.items():
+        old = current.get(name, {})
+        delta = {k: v for k, v in row.items() if old.get(k) != v}
+        if name in added:
+            lines.append(f"+ {name}")
+        for key, value in delta.items():
+            if name not in added:
+                lines.append(f"~ {name}.{key}: {short(old.get(key), 40)} -> {short(value, 40)}")
+        if delta:
+            updates[name] = delta
+    lines += [f"- {n}" for n in removed]
+    kept = len([n for n in current if n not in wanted]) if not args.prune else 0
+    print(f"{len(added)} added, {sum(1 for n in updates if n not in added)} changed, {len(removed)} removed"
+          + (f", {kept} rows only in the editor kept (--prune removes them)" if kept else ""))
+    for line in lines[: args.limit]:
+        print("  " + line)
+    if len(lines) > args.limit:
+        print(f"  ... +{len(lines) - args.limit} more (--limit)")
+    if args.dry_run or not (added or updates or removed):
+        return 0
+    if added:
+        mcp_tool(ctx, "data_table", "add_rows", {"data_table": {"refPath": dt}, "row_names": added})
+    if updates:
+        mcp_tool(ctx, "data_table", "set_rows", {"data_table": {"refPath": dt}, "values": json.dumps(updates)})
+    if removed:
+        mcp_tool(ctx, "data_table", "remove_rows", {"data_table": {"refPath": dt}, "row_names": removed})
+    after = table_rows(ctx, dt)
+    stale = [n for n, row in wanted.items() if any(after.get(n, {}).get(k) != v for k, v in row.items())]
+    if stale:
+        raise CliError("rows did not take every value (check column names and types): " + ", ".join(stale[:5]))
+    if args.save:
+        mcp_tool(ctx, "AssetTools", "save_assets", {"asset_paths": [dt.split(".")[0]]})
+    print("applied" + (" and saved" if args.save else " (unsaved; --save, or save in the editor)"))
+    return 0
+
+
+def cmd_api(ctx, args):
+    print(ctx.tether("api", name=args.name, match=args.match or "", limit=args.limit))
+    return 0
+
+
+def jobs_dir(project):
+    return os.path.join(state_dir(project), "jobs")
+
+
+def cmd_job(ctx, args):
+    """Long external work (cooks, commandlets, any command) as background jobs with a log and exit code."""
+    folder = jobs_dir(ctx.project)
+    if args.action == "_run":  # internal: the detached runner that owns the child and records its exit
+        meta = read_json(os.path.join(folder, f"{args.id}.json"))
+        child = None
+        with open(os.path.join(folder, f"{args.id}.log"), "w", encoding="utf-8", errors="replace") as log:
+            try:
+                proc = subprocess.Popen(meta["command"], stdout=log, stderr=subprocess.STDOUT,
+                                        stdin=subprocess.DEVNULL, cwd=os.path.dirname(ctx.project))
+                child = proc.pid
+                write_json(os.path.join(folder, f"{args.id}.json"), dict(meta, child=child))
+                code = proc.wait()
+            except OSError as exc:  # e.g. the program does not exist: record it instead of dying silently
+                print(f"Error: could not start {meta['command'][0]!r}: {exc}", file=log)
+                code = 127
+        write_json(os.path.join(folder, f"{args.id}.json"), dict(meta, child=child, exit=code, ended=time.time()))
+        return 0
+    if args.action in ("start", "cook"):
+        if args.action == "cook":
+            command = uat_command(engine_root(ctx.project)) + [
+                "BuildCookRun", f"-project={ctx.project}", f"-platform={args.platform or host_platform()}",
+                "-clientconfig=Development", "-cook", "-skipstage", "-unattended", "-utf8output", "-nocompileeditor"]
+            name = f"cook {args.platform or host_platform()}"
+        else:
+            command = args.command  # everything after `--` (split off before argparse)
+            if not command:
+                raise CliError("give the command after --: ue job start -- <program> <args...>")
+            name = args.name or os.path.basename(command[0])
+        job_id = time.strftime("%Y%m%d-%H%M%S")
+        os.makedirs(folder, exist_ok=True)
+        write_json(os.path.join(folder, f"{job_id}.json"), {"id": job_id, "name": name, "command": command,
+                                                             "started": time.time()})
+        runner = [sys.executable, os.path.abspath(__file__), "--project", ctx.project, "job", "_run", job_id]
+        detach = ({"creationflags": subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP}
+                  if os.name == "nt" else {"start_new_session": True})
+        proc = subprocess.Popen(runner, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL, close_fds=True, **detach)
+        write_json(os.path.join(folder, f"{job_id}.json"), dict(read_json(os.path.join(folder, f"{job_id}.json")),
+                                                                 runner=proc.pid))
+        print(f"job {job_id} started: {name} (ue job wait {job_id}; ue job log {job_id})")
+        return 0
+    jobs = sorted(f[:-5] for f in os.listdir(folder) if f.endswith(".json")) if os.path.isdir(folder) else []
+    if args.action == "status" and not args.id:
+        if not jobs:
+            print("no jobs")
+        for job_id in jobs[-args.limit:]:
+            print(job_line(folder, job_id))
+        return 0
+    job_id = args.id or (jobs[-1] if jobs else None)
+    if not job_id or job_id not in jobs:
+        raise CliError(f"no job '{args.id}' (ue job status)")
+    if args.action == "status":
+        print(job_line(folder, job_id))
+        return 0
+    if args.action == "log":
+        with open(os.path.join(folder, f"{job_id}.log"), encoding="utf-8", errors="replace") as f:
+            lines = f.read().splitlines()
+        for line in lines[-args.limit:]:
+            print(line)
+        return 0
+    if args.action == "wait":
+        deadline = time.time() + args.wait
+        while "exit" not in (read_json(os.path.join(folder, f"{job_id}.json")) or {}):
+            if job_line(folder, job_id).split("  ")[2] == "lost":
+                raise CliError(f"job {job_id} stopped without recording an exit code (ue job log {job_id})")
+            if time.time() > deadline:
+                raise CliError(f"job {job_id} still running after {args.wait:.0f}s ({job_line(folder, job_id)})", 4)
+            time.sleep(1)
+        meta = read_json(os.path.join(folder, f"{job_id}.json"))
+        with open(os.path.join(folder, f"{job_id}.log"), encoding="utf-8", errors="replace") as f:
+            lines = f.read().splitlines()
+        errors, warnings, _ = compact_diagnostics(lines, os.path.dirname(ctx.project))
+        errors += [l.strip() for l in lines if re.search(r"\bError:", l) and l.strip() not in errors][:10]
+        print(job_line(folder, job_id))
+        print_diagnostics(errors, warnings if args.verbose else [], args.limit)
+        if meta["exit"] and not errors:
+            for line in lines[-5:]:
+                print("  " + line)
+        return 0 if meta["exit"] == 0 else 1
+    raise CliError(f"unknown job action {args.action}")
+
+
+def job_line(folder, job_id):
+    meta = read_json(os.path.join(folder, f"{job_id}.json")) or {}
+    end = meta.get("ended") or time.time()
+    if "exit" in meta:
+        state = "done" if meta["exit"] == 0 else f"FAILED (exit {meta['exit']})"
+    else:
+        alive = pid_alive(meta.get("runner")) or pid_alive(meta.get("child"))
+        state = "running" if alive or time.time() - meta.get("started", 0) < 5 else "lost"
+    last = ""
+    log = os.path.join(folder, f"{job_id}.log")
+    if os.path.isfile(log) and state == "running":
+        with open(log, "rb") as f:
+            f.seek(max(0, os.path.getsize(log) - 400))
+            tail = [l for l in f.read().decode("utf-8", "replace").splitlines() if l.strip()]
+            last = f" | {tail[-1].strip()[:90]}" if tail else ""
+    return f"{job_id}  {meta.get('name', '?')}  {state}  {end - meta.get('started', end):.0f}s{last}"
+
+
 def cmd_actors(ctx, args):
     print(ctx.tether("actors", match=args.match or "", limit=args.limit, pie=args.pie))
     return 0
@@ -1892,6 +2176,9 @@ def undo_msys_paths(argv):
 
 
 def main(argv=None):
+    for stream in (sys.stdout, sys.stderr):  # Windows pipes default to cp1252; editor text is often not
+        if (getattr(stream, "encoding", "") or "").lower() not in ("utf-8", "utf8") and hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
     # Global options are accepted before or after the subcommand (agents write both).
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--project", default=argparse.SUPPRESS,
@@ -1979,6 +2266,30 @@ def main(argv=None):
     s.add_argument("action", choices=["start", "stop", "status"])
     s.add_argument("--simulate", action="store_true", help="Simulate-In-Editor (no player pawn)")
     s.add_argument("--warmup", type=float, default=0.5, help="seconds to let BeginPlay settle (0.5)")
+    s = add("bp", cmd_bp, "Blueprint graphs as text: read, --diff against the last read, --apply edited text")
+    s.add_argument("blueprint", nargs="?", help="/Game/Path/BP_Name")
+    s.add_argument("graph", nargs="?", help="graph name (default: all)")
+    s.add_argument("--diff", action="store_true", help="show only what changed since the last ue bp read")
+    s.add_argument("--apply", metavar="FILE", help="write this DSL into the graph (compiles), then show the diff")
+    s.add_argument("--save", action="store_true", help="save the Blueprint afterwards")
+    s.add_argument("--docs", action="store_true", help="print Epic's graph DSL syntax reference")
+    s = add("table", cmd_table, "DataTable round-trips: show, --export JSON/CSV, --import with a row diff")
+    s.add_argument("table", help="/Game/Path/DT_Name")
+    s.add_argument("--export", metavar="FILE", help="write all rows to FILE (.json or .csv)")
+    s.add_argument("--import", dest="import_file", metavar="FILE", help="upsert rows from FILE (.json or .csv)")
+    s.add_argument("--prune", action="store_true", help="with --import: remove rows missing from FILE")
+    s.add_argument("--dry-run", action="store_true", help="with --import: show the diff only")
+    s.add_argument("--save", action="store_true", help="save the DataTable afterwards")
+    s = add("api", cmd_api, "the unreal Python API: a class's methods and properties, or one member's doc")
+    s.add_argument("name", help="class or class.member, e.g. EditorActorSubsystem or Actor.set_actor_location")
+    s.add_argument("match", nargs="?", help="regex filter on member names")
+    s = add("job", cmd_job, "background jobs for long work: start -- <cmd>, cook, status, wait, log")
+    s.add_argument("action", choices=["start", "cook", "status", "wait", "log", "_run"])
+    s.add_argument("id", nargs="?", help="job id (default: the latest)")
+    s.add_argument("--name", help="label for a started job")
+    s.add_argument("--platform", help="with cook: target platform (default: this host)")
+    s.add_argument("--wait", type=float, default=7200, help="with wait: seconds before giving up (7200)")
+    s.add_argument("-v", "--verbose", action="store_true", help="with wait: also print warnings")
     s = add("init", cmd_init, "set up this project: enable the needed plugins, copy the Tether editor plugin in")
     s.add_argument("--unrealsharp", action="store_true", help="also install TetherUnrealSharp (auto if Script/ exists)")
     s.add_argument("--dry-run", action="store_true", help="show what would change")
@@ -1986,7 +2297,13 @@ def main(argv=None):
     s = add("hook", cmd_hook, "Claude Code hook entry points (hook JSON on stdin)")
     s.add_argument("event", choices=["pre-edit", "pre-mcp", "session-start", "post-edit", "stop"])
 
-    args = p.parse_args(undo_msys_paths(sys.argv[1:] if argv is None else argv))
+    raw = undo_msys_paths(sys.argv[1:] if argv is None else argv)
+    command = []
+    if "job" in raw and "--" in raw[raw.index("job"):]:  # `ue job start [opts] -- <program> <args...>`
+        cut = raw.index("--", raw.index("job"))
+        raw, command = raw[:cut], raw[cut + 1:]
+    args = p.parse_args(raw)
+    args.command = command
     args.timeout_given = hasattr(args, "timeout")
     for key, default in (("project", None), ("port", None), ("timeout", 120.0), ("json", False),
                          ("limit", 30), ("time", False)):
