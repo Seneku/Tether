@@ -205,6 +205,31 @@ Lessons from the spike:
 | First boot after enabling the plugins | — | 434 s, once (the editor had been closed since July) |
 | Load project knowledge | `CLAUDE.md`, 49.4 KB ≈ 12.3k tokens every session | **11.2 KB ≈ 2.8k tokens** of core; eight system docs in `docs/systems/` read only when needed |
 
+**C++ loop on IslandHorror (issue #4, measured 2026-10-12).** One game module, ~70 source files,
+16-core machine with UBA, editor headless. The probe: a clamp in `IslandHorrorCheats.cpp` read by
+`AHorrorCharacter::RefreshMovementSpeed` at BeginPlay, checked as the PIE pawn's `MaxWalkSpeed` with
+`ih.PlayerSpeed 50` (5000 → 10000 → 7500 as the clamp moved 20 → 40 → 30).
+
+| Step | Unity build (project default) | `bUseUnity = false` |
+|---|---|---|
+| `ue build` → Live Coding, first change of the session | 38 s | 9 s |
+| Live Coding, each later change | 30–37 s (UBA 24–30 s) | **6 s** (compile 2.6 s) |
+| `ue build --restart` (close, UBT, headless boot, same map) | 61–65 s | 53 s (full non-unity module build 22 s) |
+| `ue pie start` → read the pawn from Python | ~3 s | ~3 s |
+
+- **Why unity is slow here:** the whole module is one unity file (`Module.IslandHorror.cpp`). Live
+  Coding recompiles it on every change, even when adaptive unity has already split out the edited file,
+  because the object loaded at editor start differs. `ue build` now says so when it sees a
+  `Module.*.cpp` recompile in a slow Live Coding pass.
+- **Unity builds also hid a real bug:** two files defined the same anonymous-namespace constants. That
+  compiled while the files were uncommitted (adaptive unity compiled them alone) and broke once they
+  were committed and merged into one unity file. Non-unity builds cannot hit this.
+- **PIE startup noise:** Ultra Dynamic Weather draws to a render target on its first frame, which
+  fails under `-nullrhi` with "Accessed None … BeginDrawCanvasToRenderTarget". Epic's `StartPIE` then
+  reports failure although PIE runs; `ue pie start` now checks `IsPIERunning` and reports a note.
+- **Verdict:** the restart-free loop works end to end on a real project (edit → `ue build` → `ue pie
+  start` → verify from Python, no manual step). For fast iteration, turn off unity for the game module.
+
 Notes on these results:
 - **Property names:** the "fog amount" turned out to be named `fog`, and one name carries UDS's own typo,
   `Mutliplier`. Neither would have been guessed.
@@ -591,7 +616,7 @@ project's `Plugins/`, and updates hot-reload without restarting the editor.
 
 | Phase | Scope | Exit criterion |
 |---|---|---|
-| 0 — CLI spine | **done in spike:** `status`, `open`, `close`, `build` (Live Coding / UBT routing, compact diagnostics, `--restart`), `tools`, `call`, `log`, per-project port, skill v0. **Dogfooding on IslandHorror since 2026-10-12** (§3): reads 0.85 s instead of ~24 s, automated restart 27.7 s. **To do:** C++ Live Coding and PIE loops there | Sandbox and IslandHorror driven end-to-end without a manual editor step |
+| 0 — CLI spine | **done in spike:** `status`, `open`, `close`, `build` (Live Coding / UBT routing, compact diagnostics, `--restart`), `tools`, `call`, `log`, per-project port, skill v0. **Dogfooding on IslandHorror since 2026-10-12** (§3): reads 0.85 s instead of ~24 s, automated restart 27.7 s. **C++ Live Coding + PIE loop validated there (2026-10-12, §3, #4)** | Sandbox and IslandHorror driven end-to-end without a manual editor step |
 | 1 — Gap toolset | **done in spike:** `py`, `exec`, `props`, `actors`, `level_summary`, `reload`, `pie`, beacon + heartbeat. **Exit criterion met on IslandHorror** (unmodified `inspect_*.py` in 0.85 s). **Since done (2026-10-12):** `set` (one undoable transaction, all-or-nothing, typed parsing of compact values), `shot` (offscreen-render headless mode; the PIE view via `HighResShot`), `test` (Epic's AutomationTestToolset, failures with `file:line` from the log), `--pie` for `actors`/`props`/`set` | the `inspect_*.py` loop replaced; 24 s → sub-second |
 | 2 — Restart-free loop | **done in spike:** Live Coding orchestration, coarse change classifier, automated restart. **To do:** finer classifier (diff reflected declarations), hooks, `smoke` | edit C++ → verified in PIE with no human step |
 | 3 — Depth | Blueprint DSL ergonomics, DataTable/DataAsset round-trips, `api`, `job`, `watch` | Blueprint changes reviewed as text diffs |

@@ -781,6 +781,9 @@ def ubt_build(ctx, args):
     return 0 if ok else 1
 
 
+UNITY_COMPILE = re.compile(r"\] Compile \[\w+\] (Module\.[\w.]+\.cpp)")
+
+
 def live_coding_build(ctx, args, changes):
     log, ubt_log = log_path(ctx.project), ubt_log_path()
     start, ubt_mtime = log_end(ctx.project), os.path.getmtime(ubt_log) if os.path.exists(ubt_log) else 0
@@ -797,13 +800,19 @@ def live_coding_build(ctx, args, changes):
     if result is None:
         raise CliError(f"no Live Coding result within {args.wait:.0f}s (ue log --cat LogLiveCoding)", 4)
     ok = not result.startswith("Live coding failed")
-    errors, warnings = [], []
+    errors, warnings, unity = [], [], []
     if os.path.exists(ubt_log) and os.path.getmtime(ubt_log) > ubt_mtime:
         with open(ubt_log, encoding="utf-8", errors="replace") as f:
-            errors, warnings, _ = compact_diagnostics(f.read().splitlines(), os.path.dirname(ctx.project))
+            ubt_lines = f.read().splitlines()
+        errors, warnings, _ = compact_diagnostics(ubt_lines, os.path.dirname(ctx.project))
+        unity = sorted(set(UNITY_COMPILE.findall("\n".join(ubt_lines))))
     print(f"live coding: {'OK' if ok else 'FAILED'} in {time.time() - started:.1f}s"
           + ("" if ok else f" ({len(errors)} errors)"))
     print_diagnostics(errors, warnings, args.limit)
+    if unity and time.time() - started > 15:
+        print(f"  note: Live Coding recompiled whole-module unity file(s) ({', '.join(unity)}). Setting "
+              "`bUseUnity = false;` in those modules' Build.cs makes it compile only the changed files "
+              "(measured on a mid-size game: 30 s -> 6 s per change)")
     if ok and changes and changes[2]:
         names = ", ".join(os.path.basename(p) for p in changes[2][:4])
         print(f"  note: reflected headers changed ({names}). Function bodies and new UFUNCTIONs are live "
@@ -1273,6 +1282,11 @@ def cmd_pie(ctx, args):
     if args.action == "start":
         options = {"bSimulate": args.simulate, "playMode": "PlayMode_InViewPort", "warmupSeconds": args.warmup}
         text, is_error = ctx.mcp.call(toolset, "StartPIE", {"options": options})
+        if is_error and unwrap(ctx.mcp.call(toolset, "IsPIERunning", {})[0]) is True:
+            # Epic fails the call when anything logged a script error during startup (e.g. a Blueprint
+            # drawing to a render target under -nullrhi), although PIE is running. Report, don't fail.
+            print(f"note: PIE started, but startup logged: {compact_error(text)[:160]}")
+            is_error = False
         if is_error:
             with open(log_path(ctx.project), "rb") as f:
                 f.seek(start)

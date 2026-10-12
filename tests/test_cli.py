@@ -145,6 +145,10 @@ class Builds(unittest.TestCase):
         finally:
             project.close()
 
+    def test_unity_compile_detection(self):
+        log = "[1/2] Compile [x64] Cheats.cpp\n[2/2] Compile [x64] Module.Game.cpp\n[1/1] Compile [x64] Module.Game.2.cpp"
+        self.assertEqual(ue.UNITY_COMPILE.findall(log), ["Module.Game.cpp", "Module.Game.2.cpp"])
+
     def test_classify_changes(self):
         project = Project()
         try:
