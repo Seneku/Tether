@@ -46,18 +46,33 @@ def _run_python(code):
     return out
 
 
-def _actors():
+def _game_world():
+    return unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_game_world()
+
+
+def _actors(pie=False):
+    game = _game_world()
+    if pie:
+        if game is None:
+            raise RuntimeError("PIE is not running")
+        return unreal.GameplayStatics.get_all_actors_of_class(game, unreal.Actor)
+    if game is not None:
+        # During PIE the editor subsystems refuse to touch the edited level ("The Editor is currently in a
+        # play mode"), but the editor world is still loaded under the PIE world's path minus UEDPIE_<n>_.
+        editor_world = unreal.find_object(None, re.sub(r"UEDPIE_\d+_", "", game.get_path_name()))
+        if editor_world is not None:
+            return unreal.GameplayStatics.get_all_actors_of_class(editor_world, unreal.Actor)
     return unreal.get_editor_subsystem(unreal.EditorActorSubsystem).get_all_level_actors()
 
 
-def _match_actors(ref):
+def _match_actors(ref, pie=False):
     key = ref.lower()
-    actors = _actors()
+    actors = _actors(pie)
     exact = [a for a in actors if key in (a.get_actor_label().lower(), a.get_name().lower())]
     return exact or [a for a in actors if key in a.get_actor_label().lower()]
 
 
-def _resolve(ref):
+def _resolve(ref, pie=False):
     """Find an object by object/asset path, actor label or name, or 'ActorLabel.ComponentName'."""
     if "/" in ref:
         obj = unreal.find_object(None, ref)
@@ -67,9 +82,9 @@ def _resolve(ref):
         if obj is not None:
             return obj
     actor_ref, _, comp_ref = ref.partition(".")
-    matches = _match_actors(actor_ref)
+    matches = _match_actors(actor_ref, pie)
     if not matches and comp_ref:
-        matches, comp_ref = _match_actors(ref), ""
+        matches, comp_ref = _match_actors(ref, pie), ""
     if not matches:
         raise RuntimeError(f"not found: {ref}")
     if len(matches) > 1:
@@ -141,6 +156,118 @@ def _csharp():
     return lib
 
 
+_NUMBERS = re.compile(r"^\(?\s*(-?[\d.]+(?:[eE][-+]?\d+)?(?:\s*,\s*-?[\d.]+(?:[eE][-+]?\d+)?)*)\s*\)?$")
+_ACTOR_POSE = ("location", "rotation", "scale")  # set through the actor, not reflected properties
+
+
+def _numbers(text):
+    match = _NUMBERS.match(text.strip())
+    if not match:
+        return None
+    return [float(v) if any(c in v for c in ".eE") else int(v) for v in match.group(1).split(",")]
+
+
+def _parse(raw, entry, old):
+    """Turn compact text into the JSON value ToolsetLibrary expects, using the property's schema.
+
+    Accepts JSON, true/false, numbers, positional tuples for structs ('1,2,3' fills x,y,z in schema
+    order; missing trailing fields keep their current values), object paths, and enum names."""
+    text = raw.strip()
+    if isinstance(entry, dict) and entry.get("type") == "string":
+        return raw
+    props = entry.get("properties") if isinstance(entry, dict) else None
+    nums = _numbers(text)
+    if nums is not None and props and "refPath" not in props:
+        if len(nums) > len(props):
+            raise ValueError(f"{len(nums)} values for {len(props)} fields ({', '.join(props)})")
+        merged = dict(old) if isinstance(old, dict) else {}
+        merged.update(zip(props, nums))
+        return merged
+    kind = entry.get("type") if isinstance(entry, dict) else None
+    if kind == "boolean":
+        flag = {"true": True, "1": True, "yes": True, "on": True,
+                "false": False, "0": False, "no": False, "off": False}.get(text.lower())
+        if flag is None:
+            raise ValueError(f"expected true/false, got '{text}'")
+        return flag
+    if isinstance(entry, dict) and "enum" in entry:
+        names = {str(e).lower(): e for e in entry["enum"]}
+        bare = text.split("::")[-1].lower()
+        if bare not in names:
+            raise ValueError(f"expected one of {', '.join(map(str, entry['enum'][:12]))}, got '{text}'")
+        return names[bare]
+    try:
+        value = json.loads(text)
+    except ValueError:
+        value = None
+    if kind in ("number", "integer"):
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            raise ValueError(f"expected a number, got '{text}'")
+        return value
+    if value is not None:
+        return value
+    if props and "refPath" in props:
+        return {"refPath": text}
+    if props:
+        raise ValueError(f"expected {','.join(props)} (or JSON), got '{text}'")
+    return text
+
+
+def _add(old, delta, name):
+    if isinstance(old, (int, float)) and isinstance(delta, (int, float)):
+        return old + delta
+    if isinstance(old, dict) and isinstance(delta, dict):
+        return {k: (v + delta[k] if k in delta and isinstance(v, (int, float)) else v) for k, v in old.items()}
+    raise ValueError(f"'{name}' does not support += (not a number or numeric struct)")
+
+
+def _compact(value):
+    """Numeric structs as '(1, 2, 3)', everything else as in props."""
+    value = _round(value)
+    if isinstance(value, dict) and value and all(isinstance(v, (int, float)) for v in value.values()):
+        return "(" + ", ".join(f"{0 if abs(v) < 1e-6 else v:g}" for v in value.values()) + ")"
+    return _short(value)
+
+
+def _vec(d):
+    return unreal.Vector(d["x"], d["y"], d["z"])
+
+
+def _rot(d):
+    return unreal.Rotator(roll=d["roll"], pitch=d["pitch"], yaw=d["yaw"])
+
+
+def _actor_pose(actor):
+    loc, rot, scl = actor.get_actor_location(), actor.get_actor_rotation(), actor.get_actor_scale3d()
+    return {"location": {"x": loc.x, "y": loc.y, "z": loc.z},
+            "rotation": {"pitch": rot.pitch, "yaw": rot.yaw, "roll": rot.roll},
+            "scale": {"x": scl.x, "y": scl.y, "z": scl.z}}
+
+
+_POSE_FIELDS = {"location": {"properties": {"x": 0, "y": 0, "z": 0}},
+                "rotation": {"properties": {"pitch": 0, "yaw": 0, "roll": 0}},
+                "scale": {"properties": {"x": 0, "y": 0, "z": 0}}}
+
+
+def _point_and_extent(ref, pie):
+    """An actor's (or component owner's) bounds centre and extent."""
+    obj = _resolve(ref, pie)
+    actor = obj if isinstance(obj, unreal.Actor) else (obj.get_owner() if isinstance(obj, unreal.ActorComponent) else None)
+    if actor is None:
+        raise RuntimeError(f"'{ref}' is not an actor or component")
+    return actor.get_actor_bounds(False)
+
+
+def _point(ref, pie):
+    """'x,y,z' or an actor reference (its bounds centre) as an unreal.Vector."""
+    nums = _numbers(ref)
+    if nums is not None:
+        if len(nums) != 3:
+            raise RuntimeError(f"expected x,y,z, got '{ref}'")
+        return unreal.Vector(*nums)
+    return _point_and_extent(ref, pie)[0]
+
+
 _reload = {"handle": None}
 
 
@@ -209,18 +336,19 @@ class TetherCore(unreal.ToolsetDefinition):
 
     @toolset_registry.tool_call
     @staticmethod
-    def props(target: str, match: str = "", limit: int = 80) -> str:
+    def props(target: str, match: str = "", limit: int = 80, pie: bool = False) -> str:
         """List an object's reflected properties as 'name: Type = value' lines.
 
         Args:
             target: Object or asset path, actor label or name, or 'ActorLabel.ComponentName'.
             match: Case-insensitive regex matched against property name and type.
             limit: Maximum number of property lines.
+            pie: Resolve actors in the PIE world instead of the editor level.
 
         Returns:
             A header naming the resolved object, then one line per property.
         """
-        obj = _resolve(target)
+        obj = _resolve(target, pie)
         cls = obj if isinstance(obj, unreal.Struct) else obj.get_class()
         schema = json.loads(unreal.ToolsetLibrary.list_struct_properties(cls))
         names = list(schema)
@@ -234,19 +362,176 @@ class TetherCore(unreal.ToolsetDefinition):
 
     @toolset_registry.tool_call
     @staticmethod
-    def actors(match: str = "", limit: int = 60) -> str:
+    def set_props(target: str, values: str, pie: bool = False) -> str:
+        """Set reflected properties from compact text, as one undoable editor transaction.
+
+        Values are JSON, true/false, numbers, enum names, object paths, or positional tuples for
+        structs ('0,0,200' for a Vector; missing trailing fields keep their values). A key ending
+        in '+' adds to the current value. Actors also accept location, rotation and scale. If any
+        property fails, the whole change is rolled back.
+
+        Args:
+            target: Object or asset path, actor label or name, or 'ActorLabel.ComponentName'.
+            values: JSON object of property name to value text, e.g. {"Intensity": "10", "location+": "0,0,200"}.
+            pie: Change the PIE world instead of the editor level (not undoable, not saved).
+
+        Returns:
+            One 'name: old -> new' line per property.
+        """
+        obj = _resolve(target, pie)
+        cls = obj if isinstance(obj, unreal.Struct) else obj.get_class()
+        schema = json.loads(unreal.ToolsetLibrary.list_struct_properties(cls))
+        by_lower = {n.lower(): n for n in schema}
+        is_actor = isinstance(obj, unreal.Actor)
+        requested = json.loads(values)
+        if not isinstance(requested, dict) or not requested:
+            raise RuntimeError('values must be a non-empty JSON object, e.g. {"Intensity": "10"}')
+
+        plan = []  # (name, relative, raw)
+        for key, raw in requested.items():
+            relative = key.endswith("+")
+            base = key[:-1] if relative else key
+            if is_actor and base.lower() in _ACTOR_POSE and base.lower() not in by_lower:
+                plan.append((base.lower(), relative, raw))
+                continue
+            name = by_lower.get(base.lower())
+            if name is None:
+                import difflib
+                close = difflib.get_close_matches(base.lower(), list(by_lower), n=4, cutoff=0.6)
+                owners = []
+                if is_actor:  # actors usually keep the interesting properties on a component
+                    for comp in obj.get_components_by_class(unreal.ActorComponent):
+                        names = json.loads(unreal.ToolsetLibrary.list_struct_properties(comp.get_class()))
+                        if base.lower() in (n.lower() for n in names):
+                            owners.append(f"{obj.get_actor_label()}.{comp.get_name()}")
+                raise RuntimeError(f"{_label(obj)} has no property '{base}'"
+                                   + (f"; it is on {', '.join(owners[:3])}" if owners else "")
+                                   + (f" (did you mean: {', '.join(by_lower[c] for c in close)})" if close and not owners else ""))
+            plan.append((name, relative, raw))
+
+        reflected = [n for n, _, _ in plan if n in schema]
+        old = json.loads(unreal.ToolsetLibrary.get_object_properties(obj, reflected)) if reflected else {}
+        if is_actor:
+            old.update({k: v for k, v in _actor_pose(obj).items() if any(n == k for n, _, _ in plan)})
+        new = {}
+        for name, relative, raw in plan:
+            entry = schema.get(name) or _POSE_FIELDS[name]
+            try:
+                # A relative change parses as a pure delta: unspecified fields are 0, not the current value.
+                value = _parse(raw if isinstance(raw, str) else json.dumps(raw), entry,
+                               {k: 0 for k in entry.get("properties", {})} if relative else old.get(name))
+                new[name] = _add(old.get(name), value, name) if relative else value
+            except ValueError as exc:
+                raise RuntimeError(f"{name}: {exc}") from None
+
+        def apply():
+            props = {n: v for n, v in new.items() if n in schema}
+            try:
+                ok = not props or unreal.ToolsetLibrary.set_object_properties(obj, json.dumps(props))
+            except Exception as exc:  # Epic raises with the full object path; keep the useful tail
+                detail = re.split(r"could not be set: ", str(exc), maxsplit=1)[-1].strip()
+                raise RuntimeError(f"could not set {detail}") from None
+            if not ok:
+                raise RuntimeError("invalid value (see ue log)")
+            if "location" in new:
+                obj.set_actor_location(_vec(new["location"]), False, True)
+            if "rotation" in new:
+                obj.set_actor_rotation(_rot(new["rotation"]), True)
+            if "scale" in new:
+                obj.set_actor_scale3d(_vec(new["scale"]))
+
+        if pie:
+            apply()
+        else:
+            failure, before = None, unreal.ToolsetLibrary.get_active_undo_count()
+            with unreal.ScopedEditorTransaction(f"ue set {_label(obj)}"):
+                obj.modify()
+                if is_actor and obj.root_component and any(n in _ACTOR_POSE for n in new):
+                    obj.root_component.modify()
+                try:
+                    apply()
+                except Exception as exc:  # roll back below, once the transaction is closed
+                    failure = exc
+            if failure is not None:
+                # Undo only if our transaction was recorded; an empty one is dropped, and undoing then
+                # would revert the user's previous action instead.
+                rolled = unreal.ToolsetLibrary.get_active_undo_count() > before
+                if rolled:
+                    unreal.ToolsetLibrary.undo_transaction(False)
+                raise RuntimeError(f"{failure}" + (" (rolled back)" if rolled else " (nothing was changed)"))
+
+        after = json.loads(unreal.ToolsetLibrary.get_object_properties(obj, reflected)) if reflected else {}
+        if is_actor:
+            after.update(_actor_pose(obj))
+        rows = [f"{n}: {_compact(old.get(n))} -> {_compact(after.get(n))}" for n in new]
+        return "\n".join([_label(obj) + (" (PIE)" if pie else "")] + rows)
+
+    @toolset_registry.tool_call
+    @staticmethod
+    def shot_pose(actor: str = "", at: str = "", look_at: str = "", rot: str = "") -> str:
+        """Camera pose for a viewport capture, as ToolsetTransform JSON.
+
+        Starts from the level viewport camera (or the player camera while PIE runs), then applies
+        the options in order: frame an actor, move to a point, aim at a point, set a rotation.
+
+        Args:
+            actor: Frame this actor: keep the view direction and back off to fit its bounds.
+            at: Camera location 'x,y,z'.
+            look_at: Aim at 'x,y,z' or at an actor's bounds centre.
+            rot: Camera rotation 'pitch,yaw,roll'.
+
+        Returns:
+            {"location": ..., "rotation": ..., "scale": ...}
+        """
+        game = _game_world()
+        pie = game is not None
+        cam = unreal.GameplayStatics.get_player_camera_manager(game, 0) if pie else None
+        if cam is not None:
+            loc, rotation = cam.get_camera_location(), cam.get_camera_rotation()
+        elif pie:  # Simulate-In-Editor has no player; the shot is the viewport either way
+            loc, rotation = unreal.Vector(), unreal.Rotator()
+        else:
+            loc, rotation = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_level_viewport_camera_info()
+        if actor:
+            centre, extent = _point_and_extent(actor, pie)
+            distance = max(extent.length() * 2.2, 150.0)
+            loc = centre - rotation.get_forward_vector() * distance
+            rotation = unreal.MathLibrary.find_look_at_rotation(loc, centre)
+        if at:
+            nums = _numbers(at)
+            if not nums or len(nums) != 3:
+                raise RuntimeError(f"at: expected x,y,z, got '{at}'")
+            loc = unreal.Vector(*nums)
+        if look_at:
+            rotation = unreal.MathLibrary.find_look_at_rotation(loc, _point(look_at, pie))
+        if rot:
+            nums = _numbers(rot)
+            if not nums or len(nums) != 3:
+                raise RuntimeError(f"rot: expected pitch,yaw,roll, got '{rot}'")
+            rotation = unreal.Rotator(roll=nums[2], pitch=nums[0], yaw=nums[1])
+        return json.dumps({"location": {"x": loc.x, "y": loc.y, "z": loc.z},
+                           "rotation": {"pitch": rotation.pitch, "yaw": rotation.yaw, "roll": rotation.roll},
+                           "scale": {"x": 1, "y": 1, "z": 1}, "pie": pie,
+                           # Simulate-In-Editor possesses a SpectatorPawn and has no game viewport to shoot
+                           "simulate": pie and (cam is None or isinstance(
+                               unreal.GameplayStatics.get_player_pawn(game, 0), unreal.SpectatorPawn))})
+
+    @toolset_registry.tool_call
+    @staticmethod
+    def actors(match: str = "", limit: int = 60, pie: bool = False) -> str:
         """List actors in the editor level as 'label  Class  (x, y, z)' lines.
 
         Args:
             match: Case-insensitive regex matched against actor label and class.
             limit: Maximum number of actor lines.
+            pie: List the PIE world's actors instead.
 
         Returns:
             A count header, then one line per actor.
         """
         rx = re.compile(match, re.I) if match else None
         rows = []
-        for actor in _actors():
+        for actor in _actors(pie):
             label, cls = actor.get_actor_label(), actor.get_class().get_name()
             if rx and not (rx.search(label) or rx.search(cls)):
                 continue

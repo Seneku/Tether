@@ -12,11 +12,22 @@ milliseconds. A `-run=pythonscript` commandlet takes ~25 s and floods the log.
 - `ue status`: is the editor up, which map, PIE on/off, heartbeat. Exit code 2 = not available.
 - `ue call tether.level_summary`: what is in the level (counts by class).
 - `ue actors <regex>`: label, class, location. `ue props <Actor|Actor.Component|/Game/Path> [regex]`:
-  names, types and **values**. Use these instead of guessing property names.
+  names, types and **values**. Use these instead of guessing property names. Add `--pie` to read the
+  PIE world instead of the edited level.
+- `ue shot`: PNG of the viewport (the player's view during PIE) saved under `Saved/Tether/shots/`; prints
+  the path and size. Open it only when you need to see it. Frame a view with `--actor <A>`,
+  `--at x,y,z --look-at <A|x,y,z>` or `--rot p,y,r`; `--annotate` overlays a world grid and actor labels.
+  Needs a rendering editor: `ue open --headless --render` (plain `--headless` is `-nullrhi`).
 
 ## Doing things
 - `ue py "<code>"`, `ue py -f script.py` or `ue py -` (stdin): unrestricted editor Python. `unreal` is
   pre-imported, the namespace persists between calls, and a trailing expression is printed.
+- `ue set <target> name=value [name+=delta ...]`: write properties as one undoable transaction, and
+  print `old -> new` for each. Values: numbers, true/false, enum names, object paths, JSON, or tuples
+  for structs (`location+=0,0,200`, `lightColor=1,0.5,0.2`; missing trailing fields keep their values).
+  Actors also take `location`, `rotation` (pitch,yaw,roll) and `scale`. If one value fails, nothing
+  changes. `--pie` edits the running game instead (not undoable, not saved). Prefer this over `ue py`
+  for property edits.
 - `ue exec "<console command>" [--pie]`: runs the command and prints the log lines it produced.
 - `ue tools [query]` lists Epic toolsets; `ue tools <toolset>` gives one-line signatures;
   `ue tools <toolset>:<tool>` gives one schema. **Never** dump a whole toolset schema: one Niagara toolset is ~77k tokens.
@@ -62,6 +73,15 @@ milliseconds. A `-run=pythonscript` commandlet takes ~25 s and floods the log.
 - After structural changes to a C# **subsystem** (new members or signatures), test PIE straight away.
   If `ue pie start` reports `InvalidCastException`, run `ue build --restart` (about 20 s).
 - `ue call tether.cs_state` reports idle, pending or reloading.
+
+## Automated tests
+- `ue test <filter>` runs automation tests in the live editor and prints one summary line plus each
+  failure with its source line; exit code 1 if any failed. Filter syntax is Epic's: a substring,
+  `^Prefix`, `Suffix$`, `StartsWith:X`, `Group:Name`, joined with `+`. Never run without a filter (the
+  engine has ~9k tests). Anchor project filters (`^MyGame.`): a bare substring also matches engine
+  tests, and some of those change the open level. `ue test --list <substring>` lists names; `-v` adds
+  warnings.
+- New tests compiled with `ue build` are picked up automatically.
 
 ## Play testing
 - `ue pie start` / `ue pie stop` / `ue pie status`. Status explains a session that died (fatal error

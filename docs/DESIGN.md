@@ -268,6 +268,23 @@ Notes on these results:
   (`LiveCodingModule.cpp`), and `LiveCodingToolset` wraps `ILiveCodingModule::Compile(WaitForCompletion)`.
 - **Security:** binds to `127.0.0.1` only and validates `Origin` against DNS rebinding; there is no
   auth token, so any local process can call it.
+- **Capture quirks (measured 2026-10-12):** `EditorAppToolset.CaptureViewport` needs `captureTransform`
+  *and* `annotations`, although its schema marks both optional ("needs a default value" otherwise).
+  It fails with "Viewport has zero size" under `-nullrhi`, but works headless with `-RenderOffscreen`
+  (no window; 799x525 by default). During PIE it still renders the *editor* world from the given pose,
+  so `ue shot` uses `HighResShot` in the PIE world instead.
+- **Automation tests:** `AutomationTestToolset.RunTestsByFilter` blocks until the run ends and returns
+  per-test state, duration and messages, but no source locations; those are only in the log
+  (`LogAutomationController: Error: <message> [<file>(<line>)]`). Tests added through Live Coding appear
+  after `DiscoverTests(bForceRediscover=true)`. The MCP call is marked failed when any test logs a script
+  warning (Epic's own `TestFailingCppToolFromSandbox` logs "Bug in this tool" on purpose), although the
+  run completed; `ue test` then reads `GetTestResults`. Some engine tests (`AI.ToolsetRegistry.Sandbox.*`)
+  replace the open level, so project filters should be anchored (`^MyGame.`).
+- **Property writes:** `ToolsetLibrary.set_object_properties` is not transactional (partial writes
+  stick) and accepts some invalid strings silently (`"maybe"` became `false` for a bool, `"nonsense"`
+  zeroed a color). `ue set` validates against the schema first, and wraps the write in a transaction it
+  undoes on failure. During PIE, `EditorActorSubsystem.get_all_level_actors()` returns nothing; the
+  edited world is still reachable at the PIE world's path minus `UEDPIE_<n>_`.
 - Also useful: `ModelContextProtocol.GenerateClientConfig ClaudeCode` writes a `.mcp.json` for
   Claude Code; `UToolsetRegistrySettings` has `AllowedNames` / `BlockedNames` to trim toolsets;
   `MCPClientToolset` lets Epic's own assistant call *external* MCP servers.
@@ -562,7 +579,7 @@ project's `Plugins/`, and updates hot-reload without restarting the editor.
 | Phase | Scope | Exit criterion |
 |---|---|---|
 | 0 — CLI spine | **done in spike:** `status`, `open`, `close`, `build` (Live Coding / UBT routing, compact diagnostics, `--restart`), `tools`, `call`, `log`, per-project port, skill v0. **Dogfooding on IslandHorror since 2026-10-12** (§3): reads 0.85 s instead of ~24 s, automated restart 27.7 s. **To do:** C++ Live Coding and PIE loops there | Sandbox and IslandHorror driven end-to-end without a manual editor step |
-| 1 — Gap toolset | **done in spike:** `py`, `exec`, `props`, `actors`, `level_summary`, `reload`, `pie`, beacon + heartbeat. **Exit criterion met on IslandHorror** (unmodified `inspect_*.py` in 0.85 s). **To do:** `get`/`set`, `shot`, `test` | the `inspect_*.py` loop replaced; 24 s → sub-second |
+| 1 — Gap toolset | **done in spike:** `py`, `exec`, `props`, `actors`, `level_summary`, `reload`, `pie`, beacon + heartbeat. **Exit criterion met on IslandHorror** (unmodified `inspect_*.py` in 0.85 s). **Since done (2026-10-12):** `set` (one undoable transaction, all-or-nothing, typed parsing of compact values), `shot` (offscreen-render headless mode; the PIE view via `HighResShot`), `test` (Epic's AutomationTestToolset, failures with `file:line` from the log), `--pie` for `actors`/`props`/`set` | the `inspect_*.py` loop replaced; 24 s → sub-second |
 | 2 — Restart-free loop | **done in spike:** Live Coding orchestration, coarse change classifier, automated restart. **To do:** finer classifier (diff reflected declarations), hooks, `smoke` | edit C++ → verified in PIE with no human step |
 | 3 — Depth | Blueprint DSL ergonomics, DataTable/DataAsset round-trips, `api`, `job`, `watch` | Blueprint changes reviewed as text diffs |
 | 4 — Scripting | **UnrealSharp trial done in Sandbox:** headless project creation, C# pre-build in `ue open`, bridge-driven reload in `ue build` (0.6–1.2 s, structural changes included), one-line C# errors. **Gameplay feature done** (coins + score subsystem + combo, verified in PIE through `ue`). **Since done:** PreToolUse hooks that block C# edits while PIE runs and Epic's `StartPIE` while C# is unreloaded; `ue pie start` reloads pending C# first (works around UnrealSharp's recompile-on-lookup, §2); headless editors log dialogs instead of hanging on them. **Reported upstream:** [#774](https://github.com/UnrealSharp/UnrealSharp/issues/774) (recompile on lookup), [#775](https://github.com/UnrealSharp/UnrealSharp/issues/775) (.NET discovery + `StartupModule` recursion), [#776](https://github.com/UnrealSharp/UnrealSharp/issues/776) (headless reload). **To do:** Angelscript in a later pass | C# features iterated with no restarts |

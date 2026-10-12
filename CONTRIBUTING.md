@@ -57,7 +57,9 @@ There is no automated test suite yet. Before opening a PR:
 1. `python -m compileall -q cli Plugins/Tether/Content/Python` (syntax check)
 2. Against the Sandbox editor, run the commands your change touches, plus a smoke pass:
    `ue status`, `ue call tether.level_summary`, `ue actors light`,
-   `ue props DirectionalLight.LightComponent0 intensity`, `ue log --level Warning`.
+   `ue props DirectionalLight.LightComponent0 intensity`, `ue test ^Sandbox.`, `ue log --level Warning`.
+   For capture changes, open with `ue open --headless --render` and check `ue shot` both outside and
+   during PIE.
 3. If you touched build, lifecycle or PIE code, also run `ue build`, `ue build --restart`,
    `ue pie start` / `ue pie stop`, and `ue close`.
 4. For C# changes, `Sandbox/Scripts/coin_smoke.py` exercises the UnrealSharp coin feature during PIE.

@@ -39,6 +39,7 @@ costs a full editor restart. Tether keeps one editor running and talks to it.
 | C++ function-body change | Live Coding by hand; the real error only appears in a separate UBT log | **~4.5 s** Live Coding via `ue build`, one-line diagnostics |
 | Reflection / `Build.cs` change | ~53 s restart plus manual clicks | **24 s** automated `ue build --restart`, zero clicks |
 | C# change ([UnrealSharp](https://github.com/UnrealSharp/UnrealSharp)) | no agent-callable reload; restart the editor | **0.6–1.2 s** hot reload via `ue build` |
+| Run a project's automation tests | separate headless test run, thousands of log lines | **~1 s** for a small suite in the live editor: one summary line plus `file:line` per failure |
 
 In a head-to-head on the same tasks against Epic's official Claude Code plugin, the agent read **629 B**
 of tool output with Tether and **~97 KB** with Epic's plugin. Epic's tools also could not reload C#: they
@@ -113,13 +114,16 @@ and a private mid-size C++/Blueprint game. Methodology is in [docs/DESIGN.md](do
 | Command | What it does |
 |---|---|
 | `ue status` | Editor state from the beacon: map, PIE, PID, port, heartbeat. No HTTP. |
-| `ue open [--headless] [--map M]` | Launch on a per-project port and wait until ready. Prints boot errors, de-duplicated. |
+| `ue open [--headless [--render]] [--map M]` | Launch on a per-project port and wait until ready. Prints boot errors, de-duplicated. `--headless` has no window and no renderer (`-nullrhi`); add `--render` to render offscreen for `ue shot`. |
 | `ue close [--save\|--discard\|--force]` | Quit gracefully. Refuses to drop unsaved work unless told to. |
 | `ue build [--restart]` | Uses Live Coding if the editor is up and UBT if not, plus C# hot reload. `--restart` covers reflection and `Build.cs` changes: save, close, build, reopen the same map. |
 | `ue py "<code>"` / `-f file` / `-` | Unrestricted editor Python with a persistent namespace. A trailing expression is printed. |
 | `ue exec "<console cmd>" [--pie]` | Run a console command and print the log lines it produced. |
-| `ue actors [regex]` | Actors in the level: label, class, location. |
-| `ue props <target> [regex]` | Reflected properties with **values**, for an actor, a component or a `/Game/...` asset. |
+| `ue actors [regex] [--pie]` | Actors in the level (or the PIE world): label, class, location. |
+| `ue props <target> [regex] [--pie]` | Reflected properties with **values**, for an actor, a component or a `/Game/...` asset. |
+| `ue set <target> name=value [name+=delta ...] [--pie]` | Write properties as one undoable transaction and print `old -> new`. Takes numbers, booleans, enum names, object paths, JSON, or tuples for structs (`location+=0,0,200`). Actors also take `location`, `rotation` and `scale`. All-or-nothing: if one value fails, nothing changes. |
+| `ue shot [--actor A \| --at x,y,z --look-at A] [--annotate]` | Save a PNG of the viewport to `Saved/Tether/shots/` and print the path, so the agent opens it only when needed. During PIE it captures the player's view. `--annotate` overlays Epic's world grid and actor labels. |
+| `ue test <filter> [--list] [-v]` | Run automation tests in the live editor. Prints one summary line, plus each failure with its source line. Exits 1 on any failure. Uses Epic's filter syntax; anchor project tests (`^MyGame.`) so engine tests don't get pulled in. |
 | `ue tools [toolset[:tool]]` | Browse Epic's and Tether's tools as one-line signatures instead of full schema dumps. |
 | `ue call <toolset>.<tool> k=v ...` | Call any registered tool. Required blank parameters are filled in for you. |
 | `ue log [--level L] [--cat C] [--grep re] [--since start]` | New log entries since the last call, de-duplicated. The cursor is kept on disk. |

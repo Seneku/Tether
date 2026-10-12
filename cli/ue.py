@@ -21,6 +21,8 @@ import zlib
 TETHER = "tether.toolsets.TetherCore"
 LEVELS = {"Fatal": 0, "Error": 1, "Warning": 2, "Display": 3, "Log": 4, "Verbose": 5, "VeryVerbose": 6}
 NOISE = {"LogModelContextProtocol", "LogToolsetRegistry"}  # our own transport chatter
+# Epic logs this whenever a schema is generated for a class with delegates (props, set, describe_toolset).
+NOISE_MESSAGE = re.compile(r"^Property \"\w+\" type \w+ unhandled during Json schema generation")
 LOG_LINE = re.compile(r"^(?:\[[^\]]*\]\[[^\]]*\])?([A-Za-z0-9_]+): (?:(Fatal|Error|Warning|Display|Verbose|VeryVerbose): )?(.*)$")
 
 
@@ -428,7 +430,7 @@ def filter_log(lines, level="Warning", category=None, pattern=None):
         if not m:
             continue
         cat, lvl, msg = m.group(1), m.group(2) or "Log", m.group(3)
-        if cat in NOISE or (cat == "Cmd" and msg.strip() == "FLUSHLOG"):
+        if cat in NOISE or (cat == "Cmd" and msg.strip() == "FLUSHLOG") or (cat == "LogJson" and NOISE_MESSAGE.match(msg)):
             continue
         if lvl in ("Error", "Fatal"):
             msg += user_frame(lines, index)
@@ -780,6 +782,7 @@ def cmd_build(ctx, args):
         print("  editor left closed because the build failed")
         return code
     code = cmd_open(ctx, argparse.Namespace(map=reopen_map, headless=launch.get("headless", False),
+                                            render=launch.get("render", False),
                                             unattended=launch.get("unattended"), no_build=True,
                                             limit=args.limit, wait=600, no_wait=False))
     print(f"restart cycle: {time.time() - started:.1f}s total")
@@ -808,19 +811,23 @@ def cmd_open(ctx, args):
     unattended = args.unattended if args.unattended is not None else bool(args.headless and not has_csharp)
     if args.headless:
         # Agent-only session: never block on the "restore unsaved packages?" prompt.
-        cmd += ["-nullrhi", "-nosound", "-AutoDeclinePackageRecovery"]
+        # --render keeps a GPU renderer with no window (-RenderOffscreen), for `ue shot`; plain headless
+        # skips rendering entirely (-nullrhi), which boots faster and leaves the viewport zero-sized.
+        cmd += ["-RenderOffscreen" if args.render else "-nullrhi", "-nosound", "-AutoDeclinePackageRecovery"]
         if not unattended:
             # Attended for UnrealSharp, but nobody can see a dialog: log each one and take its default.
             cmd += ["-RUNNINGUNATTENDEDSCRIPT"]
     if unattended:
         cmd += ["-unattended"]
     write_json(os.path.join(state_dir(ctx.project), "launch.json"),
-               {"headless": bool(args.headless), "unattended": unattended, "port": port})
+               {"headless": bool(args.headless), "render": bool(args.render or not args.headless),
+                "unattended": unattended, "port": port})
     started = time.time()
     flags = (subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP) if os.name == "nt" else 0
     proc = subprocess.Popen(cmd, creationflags=flags, stdin=subprocess.DEVNULL, env=env,
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True)
-    mode = ", ".join(m for m, on in (("headless", args.headless), ("unattended", unattended)) if on)
+    mode = ", ".join(m for m, on in (("headless", args.headless), ("offscreen render", args.headless and args.render),
+                                     ("unattended", unattended)) if on)
     print(f"launched pid {proc.pid} on mcp :{port}" + (f" ({mode})" if mode else ""))
     if args.no_wait:
         return 0
@@ -950,12 +957,191 @@ def cmd_py(ctx, args):
 
 
 def cmd_props(ctx, args):
-    print(ctx.tether("props", target=args.target, match=args.match or "", limit=args.limit))
+    print(ctx.tether("props", target=args.target, match=args.match or "", limit=args.limit, pie=args.pie))
     return 0
 
 
+def cmd_set(ctx, args):
+    values = {}
+    for pair in args.assignments:
+        key, sep, raw = pair.partition("=")
+        if not sep or not key.strip():
+            raise CliError(f"expected name=value or name+=delta, got '{pair}'")
+        values[key.strip()] = raw
+    try:
+        print(ctx.tether("set_props", target=args.target, values=json.dumps(values), pie=args.pie))
+    except CliError as exc:  # Epic prefixes its own report, with the object's full path
+        raise CliError(re.sub(r"SetObjectProperties on '[^']*' \((\w+)\): the following properties could not be "
+                              r"set: (.*?) (?=invalid value)", r"\1.\2: ", str(exc))) from None
+    return 0
+
+
+NO_ANNOTATIONS = {"gridSpacing": 0, "gridExtent": 0, "gridHeight": 0, "maxLabelDistance": 0,
+                  "classFilter": {"refPath": ""}, "maxLabels": 0}
+ANNOTATIONS = {"gridSpacing": 500, "gridExtent": 10000, "gridHeight": 0, "maxLabelDistance": 5000,
+               "classFilter": {"refPath": ""}, "maxLabels": 15}
+
+
+def pie_screenshot(ctx, args):
+    """The PIE world as the player sees it. Epic's CaptureViewport renders the *editor* world even during
+    PIE (from whatever pose it is given), so take a HighResShot in the PIE world and collect the file."""
+    if args.actor or args.at or args.look_at or args.rot or args.annotate:
+        raise CliError("during PIE, ue shot shows the player's view; --actor/--at/--look-at/--rot/--annotate "
+                       "only work outside PIE")
+    start = log_end(ctx.project)
+    ctx.tether("console", command="HighResShot 1", pie=True)
+    saved = re.compile(r"High resolution screenshot saved as (.+\.png)")
+    deadline = time.time() + 15
+    while time.time() < deadline:
+        flush_editor_log(ctx)
+        with open(log_path(ctx.project), "rb") as f:
+            f.seek(start)
+            match = saved.search(f.read().decode("utf-8", "replace"))
+        if match and os.path.isfile(match.group(1).strip()):
+            path = match.group(1).strip()
+            with open(path, "rb") as f:
+                raw = f.read()
+            os.remove(path)  # it moves to Saved/Tether/shots (or -o) below
+            return raw
+        time.sleep(0.2)
+    raise CliError("the PIE screenshot did not appear within 15 s (ue log --level Warning)", 4)
+
+
+def cmd_shot(ctx, args):
+    """Capture the viewport (or the player's view during PIE) to a PNG and print its path."""
+    launch = read_json(os.path.join(state_dir(ctx.project), "launch.json")) or {}
+    if launch.get("headless") and not launch.get("render"):
+        raise CliError("this editor runs headless with -nullrhi and cannot render; "
+                       "reopen it with `ue open --headless --render` (or windowed)")
+    pose = ctx.tether("shot_pose", actor=args.actor or "", at=args.at or "", look_at=args.look_at or "",
+                      rot=args.rot or "")
+    pie, simulate = pose.pop("pie", False), pose.pop("simulate", False)
+    if simulate:
+        raise CliError("ue shot does not support Simulate-In-Editor yet; use `ue pie start` (play) or stop the simulation")
+    if pie:
+        raw = pie_screenshot(ctx, args)
+    else:
+        annotations = dict(ANNOTATIONS, gridHeight=args.grid_z) if args.annotate else NO_ANNOTATIONS
+        text, is_error = ctx.mcp.call("EditorToolset.EditorAppToolset", "CaptureViewport",
+                                      {"captureTransform": pose, "annotations": annotations, "bShowUI": args.ui})
+        if is_error:
+            hint = " (the viewport is not rendering: minimised window or -nullrhi?)" if "zero size" in text else ""
+            raise CliError(compact_error(text) + hint)
+        value = unwrap(text)
+        image = value.get("image") if isinstance(value, dict) else None
+        if not image or not image.get("data"):
+            raise CliError("CaptureViewport returned no image")
+        import base64
+        raw = base64.b64decode(image["data"])
+    width, height = (int.from_bytes(raw[16:20], "big"), int.from_bytes(raw[20:24], "big")) if raw[:4] == b"\x89PNG" else (0, 0)
+    if args.output:
+        path = os.path.abspath(args.output)
+    else:
+        shots = os.path.join(state_dir(ctx.project), "shots")
+        os.makedirs(shots, exist_ok=True)
+        old = sorted(f for f in os.listdir(shots) if f.endswith(".png"))
+        for name in old[:-49]:  # keep the 50 newest
+            os.remove(os.path.join(shots, name))
+        path = os.path.join(shots, time.strftime("shot-%Y%m%d-%H%M%S.png"))
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "wb") as f:
+        f.write(raw)
+    loc, rot = pose["location"], pose["rotation"]
+    print(f"{path}  {width}x{height}  {len(raw) // 1024} KB" + ("  (PIE)" if pie else ""))
+    print(f"camera at ({loc['x']:.0f}, {loc['y']:.0f}, {loc['z']:.0f}) "
+          f"rot ({rot['pitch']:.0f}, {rot['yaw']:.0f}, {rot['roll']:.0f})")
+    return 0
+
+
+TEST_LOCATION = re.compile(r"LogAutomationController: (?:Error|Warning): (.*) \[(.+)\((\d+)\)\]\s*$")
+
+
+def test_locations(ctx, start):
+    """Map each automation error/warning message to 'file:line', from the log lines since `start`."""
+    flush_editor_log(ctx)
+    with open(log_path(ctx.project), "rb") as f:
+        f.seek(start)
+        lines = f.read().decode("utf-8", "replace").splitlines()
+    root = os.path.normcase(os.path.dirname(ctx.project)) + os.sep
+    found = {}
+    for line in lines:
+        match = TEST_LOCATION.search(line)
+        if match:
+            path = match.group(2)
+            if os.path.normcase(path).startswith(root):
+                path = path[len(root):]
+            found.setdefault(match.group(1).strip(), f"{path}:{match.group(3)}")
+    return found
+
+
+def cmd_test(ctx, args):
+    """Run automation tests in the live editor through Epic's AutomationTestToolset; print only failures."""
+    if not args.filter and not args.list:
+        raise CliError("give a test filter (e.g. `ue test MyGame.`), or `ue test --list [filter]`")
+    if not args.timeout_given:
+        ctx.args.timeout = 3600.0  # a run blocks until every selected test has finished
+    toolset = "AutomationTestToolset.AutomationTestToolset"
+
+    def call(tool, payload):
+        text, is_error = ctx.mcp.call(toolset, tool, payload)
+        if is_error:
+            raise CliError(compact_error(text))
+        return unwrap(text)
+
+    call("DiscoverTests", {"bForceRediscover": True})  # picks up tests added by Live Coding
+    if args.list:
+        found = call("ListTests", {"nameFilter": args.filter or "", "tagFilter": "", "limit": 0})
+        names = found.get("tests", [])
+        prefix, short_names = strip_common(names)
+        print(f"{len(names)} tests" + (f" under {prefix}" if prefix else "") + (f" matching '{args.filter}'" if args.filter else ""))
+        for name in short_names[: args.limit]:
+            print("  " + name)
+        if len(names) > args.limit:
+            print(f"... +{len(names) - args.limit} more (--limit)")
+        return 0
+    start, started = log_end(ctx.project), time.time()
+    text, is_error = ctx.mcp.call(toolset, "RunTestsByFilter", {"filterExpression": args.filter})
+    elapsed = time.time() - started
+    result = unwrap(text) if not is_error else None
+    if is_error:
+        # Epic's MCP server fails the whole call when any test logs a script warning (some of Epic's own
+        # tests do so on purpose), although the run completed. The results are still there.
+        if "matched filter" in text:
+            raise CliError(compact_error(text) + f" (ue test --list {args.filter})")
+        result = call("GetTestResults", {})
+        if not (isinstance(result, dict) and result.get("tests")):
+            raise CliError(compact_error(text))
+        print(f"note: the run call reported '{compact_error(text)[:120]}'; results read back from the controller")
+    tests = result.get("tests", []) if isinstance(result, dict) else []
+    if not tests:
+        raise CliError(f"no tests match '{args.filter}' (ue test --list {args.filter})")
+    os.makedirs(os.path.join(state_dir(ctx.project), "tests"), exist_ok=True)
+    write_json(os.path.join(state_dir(ctx.project), "tests", "last.json"), dict(result, filter=args.filter))
+    if args.json:
+        print(json.dumps(result))
+        return 1 if result.get("failed") else 0
+    failed = [t for t in tests if t.get("state") not in ("Success", "Skipped", "NotRun")]
+    skipped = sum(1 for t in tests if t.get("state") in ("Skipped", "NotRun"))
+    warned = [t for t in tests if t.get("warnings")]
+    parts = [f"{len(tests) - len(failed) - skipped} passed"] + ([f"{len(failed)} failed"] if failed else []) \
+        + ([f"{skipped} skipped"] if skipped else []) + ([f"{len(warned)} with warnings"] if warned else [])
+    print(f"{len(tests)} tests: {', '.join(parts)} in {elapsed:.1f}s")
+    where = test_locations(ctx, start) if failed or (warned and args.verbose) else {}
+    for test in failed:
+        print(f"FAIL {test['name']} ({test.get('duration', 0):.2f}s)" + (f" [{test.get('state')}]" if test.get("state") != "Fail" else ""))
+        for message in test.get("errors", [])[:5] or ["(no error message; ue log --level Warning)"]:
+            loc = where.get(message.strip())
+            print(f"  {message}" + (f"  [{loc}]" if loc else ""))
+    if args.verbose:
+        for test in warned:
+            for message in test["warnings"][:5]:
+                loc = where.get(message.strip())
+                print(f"WARN {test['name']}: {message}" + (f"  [{loc}]" if loc else ""))
+    return 1 if failed else 0
+
+
 def cmd_actors(ctx, args):
-    print(ctx.tether("actors", match=args.match or "", limit=args.limit))
+    print(ctx.tether("actors", match=args.match or "", limit=args.limit, pie=args.pie))
     return 0
 
 
@@ -1144,6 +1330,7 @@ def main(argv=None):
     s = add("open", cmd_open, "launch the editor with the MCP server on a per-project port and wait until ready")
     s.add_argument("--map", help="map to open, e.g. /Game/Maps/Lvl_Test")
     s.add_argument("--headless", action="store_true", help="no window: -nullrhi -nosound (+ -unattended, see below)")
+    s.add_argument("--render", action="store_true", help="with --headless: render offscreen instead of -nullrhi (for ue shot)")
     s.add_argument("--unattended", dest="unattended", action="store_true", default=None,
                    help="force -unattended (default for headless, except UnrealSharp projects)")
     s.add_argument("--attended", dest="unattended", action="store_false", help="never pass -unattended")
@@ -1174,8 +1361,27 @@ def main(argv=None):
     s = add("props", cmd_props, "reflected properties of an object/actor/component")
     s.add_argument("target")
     s.add_argument("match", nargs="?")
+    s.add_argument("--pie", action="store_true", help="read the PIE world's actor instead")
+    s = add("set", cmd_set, "set properties (name=value, name+=delta) as one undoable transaction")
+    s.add_argument("target")
+    s.add_argument("assignments", nargs="+", metavar="name=value")
+    s.add_argument("--pie", action="store_true", help="change the PIE world (not undoable, not saved)")
+    s = add("shot", cmd_shot, "capture the viewport (or the PIE view) to a PNG; prints the path")
+    s.add_argument("--actor", help="frame this actor, keeping the current view direction")
+    s.add_argument("--at", help="camera location x,y,z")
+    s.add_argument("--look-at", help="aim at x,y,z or an actor")
+    s.add_argument("--rot", help="camera rotation pitch,yaw,roll")
+    s.add_argument("--annotate", action="store_true", help="overlay Epic's world grid and actor labels")
+    s.add_argument("--grid-z", type=float, default=0, help="with --annotate: grid height (0)")
+    s.add_argument("--ui", action="store_true", help="include gizmos and selection outlines")
+    s.add_argument("-o", "--output", help="PNG path (default Saved/Tether/shots/shot-<time>.png)")
+    s = add("test", cmd_test, "run automation tests in the live editor; prints failures only (exit 1 on failure)")
+    s.add_argument("filter", nargs="?", help="Epic filter: substring, ^Prefix, Suffix$, StartsWith:X, Group:Name; '+' joins")
+    s.add_argument("--list", action="store_true", help="list matching tests instead of running them")
+    s.add_argument("-v", "--verbose", action="store_true", help="also print warnings")
     s = add("actors", cmd_actors, "actors in the editor level")
     s.add_argument("match", nargs="?")
+    s.add_argument("--pie", action="store_true", help="list the PIE world's actors instead")
     s = add("exec", cmd_exec, "console command; prints the log lines it produced")
     s.add_argument("command", nargs="+")
     s.add_argument("--pie", action="store_true", help="run in the PIE world")
@@ -1193,6 +1399,7 @@ def main(argv=None):
     s.add_argument("event", choices=["pre-edit", "pre-mcp"])
 
     args = p.parse_args(argv)
+    args.timeout_given = hasattr(args, "timeout")
     for key, default in (("project", None), ("port", None), ("timeout", 120.0), ("json", False),
                          ("limit", 30), ("time", False)):
         if not hasattr(args, key):
