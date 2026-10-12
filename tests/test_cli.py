@@ -7,6 +7,7 @@ import tempfile
 import time
 import types
 import unittest
+import unittest.mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "cli"))
 import ue  # noqa: E402
@@ -79,6 +80,20 @@ class ToolSchemas(unittest.TestCase):
     def test_fill_args_parses_json_wraps_refs_and_fills_blanks(self):
         args = ue.fill_args(self.TOOL, {"limit": "5", "world": "/Game/Maps/L.L"})
         self.assertEqual(args, {"limit": 5, "world": {"refPath": "/Game/Maps/L.L"}, "tag": "", "classes": []})
+
+    def test_fill_args_keeps_string_params_as_text(self):
+        self.assertEqual(ue.fill_args(self.TOOL, {"tag": '{"a": 1}'})["tag"], '{"a": 1}')
+        self.assertEqual(ue.fill_args(self.TOOL, {"tag": "5"})["tag"], "5")
+
+    @unittest.mock.patch.dict(os.environ, {"MSYSTEM": "MINGW64"})
+    def test_undo_msys_paths(self):
+        if os.name != "nt":
+            self.skipTest("Git Bash rewriting only happens on Windows")
+        with unittest.mock.patch("shutil.which", return_value=r"C:\Program Files\Git\usr\bin\bash.EXE"):
+            out = ue.undo_msys_paths(["props", "C:/Program Files/Git/Game/Maps/L.L", "graph=C:/Program Files/Git/Game/BP.BP:G",
+                                      "D:/Projects/Game/Source", "C:/Program Files/Git/usr/bin"])
+        self.assertEqual(out, ["props", "/Game/Maps/L.L", "graph=/Game/BP.BP:G", "D:/Projects/Game/Source",
+                               "C:/Program Files/Git/usr/bin"])
 
 
 class Logs(unittest.TestCase):
@@ -519,7 +534,6 @@ class Watchdog(unittest.TestCase):
             project.close()
 
 
-import unittest.mock  # noqa: E402  (used above; kept at module level for Python 3.11)
 
 if __name__ == "__main__":
     unittest.main()

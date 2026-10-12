@@ -541,6 +541,9 @@ def fill_args(tool, given):
     args = {}
     for key, raw in given.items():
         spec = props.get(key, {})
+        if spec.get("type") == "string":  # e.g. a JSON document passed as text: keep it text
+            args[key] = raw
+            continue
         try:
             value = json.loads(raw)
         except ValueError:
@@ -1870,6 +1873,24 @@ def cmd_reload(ctx, args):
     return 0
 
 
+UNREAL_ROOTS = ("Game", "Script", "Engine", "Temp", "Memory")
+
+
+def undo_msys_paths(argv):
+    """Git Bash (MSYS) rewrites arguments that look like POSIX paths when it starts a Windows program, so
+    `/Game/Maps/L` arrives as `C:/Program Files/Git/Game/Maps/L` (also after `key=`). Undo that for
+    Unreal package roots. bin/ue disables the rewrite; this covers `python ue.py` called directly."""
+    if os.name != "nt" or not os.environ.get("MSYSTEM"):
+        return argv
+    import shutil
+    bash = shutil.which("bash")
+    if not bash:
+        return argv
+    root = os.path.dirname(os.path.dirname(os.path.dirname(bash))).replace("\\", "/")  # ...\Git\usr\bin\bash
+    rx = re.compile("(^|=)" + re.escape(root) + "(?=/(?:" + "|".join(UNREAL_ROOTS) + ")/)", re.I)
+    return [rx.sub(r"\1", a) for a in argv]
+
+
 def main(argv=None):
     # Global options are accepted before or after the subcommand (agents write both).
     common = argparse.ArgumentParser(add_help=False)
@@ -1965,7 +1986,7 @@ def main(argv=None):
     s = add("hook", cmd_hook, "Claude Code hook entry points (hook JSON on stdin)")
     s.add_argument("event", choices=["pre-edit", "pre-mcp", "session-start", "post-edit", "stop"])
 
-    args = p.parse_args(argv)
+    args = p.parse_args(undo_msys_paths(sys.argv[1:] if argv is None else argv))
     args.timeout_given = hasattr(args, "timeout")
     for key, default in (("project", None), ("port", None), ("timeout", 120.0), ("json", False),
                          ("limit", 30), ("time", False)):
