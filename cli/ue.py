@@ -29,7 +29,7 @@ class _Lazy:
 socket, subprocess, zlib = _Lazy("socket"), _Lazy("subprocess"), _Lazy("zlib")
 
 TETHER = "tether.toolsets.TetherCore"
-GATED = {"py", "console", "set_props", "undo", "save", "spawn", "delete", "duplicate", "mv", "rm", "set_material"}  # tools that need the session token (see beacon.session_token)
+GATED = {"py", "console", "set_props", "undo", "save", "spawn", "delete", "duplicate", "mv", "rm", "set_material", "pie_step"}  # tools that need the session token (see beacon.session_token)
 LEVELS = {"Fatal": 0, "Error": 1, "Warning": 2, "Display": 3, "Log": 4, "Verbose": 5, "VeryVerbose": 6}
 NOISE = {"LogModelContextProtocol", "LogToolsetRegistry"}  # our own transport chatter
 # Epic logs this whenever a schema is generated for a class with delegates (props, set, describe_toolset).
@@ -2571,6 +2571,8 @@ def cmd_selftest(ctx, args):
     check("pie start", ["pie", "start"], ok=lambda c, o: c == 0 and "OK" in o, timeout=300)
     check("pie status", ["pie", "status"], ok=lambda c, o: c == 0 and "running" in o)
     check("actors --pie", ["actors", "--pie", "--limit", "1"])
+    check("pie do", ["pie", "do", "at 100,200,300", "near 100,200,300 50", "expect player.location ~ ."],
+          ok=lambda c, o: c == 0 and "PASS" in o)
     check("pie stop", ["pie", "stop"], ok=lambda c, o: c == 0 and "OK" in o)
     if args.reload:
         check("reload", ["reload"])
@@ -2810,7 +2812,7 @@ def pie_run(ctx, args):
     """A scripted gameplay check: PIE, a script in the game world, log expectations, then stop. Exit 0/1."""
     if not args.script:
         raise CliError("give a script: ue pie run checks.py --expect '<log regex>'")
-    with open(args.script, encoding="utf-8-sig") as f:
+    with open(args.script[0], encoding="utf-8-sig") as f:
         code = f.read()
     expects = [re.compile(e, re.I) for e in args.expect or []]
     rejects = [re.compile(r, re.I) for r in args.reject or []]
@@ -2860,10 +2862,120 @@ def pie_run(ctx, args):
     return 1 if failures else 0
 
 
+WITHIN = re.compile(r"\s+within\s+([\d.]+)\s*s?\s*$", re.I)
+
+
+def pie_do(ctx, args):
+    """Drive the player through a list of steps in PIE and check the results. Exit 0/1."""
+    steps = list(args.script or [])
+    if args.file:
+        with open(args.file, encoding="utf-8-sig") as f:
+            steps += [l.strip() for l in f if l.strip() and not l.strip().startswith("#")]
+    if not steps:
+        raise CliError('give steps: ue pie do "at PlayerStart" "tap IA_Jump" "until player.location ~ ..." '
+                       "(or -f steps.txt, one per line)")
+    rejects = [re.compile(r, re.I) for r in args.reject or []]
+    log_start, started = log_end(ctx.project), time.time()
+    was_running = ctx.tether("pie", action="status") == "running"
+    if not was_running:
+        code = cmd_pie(ctx, argparse.Namespace(action="start", simulate=False, warmup=args.warmup, limit=0, script=None))
+        if code:
+            return code
+
+    def tool(step):
+        result = ctx.tether("pie_step", step=step)
+        result = json.loads(result) if isinstance(result, str) else result
+        return bool(result["ok"]), result.get("detail", "")
+
+    def log_lines():
+        flush_editor_log(ctx)
+        with open(log_path(ctx.project), "rb") as f:
+            f.seek(log_start)
+            return f.read().decode("utf-8", "replace").splitlines()
+
+    def poll(check, seconds):
+        deadline = time.time() + seconds
+        while True:
+            ok, detail = check()
+            if ok or time.time() > deadline:
+                return ok, detail + ("" if ok else f" after {seconds:g}s")
+            time.sleep(0.25)
+
+    def run(step):
+        verb, _, rest = step.partition(" ")
+        verb, rest = verb.lower(), rest.strip()
+        within = WITHIN.search(rest)
+        seconds = float(within.group(1)) if within else None
+        rest = rest[: within.start()].strip() if within else rest
+        if verb == "wait":
+            time.sleep(float(rest or 1))
+            return True, ""
+        if verb == "until":
+            return poll(lambda: tool("expect " + rest), seconds or 5)
+        if verb == "log":
+            rx = re.compile(rest, re.I)
+            return poll(lambda: (any(rx.search(l) for l in log_lines()), "no matching log line"), seconds or 5)
+        if verb == "move":
+            tool("move " + rest)
+            return poll(lambda: tool(f"near {rest} 120"), seconds or 15)
+        if verb == "press":
+            name, _, hold_for = rest.partition(" ")
+            if not hold_for:
+                return tool(f"tap {name}")
+            tool(f"hold {name}")
+            held.add(name)
+            time.sleep(float(hold_for))
+            held.discard(name)
+            return tool(f"release {name}")
+        if verb == "hold":
+            held.add(rest.split()[0])
+        elif verb == "release":
+            held.discard(rest.split()[0])
+        if verb == "shot":
+            shot_args = argparse.Namespace(actor=None, at=None, look_at=None, rot=None, annotate=False, grid_z=0,
+                                           ui=False, output=rest or None)
+            buf = __import__("io").StringIO()
+            with __import__("contextlib").redirect_stdout(buf):
+                cmd_shot(ctx, shot_args)
+            return True, buf.getvalue().strip()
+        return tool(step)
+
+    failures, held = [], set()
+    try:
+        for number, step in enumerate(steps, 1):
+            try:
+                ok, detail = run(step.strip())
+            except CliError as exc:
+                ok, detail = False, str(exc)
+            print(f"{number:>2} {'ok  ' if ok else 'FAIL'} {step}" + (f"  ({detail})" if detail else ""))
+            bad = [(rx.pattern, l) for rx in rejects for l in log_lines() if rx.search(l)] if rejects else []
+            if bad:
+                print(f"   BAD  /{bad[0][0]}/  {bad[0][1].split(']', 2)[-1].strip()[:140]}")
+                failures.append(f"rejected /{bad[0][0]}/ appeared")
+                break
+            if not ok:
+                failures.append(f"step {number} failed")
+                if not args.keep_going:
+                    break
+    finally:
+        for name in held:
+            try:
+                ctx.tether("pie_step", step=f"release {name}")
+            except CliError:
+                pass
+        if not (args.keep or was_running):
+            cmd_pie(ctx, argparse.Namespace(action="stop", simulate=False, warmup=0, limit=0, script=None))
+    print(("PASS" if not failures else "FAIL") + f" in {time.time() - started:.1f}s"
+          + ("" if not failures else ": " + "; ".join(failures)))
+    return 1 if failures else 0
+
+
 def cmd_pie(ctx, args):
     """Play-In-Editor through Epic's EditorAppToolset, reporting only what went wrong."""
     if args.action == "run":
         return pie_run(ctx, args)
+    if args.action == "do":
+        return pie_do(ctx, args)
     toolset = None if ctx.transport == "remote" else resolve_toolset(ctx, "editorapp")
     start = log_end(ctx.project)
     started = time.time()
@@ -3419,13 +3531,15 @@ def main(argv=None):
     s.add_argument("--level", default="Warning", help="Error, Warning, Display, Log, Verbose")
     s.add_argument("--cat", help="only this log category")
     s.add_argument("--grep", help="regex filter")
-    s = add("pie", cmd_pie, "Play-In-Editor: start | stop | status (prints only new warnings/errors)")
-    s.add_argument("action", choices=["start", "stop", "status", "run"])
-    s.add_argument("script", nargs="?", help="with run: Python to execute in the PIE world")
+    s = add("pie", cmd_pie, "Play-In-Editor: start | stop | status | run <script> | do <steps...>")
+    s.add_argument("action", choices=["start", "stop", "status", "run", "do"])
+    s.add_argument("script", nargs="*", help="with run: Python file to execute in the PIE world; with do: steps")
+    s.add_argument("-f", "--file", help="with do: a file of steps, one per line (# comments)")
+    s.add_argument("--keep-going", action="store_true", help="with do: run every step even after a failure")
     s.add_argument("--expect", action="append", help="with run: log regex that must appear (repeatable)")
-    s.add_argument("--reject", action="append", help="with run: log regex that must not appear (repeatable)")
+    s.add_argument("--reject", action="append", help="with run/do: log regex that must not appear (repeatable)")
     s.add_argument("--seconds", type=float, default=5, help="with run: how long to wait for expectations (5)")
-    s.add_argument("--keep", action="store_true", help="with run: leave PIE running afterwards")
+    s.add_argument("--keep", action="store_true", help="with run/do: leave PIE running afterwards")
     s.add_argument("--simulate", action="store_true", help="Simulate-In-Editor (no player pawn)")
     s.add_argument("--warmup", type=float, default=0.5, help="seconds to let BeginPlay settle (0.5)")
     s = add("bp", cmd_bp, "Blueprint graphs as text: read, --diff against the last read, --apply edited text")

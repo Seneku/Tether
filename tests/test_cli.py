@@ -644,6 +644,32 @@ class LifecycleHooks(unittest.TestCase):
         self.assertIsNone(ue.hook_stop(payload))  # nudged once for this change
 
 
+class PieDo(unittest.TestCase):
+    def test_within_suffix(self):
+        match = ue.WITHIN.search("player.Health < 50 within 2.5s")
+        self.assertEqual(match.group(1), "2.5")
+        self.assertEqual("player.Health < 50 within 2.5s"[: match.start()], "player.Health < 50")
+        self.assertIsNone(ue.WITHIN.search("Door_Within.bOpen = true"))
+
+    def test_steps_run_in_order_and_stop_at_the_first_failure(self):
+        calls = []
+
+        class Ctx:
+            project = "x.uproject"
+
+            def tether(self, tool, **kw):
+                calls.append((tool, kw))
+                if tool == "pie":
+                    return "running"
+                return {"ok": "fail" not in kw["step"], "detail": "d"}
+
+        args = argparse.Namespace(script=["at 0,0,0", "expect fail.x = 1", "at 1,1,1"], file=None, reject=None,
+                                  warmup=0, keep=False, keep_going=False)
+        with unittest.mock.patch.object(ue, "log_end", return_value=0), unittest.mock.patch("builtins.print"):
+            self.assertEqual(ue.pie_do(Ctx(), args), 1)
+        self.assertEqual([kw["step"] for tool, kw in calls if tool == "pie_step"], ["at 0,0,0", "expect fail.x = 1"])
+
+
 class Validate(unittest.TestCase):
     def setUp(self):
         self.project = Project()

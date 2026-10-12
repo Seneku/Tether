@@ -624,6 +624,143 @@ def _material_of(target):
     return obj
 
 
+def _pie_player():
+    game = _game_world()
+    if game is None:
+        raise RuntimeError("PIE is not running (ue pie start; ue pie do starts it for you)")
+    pawn = unreal.GameplayStatics.get_player_pawn(game, 0)
+    controller = unreal.GameplayStatics.get_player_controller(game, 0)
+    if pawn is None or controller is None:
+        raise RuntimeError("no player pawn (Simulate has none; use play)")
+    return game, pawn, controller
+
+
+def _pie_object(ref, pawn, controller):
+    """'player'/'pawn', 'controller', or an actor/component in the PIE world."""
+    key = ref.lower()
+    if key in ("player", "pawn"):
+        return pawn
+    if key == "controller":
+        return controller
+    if key.startswith(("player.", "pawn.")):
+        comp = key.split(".", 1)[1]
+        for c in pawn.get_components_by_class(unreal.ActorComponent):
+            if c.get_name().lower() == comp:
+                return c
+        raise RuntimeError(f"the player pawn has no component '{ref.split('.', 1)[1]}'")
+    return _resolve(ref, pie=True)
+
+
+def _pie_point(ref, pawn, controller):
+    nums = _numbers(ref)
+    if nums is not None:
+        if len(nums) != 3:
+            raise RuntimeError(f"expected x,y,z, got '{ref}'")
+        return unreal.Vector(*nums)
+    obj = _pie_object(ref, pawn, controller)
+    actor = obj if isinstance(obj, unreal.Actor) else obj.get_owner()
+    return actor.get_actor_bounds(False)[0]
+
+
+def _input_action(name, pawn):
+    if name.startswith("/"):
+        action = unreal.load_asset(name.split(".")[0])
+        if isinstance(action, unreal.InputAction):
+            return action
+        raise RuntimeError(f"no InputAction at {name}")
+    registry = unreal.AssetRegistryHelpers.get_asset_registry()
+    found = [a for a in registry.get_assets_by_class(unreal.TopLevelAssetPath("/Script/EnhancedInput", "InputAction"))
+             if str(a.asset_name).lower() == name.lower()]
+    if found:
+        return unreal.load_asset(str(found[0].package_name))
+    # Actions can also be created in C++ as subobjects of the character, e.g. CreateDefaultSubobject<UInputAction>.
+    action = _try(lambda: pawn.get_editor_property(name))
+    if isinstance(action, unreal.InputAction):
+        return action
+    action = unreal.find_object(pawn, name)
+    if isinstance(action, unreal.InputAction):
+        return action
+    names = sorted(str(a.asset_name) for a in
+                   registry.get_assets_by_class(unreal.TopLevelAssetPath("/Script/EnhancedInput", "InputAction")))
+    raise RuntimeError(f"no InputAction '{name}' (assets: {', '.join(names[:12])}; or a property/subobject of the pawn)")
+
+
+def _input_subsystem(game):
+    for subsystem in unreal.ObjectIterator(unreal.EnhancedInputLocalPlayerSubsystem):
+        if _try(lambda: subsystem.get_world()) == game:
+            return subsystem
+    raise RuntimeError("no Enhanced Input subsystem for the PIE player (does the project use Enhanced Input?)")
+
+
+# Held input actions, re-injected every tick: FInputActionValue has no Python-settable fields, so the
+# subsystem's own continuous injection cannot be given a value. Stashed on sys to survive hot reloads.
+_HELD = getattr(sys, "_tether_held", None) or {"actions": {}, "handle": None}
+sys._tether_held = _HELD
+
+
+def _hold_tick(_delta):
+    game = _game_world()
+    if game is None or not _HELD["actions"]:
+        _HELD["actions"].clear()
+        unreal.unregister_slate_post_tick_callback(_HELD["handle"])
+        _HELD["handle"] = None
+        return
+    for action, vector in list(_HELD["actions"].values()):
+        _try(lambda: _input_subsystem(game).inject_input_vector_for_action(action, vector, [], []))
+
+
+def _hold(action, vector):
+    _HELD["actions"][action.get_path_name()] = (action, vector)
+    if _HELD["handle"] is None:
+        _HELD["handle"] = unreal.register_slate_post_tick_callback(_hold_tick)
+
+
+def _release(action):
+    _HELD["actions"].pop(action.get_path_name(), None)
+
+
+_COMPARE = re.compile(r"^(?P<lhs>\S+)\s*(?P<op>==|!=|<=|>=|=|<|>|~)\s*(?P<rhs>.*)$")
+
+
+def _pie_expect(expr, pawn, controller):
+    """'<target>.<prop> <op> <value>': (ok, actual text)."""
+    match = _COMPARE.match(expr.strip())
+    if not match:
+        raise RuntimeError(f"expected '<target>.<property> <op> <value>' (op: = != < > <= >= ~), got '{expr}'")
+    lhs, op, rhs = match.group("lhs"), match.group("op"), match.group("rhs").strip()
+    target, _, prop = lhs.rpartition(".")
+    if not target:
+        raise RuntimeError(f"'{lhs}': give target.property, e.g. player.Health or Door_1.bIsOpen")
+    obj = _pie_object(target, pawn, controller)
+    if prop.lower() in ("location", "rotation"):
+        value = _actor_pose(obj if isinstance(obj, unreal.Actor) else obj.get_owner())[prop.lower()]
+    else:
+        schema = _reflect(unreal.ToolsetLibrary.list_struct_properties(obj.get_class()), obj)
+        name = {n.lower(): n for n in schema}.get(prop.lower())
+        if name is None:
+            raise RuntimeError(f"{_label(obj)} has no property '{prop}'")
+        value = _reflect(unreal.ToolsetLibrary.get_object_properties(obj, [name]), obj).get(name)
+    actual = str(value).lower() if isinstance(value, bool) else _compact(value)
+    if op == "~":
+        return bool(re.search(rhs, actual, re.I)), actual
+    nums = _numbers(rhs)
+    if isinstance(value, bool) or rhs.lower() in ("true", "false"):
+        want = rhs.lower() in ("true", "1", "yes")
+        ok = {"=": value == want, "==": value == want, "!=": value != want}.get(op)
+        if ok is None:
+            raise RuntimeError(f"'{op}' does not apply to true/false")
+        return ok, actual
+    if isinstance(value, (int, float)) and nums and len(nums) == 1:
+        a, b = float(value), float(nums[0])
+        ok = {"=": abs(a - b) < 1e-3, "==": abs(a - b) < 1e-3, "!=": abs(a - b) >= 1e-3,
+              "<": a < b, ">": a > b, "<=": a <= b + 1e-3, ">=": a >= b - 1e-3}[op]
+        return ok, actual
+    if op in ("=", "==", "!="):
+        same = actual.lower() == rhs.lower() or _short(value).lower() == rhs.lower()
+        return same == (op != "!="), actual
+    raise RuntimeError(f"'{op}' needs a number on both sides (value is {actual})")
+
+
 _reload = {"handle": None}
 
 
@@ -1684,6 +1821,94 @@ class TetherCore(_Base):
         rows = [f"{name}: {_mat_text(old[name])} -> {_mat_text(_mat_value(material, kind, name))}"
                 + (" (parent value)" if name in resets else "") for kind, name, _ in plan]
         return "\n".join([_label(material)] + rows)
+
+    @_tool
+    @staticmethod
+    def pie_step(step: str, token: str = "") -> str:
+        """One step of a scripted play test in the running PIE session (the ue CLI's `pie do` runs a list).
+
+        Steps: 'at <x,y,z|actor> [dx,dy,dz]' teleports the player; 'look <x,y,z|actor>' aims the camera;
+        'move <x,y,z|actor>' starts walking there on the navmesh; 'near <x,y,z|actor> [radius]' checks
+        distance; 'tap <action>' presses an Enhanced Input action for one frame; 'hold <action> [x[,y]]' keeps
+        it pressed (or a 2D value, e.g. 'hold IA_Move 0,1') until 'release <action>'; 'call <target> <Fn>
+        [json args]' calls a function; 'expect <target>.<prop> <op> <value>' checks a property (op = != < >
+        <= >= ~regex); 'exists <actor>' / 'gone <actor>'; 'exec <console command>'. Targets: 'player',
+        'controller', 'player.<Component>', or an actor label/name. Actions: an InputAction asset name or path,
+        or a property/subobject of the pawn holding one.
+
+        Args:
+            step: The step text.
+            token: Session token from Saved/Tether/session.json (the ue CLI sends it).
+
+        Returns:
+            JSON {"ok": bool, "detail": str}.
+        """
+        _authorize(token)
+        verb, _, rest = step.strip().partition(" ")
+        verb, rest = verb.lower(), rest.strip()
+        game, pawn, controller = _pie_player()
+        ok, detail = True, ""
+        if verb == "at":
+            where, _, offset = rest.partition(" ")
+            point = _pie_point(where, pawn, controller)
+            if offset:
+                point = point + unreal.Vector(*(_numbers(offset) or [0, 0, 0]))
+            pawn.set_actor_location(point, False, True)
+            loc = pawn.get_actor_location()
+            detail = f"player at ({loc.x:.0f}, {loc.y:.0f}, {loc.z:.0f})"
+        elif verb == "look":
+            camera = unreal.GameplayStatics.get_player_camera_manager(game, 0)
+            eye = camera.get_camera_location() if camera else pawn.get_actor_location()
+            rotation = unreal.MathLibrary.find_look_at_rotation(eye, _pie_point(rest, pawn, controller))
+            controller.set_control_rotation(rotation)
+            detail = f"looking pitch {rotation.pitch:.0f} yaw {rotation.yaw:.0f}"
+        elif verb == "move":
+            unreal.AIHelperLibrary.simple_move_to_location(controller, _pie_point(rest, pawn, controller))
+            detail = "moving"
+        elif verb == "near":
+            where, _, radius = rest.partition(" ")
+            distance = pawn.get_actor_location().distance(_pie_point(where, pawn, controller))
+            ok = distance <= float(radius or 150)
+            detail = f"{distance:.0f} cm away"
+        elif verb in ("tap", "hold", "release"):
+            name, _, value = rest.partition(" ")
+            action = _input_action(name, pawn)
+            subsystem = _input_subsystem(game)
+            nums = _numbers(value) if value else None
+            vector = unreal.Vector(*(list(nums or [1.0]) + [0.0, 0.0])[:3])
+            if verb == "tap":
+                subsystem.inject_input_vector_for_action(action, vector, [], [])
+            elif verb == "hold":
+                _hold(action, vector)
+            else:
+                _release(action)
+            detail = f"{verb} {action.get_name()}"
+        elif verb == "call":
+            parts = rest.split(None, 2)
+            if len(parts) < 2:
+                raise RuntimeError("call <target> <Function> [json args]")
+            obj = _pie_object(parts[0], pawn, controller)
+            args = json.loads(parts[2]) if len(parts) > 2 else []
+            result = obj.call_method(parts[1], tuple(args) if isinstance(args, list) else (args,))
+            if isinstance(result, unreal.StructBase):
+                result = _compact(_try(lambda: result.to_dict(), str(result)))
+            elif isinstance(result, unreal.Object):
+                result = _label(result)
+            detail = f"{_label(obj)}.{parts[1]}() -> {_short(result) if result is not None else 'done'}"
+        elif verb == "expect":
+            ok, actual = _pie_expect(rest, pawn, controller)
+            detail = f"is {actual}"
+        elif verb in ("exists", "gone"):
+            found = _match_actors(rest, pie=True)
+            ok = bool(found) == (verb == "exists")
+            detail = f"{len(found)} match(es)"
+        elif verb == "exec":
+            unreal.SystemLibrary.execute_console_command(game, rest)
+            detail = "ran"
+        else:
+            raise RuntimeError(f"unknown step '{verb}' (at, look, move, near, tap, hold, release, call, expect, "
+                               "exists, gone, exec; the CLI adds wait, until, press, log, shot)")
+        return json.dumps({"ok": ok, "detail": detail})
 
     @_tool
     @staticmethod

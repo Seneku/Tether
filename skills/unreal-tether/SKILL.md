@@ -129,6 +129,11 @@ broken or unsupported.
 ## Play testing
 - Performance: `ue perf` before and after a change; each run prints the difference from the previous one.
   When it says the frame rate is capped, compare the per-frame game/render/GPU work, not the fps.
+- To play the game like a player would: `ue pie do "at ItemPickup_Key -150,0,100" "look ItemPickup_Key"
+  "tap InteractAction" "until player.Inventory.Items ~ Key within 2" "gone ItemPickup_Key"` (or `-f steps.txt`).
+  Steps: at, look, move, press/tap/hold/release (Enhanced Input actions: asset names, or actions the
+  character creates in C++), call, expect/until (`= != < > <= >= ~`), log, exists/gone, wait, exec, shot.
+  Each step prints ok/FAIL; it stops at the first failure. Write the step file once and rerun it after changes.
 - Prefer `ue pie run check.py --expect '<log regex>' --reject 'Error|no subsystem'` for verifying gameplay:
   it starts PIE, runs the script in the PIE world, waits for the log lines, stops PIE and exits 0/1.
   Write the script once and rerun it after every change.
