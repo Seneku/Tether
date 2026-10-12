@@ -98,6 +98,9 @@ broken or unsupported.
   `ue mat MI_X Roughness=0.3 Tint=1,0,0 UseDetail=true` sets them (undoable); `ue mat <actor>` shows which
   material is on each slot; `ue mat M_X --compile` lists shader compile errors. Prefer it over `ue props`
   on materials, which shows parameter arrays raw.
+- Settings: `ue config` lists sections; `ue config maps` / `ue config rendering lumen` reads one;
+  `ue config maps gameDefaultMap=/Game/Maps/L` sets and saves it (to Config/Default*.ini for project settings).
+  Prefer it to editing .ini files by hand: names and values are checked, and the editor applies them live.
 - Budgets: `ue size [folder]` (biggest assets on disk), `ue size /Game/Maps/L --deps` (what a level pulls in,
   by folder), `ue mem` (what the editor or PIE holds in memory, by class and mesh; ~20 s).
 - `ue diff /Game/Path/Asset [rev]` shows what changed in a binary asset since a git revision (default HEAD,

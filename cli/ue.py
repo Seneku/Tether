@@ -29,7 +29,7 @@ class _Lazy:
 socket, subprocess, zlib = _Lazy("socket"), _Lazy("subprocess"), _Lazy("zlib")
 
 TETHER = "tether.toolsets.TetherCore"
-GATED = {"py", "console", "set_props", "undo", "save", "spawn", "delete", "duplicate", "mv", "rm", "set_material", "pie_step"}  # tools that need the session token (see beacon.session_token)
+GATED = {"py", "console", "set_props", "undo", "save", "spawn", "delete", "duplicate", "mv", "rm", "set_material", "pie_step", "set_config"}  # tools that need the session token (see beacon.session_token)
 LEVELS = {"Fatal": 0, "Error": 1, "Warning": 2, "Display": 3, "Log": 4, "Verbose": 5, "VeryVerbose": 6}
 NOISE = {"LogModelContextProtocol", "LogToolsetRegistry"}  # our own transport chatter
 # Epic logs this whenever a schema is generated for a class with delegates (props, set, describe_toolset).
@@ -2435,6 +2435,21 @@ def cmd_mem(ctx, args):
     return 0
 
 
+def cmd_config(ctx, args):
+    """Project and editor settings: list sections, read one, or set values (saved like the Settings window)."""
+    assignments = [a for a in args.rest if "=" in a]
+    match = " ".join(a for a in args.rest if "=" not in a)
+    if assignments:
+        values = {}
+        for item in assignments:
+            name, _, value = item.partition("=")
+            values[name.strip()] = value
+        print(ctx.tether("set_config", section=args.section, values=json.dumps(values)))
+        return 0
+    print(ctx.tether("config", section=args.section or "", match=match, limit=args.limit if args.section else 200))
+    return 0
+
+
 def cmd_find(ctx, args):
     print(ctx.tether("find", query=args.query or "", cls=args.cls or "", under=args.under, limit=args.limit))
     return 0
@@ -2699,6 +2714,8 @@ def cmd_selftest(ctx, args):
     check("changes", ["changes"], ok=lambda c, o: c == 0 and "unsaved package" in o)
     check("size", ["size", "--top", "3"], ok=lambda c, o: c == 0 and "packages" in o)
     check("mem", ["mem", "--top", "3"], timeout=300, ok=lambda c, o: c == 0 and "process:" in o)
+    check("config", ["config", "Project/Project/Maps", "DefaultMap"], skip="needs UE 5.8+" if remote else None,
+          ok=lambda c, o: c == 0 and "gameDefaultMap" in o)
     check("nav", ["nav"], ok=lambda c, o: c == 0 and ("bounds" in o or "NavMeshBoundsVolume" in o))
     check("call tether.level_summary", ["call", "tether.level_summary", "limit=3"],
           ok=lambda c, o: c == 0 and "actors" in o)
@@ -3794,6 +3811,9 @@ def main(argv=None):
     s = add("mem", cmd_mem, "memory of the running editor/PIE from a memreport: process, classes, meshes, textures")
     s.add_argument("--full", action="store_true", help="memreport -full: adds the texture list (slower)")
     s.add_argument("--top", type=int, default=8, help="rows per list (8)")
+    s = add("config", cmd_config, "project/editor settings: list sections, read one, or Name=value to set (saved)")
+    s.add_argument("section", nargs="?", help="Maps, Rendering, Engine/General, or Container/Category/Section")
+    s.add_argument("rest", nargs="*", metavar="regex|Name=value", help="a regex to filter settings, or values to set")
     s = add("find", cmd_find, "search assets by name and/or class (asset registry)")
     s.add_argument("query", nargs="?", help="regex on the asset name")
     s.add_argument("--class", dest="cls", help="regex on the class name, e.g. StaticMesh or 'Material$'")

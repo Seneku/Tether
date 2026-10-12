@@ -761,6 +761,47 @@ def _pie_expect(expr, pawn, controller):
     raise RuntimeError(f"'{op}' needs a number on both sides (value is {actual})")
 
 
+def _settings(method, *args):
+    """Call Epic's ConfigSettingsToolset (the editor's Project/Editor Settings registry) and decode its JSON."""
+    tool = getattr(unreal, "ConfigSettingsToolset", None)
+    if tool is None:
+        raise RuntimeError("needs Epic's ConfigSettingsToolset (UE 5.8+)")
+    result = unreal.get_default_object(tool).call_method(method, args)
+    if isinstance(result, str):
+        try:
+            return json.loads(result)
+        except ValueError:
+            return result
+    return result
+
+
+_SECTIONS = getattr(sys, "_tether_sections", None) or []  # [(container, category, section)], once per session
+sys._tether_sections = _SECTIONS
+
+
+def _all_sections():
+    if not _SECTIONS:
+        for container in _settings("ListContainers") or []:
+            for category in _settings("ListCategories", container) or []:
+                for section in _settings("ListSections", container, category) or []:
+                    _SECTIONS.append((container, category, section))
+    return _SECTIONS
+
+
+def _find_section(query):
+    squash = lambda t: re.sub(r"[\s_]", "", t).lower()
+    want = squash(query)
+    sections = _all_sections()
+    exact = [s for s in sections if want in (squash("/".join(s)), squash(s[2]), squash(f"{s[1]}/{s[2]}"))]
+    found = exact or [s for s in sections if want in squash("/".join(s))]
+    if not found:
+        raise RuntimeError(f"no settings section matches '{query}' (ue config lists them)")
+    if len(found) > 1:
+        raise RuntimeError(f"'{query}' matches {len(found)} sections: " + ", ".join("/".join(s) for s in found[:10])
+                           + " (give Container/Category/Section)")
+    return found[0]
+
+
 _reload = {"handle": None}
 
 
@@ -2049,6 +2090,79 @@ class TetherCore(_Base):
             data = registry.get_assets_by_package_name(package)
             classes[package] = str(data[0].asset_class_path.asset_name) if data else ""
         return json.dumps({"classes": classes, "deps": found})
+
+    @_tool
+    @staticmethod
+    def config(section: str = "", match: str = "", limit: int = 80) -> str:
+        """Project and editor settings (the Settings windows), read through the editor's settings registry: the
+        list of sections, or one section's properties with values.
+
+        Args:
+            section: Section name ('Maps', 'Rendering', 'Engine/General') or Container/Category/Section; '' lists all.
+            match: Case-insensitive regex on property names.
+            limit: Maximum number of lines.
+
+        Returns:
+            Sections grouped by Container/Category, or 'name: type = value' lines.
+        """
+        if not section:
+            groups = {}
+            for container, category, name in _all_sections():
+                groups.setdefault(f"{container}/{category}", []).append(name)
+            return "\n".join(f"{key}: {', '.join(names)}" for key, names in sorted(groups.items()))
+        container, category, name = _find_section(section)
+        schema = _settings("GetSectionSchema", container, category, name) or {}
+        names = list(schema)
+        if match:
+            rx = re.compile(match, re.I)
+            names = [n for n in names if rx.search(n)]
+        values = _settings("GetSectionPropertyValues", container, category, name, names) if names else {}
+        values = values if isinstance(values, dict) else {}
+        rows = [f"{n}: {_type_name(schema[n])} = {_short(_round(values.get(n)))}" for n in names]
+        head = f"{container}/{category}/{name} ({len(schema)} settings" + (f", {len(names)} match" if match else "") + ")"
+        return _capped(head, rows, limit)
+
+    @_tool
+    @staticmethod
+    def set_config(section: str, values: str, token: str = "") -> str:
+        """Change project or editor settings and save them where the Settings window would (not undoable).
+
+        Args:
+            section: Section name or Container/Category/Section (see `config`).
+            values: JSON object of setting name to value text (numbers, true/false, enum names, paths, JSON).
+            token: Session token from Saved/Tether/session.json (the ue CLI sends it).
+
+        Returns:
+            One 'name: old -> new' line per setting.
+        """
+        _authorize(token)
+        container, category, name = _find_section(section)
+        schema = _settings("GetSectionSchema", container, category, name) or {}
+        by_lower = {n.lower(): n for n in schema}
+        requested = json.loads(values)
+        plan = {}
+        for key, raw in requested.items():
+            prop = by_lower.get(key.lower())
+            if prop is None:
+                import difflib
+                close = difflib.get_close_matches(key.lower(), list(by_lower), n=4, cutoff=0.6)
+                raise RuntimeError(f"{name} has no setting '{key}'"
+                                   + (f" (did you mean: {', '.join(by_lower[c] for c in close)})" if close else ""))
+            plan[prop] = raw
+        old = _settings("GetSectionPropertyValues", container, category, name, list(plan)) or {}
+        new = {}
+        for prop, raw in plan.items():
+            try:
+                new[prop] = _parse(raw if isinstance(raw, str) else json.dumps(raw), schema[prop], old.get(prop))
+            except ValueError as exc:
+                raise RuntimeError(f"{prop}: {exc}") from None
+        _settings("SetSectionProperties", container, category, name, json.dumps(new))
+        after = _settings("GetSectionPropertyValues", container, category, name, list(plan)) or {}
+        ignored = [p for p in new if not _took(new[p], after.get(p))]
+        if ignored:
+            raise RuntimeError("did not take: " + ", ".join(f"{p} stayed {_compact(after.get(p))}" for p in ignored))
+        rows = [f"{p}: {_compact(old.get(p))} -> {_compact(after.get(p))}" for p in plan]
+        return "\n".join([f"{container}/{category}/{name} (saved)"] + rows)
 
     @_tool
     @staticmethod
