@@ -768,7 +768,7 @@ class Validate(unittest.TestCase):
         os.remove(os.path.join(root, "Content", "B.uasset"))  # deleted
         run("mv", "Content/Old Name.uasset", "Content/Renamed.uasset")  # renamed, path with a space
         changed, deleted = ue.git_changes(self.project.uproject)
-        names = lambda paths: sorted(os.path.relpath(p, root).replace(os.sep, "/") for p in paths)
+        names = lambda paths: sorted(os.path.relpath(p, os.path.realpath(root)).replace(os.sep, "/") for p in paths)
         self.assertEqual(names(changed), ["Content/A.uasset", "Content/New.uasset", "Content/Renamed.uasset"])
         self.assertEqual(names(deleted), ["Content/B.uasset", "Content/Old Name.uasset"])
         run("add", "-A")

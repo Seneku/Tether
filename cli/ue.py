@@ -1898,7 +1898,7 @@ def cmd_asset(ctx, args):
 def content_package(project, path):
     """A content file's package path (Content/X/Y.uasset -> /Game/X/Y, a plugin's -> /Plugin/X), or None."""
     try:
-        rel = os.path.relpath(os.path.abspath(path), os.path.dirname(project)).replace("\\", "/")
+        rel = os.path.relpath(os.path.realpath(path), os.path.realpath(os.path.dirname(project))).replace("\\", "/")
     except ValueError:  # another drive
         return None
     stem, ext = os.path.splitext(rel)
@@ -2025,7 +2025,7 @@ def external_actor_changes(ctx, package, rev, to):
         return []
     actors_dir = os.path.join(content, "__ExternalActors__", *rest.split("/"))
     top = run_git(project, "rev-parse", "--show-toplevel").strip()
-    rel = os.path.relpath(actors_dir, top).replace("\\", "/")
+    rel = os.path.relpath(os.path.realpath(actors_dir), top).replace("\\", "/")
     args = ["diff", "--name-status", "-z", "--no-renames", rev] + ([to] if to else []) + ["--", rel]
     fields = run_git(project, *args).split("\0")
     entries = [(s, p) for s, p in zip(fields[0::2], fields[1::2]) if s]
@@ -2084,7 +2084,7 @@ def cmd_diff(ctx, args):
 
         def blob(revision):
             for candidate in (file, os.path.splitext(file)[0] + (".umap" if file.endswith(".uasset") else ".uasset")):
-                rel = os.path.relpath(candidate, top).replace("\\", "/")
+                rel = os.path.relpath(os.path.realpath(candidate), top).replace("\\", "/")
                 data = run_git(project, "cat-file", "--filters", f"{revision}:{rel}", binary=True, check=False)
                 if data is not None:
                     return data, os.path.splitext(candidate)[1]
