@@ -1,8 +1,8 @@
 using UnrealBuildTool;
 
-public class ToolSuiteUnrealSharp : ModuleRules
+public class TetherUnrealSharp : ModuleRules
 {
-	public ToolSuiteUnrealSharp(ReadOnlyTargetRules Target) : base(Target)
+	public TetherUnrealSharp(ReadOnlyTargetRules Target) : base(Target)
 	{
 		PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
 		PublicDependencyModuleNames.AddRange(new string[] { "Core", "CoreUObject", "Engine" });

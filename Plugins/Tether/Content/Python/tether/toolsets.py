@@ -1,4 +1,4 @@
-"""ToolSuite gap-filling toolset, registered into Epic's ToolsetRegistry.
+"""Tether gap-filling toolset, registered into Epic's ToolsetRegistry.
 
 Fills what Epic's 5.8 toolsets leave out for coding agents: unrestricted editor
 Python, console commands, and compact (token-frugal) reads. Pure Python, so
@@ -19,8 +19,8 @@ from toolset_registry.registration import Registration
 _MAX_OUT = 20000
 
 # Persistent REPL namespace for `py`; stashed on sys so it survives hot reloads.
-_NAMESPACE = getattr(sys, "_toolsuite_ns", None) or {"unreal": unreal, "__name__": "__toolsuite_py__"}
-sys._toolsuite_ns = _NAMESPACE
+_NAMESPACE = getattr(sys, "_tether_ns", None) or {"unreal": unreal, "__name__": "__tether_py__"}
+sys._tether_ns = _NAMESPACE
 
 
 def _run_python(code):
@@ -135,9 +135,9 @@ def _capped(head, rows, limit):
 
 
 def _csharp():
-    lib = getattr(unreal, "ToolSuiteCSharpLibrary", None)
+    lib = getattr(unreal, "TetherCSharpLibrary", None)
     if lib is None:
-        raise RuntimeError("ToolSuiteUnrealSharp plugin is not enabled in this project")
+        raise RuntimeError("TetherUnrealSharp plugin is not enabled in this project")
     return lib
 
 
@@ -151,20 +151,20 @@ def _schedule_reload():
     def _do(_delta):
         unreal.unregister_slate_post_tick_callback(_reload["handle"])
         _reload["handle"] = None
-        import toolsuite
-        from toolsuite import beacon
-        toolset_registry.reload_module(toolsuite)
+        import tether
+        from tether import beacon
+        toolset_registry.reload_module(tether)
         beacon.start()  # re-bind the tick callback to the reloaded module
-        unreal.log("ToolSuite: reloaded")
+        unreal.log("Tether: reloaded")
 
     _reload["handle"] = unreal.register_slate_post_tick_callback(_do)
 
 
 @unreal.uclass()
-class ToolSuiteCore(unreal.ToolsetDefinition):
-    """ToolSuite core tools for coding agents: unrestricted editor Python with a
+class TetherCore(unreal.ToolsetDefinition):
+    """Tether core tools for coding agents: unrestricted editor Python with a
     persistent namespace, console commands, compact property and actor reads,
-    and hot reload of the ToolSuite package. Output is compact text by design."""
+    and hot reload of the Tether package. Output is compact text by design."""
 
     @toolset_registry.tool_call
     @staticmethod
@@ -300,7 +300,7 @@ class ToolSuiteCore(unreal.ToolsetDefinition):
     @toolset_registry.tool_call
     @staticmethod
     def reload() -> str:
-        """Hot-reload the toolsuite Python package and re-register its toolsets on the next editor tick.
+        """Hot-reload the tether Python package and re-register its toolsets on the next editor tick.
 
         Returns:
             Confirmation that the reload was scheduled.
@@ -309,4 +309,4 @@ class ToolSuiteCore(unreal.ToolsetDefinition):
         return "reload scheduled"
 
 
-registration = Registration([ToolSuiteCore])
+registration = Registration([TetherCore])

@@ -1,4 +1,4 @@
-# ToolSuite — an agent-native workflow for Unreal Engine 5.8
+# Tether — an agent-native workflow for Unreal Engine 5.8
 
 Status: design v0.1, 2026-10-09. Numbers marked *measured* come from this machine (UE 5.8.3,
 `D:\Projects\Unreal\Horror` = IslandHorror, and the scratch project in `Sandbox/`).
@@ -25,7 +25,7 @@ Status: design v0.1, 2026-10-09. Numbers marked *measured* come from this machin
 
 ## 2. Proof of concept (measured on `Sandbox/`, 2026-10-09)
 
-`Plugins/ToolSuite` (content-only, pure Python) + `cli/ue.py` (stdlib only), against Epic's MCP
+`Plugins/Tether` (content-only, pure Python) + `cli/ue.py` (stdlib only), against Epic's MCP
 server with `AllToolsets` enabled:
 
 | Command | Time | Output |
@@ -34,9 +34,9 @@ server with `AllToolsets` enabled:
 | `ue py "import sys; print(sys.version.split()[0]); 6*7"` | 37 ms | `3.11.8` / `42` — unrestricted `unreal` Python, persistent namespace |
 | `ue actors light` | 50 ms | 3 lines |
 | `ue props DirectionalLight.LightComponent0 "^intensity\|^temperature"` | 67 ms | 3 lines with values |
-| `ue call toolsuite.level_summary` | 46 ms | 2 lines (138 actors, 12 classes) vs ~3.9k tokens of `find_actors` paths |
+| `ue call tether.level_summary` | 46 ms | 2 lines (138 actors, 12 classes) vs ~3.9k tokens of `find_actors` paths |
 | `ue call scene.find_actors` (any Epic tool) | 75 ms | required blanks auto-filled; common prefix stripped; capped |
-| `ue tools toolsuite` | 66 ms | one-line signatures instead of a full `describe_toolset` dump |
+| `ue tools tether` | 66 ms | one-line signatures instead of a full `describe_toolset` dump |
 | `ue log --level Warning` | 68 ms | 7 de-duplicated entries out of 2,089 new log lines |
 | `ue reload` | 40 ms | edited Python tools live in the running editor (added `level_summary` this way) |
 | `ue open --headless` | 10.6 s | engine from `EngineAssociation`, per-project port (18160), waits for beacon + MCP, prints boot errors de-duplicated |
@@ -56,7 +56,7 @@ C++ iteration, measured on a minimal C++ module added to `Sandbox/` (editor runn
 | First full UBT build of the module | 42 s, 142 output lines, all engine-header deprecation warnings; `ue build` hides and counts these |
 
 C# iteration with **UnrealSharp** (trial 2026-10-11, commit `06769c4`, Sandbox editor headless and
-attended, auto-reload off, reloads driven by `ue build` through the `ToolSuiteUnrealSharp` bridge):
+attended, auto-reload off, reloads driven by `ue build` through the `TetherUnrealSharp` bridge):
 
 | Scenario | Result |
 |---|---|
@@ -64,11 +64,11 @@ attended, auto-reload off, reloads driven by `ue build` through the `ToolSuiteUn
 | Create the C# project headlessly (UAT `GenerateProject`, same as the GUI dialog) | 5.8 s, no GUI |
 | Pre-build user C# (UAT `BuildUserSolution`, run by `ue open`) | 2.4–2.7 s |
 | Function-body edit → `ue build` | **0.6 s** end to end (UnrealSharp 0.42 s) |
-| Compile error → `ue build` | 0.1 s, one line (`ToolSuiteProbe.cs:16: CS0103 ...`); editor stays responsive; last good C# stays loaded |
+| Compile error → `ue build` | 0.1 s, one line (`TetherProbe.cs:16: CS0103 ...`); editor stays responsive; last good C# stays loaded |
 | Fix + new `UFunction` + new `UProperty` (constructor default) + brand-new `UClass` in one reload | **1.2 s** (UnrealSharp 0.80 s); all four live, no restart |
 | Editor boot with UnrealSharp | 9.6–11 s warm (37.6 s on the very first boot) |
 
-UnrealSharp gotchas for agents, and how ToolSuite handles them:
+UnrealSharp gotchas for agents, and how Tether handles them:
 - **Under `-unattended`, the hot-reload subsystem is not created** (`ShouldCreateSubsystem`), and the
   startup user build is skipped. `ue open --headless` therefore runs UnrealSharp projects attended,
   and pre-builds C# itself.
@@ -78,7 +78,7 @@ UnrealSharp gotchas for agents, and how ToolSuite handles them:
   text: <errors>`), where `ue build` parses it.
 - **Reload is not scriptable:** `PerformHotReload` is C++ only and the subsystem's `StaticClass()` is
   not exported. The bridge (one small C++ editor module) resolves the subsystem by class path and
-  exposes `reload_csharp` / `csharp_reload_state` to Python. These are the only C++ lines in ToolSuite.
+  exposes `reload_csharp` / `csharp_reload_state` to Python. These are the only C++ lines in Tether.
 - **The project wizard is a GUI**, but it only wraps a UAT command, which `ue` can call directly.
 - **Auto-reload on save is off** for agent sessions (`AutomaticHotReloading=Off`), so multi-file edits
   reload once, on `ue build`.
@@ -95,7 +95,7 @@ UnrealSharp gotchas for agents, and how ToolSuite handles them:
     every coin logged "no score subsystem in this world".
   - *Reproduction:* save a C# change without reloading, start PIE, look the subsystem up. The same
     on-access recompile is the likely cause of "saving C# during PIE crashes PIE".
-  - *ToolSuite's handling:* `ue pie start` hot-reloads pending C# first and refuses to start PIE if the
+  - *Tether's handling:* `ue pie start` hot-reloads pending C# first and refuses to start PIE if the
     reload fails.
   - *Epic's `StartPIE`:* a PreToolUse hook (`ue hook pre-mcp`) denies it while C# is pending.
   - *Gap:* the editor's Play button is not guarded, and `AutomaticHotReloading=Off` widens that window.
@@ -103,7 +103,7 @@ UnrealSharp gotchas for agents, and how ToolSuite handles them:
   the file watcher). That happens outside any reload the bridge can guard.
   - *Why it hangs:* in a `-nullrhi` editor the dialog is an invisible Slate modal. The engine tick and
     the MCP server stop, while Slate, and so the beacon, keep ticking.
-  - *ToolSuite's handling:* `ue open --headless` starts UnrealSharp editors with `-RUNNINGUNATTENDEDSCRIPT`.
+  - *Tether's handling:* `ue open --headless` starts UnrealSharp editors with `-RUNNINGUNATTENDEDSCRIPT`.
     Every `FMessageDialog` then logs its text and takes its default answer, and hot reload stays
     available, because UnrealSharp only checks `-unattended`.
   - *Reporting:* `ue build` and `ue pie start` turn the logged text into a failed reload ("UnrealSharp
@@ -112,7 +112,7 @@ UnrealSharp gotchas for agents, and how ToolSuite handles them:
   included.** Git Bash drops that backslash. The editor then shows "An installation of .NET 10.0.0 SDK
   can't be found". The dialog comes back after every OK, because `FUnrealSharpCoreModule::StartupModule()`
   calls itself whenever the check fails, with no exit condition. With dialogs suppressed, that recursion
-  would not wait at all. ToolSuite handles it in `ue open`:
+  would not wait at all. Tether handles it in `ue open`:
   - it restores the backslash in the editor's environment;
   - it refuses to launch when no SDK exists;
   - on Windows, it kills a headless editor that stops on a native modal dialog during startup, and
@@ -193,9 +193,9 @@ Lessons from the spike:
 | Verify behaviour | a human plays in PIE | minutes | invisible to the agent |
 | Load project knowledge | `CLAUDE.md` | — | 49 KB ≈ 12k tokens every session |
 
-**With ToolSuite (IslandHorror, measured 2026-10-12).** The editor runs headless under `ue open`.
+**With Tether (IslandHorror, measured 2026-10-12).** The editor runs headless under `ue open`.
 
-| Loop | Before | With ToolSuite |
+| Loop | Before | With Tether |
 |---|---|---|
 | Read state: `inspect_uds_fog_exposure.py`, unmodified | ~24 s, ~1,940 log lines | **0.85 s** with `ue py -f`; only the script's report reaches the agent |
 | Find a property's real name | guesses (`MISS 'Fog Amount'`) | `ue props Ultra_Dynamic_Sky fog`: **78 ms**, 102 real names (see below) |
@@ -208,7 +208,7 @@ Notes on these results:
 - **Property names:** the "fog amount" turned out to be named `fog`, and one name carries UDS's own typo,
   `Mutliplier`. Neither would have been guessed.
 - **Setup:** IslandHorror's `.uproject` gains `AdditionalPluginDirectories: ["../ToolSuite/Plugins"]` and
-  four plugins: `PythonScriptPlugin`, `ModelContextProtocol`, `EditorToolset`, `ToolSuite`.
+  four plugins: `PythonScriptPlugin`, `ModelContextProtocol`, `EditorToolset`, `Tether`.
   `EditorToolset` is used instead of `AllToolsets` to avoid side plugins.
 - **Agent onboarding:** the skill is copied into its `.claude/skills/` with the `ue` path, and its
   `CLAUDE.md` gains one bullet pointing scripts at `ue py`.
@@ -328,7 +328,7 @@ The same information rendered compactly (measured on the captured payloads): `fi
   ~870 installs): an `unreal-mcp` skill, a SessionStart hook, and an optional proxy that keeps
   Claude Code's MCP session alive while the editor is down. Its rules: save before and after bulk
   edits, run dependent calls one at a time, treat anything short of explicit success as failure.
-  ToolSuite should *complement* it (CLI, lifecycle, build routing, compaction, unrestricted
+  Tether should *complement* it (CLI, lifecycle, build routing, compaction, unrestricted
   Python), not duplicate its skill.
 - **UEFN** has had Unreal MCP in beta since 2026-08-20 (it can edit and compile Verse).
 - At **State of Unreal 2026-06-17**, Epic showed a live Claude demo, said UE6 integrates models
@@ -349,7 +349,7 @@ The same information rendered compactly (measured on the captured payloads): `fi
 | db-lyon/ue-mcp | 0.4k / 2026-10 | Node stdio → C++ WebSocket | 26 tools / 1,975 actions, wraps Epic's tools |
 | tumourlove/monolith | 0.3k / 2026-09 | C++ HTTP + restart-surviving stdio proxy | ~1,400 actions behind ~26 query tools |
 | runreal/unreal-mcp | 0.1k / 2025-06 | Python remote execution, no plugin | `editor_run_python` |
-| Italink/UnrealClientProtocol | 0.1k / 2026-08 | Python **CLI + skills**, no MCP | closest in spirit to ToolSuite |
+| Italink/UnrealClientProtocol | 0.1k / 2026-08 | Python **CLI + skills**, no MCP | closest in spirit to Tether |
 | ZiggyMar/unreal-mcp | <0.1k / 2026-09 | C++ TCP + Node | measured: 4-tool profile 2.4k vs 34.8k tokens; Blueprint text 126k → 3.1k tokens for 807 nodes |
 
 **Commercial:** **Aura** (Ramen; Claude-based agents including a playtesting "verification"
@@ -387,7 +387,7 @@ Verified details (Unity docs/blog, as of 2026-10-09):
   reviewers call CLI + `com.unity.pipeline` "the bridge".
 - **Connection:** `com.unity.pipeline` auto-starts an editor HTTP/JSON server on
   127.0.0.1:7800–7849. Discovery uses `Library/Pipeline/.unity-pipeline-port` (pid, port,
-  **token**, heartbeat) — the same shape as our `Saved/ToolSuite/editor.json` beacon, plus a bearer
+  **token**, heartbeat) — the same shape as our `Saved/Tether/editor.json` beacon, plus a bearer
   token we should add.
 - **Commands:** 150+ built-ins; `unity command eval '<C#>'` runs Roslyn on the main thread without
   a recompile (our `ue py`); custom commands are static methods tagged `[CliCommand]` (our
@@ -445,8 +445,8 @@ consider Angelscript only if a source-built fork is acceptable for IslandHorror.
 ```
 Claude Code --Bash--> ue CLI --HTTP JSON-RPC--> Epic MCP server (in editor)
      |                   |                          |-- Epic toolsets (~830 tools)
-     |                   |                          '-- toolsuite.* toolset (Python, hot-reload)
-     |                   |-- reads Saved/ToolSuite/editor.json  (pid, port, state, heartbeat)
+     |                   |                          '-- tether.* toolset (Python, hot-reload)
+     |                   |-- reads Saved/Tether/editor.json  (pid, port, state, heartbeat)
      |                   |-- runs UBT / Build.bat               (when the editor is closed)
      |                   |-- launches / quits UnrealEditor.exe  (open, close, restart)
      |                   '-- tails Saved/Logs/*.log             (works when hung or crashed)
@@ -469,7 +469,7 @@ Claude Code --Bash--> ue CLI --HTTP JSON-RPC--> Epic MCP server (in editor)
 | `ue pie start\|stop\|status`, `ue smoke <map> [--cmd ...] [--secs N]` | PIE plus a "did anything error/ensure" verdict | a human playing | planned |
 | `ue shot [--pie] [--w 960]` | viewport capture → PNG path; the agent opens it only when needed | — | planned |
 | `ue test [filter]` | automation tests, compact pass/fail | — | planned |
-| `ue tools [query]`, `ue call <toolset.tool> k=v ...` | discover and invoke any Epic or ToolSuite tool, defaults filled in, output compacted | raw MCP | spike |
+| `ue tools [query]`, `ue call <toolset.tool> k=v ...` | discover and invoke any Epic or Tether tool, defaults filled in, output compacted | raw MCP | spike |
 | `ue job list\|wait\|cancel` | detached long-running operations | — | planned |
 | `ue api <Symbol>` | exact UE 5.8 signatures from live reflection | hallucinated APIs | planned |
 
@@ -480,12 +480,12 @@ Output contract:
 - Exit codes are a protocol: `0` ok · `1` failed · `2` editor unavailable · `3` restart required ·
   `4` timeout · `7` busy, safe to retry (planned, matching Unity's CLI).
 
-### 6.2 ToolSuite editor plugin — fill the gaps, nothing more
+### 6.2 Tether editor plugin — fill the gaps, nothing more
 
 v1 is a **content-only plugin (pure Python, zero C++)**: nothing to compile, it drops into any 5.8
 project's `Plugins/`, and updates hot-reload without restarting the editor.
 
-- **Python toolset `toolsuite.*`** registered into `ToolsetRegistry`, so the `ue` CLI, Claude
+- **Python toolset `tether.*`** registered into `ToolsetRegistry`, so the `ue` CLI, Claude
   Code's own MCP client and Epic's in-editor assistant all see it: `py`, `console`, `props`
   (names, types *and* values, filtered), `actors`, `level_summary`, `reload` (all working in the
   spike), then `live_compile`, `smoke`, `shot` and project-specific tools. Re-registered through
@@ -493,14 +493,14 @@ project's `Plugins/`, and updates hot-reload without restarting the editor.
 - **`live_compile` must not block the game thread:** fire `LiveCoding.Compile` (async), let the
   CLI follow `LogLiveCoding` through its log cursor, and parse compiler diagnostics from
   `%LOCALAPPDATA%\UnrealBuildTool\Log.txt` — the path Epic's toolset misses on launcher builds.
-- **Screenshots go to files:** decode PNGs to `Saved/ToolSuite/shots/` and return the path, so
+- **Screenshots go to files:** decode PNGs to `Saved/Tether/shots/` and return the path, so
   the agent pays for an image only when it chooses to look.
-- **Beacon:** a Slate post-tick callback writes `Saved/ToolSuite/editor.json` (pid, port, map,
+- **Beacon:** a Slate post-tick callback writes `Saved/Tether/editor.json` (pid, port, map,
   PIE state, heartbeat) every second. A stale heartbeat with a live PID means the game thread is
   hung — detectable without HTTP.
 - **Log cursors live in the CLI**, as byte offsets into `Saved/Logs/<Project>.log`, so they keep
   working after a hang or crash and need no editor code.
-- **Guard rails for `py` / `exec`:** a per-session token in `Saved/ToolSuite/` that the CLI sends
+- **Guard rails for `py` / `exec`:** a per-session token in `Saved/Tether/` that the CLI sends
   with each call, on top of Epic's localhost-only binding.
 - **Modal-dialog watchdog:** a dialog freezes every bridge, so detection must happen out of
   process. When the heartbeat is stale but the PID is alive, the CLI lists the editor's top-level
@@ -518,7 +518,7 @@ project's `Plugins/`, and updates hot-reload without restarting the editor.
 
 ### 6.3 Claude Code integration
 
-- **Skill `unreal-toolsuite`** (v0 in `.claude/skills/`, loaded on demand): command reference, the iteration decision table, and the
+- **Skill `unreal-tether`** (v0 in `.claude/skills/`, loaded on demand): command reference, the iteration decision table, and the
   Python gotchas currently buried in IslandHorror's CLAUDE.md.
 - **Hooks, done:** two PreToolUse hooks.
   - `ue hook pre-edit` denies C# edits while PIE runs.

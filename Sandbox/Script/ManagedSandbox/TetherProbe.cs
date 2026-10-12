@@ -5,9 +5,9 @@ namespace ManagedSandbox;
 
 /// <summary>Tiny reflected surface used to measure UnrealSharp hot reload from the ue CLI.</summary>
 [UClass]
-public partial class AToolSuiteProbe : AActor
+public partial class ATetherProbe : AActor
 {
-    public AToolSuiteProbe()
+    public ATetherProbe()
     {
         ProbeLabel = "added by reload";
     }

@@ -1,4 +1,4 @@
-#include "ToolSuiteCSharpLibrary.h"
+#include "TetherCSharpLibrary.h"
 
 #include "Editor.h"
 #include "HotReload/CSHotReloadSubsystem.h"
@@ -17,7 +17,7 @@ namespace
 	}
 }
 
-FString UToolSuiteCSharpLibrary::ReloadCSharp()
+FString UTetherCSharpLibrary::ReloadCSharp()
 {
 	UCSHotReloadSubsystem* Subsystem = FindHotReloadSubsystem();
 	if (!Subsystem)
@@ -45,7 +45,7 @@ FString UToolSuiteCSharpLibrary::ReloadCSharp()
 	return Subsystem->HasPendingHotReloadChanges() ? TEXT("not reloaded") : TEXT("reloaded");
 }
 
-FString UToolSuiteCSharpLibrary::GetCSharpReloadState()
+FString UTetherCSharpLibrary::GetCSharpReloadState()
 {
 	UCSHotReloadSubsystem* Subsystem = FindHotReloadSubsystem();
 	if (!Subsystem)

@@ -1,6 +1,6 @@
 ---
-name: unreal-toolsuite
-description: Drive a running Unreal Editor (UE 5.8+) through the `ue` CLI. Use it to query actors and properties, run editor Python and console commands, call Epic's ~870 editor tools, and read logs, all without headless commandlets or editor restarts. Use when working in an Unreal project whose editor runs with the ToolSuite plugin and Epic's ModelContextProtocol server.
+name: unreal-tether
+description: Drive a running Unreal Editor (UE 5.8+) through the `ue` CLI. Use it to query actors and properties, run editor Python and console commands, call Epic's ~870 editor tools, and read logs, all without headless commandlets or editor restarts. Use when working in an Unreal project whose editor runs with the Tether plugin and Epic's ModelContextProtocol server.
 ---
 
 # Unreal via `ue`
@@ -10,7 +10,7 @@ milliseconds. A `-run=pythonscript` commandlet takes ~25 s and floods the log.
 
 ## First moves
 - `ue status`: is the editor up, which map, PIE on/off, heartbeat. Exit code 2 = not available.
-- `ue call toolsuite.level_summary`: what is in the level (counts by class).
+- `ue call tether.level_summary`: what is in the level (counts by class).
 - `ue actors <regex>`: label, class, location. `ue props <Actor|Actor.Component|/Game/Path> [regex]`:
   names, types and **values**. Use these instead of guessing property names.
 
@@ -26,7 +26,7 @@ milliseconds. A `-run=pythonscript` commandlet takes ~25 s and floods the log.
   `fill_data_table_from_json_string`, which wipes every row).
 - `ue log [--level Warning|Display|Log] [--cat X] [--grep re]`: only entries that are new since the last
   `ue log`, de-duplicated. Run it after anything that might have warned or errored.
-- `ue reload`: hot-reloads `Plugins/ToolSuite/Content/Python/toolsuite` after you edit or add a tool.
+- `ue reload`: hot-reloads `Plugins/Tether/Content/Python/tether` after you edit or add a tool.
   To make a throwaway inspection script reusable, add it there as a `@toolset_registry.tool_call`.
 
 ## C++ changes
@@ -61,7 +61,7 @@ milliseconds. A `-run=pythonscript` commandlet takes ~25 s and floods the log.
   rejected the saved files", with the line. Fix the line, then rerun the command.
 - After structural changes to a C# **subsystem** (new members or signatures), test PIE straight away.
   If `ue pie start` reports `InvalidCastException`, run `ue build --restart` (about 20 s).
-- `ue call toolsuite.cs_state` reports idle, pending or reloading.
+- `ue call tether.cs_state` reports idle, pending or reloading.
 
 ## Play testing
 - `ue pie start` / `ue pie stop` / `ue pie status`. Status explains a session that died (fatal error

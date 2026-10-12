@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """ue: a token-frugal CLI for driving a running Unreal Editor (UE 5.8+) from coding agents.
 
-Talks to Epic's in-editor MCP server (ModelContextProtocol plugin) plus the ToolSuite
-toolset, and reads Saved/ToolSuite/editor.json and Saved/Logs directly, so status and
+Talks to Epic's in-editor MCP server (ModelContextProtocol plugin) plus the Tether
+toolset, and reads Saved/Tether/editor.json and Saved/Logs directly, so status and
 logs keep working when the editor is hung or gone. Stdlib only.
 
 Exit codes: 0 ok, 1 tool/command failed, 2 editor unavailable, 3 restart required, 4 timeout.
@@ -18,7 +18,7 @@ import sys
 import time
 import zlib
 
-TOOLSUITE = "toolsuite.toolsets.ToolSuiteCore"
+TETHER = "tether.toolsets.TetherCore"
 LEVELS = {"Fatal": 0, "Error": 1, "Warning": 2, "Display": 3, "Log": 4, "Verbose": 5, "VeryVerbose": 6}
 NOISE = {"LogModelContextProtocol", "LogToolsetRegistry"}  # our own transport chatter
 LOG_LINE = re.compile(r"^(?:\[[^\]]*\]\[[^\]]*\])?([A-Za-z0-9_]+): (?:(Fatal|Error|Warning|Display|Verbose|VeryVerbose): )?(.*)$")
@@ -52,7 +52,7 @@ def find_project(explicit):
 
 
 def state_dir(project):
-    return os.path.join(os.path.dirname(project), "Saved", "ToolSuite")
+    return os.path.join(os.path.dirname(project), "Saved", "Tether")
 
 
 def read_json(path):
@@ -223,8 +223,8 @@ class Ctx:
             self._mcp = Mcp(self.port, self.args.timeout).connect()
         return self._mcp
 
-    def toolsuite(self, tool, **kwargs):
-        text, is_error = self.mcp.call(TOOLSUITE, tool, kwargs)
+    def tether(self, tool, **kwargs):
+        text, is_error = self.mcp.call(TETHER, tool, kwargs)
         if is_error:
             raise CliError(compact_error(text))
         return unwrap(text)
@@ -449,7 +449,7 @@ def cmd_status(ctx, args):
     beacon = ctx.beacon
     name = os.path.splitext(os.path.basename(ctx.project))[0]
     if not beacon:
-        print(f"{name}: no beacon (editor never started with ToolSuite, or not yet ready)")
+        print(f"{name}: no beacon (editor never started with Tether, or not yet ready)")
         return 2
     alive = pid_alive(beacon.get("pid"))
     age = time.time() - beacon.get("heartbeat", 0)
@@ -639,10 +639,10 @@ def uat_user_solution(ctx, limit):
 
 
 def csharp_reload_build(ctx, args):
-    """In-editor C# hot reload through the ToolSuiteUnrealSharp bridge (no modal dialogs)."""
+    """In-editor C# hot reload through the TetherUnrealSharp bridge (no modal dialogs)."""
     log = log_path(ctx.project)
     start, started = log_end(ctx.project), time.time()
-    while ctx.toolsuite("cs_state") == "idle" and time.time() - started < 3:
+    while ctx.tether("cs_state") == "idle" and time.time() - started < 3:
         time.sleep(0.2)  # give the directory watcher a moment to register the saves
 
     def new_log():
@@ -651,7 +651,7 @@ def csharp_reload_build(ctx, args):
             return f.read().decode("utf-8", "replace")
 
     while True:
-        state = ctx.toolsuite("cs_reload")
+        state = ctx.tether("cs_reload")
         chunk = new_log()
         if state != "not reloaded" or "C# Compilation Failed" in chunk or time.time() - started > args.wait:
             break
@@ -714,7 +714,7 @@ def live_coding_build(ctx, args, changes):
     log, ubt_log = log_path(ctx.project), ubt_log_path()
     start, ubt_mtime = log_end(ctx.project), os.path.getmtime(ubt_log) if os.path.exists(ubt_log) else 0
     started = time.time()
-    ctx.toolsuite("console", command="LiveCoding.Compile")
+    ctx.tether("console", command="LiveCoding.Compile")
     result = None
     while time.time() - started < args.wait and result is None:
         time.sleep(0.25)
@@ -859,19 +859,19 @@ def cmd_close(ctx, args):
         print("not running")
         return 0
     if not args.force:
-        dirty = ctx.toolsuite("py", code=(
+        dirty = ctx.tether("py", code=(
             "U = unreal.EditorLoadingAndSavingUtils\n"
             "len(U.get_dirty_content_packages()) + len(U.get_dirty_map_packages())")).strip()
         dirty_count = 0 if dirty in ("", "0") else dirty
         if dirty_count and not (args.save or args.discard):
             raise CliError(f"{dirty_count} unsaved packages: pass --save or --discard")
         if args.save and dirty_count:
-            ctx.toolsuite("py", code="unreal.EditorLoadingAndSavingUtils.save_dirty_packages(True, True)")
+            ctx.tether("py", code="unreal.EditorLoadingAndSavingUtils.save_dirty_packages(True, True)")
         if args.discard and dirty_count:
             # Quitting would stop on a "Save Content?" modal; dropping the work was requested.
             print(f"discarding {dirty_count} unsaved packages")
         else:
-            ctx.toolsuite("py", code="unreal.SystemLibrary.quit_editor()")
+            ctx.tether("py", code="unreal.SystemLibrary.quit_editor()")
             deadline = time.time() + 30
             while time.time() < deadline and pid_alive(pid):
                 time.sleep(0.25)
@@ -943,25 +943,25 @@ def cmd_py(ctx, args):
         code = sys.stdin.read()
     else:
         code = " ".join(args.code)
-    out = ctx.toolsuite("py", code=code.lstrip("﻿"))  # PowerShell pipes a BOM
+    out = ctx.tether("py", code=code.lstrip("﻿"))  # PowerShell pipes a BOM
     if out:
         print(out.rstrip("\n"))
     return 0
 
 
 def cmd_props(ctx, args):
-    print(ctx.toolsuite("props", target=args.target, match=args.match or "", limit=args.limit))
+    print(ctx.tether("props", target=args.target, match=args.match or "", limit=args.limit))
     return 0
 
 
 def cmd_actors(ctx, args):
-    print(ctx.toolsuite("actors", match=args.match or "", limit=args.limit))
+    print(ctx.tether("actors", match=args.match or "", limit=args.limit))
     return 0
 
 
 def cmd_exec(ctx, args):
     start = log_end(ctx.project)
-    world = ctx.toolsuite("console", command=" ".join(args.command), pie=args.pie)
+    world = ctx.tether("console", command=" ".join(args.command), pie=args.pie)
     flush_editor_log(ctx)
     with open(log_path(ctx.project), "rb") as f:
         f.seek(start)
@@ -978,7 +978,7 @@ def flush_editor_log(ctx):
     beacon = ctx.beacon
     if beacon and pid_alive(beacon.get("pid")) and beacon.get("mcp_port") and port_open(beacon["mcp_port"]):
         try:
-            ctx.toolsuite("console", command="FLUSHLOG")
+            ctx.tether("console", command="FLUSHLOG")
         except CliError:
             pass  # hung or busy editor: read whatever is on disk
 
@@ -1003,7 +1003,7 @@ def cmd_pie(ctx, args):
         # UnrealSharp recompiles a saved but unreloaded C# type in place on its first lookup, from the old
         # reflection data. That drops the type's subsystems from every live world, PIE included, for the
         # rest of the session. So PIE only ever starts on reloaded code.
-        if csharp_changes(ctx.project) or ctx.toolsuite("cs_state") == "pending":
+        if csharp_changes(ctx.project) or ctx.tether("cs_state") == "pending":
             if csharp_reload_build(ctx, argparse.Namespace(wait=120, limit=args.limit)):
                 raise CliError("PIE not started: the C# reload failed (errors above)")
             start, started = log_end(ctx.project), time.time()
@@ -1113,7 +1113,7 @@ def cmd_hook(ctx, args):
 
 
 def cmd_reload(ctx, args):
-    print(ctx.toolsuite("reload"))
+    print(ctx.tether("reload"))
     cache = os.path.join(state_dir(ctx.project), "cache")
     for name in os.listdir(cache) if os.path.isdir(cache) else []:
         os.remove(os.path.join(cache, name))  # tool schemas may have changed
@@ -1188,7 +1188,7 @@ def main(argv=None):
     s.add_argument("action", choices=["start", "stop", "status"])
     s.add_argument("--simulate", action="store_true", help="Simulate-In-Editor (no player pawn)")
     s.add_argument("--warmup", type=float, default=0.5, help="seconds to let BeginPlay settle (0.5)")
-    add("reload", cmd_reload, "hot-reload the ToolSuite Python package in the editor")
+    add("reload", cmd_reload, "hot-reload the Tether Python package in the editor")
     s = add("hook", cmd_hook, "Claude Code hook entry points (hook JSON on stdin)")
     s.add_argument("event", choices=["pre-edit", "pre-mcp"])
 

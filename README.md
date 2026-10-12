@@ -1,17 +1,20 @@
-# ToolSuite
+# Tether
 
 Agent-native tooling for Unreal Engine 5.8+: drive a **running** editor from Claude Code (or any
 agent) quickly and with few tokens, instead of booting headless commandlets or restarting the editor.
 
+Formerly named ToolSuite (until 2026-10-12). The repo folder may still be called `ToolSuite`, and the
+command is still `ue`.
+
 - `cli/ue.py`: token-frugal CLI (stdlib-only Python). It talks to Epic's in-editor MCP server
   and reads the editor beacon and logs directly.
-- `Plugins/ToolSuite`: content-only (pure Python) editor plugin. It registers a `toolsuite` toolset
+- `Plugins/Tether`: content-only (pure Python) editor plugin. It registers a `tether` toolset
   into Epic's `ToolsetRegistry` (unrestricted Python, console commands, compact reads, hot reload)
-  and writes `Saved/ToolSuite/editor.json` as a heartbeat.
-- `Plugins/ToolSuiteUnrealSharp`: optional, tiny C++ editor plugin for UnrealSharp projects. It
+  and writes `Saved/Tether/editor.json` as a heartbeat.
+- `Plugins/TetherUnrealSharp`: optional, tiny C++ editor plugin for UnrealSharp projects. It
   makes C# hot reload callable from Python/MCP with modal dialogs suppressed, so `ue build`
   reloads C# in about 1 s.
-- `.claude/skills/unreal-toolsuite`: Claude Code skill that teaches the workflow. It loads
+- `.claude/skills/unreal-tether`: Claude Code skill that teaches the workflow. It loads
   automatically in sessions started at this repo's root; copy it into another project's
   `.claude/skills/` to use it there.
 - `.claude/settings.json`: two PreToolUse hooks:
@@ -28,12 +31,12 @@ Status: working spike (Phase 0/1). See `docs/DESIGN.md` §2a for measured result
 ## Quickstart (any UE 5.8 project)
 
 1. Enable plugins in the `.uproject`: `ModelContextProtocol`, `EditorToolset` (or all of Epic's
-   toolsets via `AllToolsets`, which also pulls in plugins such as GameFeatures) and `ToolSuite`.
-   - To get `ToolSuite`, either copy `Plugins/ToolSuite` into the project's `Plugins/`, or add
+   toolsets via `AllToolsets`, which also pulls in plugins such as GameFeatures) and `Tether`.
+   - To get `Tether`, either copy `Plugins/Tether` into the project's `Plugins/`, or add
      `"AdditionalPluginDirectories": ["<path to this repo>/Plugins"]`.
    - The entry must point at `Plugins`, not at a plugin folder: UnrealBuildTool only searches subfolders.
-   - Both ToolSuite plugins are opt-in (`EnabledByDefault: false`), so list `ToolSuite` explicitly.
-     Projects without UnrealSharp simply leave `ToolSuiteUnrealSharp` out. IslandHorror's setup is the
+   - Both Tether plugins are opt-in (`EnabledByDefault: false`), so list `Tether` explicitly.
+     Projects without UnrealSharp simply leave `TetherUnrealSharp` out. IslandHorror's setup is the
      example.
 2. Put this repo's `cli/` folder on `PATH` (or call `<repo>\cli\ue.cmd`). Then run these from the project folder, or with `UE_PROJECT` set:
 
@@ -53,7 +56,7 @@ cli\ue.cmd close                # refuses to drop unsaved work unless --save or 
 
 ## C# with UnrealSharp (optional)
 
-1. Clone UnrealSharp into the project's `Plugins/UnrealSharp` and enable `ToolSuiteUnrealSharp`.
+1. Clone UnrealSharp into the project's `Plugins/UnrealSharp` and enable `TetherUnrealSharp`.
    This needs .NET SDK 10.0.5 or later. `Sandbox/` uses commit `06769c4`.
 2. Run `ue build` with the editor closed (UBT; the first build takes about 2 minutes).
 3. Create the C# project without the GUI wizard:

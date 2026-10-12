@@ -2,17 +2,17 @@
 	"FileVersion": 3,
 	"Version": 1,
 	"VersionName": "0.1.0",
-	"FriendlyName": "ToolSuite UnrealSharp Bridge",
-	"Description": "Lets coding agents drive UnrealSharp C# hot reload from Python/MCP without modal dialogs. Optional companion to the ToolSuite plugin.",
+	"FriendlyName": "Tether UnrealSharp Bridge",
+	"Description": "Lets coding agents drive UnrealSharp C# hot reload from Python/MCP without modal dialogs. Optional companion to the Tether plugin.",
 	"Category": "Editor",
-	"CreatedBy": "ToolSuite",
+	"CreatedBy": "Tether",
 	"CanContainContent": false,
 	"IsBetaVersion": true,
 	"Installed": false,
 	"EnabledByDefault": false,
 	"Modules": [
 		{
-			"Name": "ToolSuiteUnrealSharp",
+			"Name": "TetherUnrealSharp",
 			"Type": "Editor",
 			"LoadingPhase": "PostEngineInit"
 		}

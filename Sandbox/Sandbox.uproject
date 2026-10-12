@@ -2,7 +2,7 @@
 	"FileVersion": 3,
 	"EngineAssociation": "5.8",
 	"Category": "",
-	"Description": "ToolSuite scratch project for editor-bridge experiments. Safe to delete.",
+	"Description": "Tether scratch project for editor-bridge experiments. Safe to delete.",
 	"Modules": [
 		{
 			"Name": "Sandbox",
@@ -35,11 +35,11 @@
 			"Enabled": true
 		},
 		{
-			"Name": "ToolSuite",
+			"Name": "Tether",
 			"Enabled": true
 		},
 		{
-			"Name": "ToolSuiteUnrealSharp",
+			"Name": "TetherUnrealSharp",
 			"Enabled": true
 		}
 	]

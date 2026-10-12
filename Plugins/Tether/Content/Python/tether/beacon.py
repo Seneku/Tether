@@ -1,4 +1,4 @@
-"""Writes Saved/ToolSuite/editor.json about once a second from the editor tick.
+"""Writes Saved/Tether/editor.json about once a second from the editor tick.
 
 A fresh heartbeat proves the game thread is alive; a stale heartbeat with a live
 PID means the editor is hung. The `ue` CLI reads this file without any HTTP.
@@ -13,13 +13,13 @@ import unreal
 
 _INTERVAL = 1.0
 # Stashed on sys so a hot reload (which re-executes this module in place) keeps the state.
-_state = getattr(sys, "_toolsuite_beacon_state", None) or {"last": 0.0, "warned": False, "port": None}
-sys._toolsuite_beacon_state = _state
+_state = getattr(sys, "_tether_beacon_state", None) or {"last": 0.0, "warned": False, "port": None}
+sys._tether_beacon_state = _state
 
 
 def _path():
     saved = unreal.Paths.convert_relative_path_to_full(unreal.Paths.project_saved_dir())
-    return os.path.join(saved, "ToolSuite", "editor.json")
+    return os.path.join(saved, "Tether", "editor.json")
 
 
 def _mcp_port():
@@ -69,13 +69,13 @@ def _tick(_delta):
     except Exception as exc:  # never let the beacon break or spam the tick
         if not _state["warned"]:
             _state["warned"] = True
-            unreal.log_warning(f"ToolSuite beacon: {exc}")
+            unreal.log_warning(f"Tether beacon: {exc}")
 
 
 def start():
     """(Re)start the beacon; safe to call again after a hot reload."""
     _state["port"] = _mcp_port()
-    previous = getattr(sys, "_toolsuite_beacon", None)
+    previous = getattr(sys, "_tether_beacon", None)
     if previous is not None:
         unreal.unregister_slate_post_tick_callback(previous)
-    sys._toolsuite_beacon = unreal.register_slate_post_tick_callback(_tick)
+    sys._tether_beacon = unreal.register_slate_post_tick_callback(_tick)
