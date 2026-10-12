@@ -189,6 +189,11 @@ design decisions are in [docs/DESIGN.md](docs/DESIGN.md) §8–9.
   in the editor console.
 - Tether is not affiliated with or endorsed by Epic Games. Unreal Engine is a trademark of Epic Games, Inc.
 
+## Contributing
+
+Bug reports, measurements and PRs are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for dev setup,
+testing and the design rules.
+
 ## License
 
 [MIT](LICENSE)

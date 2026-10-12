@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: UnrealSharp bug
+    url: https://github.com/UnrealSharp/UnrealSharp/issues
+    about: C# compile, glue or hot-reload problems that also happen without Tether.
+  - name: Contributing guide
+    url: https://github.com/Seneku/Tether/blob/main/CONTRIBUTING.md
+    about: Dev setup, testing and the design rules for compact, agent-friendly output.

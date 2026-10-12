@@ -1,0 +1,80 @@
+name: Bug report
+description: A `ue` command, the Tether toolset or a hook misbehaves
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. Exact commands and their full output are what make a bug fixable.
+        Problems in Epic's MCP server or UnrealSharp may belong upstream; see CONTRIBUTING.md.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you ran, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Commands and output
+      description: The exact `ue` commands and their full output. Add `ue log --since start --level Warning` if relevant.
+      render: shell
+    validations:
+      required: true
+  - type: input
+    id: ue-version
+    attributes:
+      label: Unreal Engine version
+      description: The version from `ue status`, and whether it's a launcher or source build.
+      placeholder: 5.8.3 launcher
+    validations:
+      required: true
+  - type: input
+    id: tether-version
+    attributes:
+      label: Tether commit
+      description: Output of `git rev-parse --short HEAD` in your Tether checkout.
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: OS and Python version
+      placeholder: Windows 11, Python 3.14
+    validations:
+      required: true
+  - type: dropdown
+    id: shell
+    attributes:
+      label: Shell
+      options:
+        - PowerShell
+        - cmd
+        - Git Bash
+        - Other
+    validations:
+      required: true
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Editor mode
+      options:
+        - Headless (ue open --headless)
+        - Windowed (ue open)
+        - Editor started outside ue
+    validations:
+      required: true
+  - type: checkboxes
+    id: setup
+    attributes:
+      label: Setup
+      options:
+        - label: The project uses UnrealSharp (TetherUnrealSharp enabled)
+        - label: An agent was driving the editor (e.g. Claude Code with the unreal-tether skill)
+        - label: Reproduces in the bundled Sandbox project
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else
+      description: Workarounds you found, logs, screenshots, related issues.

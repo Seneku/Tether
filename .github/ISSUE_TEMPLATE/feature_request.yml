@@ -1,0 +1,29 @@
+name: Feature request
+description: A new command, tool or workflow for driving Unreal from an agent
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The loop you want to speed up
+      description: What an agent (or you) is doing today, and what it costs in time, tokens, restarts or manual steps.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed command or tool
+      description: What it would look like, e.g. `ue shot --actor Foo`, plus example output. Keep the output compact; see the design rules in CONTRIBUTING.md.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Existing options
+      description: Can one of Epic's toolsets (`ue tools`) or `ue py` already do this? Why isn't that good enough?
+  - type: checkboxes
+    id: contribute
+    attributes:
+      label: Contribution
+      options:
+        - label: I'd be willing to open a PR for this
