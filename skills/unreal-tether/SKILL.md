@@ -94,6 +94,10 @@ broken or unsupported.
 ## Blueprints, DataTables, API lookups, long jobs
 - `ue asset <path>` summarises an asset in a few lines (mesh triangles/LODs/Nanite, texture size and
   compression, material parameters...); use it before `ue props`, which lists every property.
+- Materials: `ue mat /Game/Path/MI_X` lists parameters with values (and which are overridden);
+  `ue mat MI_X Roughness=0.3 Tint=1,0,0 UseDetail=true` sets them (undoable); `ue mat <actor>` shows which
+  material is on each slot; `ue mat M_X --compile` lists shader compile errors. Prefer it over `ue props`
+  on materials, which shows parameter arrays raw.
 - `ue diff /Game/Path/Asset [rev]` shows what changed in a binary asset since a git revision (default HEAD,
   compared with the editor's current version) or between two (`--to rev2`): Blueprint variables, components,
   defaults and graph text, DataTable rows, map actors. Use it to review your own asset edits before

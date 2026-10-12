@@ -29,7 +29,7 @@ class _Lazy:
 socket, subprocess, zlib = _Lazy("socket"), _Lazy("subprocess"), _Lazy("zlib")
 
 TETHER = "tether.toolsets.TetherCore"
-GATED = {"py", "console", "set_props", "undo", "save", "spawn", "delete", "duplicate", "mv", "rm"}  # tools that need the session token (see beacon.session_token)
+GATED = {"py", "console", "set_props", "undo", "save", "spawn", "delete", "duplicate", "mv", "rm", "set_material"}  # tools that need the session token (see beacon.session_token)
 LEVELS = {"Fatal": 0, "Error": 1, "Warning": 2, "Display": 3, "Log": 4, "Verbose": 5, "VeryVerbose": 6}
 NOISE = {"LogModelContextProtocol", "LogToolsetRegistry"}  # our own transport chatter
 # Epic logs this whenever a schema is generated for a class with delegates (props, set, describe_toolset).
@@ -1510,6 +1510,26 @@ def mcp_tool(ctx, toolset_query, tool, payload):
     return unwrap(text)
 
 
+def graph_source(ctx, bp):
+    """Where to read a Blueprint's graphs from. Epic's read_graph_dsl marks the Blueprint modified, so one with
+    no unsaved changes is read from a copy of its file (loaded as /Temp/...) and stays clean."""
+    package = bp.split(".")[0]
+    dirty = ctx.tether("py", code=f"{package!r} in [p.get_name() for p in "
+                                  "unreal.EditorLoadingAndSavingUtils.get_dirty_content_packages()]")
+    file = package_file(ctx.project, package) if package.startswith("/Game/") else None
+    if str(dirty).strip().endswith("True") or not file or not os.path.isfile(file):
+        return bp
+    with open(file, "rb") as f:
+        return stage_copy(ctx.project, f.read(), package.rsplit("/", 1)[-1], os.path.splitext(file)[1])
+
+
+def read_graph(ctx, source, bp, graph):
+    """A graph's DSL text, read from `source` (see graph_source) but naming the Blueprint `bp`."""
+    text = mcp_tool(ctx, "blueprint", "read_graph_dsl", {"graph": {"refPath": f"{source}:{graph}"}})
+    text = text if isinstance(text, str) else json.dumps(text)
+    return text.replace(source.split(".")[0], bp.split(".")[0]) if source != bp else text
+
+
 COMPILER_LINE = re.compile(r"(?:LogBlueprint|LogK2Compiler|BlueprintLog)\w*: (Error|Warning): (.*)")
 
 
@@ -1573,9 +1593,9 @@ def cmd_bp(ctx, args):
             time.sleep(0.25)
         print(f"applied {os.path.basename(args.apply)} to {names[0]} (compiled)")
     changed = 0
+    source = bp if args.apply else graph_source(ctx, bp)
     for name in names:
-        text = mcp_tool(ctx, "blueprint", "read_graph_dsl", {"graph": {"refPath": f"{bp}:{name}"}})
-        text = text if isinstance(text, str) else json.dumps(text)
+        text = read_graph(ctx, source, bp, name)
         snap = snapshot_path(ctx, "bp", bp, name + ".dsl")
         before = open(snap, encoding="utf-8").read() if os.path.isfile(snap) else None
         if args.diff or args.apply:
@@ -2100,17 +2120,13 @@ def cmd_diff(ctx, args):
                 print(f"{key}: " + ", ".join([f"+{n}" for n in added] + [f"-{n}" for n in removed]))
     print(ctx.tether("diff", old=old, new=new, limit=400))
     if old_bp and new_bp:
-        old_root, new_root = old.split(".")[0], new.split(".")[0]
+        source = new if new.startswith("/Temp/") else graph_source(ctx, new)
         for graph in [g for g in new_bp["graphs"] if g in old_bp["graphs"]]:
-            before = mcp_tool(ctx, "blueprint", "read_graph_dsl", {"graph": {"refPath": f"{old}:{graph}"}})
-            after = mcp_tool(ctx, "blueprint", "read_graph_dsl", {"graph": {"refPath": f"{new}:{graph}"}})
-            before = (before if isinstance(before, str) else json.dumps(before)).replace(old_root, new_root)
-            after = after if isinstance(after, str) else json.dumps(after)
+            before, after = read_graph(ctx, old, new, graph), read_graph(ctx, source, new, graph)
             if before != after:
                 print(text_diff(before, after, graph).rstrip())
         for graph in [g for g in new_bp["graphs"] if g not in old_bp["graphs"]]:
-            text = mcp_tool(ctx, "blueprint", "read_graph_dsl", {"graph": {"refPath": f"{new}:{graph}"}})
-            print(f"== {graph} (new)\n" + (text if isinstance(text, str) else json.dumps(text)).rstrip())
+            print(f"== {graph} (new)\n" + read_graph(ctx, source, new, graph).rstrip())
     if not args.files and package.startswith("/Game/") and ext == ".umap":
         actors = external_actor_changes(ctx, package, rev, to)
         if actors:
@@ -2198,6 +2214,25 @@ def cmd_validate(ctx, args):
     warnings = len(problems) - invalid
     write_json(os.path.join(state_dir(ctx.project), "validated.json"), {"time": time.time(), "errors": errors})
     return 1 if errors or (args.strict and (warnings or other)) else 0
+
+
+def cmd_mat(ctx, args):
+    """Material parameters: list them (with where each value comes from), or set them (undoable)."""
+    if args.assignments or args.reset:
+        values = {}
+        for item in args.assignments:
+            name, eq, value = item.partition("=")
+            if not eq or not name:
+                raise CliError(f"expected Name=value, got '{item}'")
+            values[name.strip()] = value
+        print(ctx.tether("set_material", target=args.target, values=json.dumps(values) if values else "",
+                         reset=",".join(args.reset or [])))
+        if args.compile:
+            text = ctx.tether("material", target=args.target, compile=True, limit=0)
+            print(text[text.find("compiled "):])
+        return 0
+    print(ctx.tether("material", target=args.target, compile=args.compile, limit=args.limit))
+    return 0
 
 
 def cmd_find(ctx, args):
@@ -2481,6 +2516,17 @@ def cmd_selftest(ctx, args):
         check("undo", ["undo"], skip=probe_skip, ok=lambda c, o: c == 0 and "undone: TetherSelftestProbe" in o)
         check("set rollback", ["set", "TetherSelftestProbe", "location=0,0,0", "no_such_property_xyz=1"],
               skip=probe_skip, ok=lambda c, o: c != 0 and "no property" in o)
+    check("mat", ["mat", "/Engine/BasicShapes/BasicShapeMaterial"], ok=lambda c, o: c == 0 and "vector  Color" in o)
+    instance = None if remote else check("mat: transient instance", ["py",
+        "mi = unreal.find_object(None, '/Engine/Transient.MI_TetherSelftest') or "
+        "unreal.new_object(unreal.MaterialInstanceConstant, name='MI_TetherSelftest')\n"
+        "unreal.MaterialEditingLibrary.set_material_instance_parent(mi, unreal.load_asset('/Engine/BasicShapes/BasicShapeMaterial'))\n"
+        "mi.get_path_name()"], ok=lambda c, o: c == 0 and o.endswith("MI_TetherSelftest"))
+    check("mat set", ["mat", "/Engine/Transient.MI_TetherSelftest", "Color=1,0,0"],
+          skip="needs UE 5.8+" if remote else None if instance else "no transient instance",
+          ok=lambda c, o: c == 0 and "-> (1, 0, 0, 1)" in o)
+    check("undo mat", ["undo"], skip="needs UE 5.8+" if remote else None if instance else "no transient instance",
+          ok=lambda c, o: c == 0 and "undone: mat" in o)
     check("destroy probe actor", ["py", "w = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_editor_world()\n"
           "found = [a for a in unreal.GameplayStatics.get_all_actors_of_class(w, unreal.Actor) "
           "if a.get_actor_label() == 'TetherSelftestProbe']\n"
@@ -2684,12 +2730,16 @@ def cmd_perf(ctx, args):
     path, complete = None, False
     # A headless or background editor throttles itself to a few fps ("Use Less CPU when in Background"),
     # which makes frame time meaningless; lift that for the capture and restore it afterwards.
-    perf_settings = "/Script/UnrealEd.Default__EditorPerformanceSettings"
-    throttled = "= True" in ctx.tether("props", target=perf_settings, match="^bThrottleCPUWhenNotForeground$",
-                                       limit=5, pie=False)
+    # Set directly, not with set_props: an editor setting is not level work, and a transaction would put it in
+    # the undo history (`ue undo` would then "undo" the restore below).
+    throttle = ("s = unreal.find_object(None, '/Script/UnrealEd.Default__EditorPerformanceSettings')\n"
+                "s.set_editor_property('bThrottleCPUWhenNotForeground', {})\n"
+                "s.get_editor_property('bThrottleCPUWhenNotForeground')")
+    throttled = str(ctx.tether("py", code=throttle.format("s.get_editor_property('bThrottleCPUWhenNotForeground')"))
+                    ).strip().endswith("True")
     try:
         if throttled:
-            ctx.tether("set_props", target=perf_settings, values=json.dumps({"bThrottleCPUWhenNotForeground": "false"}))
+            ctx.tether("py", code=throttle.format(False))
         ctx.tether("py", code="unreal.SystemLibrary.execute_console_command(None, 'CsvProfile Start')")
         time.sleep(args.seconds)
         ctx.tether("py", code="unreal.SystemLibrary.execute_console_command(None, 'CsvProfile Stop')")
@@ -2708,7 +2758,7 @@ def cmd_perf(ctx, args):
             time.sleep(0.5)
     finally:
         if throttled:
-            ctx.tether("set_props", target=perf_settings, values=json.dumps({"bThrottleCPUWhenNotForeground": "true"}))
+            ctx.tether("py", code=throttle.format(True))
         if started_pie:
             cmd_pie(ctx, argparse.Namespace(action="stop", simulate=False, warmup=0, limit=0, script=None))
     if not path or not complete:
@@ -3411,6 +3461,11 @@ def main(argv=None):
                    help="also the assets changed in git (uncommitted, plus committed since REV if given)")
     s.add_argument("--map-check", action="store_true", help="also Map Check the open level (default without paths)")
     s.add_argument("--strict", action="store_true", help="fail on warnings too")
+    s = add("mat", cmd_mat, "material parameters with values and sources; Name=value sets them (undoable)")
+    s.add_argument("target", help="material or instance path, or an actor (lists its materials)")
+    s.add_argument("assignments", nargs="*", metavar="Name=value", help="scalar, r,g,b[,a], true/false, texture path")
+    s.add_argument("--reset", action="append", metavar="NAME", help="stop overriding NAME (instances; repeatable)")
+    s.add_argument("--compile", action="store_true", help="recompile the base material and list compile errors")
     s = add("find", cmd_find, "search assets by name and/or class (asset registry)")
     s.add_argument("query", nargs="?", help="regex on the asset name")
     s.add_argument("--class", dest="cls", help="regex on the class name, e.g. StaticMesh or 'Material$'")

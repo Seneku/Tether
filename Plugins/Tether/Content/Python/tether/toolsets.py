@@ -140,7 +140,12 @@ def _resolve(ref, pie=False):
 
 
 def _short_path(path):
-    return path.split(":PersistentLevel.", 1)[-1] if path else "None"
+    if not path:
+        return "None"
+    package, dot, name = path.rpartition(".")
+    if dot and ":" not in name and package.rsplit("/", 1)[-1] == name:  # /Game/X/A.A -> /Game/X/A
+        return package
+    return path.split(":PersistentLevel.", 1)[-1]
 
 
 def _label(obj):
@@ -383,7 +388,14 @@ def snapshot_level(level=None):
         return
     level = level or world.get_path_name().split(".")[0]
     _LEVELS[level] = {a.get_path_name(): (a.get_actor_label(), a.get_class().get_name(), _pose_key(a))
-                      for a in unreal.get_editor_subsystem(unreal.EditorActorSubsystem).get_all_level_actors()}
+                      for a in _authored_actors()}
+
+
+def _authored_actors():
+    """The edited level's actors minus World Partition HLOD actors, which the editor generates (and spawns
+    after a map loads) rather than anyone placing them."""
+    return [a for a in unreal.get_editor_subsystem(unreal.EditorActorSubsystem).get_all_level_actors()
+            if not a.get_class().get_name().startswith("WorldPartitionHLOD")]
 
 
 def _try(fn, default=None):
@@ -542,6 +554,74 @@ def _level_actors(world):
 def _table_rows(table):
     rows = json.loads(unreal.DataTableFunctionLibrary.export_data_table_to_json_string(table) or "[]")
     return {str(r.get("Name")): {k: v for k, v in r.items() if k != "Name"} for r in rows}
+
+
+_MAT_KINDS = ("scalar", "vector", "texture", "switch")
+
+
+def _mat_names(material):
+    lib = unreal.MaterialEditingLibrary
+    getters = {"scalar": lib.get_scalar_parameter_names, "vector": lib.get_vector_parameter_names,
+               "texture": lib.get_texture_parameter_names, "switch": lib.get_static_switch_parameter_names}
+    return {kind: [str(n) for n in (_try(lambda: getters[kind](material), []) or [])] for kind in _MAT_KINDS}
+
+
+def _mat_value(material, kind, name):
+    lib = unreal.MaterialEditingLibrary
+    if isinstance(material, unreal.MaterialInstance):
+        get = {"scalar": lib.get_material_instance_scalar_parameter_value,
+               "vector": lib.get_material_instance_vector_parameter_value,
+               "texture": lib.get_material_instance_texture_parameter_value,
+               "switch": lib.get_material_instance_static_switch_parameter_value}[kind]
+    else:
+        get = {"scalar": lib.get_material_default_scalar_parameter_value,
+               "vector": lib.get_material_default_vector_parameter_value,
+               "texture": lib.get_material_default_texture_parameter_value,
+               "switch": lib.get_material_default_static_switch_parameter_value}[kind]
+    return get(material, name)
+
+
+def _mat_text(value):
+    if isinstance(value, unreal.LinearColor):
+        return "(" + ", ".join(f"{v:.4g}" for v in (value.r, value.g, value.b, value.a)) + ")"
+    if isinstance(value, unreal.Object):
+        return _short_path(value.get_path_name())
+    if isinstance(value, float):
+        return f"{value:.6g}"
+    return "None" if value is None else str(value).lower() if isinstance(value, bool) else str(value)
+
+
+def _mat_parse(kind, text):
+    raw = text.strip()
+    if kind == "scalar":
+        nums = _numbers(raw)
+        if not nums or len(nums) != 1:
+            raise ValueError(f"expected a number, got '{text}'")
+        return float(nums[0])
+    if kind == "vector":
+        nums = _numbers(raw)
+        if not nums or len(nums) not in (3, 4):
+            raise ValueError(f"expected r,g,b[,a], got '{text}'")
+        return unreal.LinearColor(*[float(n) for n in nums] + ([1.0] if len(nums) == 3 else []))
+    if kind == "switch":
+        flag = {"true": True, "1": True, "on": True, "false": False, "0": False, "off": False}.get(raw.lower())
+        if flag is None:
+            raise ValueError(f"expected true/false, got '{text}'")
+        return flag
+    if raw.lower() in ("", "none", "null"):
+        return None
+    texture = unreal.load_asset(raw.split(".")[0])
+    if not isinstance(texture, unreal.Texture):
+        raise ValueError(f"no texture at {raw} (ue find {raw.rsplit('/', 1)[-1]} --class Texture)")
+    return texture
+
+
+def _material_of(target):
+    obj = _resolve(target)
+    if not isinstance(obj, unreal.MaterialInterface):
+        raise RuntimeError(f"{_label(obj)} is a {obj.get_class().get_name()}, not a material or material instance"
+                           + (" (for an actor, `ue mat <actor>` lists its materials)" if isinstance(obj, unreal.Actor) else ""))
+    return obj
 
 
 _reload = {"handle": None}
@@ -1138,7 +1218,7 @@ class TetherCore(_Base):
             lines.append(f"  {len(actor_packages)} World Partition actor package(s)")
         base = _LEVELS.get(level)
         if level and base is not None and (maps or actor_packages):
-            now = {a.get_path_name(): a for a in unreal.get_editor_subsystem(unreal.EditorActorSubsystem).get_all_level_actors()}
+            now = {a.get_path_name(): a for a in _authored_actors()}
             added = [now[p].get_actor_label() for p in now if p not in base]
             removed = [base[p][0] for p in base if p not in now]
             moved = [now[p].get_actor_label() for p in now if p in base and _pose_key(now[p]) != base[p][2]]
@@ -1474,6 +1554,136 @@ class TetherCore(_Base):
             return ("no actors added, removed or changed in the map package itself" if isinstance(b, unreal.World)
                     else "no differences in reflected properties")
         return "\n".join(out[:limit]) + (f"\n... +{len(out) - limit} more lines" if len(out) > limit else "")
+
+    @_tool
+    @staticmethod
+    def material(target: str, compile: bool = False, limit: int = 80) -> str:
+        """A material's or material instance's parameters with their values and where each value comes from,
+        or, for an actor, the materials on each of its components' slots.
+
+        Args:
+            target: Material or material instance path, or an actor or 'Actor.Component'.
+            compile: Recompile the (base) material and list its compile errors.
+            limit: Maximum number of parameter lines.
+
+        Returns:
+            A header (class, parent chain), one line per parameter, then compile errors if asked.
+        """
+        lib = unreal.MaterialEditingLibrary
+        obj = _resolve(target)
+        if isinstance(obj, (unreal.Actor, unreal.PrimitiveComponent)):
+            rows = []
+            comps = obj.get_components_by_class(unreal.PrimitiveComponent) if isinstance(obj, unreal.Actor) else [obj]
+            for comp in comps:
+                slots = [str(n) for n in (_try(lambda: comp.get_material_slot_names(), []) or [])]
+                for i in range(_try(lambda: comp.get_num_materials(), 0) or 0):
+                    mat = comp.get_material(i)
+                    slot = slots[i] if i < len(slots) else str(i)
+                    text = _short_path(mat.get_path_name()) if mat else "None"
+                    if isinstance(mat, unreal.MaterialInstanceDynamic):
+                        text = f"dynamic instance of {_short_path(mat.get_editor_property('parent').get_path_name())}"
+                    rows.append(f"{comp.get_name()}[{slot}]: {text}")
+            return _capped(f"{_label(obj)}: {len(rows)} material slot(s)", rows, limit)
+        material = _material_of(target)
+        chain, parent = [], _try(lambda: material.get_editor_property("parent"))
+        while parent is not None and len(chain) < 8:
+            chain.append(_short_path(parent.get_path_name()))
+            parent = _try(lambda: parent.get_editor_property("parent")) if isinstance(parent, unreal.MaterialInstance) else None
+        head = f"{_short_path(material.get_path_name())} ({material.get_class().get_name()})"
+        if chain:
+            head += " <- " + " <- ".join(chain)
+        is_instance = isinstance(material, unreal.MaterialInstance)
+        parent = _try(lambda: material.get_editor_property("parent")) if is_instance else None
+        rows = []
+        for kind, names in _mat_names(material).items():
+            for name in names:
+                value = _try(lambda: _mat_value(material, kind, name))
+                note = ""
+                if is_instance:
+                    if _try(lambda: lib.is_material_instance_parameter_overridden(material, name), False):
+                        inherited = _try(lambda: _mat_value(parent, kind, name)) if parent else None
+                        note = "  (override" + (f"; parent {_mat_text(inherited)}" if parent else "") + ")"
+                else:
+                    getter = getattr(lib, f"get_{'static_switch' if kind == 'switch' else kind}_parameter_source", None)
+                    source = _try(lambda: str(getter(material, name).export_text())) if getter else None
+                    if source and source not in ("", "None") and material.get_path_name() not in source:
+                        note = f"  (from {_short_path(source)})"
+                rows.append(f"{kind:<7} {name} = {_mat_text(value)}{note}")
+        out = _capped(head + f"\n{len(rows)} parameter(s)", rows, limit)
+        if compile:
+            base = material
+            while isinstance(base, unreal.MaterialInstance) and _try(lambda: base.get_editor_property("parent")):
+                base = base.get_editor_property("parent")
+            errors = [str(e) for e in lib.recompile_material(base)] if isinstance(base, unreal.Material) else []
+            out += f"\ncompiled {_short_path(base.get_path_name())}: " + \
+                (f"{len(errors)} error(s)\n" + "\n".join("  " + e for e in errors) if errors else "no errors")
+        return out
+
+    @_tool
+    @staticmethod
+    def set_material(target: str, values: str, reset: str = "", token: str = "") -> str:
+        """Set material instance parameters (or a material's parameter defaults), as one undoable transaction.
+
+        Args:
+            target: Material instance (or material) path.
+            values: JSON object of parameter name to value text: numbers, 'r,g,b[,a]', true/false, texture paths.
+            reset: Comma-separated parameter names to stop overriding (instances only).
+            token: Session token from Saved/Tether/session.json (the ue CLI sends it).
+
+        Returns:
+            One 'name: old -> new' line per parameter.
+        """
+        _authorize(token)
+        lib = unreal.MaterialEditingLibrary
+        material = _material_of(target)
+        is_instance = isinstance(material, unreal.MaterialInstance)
+        names = _mat_names(material)
+        kind_of = {n.lower(): (k, n) for k, ns in names.items() for n in ns}
+        requested = json.loads(values) if values else {}
+        resets = [r.strip() for r in reset.split(",") if r.strip()]
+        plan = []
+        for key, raw in list(requested.items()) + [(r, None) for r in resets]:
+            if key.lower() not in kind_of:
+                import difflib
+                close = difflib.get_close_matches(key.lower(), list(kind_of), n=4, cutoff=0.5)
+                raise RuntimeError(f"{_label(material)} has no parameter '{key}'"
+                                   + (f" (did you mean: {', '.join(kind_of[c][1] for c in close)})" if close else ""))
+            kind, name = kind_of[key.lower()]
+            try:
+                plan.append((kind, name, None if raw is None else _mat_parse(kind, str(raw))))
+            except ValueError as exc:
+                raise RuntimeError(f"{name}: {exc}") from None
+        if resets and not is_instance:
+            raise RuntimeError("--reset is for material instances (a material's parameters are its defaults)")
+        old = {name: _mat_value(material, kind, name) for kind, name, _ in plan}
+        before = unreal.ToolsetLibrary.get_active_undo_count() if not _LEGACY else 0
+        with unreal.ScopedEditorTransaction(f"ue mat {_label(material)}"):
+            material.modify()
+            for kind, name, value in plan:
+                if value is None and name in resets:
+                    lib.set_material_instance_parameter_override(material, name, False)
+                elif is_instance:
+                    setter = {"scalar": lib.set_material_instance_scalar_parameter_value,
+                              "vector": lib.set_material_instance_vector_parameter_value,
+                              "texture": lib.set_material_instance_texture_parameter_value,
+                              "switch": lib.set_material_instance_static_switch_parameter_value}[kind]
+                    setter(material, name, value)
+                else:  # a base material: change the parameter node's default value
+                    expressions = [e for e in lib.get_material_expressions(material)
+                                   if str(_try(lambda: e.get_editor_property("parameter_name"), "")) == name]
+                    if not expressions:
+                        raise RuntimeError(f"{name} is defined in a material function; edit it there")
+                    for expression in expressions:
+                        expression.modify()
+                        expression.set_editor_property("default_value", value)
+            if is_instance:
+                lib.update_material_instance(material)
+        if not is_instance:
+            lib.recompile_material(material)
+        _record_undo(before, f"mat {_label(material)}: " + ", ".join(n for _, n, _ in plan))
+        rows = [f"{name}: {_mat_text(old[name])} -> {_mat_text(_mat_value(material, kind, name))}"
+                + (" (parent value)" if name in resets else "") for kind, name, _ in plan]
+        return "\n".join([_label(material)] + rows)
 
     @_tool
     @staticmethod
