@@ -251,7 +251,8 @@ class FakeCtx:
 class Commands(unittest.TestCase):
     def test_set_builds_values_and_keeps_deltas(self):
         ctx = FakeCtx("Light\nintensity: 1 -> 2")
-        args = argparse.Namespace(target="Light", assignments=["intensity=2", "location+=0,0,10", "name=a=b"], pie=False)
+        args = argparse.Namespace(target="Light", assignments=["intensity=2", "location+=0,0,10", "name=a=b"], pie=False,
+                                  from_file=None, dry_run=False)
         with unittest.mock.patch("builtins.print"):
             self.assertEqual(ue.cmd_set(ctx, args), 0)
         tool, kwargs = ctx.calls[0]
@@ -259,7 +260,7 @@ class Commands(unittest.TestCase):
         self.assertEqual(json.loads(kwargs["values"]), {"intensity": "2", "location+": "0,0,10", "name": "a=b"})
 
     def test_set_rejects_missing_equals(self):
-        args = argparse.Namespace(target="Light", assignments=["intensity"], pie=False)
+        args = argparse.Namespace(target="Light", assignments=["intensity"], pie=False, from_file=None, dry_run=False)
         with self.assertRaises(ue.CliError):
             ue.cmd_set(FakeCtx(), args)
 
@@ -268,7 +269,7 @@ class Commands(unittest.TestCase):
             def tether(self, tool, **kwargs):
                 raise ue.CliError("SetObjectProperties on '/Temp/L.L:PersistentLevel.A.C' (LightComponent): the "
                                   "following properties could not be set: mobility invalid value (see ue log) (rolled back)")
-        args = argparse.Namespace(target="A.C", assignments=["mobility=Wobbly"], pie=False)
+        args = argparse.Namespace(target="A.C", assignments=["mobility=Wobbly"], pie=False, from_file=None, dry_run=False)
         with self.assertRaises(ue.CliError) as caught:
             ue.cmd_set(Failing(), args)
         self.assertEqual(str(caught.exception), "LightComponent.mobility: invalid value (see ue log) (rolled back)")
@@ -393,6 +394,14 @@ class RemoteResults(unittest.TestCase):
 
 
 class Phase3(unittest.TestCase):
+    def test_same_value(self):
+        self.assertTrue(ue.same_value({"r": 1, "g": 0.8}, {"r": 1, "g": 0.8000001}))
+        self.assertFalse(ue.same_value({"r": 1, "g": 0.8}, {"r": 1, "g": 0.9}))
+        self.assertFalse(ue.same_value({"r": 1}, {"r": 1, "g": 0}))
+        self.assertTrue(ue.same_value([1, 2.004], [1, 2]))
+        self.assertFalse(ue.same_value(True, 1))
+        self.assertTrue(ue.same_value("Movable", "Movable"))
+
     def test_profile_csv_and_stats(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "Profile.csv")

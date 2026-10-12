@@ -29,7 +29,7 @@ class _Lazy:
 socket, subprocess, zlib = _Lazy("socket"), _Lazy("subprocess"), _Lazy("zlib")
 
 TETHER = "tether.toolsets.TetherCore"
-GATED = {"py", "console", "set_props"}  # tools that need the session token (see beacon.session_token)
+GATED = {"py", "console", "set_props", "undo"}  # tools that need the session token (see beacon.session_token)
 LEVELS = {"Fatal": 0, "Error": 1, "Warning": 2, "Display": 3, "Log": 4, "Verbose": 5, "VeryVerbose": 6}
 NOISE = {"LogModelContextProtocol", "LogToolsetRegistry"}  # our own transport chatter
 # Epic logs this whenever a schema is generated for a class with delegates (props, set, describe_toolset).
@@ -1251,12 +1251,49 @@ def cmd_py(ctx, args):
 
 
 def cmd_props(ctx, args):
+    if args.export:
+        values = ctx.tether("get_props", target=args.target, names="", pie=args.pie)
+        values = json.loads(values) if isinstance(values, str) else values
+        with open(args.export, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(values, f, indent=2)
+            f.write("\n")
+        print(f"exported {len(values)} properties of {args.target} to {args.export} (edit, then ue set {args.target} "
+              f"--from {os.path.basename(args.export)})")
+        return 0
     print(ctx.tether("props", target=args.target, match=args.match or "", limit=args.limit, pie=args.pie))
     return 0
 
 
+def same_value(a, b):
+    """Equal for property purposes: numbers within 0.01 (8-bit colours, float noise), recursively."""
+    if isinstance(a, bool) or isinstance(b, bool):
+        return type(a) is type(b) and a == b  # True == 1 in Python; not for properties
+    if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+        return abs(a - b) <= 0.01
+    if isinstance(a, dict) and isinstance(b, dict):
+        return a.keys() == b.keys() and all(same_value(a[k], b[k]) for k in a)
+    if isinstance(a, list) and isinstance(b, list):
+        return len(a) == len(b) and all(same_value(x, y) for x, y in zip(a, b))
+    return a == b
+
+
 def cmd_set(ctx, args):
     values = {}
+    if args.from_file:  # apply only what differs from the object now (e.g. an exported DataAsset, edited)
+        with open(args.from_file, encoding="utf-8-sig") as f:
+            wanted = json.load(f)
+        current = ctx.tether("get_props", target=args.target, names=",".join(wanted), pie=args.pie)
+        current = json.loads(current) if isinstance(current, str) else current
+        values = {k: v for k, v in wanted.items() if not same_value(current.get(k), v)}
+        if not values:
+            print(f"{args.target}: already matches {os.path.basename(args.from_file)}")
+            return 0
+        if args.dry_run:
+            for key, value in values.items():
+                print(f"~ {key}: {short(current.get(key), 50)} -> {short(value, 50)}")
+            return 0
+    elif not args.assignments:
+        raise CliError("give name=value pairs, or --from file.json")
     for pair in args.assignments:
         key, sep, raw = pair.partition("=")
         if not sep or not key.strip():
@@ -1310,11 +1347,9 @@ def cmd_shot(ctx, args):
     pose = ctx.tether("shot_pose", actor=args.actor or "", at=args.at or "", look_at=args.look_at or "",
                       rot=args.rot or "")
     pie, simulate = pose.pop("pie", False), pose.pop("simulate", False)
-    if simulate:
-        raise CliError("ue shot does not support Simulate-In-Editor yet; use `ue pie start` (play) or stop the simulation")
-    if pie:
+    if pie and not simulate:  # Play: CaptureViewport would render the editor world, so HighResShot the game
         raw = pie_screenshot(ctx, args)
-    else:
+    else:  # editor, or Simulate-In-Editor, whose simulation the level viewport shows
         annotations = dict(ANNOTATIONS, gridHeight=args.grid_z) if args.annotate else NO_ANNOTATIONS
         text, is_error = ctx.mcp.call("EditorToolset.EditorAppToolset", "CaptureViewport",
                                       {"captureTransform": pose, "annotations": annotations, "bShowUI": args.ui})
@@ -1341,7 +1376,7 @@ def cmd_shot(ctx, args):
     with open(path, "wb") as f:
         f.write(raw)
     loc, rot = pose["location"], pose["rotation"]
-    print(f"{path}  {width}x{height}  {len(raw) // 1024} KB" + ("  (PIE)" if pie else ""))
+    print(f"{path}  {width}x{height}  {len(raw) // 1024} KB" + ("  (Simulate)" if simulate else "  (PIE)" if pie else ""))
     print(f"camera at ({loc['x']:.0f}, {loc['y']:.0f}, {loc['z']:.0f}) "
           f"rot ({rot['pitch']:.0f}, {rot['yaw']:.0f}, {rot['roll']:.0f})")
     return 0
@@ -1650,6 +1685,42 @@ def cmd_table(ctx, args):
     return 0
 
 
+def cmd_undo(ctx, args):
+    print(ctx.tether("undo"))
+    return 0
+
+
+def cmd_watch(ctx, args):
+    """Wait until a log line matches, or a property's value matches, then print it (exit 4 on timeout)."""
+    deadline, start = time.time() + args.seconds, log_end(ctx.project)
+    if args.prop:
+        target, name = args.prop
+        rx = re.compile(args.until or ".", re.I)
+        while True:
+            line = ctx.tether("props", target=target, match=f"^{re.escape(name)}$", limit=5, pie=args.pie)
+            value = line.splitlines()[-1].split(" = ", 1)[-1] if " = " in line else ""
+            if rx.search(value):
+                print(f"{target}.{name} = {value}")
+                return 0
+            if time.time() > deadline:
+                raise CliError(f"{target}.{name} is still {value} after {args.seconds:g}s", 4)
+            time.sleep(0.5)
+    if not args.pattern:
+        raise CliError("give a log regex, or --prop <target> <name> --until <regex>")
+    rx = re.compile(args.pattern, re.I)
+    while True:
+        flush_editor_log(ctx)
+        with open(log_path(ctx.project), "rb") as f:
+            f.seek(start)
+            hit = next((l for l in f.read().decode("utf-8", "replace").splitlines() if rx.search(l)), None)
+        if hit:
+            print(hit.split("]", 2)[-1].strip())
+            return 0
+        if time.time() > deadline:
+            raise CliError(f"no log line matched /{args.pattern}/ within {args.seconds:g}s", 4)
+        time.sleep(0.5)
+
+
 def cmd_find(ctx, args):
     print(ctx.tether("find", query=args.query or "", cls=args.cls or "", under=args.under, limit=args.limit))
     return 0
@@ -1901,6 +1972,7 @@ def cmd_selftest(ctx, args):
     else:
         check("set", ["set", "TetherSelftestProbe", "location+=0,0,50"], skip=probe_skip,
               ok=lambda c, o: c == 0 and "-> (0, 0, 100050)" in o)
+        check("undo", ["undo"], skip=probe_skip, ok=lambda c, o: c == 0 and "undone: TetherSelftestProbe" in o)
         check("set rollback", ["set", "TetherSelftestProbe", "location=0,0,0", "no_such_property_xyz=1"],
               skip=probe_skip, ok=lambda c, o: c != 0 and "no property" in o)
     check("destroy probe actor", ["py", "w = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_editor_world()\n"
@@ -2628,10 +2700,20 @@ def main(argv=None):
     s.add_argument("target")
     s.add_argument("match", nargs="?")
     s.add_argument("--pie", action="store_true", help="read the PIE world's actor instead")
+    s.add_argument("--export", metavar="FILE", help="write every property value to FILE as JSON (e.g. a DataAsset)")
     s = add("set", cmd_set, "set properties (name=value, name+=delta) as one undoable transaction")
     s.add_argument("target")
-    s.add_argument("assignments", nargs="+", metavar="name=value")
+    s.add_argument("assignments", nargs="*", metavar="name=value")
     s.add_argument("--pie", action="store_true", help="change the PIE world (not undoable, not saved)")
+    s.add_argument("--from", dest="from_file", metavar="FILE", help="apply the values in FILE (JSON) that differ")
+    s.add_argument("--dry-run", action="store_true", help="with --from: show what would change")
+    add("undo", cmd_undo, "undo Tether's last `ue set` (only if nothing else changed since)")
+    s = add("watch", cmd_watch, "wait for a log line, or for a property value (exit 4 on timeout)")
+    s.add_argument("pattern", nargs="?", help="log regex to wait for")
+    s.add_argument("--prop", nargs=2, metavar=("TARGET", "NAME"), help="watch this property instead")
+    s.add_argument("--until", help="with --prop: regex the value must match")
+    s.add_argument("--seconds", type=float, default=60, help="give up after this long (60)")
+    s.add_argument("--pie", action="store_true", help="with --prop: read the PIE world")
     s = add("shot", cmd_shot, "capture the viewport (or the PIE view) to a PNG; prints the path")
     s.add_argument("--actor", help="frame this actor, keeping the current view direction")
     s.add_argument("--at", help="camera location x,y,z")

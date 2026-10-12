@@ -42,6 +42,10 @@ def _tool(fn):
 
 _MAX_OUT = 20000
 
+# Tether's own edits, newest last, with the undo-history depth right after each; stashed on sys like below.
+_UNDO = getattr(sys, "_tether_undo", None) or []
+sys._tether_undo = _UNDO
+
 # Persistent REPL namespace for `py`; stashed on sys so it survives hot reloads.
 _NAMESPACE = getattr(sys, "_tether_ns", None) or {"unreal": unreal, "__name__": "__tether_py__"}
 sys._tether_ns = _NAMESPACE
@@ -538,6 +542,14 @@ class TetherCore(_Base):
                 new[name] = _add(old.get(name), value, name) if relative else value
             except ValueError as exc:
                 raise RuntimeError(f"{name}: {exc}") from None
+        # Skip values that are already set: a write that changes nothing opens an empty transaction, which the
+        # editor drops, and `ue undo` would then line up with the wrong entry.
+        unchanged = [n for n in new if n in old and isinstance(new[n], (int, float, bool, dict)) and _took(new[n], old[n])
+                     and (not isinstance(new[n], dict) or all(isinstance(v, (int, float, bool)) for v in new[n].values()))]
+        for name in unchanged:
+            del new[name]
+        if not new:
+            return _label(obj) + (" (PIE)" if pie else "") + "\n(no change: " + ", ".join(unchanged) + " already set)"
 
         def apply():
             props = {n: v for n, v in new.items() if n in schema}
@@ -587,6 +599,9 @@ class TetherCore(_Base):
             raise RuntimeError("did not take: " + ", ".join(f"{n} stayed {_compact(after.get(n))}" for n in ignored)
                                + hint + ("" if pie else " (rolled back)"))
         rows = [f"{n}: {_compact(old.get(n))} -> {_compact(after.get(n))}" for n in new]
+        count = unreal.ToolsetLibrary.get_active_undo_count()
+        if not pie and count > before:  # remember where the undo history stands after our change, for `ue undo`
+            _UNDO.append({"count": count, "label": f"{_label(obj)}: " + ", ".join(new)})
         return "\n".join([_label(obj) + (" (PIE)" if pie else "")] + rows)
 
     @_tool
@@ -609,10 +624,10 @@ class TetherCore(_Base):
         game = _game_world()
         pie = game is not None
         cam = unreal.GameplayStatics.get_player_camera_manager(game, 0) if pie else None
-        if cam is not None:
+        # Simulate-In-Editor possesses a SpectatorPawn and shows the simulation in the level viewport
+        simulate = pie and (cam is None or isinstance(unreal.GameplayStatics.get_player_pawn(game, 0), unreal.SpectatorPawn))
+        if pie and not simulate:
             loc, rotation = cam.get_camera_location(), cam.get_camera_rotation()
-        elif pie:  # Simulate-In-Editor has no player; the shot is the viewport either way
-            loc, rotation = unreal.Vector(), unreal.Rotator()
         else:
             loc, rotation = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_level_viewport_camera_info()
         if actor:
@@ -634,10 +649,7 @@ class TetherCore(_Base):
             rotation = unreal.Rotator(roll=nums[2], pitch=nums[0], yaw=nums[1])
         return json.dumps({"location": {"x": loc.x, "y": loc.y, "z": loc.z},
                            "rotation": {"pitch": rotation.pitch, "yaw": rotation.yaw, "roll": rotation.roll},
-                           "scale": {"x": 1, "y": 1, "z": 1}, "pie": pie,
-                           # Simulate-In-Editor possesses a SpectatorPawn and has no game viewport to shoot
-                           "simulate": pie and (cam is None or isinstance(
-                               unreal.GameplayStatics.get_player_pawn(game, 0), unreal.SpectatorPawn))})
+                           "scale": {"x": 1, "y": 1, "z": 1}, "pie": pie, "simulate": simulate})
 
     @_tool
     @staticmethod
@@ -736,6 +748,52 @@ class TetherCore(_Base):
             if not rx or rx.search(prop):
                 rows.append(f"  {prop}: {kind}")
         return _capped(rows[0], rows[1:], limit)
+
+    @_tool
+    @staticmethod
+    def undo(token: str = "") -> str:
+        """Undo Tether's most recent `ue set`, but only if nothing else entered the editor's undo history
+        since; it never undoes someone else's edit.
+
+        Args:
+            token: Session token from Saved/Tether/session.json (the ue CLI sends it).
+
+        Returns:
+            What was undone.
+        """
+        _authorize(token)
+        if not _UNDO:
+            raise RuntimeError("nothing from Tether to undo in this editor session")
+        last = _UNDO[-1]
+        now = unreal.ToolsetLibrary.get_active_undo_count()
+        if now != last["count"]:
+            raise RuntimeError(f"the undo history changed after Tether's last edit ({last['label']}): another edit or "
+                               "undo happened since, so `ue undo` will not touch it; use Edit > Undo in the editor")
+        if not unreal.ToolsetLibrary.undo_transaction(True):
+            raise RuntimeError("the editor refused the undo")
+        _UNDO.pop()
+        return f"undone: {last['label']}" + (f" ({len(_UNDO)} more Tether edit(s) can be undone)" if _UNDO else "")
+
+    @_tool
+    @staticmethod
+    def get_props(target: str, names: str = "", pie: bool = False) -> str:
+        """Property values as JSON, for exporting an asset or object (e.g. a DataAsset) to a file.
+
+        Args:
+            target: Object or asset path, actor label or name, or 'ActorLabel.ComponentName'.
+            names: Comma-separated property names ('' for all).
+            pie: Resolve actors in the PIE world.
+
+        Returns:
+            JSON object of property name to value.
+        """
+        if _LEGACY:
+            raise RuntimeError("needs UE 5.8+ (Epic's ToolsetLibrary)")
+        obj = _resolve(target, pie)
+        cls = obj if isinstance(obj, unreal.Struct) else obj.get_class()
+        wanted = [n.strip() for n in names.split(",") if n.strip()] or \
+            list(json.loads(unreal.ToolsetLibrary.list_struct_properties(cls)))
+        return unreal.ToolsetLibrary.get_object_properties(obj, wanted)
 
     @_tool
     @staticmethod

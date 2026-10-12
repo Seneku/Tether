@@ -100,6 +100,11 @@ and a private mid-size C++/Blueprint game. Methodology is in [docs/DESIGN.md](do
    the plugin to refresh the copy.
 3. `ue open --headless` (or `--headless --render` for screenshots), then `ue status`.
 
+**Moving from a copied skill** (projects set up before the plugin existed): delete the project's
+`.claude/skills/unreal-tether` folder (the plugin's skill replaces it, and two copies would compete), install
+the plugin, and keep or replace the project's `AdditionalPluginDirectories` entry; `ue init` reports what is
+missing either way.
+
 ### Hooks
 
 The plugin's hooks stay silent outside Unreal projects, and never block a tool call because they failed.
@@ -160,7 +165,10 @@ The plugin's hooks stay silent outside Unreal projects, and never block a tool c
 | `ue actors [regex] [--pie]` | Actors in the level (or the PIE world): label, class, location. |
 | `ue props <target> [regex] [--pie]` | Reflected properties with **values**, for an actor, a component or a `/Game/...` asset. |
 | `ue set <target> name=value [name+=delta ...] [--pie]` | Write properties as one undoable transaction and print `old -> new`. Takes numbers, booleans, enum names, object paths, JSON, or tuples for structs (`location+=0,0,200`). Actors also take `location`, `rotation` and `scale`. All-or-nothing: if one value fails, nothing changes. |
-| `ue shot [--actor A \| --at x,y,z --look-at A] [--annotate]` | Save a PNG of the viewport to `Saved/Tether/shots/` and print the path, so the agent opens it only when needed. During PIE it captures the player's view. `--annotate` overlays Epic's world grid and actor labels. |
+| `ue undo` | Undo Tether's last `ue set`, only if nothing else entered the editor's undo history since (it never undoes your edits). |
+| `ue watch <regex>` / `ue watch --prop <target> <name> --until <regex>` | Wait for a log line or a property value, up to `--seconds` (exit 4 on timeout). |
+| `ue props <target> --export F` / `ue set <target> --from F [--dry-run]` | Round-trip any object or asset (e.g. a DataAsset) through JSON; `--from` applies only what differs. |
+| `ue shot [--actor A \| --at x,y,z --look-at A] [--annotate]` | Save a PNG of the viewport to `Saved/Tether/shots/` and print the path, so the agent opens it only when needed. During PIE it captures the player's view; during Simulate, the simulated world. `--annotate` overlays Epic's world grid and actor labels. |
 | `ue test <filter> [--list] [-v]` | Run automation tests in the live editor. Prints one summary line, plus each failure with its source line. Exits 1 on any failure. Uses Epic's filter syntax; anchor project tests (`^MyGame.`) so engine tests don't get pulled in. |
 | `ue tools [toolset[:tool]]` | Browse Epic's and Tether's tools as one-line signatures instead of full schema dumps. |
 | `ue call <toolset>.<tool> k=v ...` | Call any registered tool. Required blank parameters are filled in for you. |

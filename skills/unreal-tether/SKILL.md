@@ -35,6 +35,9 @@ broken or unsupported.
   Actors also take `location`, `rotation` (pitch,yaw,roll) and `scale`. If one value fails, nothing
   changes. `--pie` edits the running game instead (not undoable, not saved). Prefer this over `ue py`
   for property edits.
+- `ue undo` reverts your last `ue set` (it refuses if anything else changed since). `ue props X --export f.json`
+  then `ue set X --from f.json` round-trips any object or asset, e.g. a DataAsset.
+- `ue watch '<log regex>'` or `ue watch --prop <target> <name> --until <regex>` waits for something to happen.
 - `ue exec "<console command>" [--pie]`: runs the command and prints the log lines it produced.
 - `ue tools [query]` lists Epic toolsets; `ue tools <toolset>` gives one-line signatures;
   `ue tools <toolset>:<tool>` gives one schema. **Never** dump a whole toolset schema: one Niagara toolset is ~77k tokens.
