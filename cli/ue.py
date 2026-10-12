@@ -2168,6 +2168,63 @@ def cmd_selftest(ctx, args):
     return 1 if counts["FAIL"] else 0
 
 
+def cmd_ci(ctx, args):
+    """A project's checks in one pass/fail command: open (if needed), tests, Blueprint compile, cook, close."""
+    project, name = ctx.project, os.path.splitext(os.path.basename(ctx.project))[0]
+    base = [sys.executable, os.path.abspath(__file__), "--project", project]
+    steps, started = [], time.time()
+
+    def step(label, argv, timeout=3600, required=True):
+        t0 = time.time()
+        try:
+            proc = subprocess.run(base + argv, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                                  timeout=timeout)
+            code, out = proc.returncode, (proc.stdout + proc.stderr).strip()
+        except subprocess.TimeoutExpired:
+            code, out = 4, f"no result within {timeout}s"
+        steps.append({"step": label, "ok": code == 0, "exit": code, "seconds": round(time.time() - t0, 1),
+                      "output": out[-4000:], "required": required})
+        status = ("PASS" if code == 0 else "FAIL") if required else ("INFO" if code == 0 else "WARN")
+        summary = out.splitlines()[0] if code == 0 and out else (out.splitlines()[-1] if out else f"exit {code}")
+        print(f"{status}  {label:<12} {time.time() - t0:6.1f}s  {summary[:150]}")
+        if code and args.verbose:
+            for line in out.splitlines()[-15:]:
+                print("      " + line[:200])
+        return code == 0
+
+    opened = False
+    if not editor_live(project):
+        opened = step("open", ["open", "--headless"], timeout=1800)
+        if not opened:
+            return finish_ci(args, steps, started)
+    try:
+        test_filter = args.tests or f"^{name}."
+        listing = subprocess.run(base + ["test", "--list", test_filter], capture_output=True, text=True,
+                                 encoding="utf-8", errors="replace", timeout=600)
+        if listing.returncode == 0 and not listing.stdout.startswith("0 tests"):
+            step("tests", ["test", test_filter])
+        else:
+            print(f"SKIP  tests        no tests match {test_filter}" + (" (--tests to choose)" if not args.tests else ""))
+        step("blueprints", ["bp", "check", args.bp or "/Game"])
+        if args.cook:
+            if step("cook start", ["job", "cook"], timeout=120):
+                step("cook", ["job", "wait", "--wait", str(args.cook_timeout)], timeout=args.cook_timeout + 60)
+        step("errors", ["log", "--since", "start", "--level", "Error"], required=False)
+    finally:
+        if opened:
+            step("close", ["close", "--discard"], required=False)
+    return finish_ci(args, steps, started)
+
+
+def finish_ci(args, steps, started):
+    failed = [s["step"] for s in steps if s["required"] and not s["ok"]]
+    print(f"{'FAILED' if failed else 'PASSED'} in {time.time() - started:.0f}s" + (": " + ", ".join(failed) if failed else ""))
+    if args.report:
+        write_json(os.path.abspath(args.report), {"passed": not failed, "failed": failed, "steps": steps,
+                                                  "seconds": round(time.time() - started, 1)})
+    return 1 if failed else 0
+
+
 def cmd_actors(ctx, args):
     print(ctx.tether("actors", match=args.match or "", limit=args.limit, pie=args.pie))
     return 0
@@ -2953,6 +3010,13 @@ def main(argv=None):
     s.add_argument("--platform", help="with cook: target platform (default: this host)")
     s.add_argument("--wait", type=float, default=7200, help="with wait: seconds before giving up (7200)")
     s.add_argument("-v", "--verbose", action="store_true", help="with wait: also print warnings")
+    s = add("ci", cmd_ci, "project checks in one pass/fail: open if needed, tests, Blueprint compile, cook, close")
+    s.add_argument("--tests", help="test filter (default ^<Project>.)")
+    s.add_argument("--bp", help="content path for the Blueprint check (default /Game)")
+    s.add_argument("--cook", action="store_true", help="also cook for this platform")
+    s.add_argument("--cook-timeout", type=float, default=3600, help="seconds to allow the cook (3600)")
+    s.add_argument("--report", metavar="FILE", help="write a JSON report (for CI artifacts)")
+    s.add_argument("-v", "--verbose", action="store_true", help="print the tail of failing steps")
     s = add("selftest", cmd_selftest, "check every capability against the running editor (pass/fail/skip)")
     s.add_argument("--reload", action="store_true", help="also hot-reload the Tether package and re-check")
     s = add("init", cmd_init, "set up this project: enable the needed plugins, copy the Tether editor plugin in")

@@ -156,6 +156,7 @@ The plugin's hooks stay silent outside Unreal projects, and never block a tool c
 |---|---|
 | `ue status` | Editor state from the beacon: map, PIE, PID, port, heartbeat. No HTTP. Names the dialog a hung windowed editor is waiting on. |
 | `ue init [--dry-run]` | Set up the project: enable the engine plugins Tether needs, copy the Tether editor plugin into `Plugins/`. |
+| `ue ci [--tests F] [--bp PATH] [--cook] [--report FILE]` | A project's checks in one pass/fail command: opens the editor headless if needed, runs the project's tests (`^<Project>.` by default), compiles all Blueprints, optionally cooks, closes again. IslandHorror: 64 s. Example GitHub Actions workflow (self-hosted runner): [docs/ci/unreal-ci.yml](docs/ci/unreal-ci.yml). |
 | `ue selftest` | Check every capability against the running editor: one line of pass/fail/skip per feature (~35 s). Leaves nothing behind. Paste its output into bug reports. |
 | `ue open [--headless [--render]] [--map M]` | Launch on a per-project port and wait until ready. Prints boot errors, de-duplicated. `--headless` has no window and no renderer (`-nullrhi`); add `--render` to render offscreen for `ue shot`. |
 | `ue close [--save\|--discard\|--force]` | Quit gracefully. Refuses to drop unsaved work unless told to. |

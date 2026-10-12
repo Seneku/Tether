@@ -1,0 +1,45 @@
+# Example GitHub Actions workflow for a game project checked by Tether's `ue ci`.
+# Copy to .github/workflows/ in the game repo and adjust the marked lines.
+#
+# Unreal does not run on GitHub-hosted runners, so this needs a self-hosted Windows runner with
+# Unreal Engine (and Visual Studio, and the .NET SDK for UnrealSharp projects) installed, and Python 3
+# on PATH. The project must have Tether set up (`ue init`): the Tether editor plugin either in
+# Plugins/ or reachable through AdditionalPluginDirectories (here: a sibling checkout).
+
+name: Unreal checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  ue-ci:
+    runs-on: [self-hosted, windows, unreal]   # labels of your runner
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+          path: game                            # the game project
+
+      - uses: actions/checkout@v4
+        with:
+          repository: Seneku/Tether
+          ref: v0.4.0                           # pin a release
+          path: Tether                          # sibling, matching AdditionalPluginDirectories "../Tether/Plugins"
+
+      - name: ue ci
+        working-directory: game
+        env:
+          # UE_ROOT: C:\Program Files\Epic Games\UE_5.8   # only if the engine is not a launcher install
+          PYTHONUTF8: "1"
+        run: python ../Tether/cli/ue.py ci --report ue-ci.json --verbose
+        # add --cook to also cook, --tests "^MyGame." to choose tests, --bp /Game/MyGame to narrow the check
+
+      - name: Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ue-ci-report
+          path: game/ue-ci.json

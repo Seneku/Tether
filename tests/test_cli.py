@@ -484,6 +484,36 @@ class Phase3(unittest.TestCase):
             project.close()
 
 
+class Ci(unittest.TestCase):
+    def run_ci(self, codes, report):
+        """cmd_ci against a running editor, with each step's exit code scripted by subcommand."""
+        def fake_run(argv, **kw):
+            sub = argv[argv.index("--project") + 2:]
+            code, out = codes.get(sub[0], (0, "ok"))
+            if sub[:2] == ["test", "--list"]:
+                code, out = 0, "1 tests matching '^Game.'"
+            return types.SimpleNamespace(returncode=code, stdout=out, stderr="")
+        project = Project()
+        try:
+            args = argparse.Namespace(tests=None, bp=None, cook=False, cook_timeout=60, report=report, verbose=False)
+            ctx = argparse.Namespace(project=project.uproject)
+            with unittest.mock.patch.object(ue, "editor_live", return_value={"pid": 1}), \
+                    unittest.mock.patch.object(ue.subprocess, "run", side_effect=fake_run), \
+                    unittest.mock.patch("builtins.print"):
+                return ue.cmd_ci(ctx, args)
+        finally:
+            project.close()
+
+    def test_failing_step_fails_the_run_and_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report = os.path.join(tmp, "ci.json")
+            self.assertEqual(self.run_ci({"bp": (1, "1 Blueprint ... 1 with problems")}, report), 1)
+            data = ue.read_json(report)
+            self.assertEqual((data["passed"], data["failed"]), (False, ["blueprints"]))
+            self.assertEqual(self.run_ci({"log": (1, "log unreadable")}, report), 0)  # informational only
+            self.assertTrue(ue.read_json(report)["passed"])
+
+
 class Crashes(unittest.TestCase):
     def test_parse_describe_and_recent(self):
         project = Project()
