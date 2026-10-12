@@ -1,7 +1,8 @@
 # Tether — an agent-native workflow for Unreal Engine 5.8
 
-Status: design v0.1, 2026-10-09. Numbers marked *measured* come from this machine (UE 5.8.3,
-`D:\Projects\Unreal\Horror` = IslandHorror, and the scratch project in `Sandbox/`).
+Status: design v0.1, 2026-10-09. Numbers marked *measured* come from the author's machine (Windows 11,
+UE 5.8.3): the scratch project in `Sandbox/`, and IslandHorror, a private mid-size C++/Blueprint game
+project used for dogfooding.
 
 ## 1. Summary
 

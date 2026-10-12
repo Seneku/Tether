@@ -1,68 +1,194 @@
 # Tether
 
-Agent-native tooling for Unreal Engine 5.8+: drive a **running** editor from Claude Code (or any
-agent) quickly and with few tokens, instead of booting headless commandlets or restarting the editor.
+**Drive a running Unreal Editor from a coding agent: fast, token-frugal, and with no editor restarts.**
 
-Formerly named ToolSuite (until 2026-10-12). The command is still `ue`.
+Tether is agent-native tooling for Unreal Engine 5.8+. It is built on Epic's experimental in-editor MCP
+server (`ModelContextProtocol` + `ToolsetRegistry`) and adds the parts that are missing for agent work:
 
-- `cli/ue.py`: token-frugal CLI (stdlib-only Python). It talks to Epic's in-editor MCP server
-  and reads the editor beacon and logs directly.
-- `Plugins/Tether`: content-only (pure Python) editor plugin. It registers a `tether` toolset
-  into Epic's `ToolsetRegistry` (unrestricted Python, console commands, compact reads, hot reload)
-  and writes `Saved/Tether/editor.json` as a heartbeat.
-- `Plugins/TetherUnrealSharp`: optional, tiny C++ editor plugin for UnrealSharp projects. It
-  makes C# hot reload callable from Python/MCP with modal dialogs suppressed, so `ue build`
-  reloads C# in about 1 s.
-- `.claude/skills/unreal-tether`: Claude Code skill that teaches the workflow. It loads
-  automatically in sessions started at this repo's root; copy it into another project's
-  `.claude/skills/` to use it there.
-- `.claude/settings.json`: two PreToolUse hooks:
-  - one blocks C# edits while the project's editor is in PIE;
-  - one blocks Epic's `StartPIE` while saved C# has not been hot-reloaded.
+- editor lifecycle;
+- build routing;
+- compact output;
+- log cursors;
+- unrestricted editor Python;
+- PIE smoke tests;
+- Claude Code glue.
 
-  It also enables Epic's official `unreal-engine-skills-for-claude-code` plugin for side-by-side
-  comparison, with its `unreal-mcp` connection to the sandbox editor configured in `.mcp.json`.
-- `Sandbox/`: scratch UE 5.8 project used for development.
-- `docs/DESIGN.md`: analysis, measurements, architecture and roadmap.
-
-Status: working spike (Phase 0/1). See `docs/DESIGN.md` §2a for measured results.
-
-## Quickstart (any UE 5.8 project)
-
-1. Enable plugins in the `.uproject`: `ModelContextProtocol`, `EditorToolset` (or all of Epic's
-   toolsets via `AllToolsets`, which also pulls in plugins such as GameFeatures) and `Tether`.
-   - To get `Tether`, either copy `Plugins/Tether` into the project's `Plugins/`, or add
-     `"AdditionalPluginDirectories": ["<path to this repo>/Plugins"]`.
-   - The entry must point at `Plugins`, not at a plugin folder: UnrealBuildTool only searches subfolders.
-   - Both Tether plugins are opt-in (`EnabledByDefault: false`), so list `Tether` explicitly.
-     Projects without UnrealSharp simply leave `TetherUnrealSharp` out. IslandHorror's setup is the
-     example.
-2. Put this repo's `cli/` folder on `PATH` (or call `<repo>\cli\ue.cmd`). Then run these from the project folder, or with `UE_PROJECT` set:
+It works with Claude Code out of the box. Any agent that can run a shell command can use it.
 
 ```
-cli\ue.cmd open                 # launches with the MCP server on a per-project port, waits until ready
-cli\ue.cmd status
-cli\ue.cmd actors light
-cli\ue.cmd props DirectionalLight.LightComponent0 intensity
-cli\ue.cmd py "print(unreal.SystemLibrary.get_engine_version())"
-cli\ue.cmd tools blueprint
-cli\ue.cmd log --level Warning
-cli\ue.cmd pie start            # Play-In-Editor; `pie status` explains a session that died
-cli\ue.cmd build                # Live Coding if the editor is up (~5 s), UBT if not; one-line diagnostics
-cli\ue.cmd build --restart      # reflection/Build.cs changes: save, close, UBT, reopen same map
-cli\ue.cmd close                # refuses to drop unsaved work unless --save or --discard
+$ ue status
+Sandbox | ready | UE 5.8.3-58210709 | pid 16348 | map /Temp/Untitled_1 | mcp :18873 up | heartbeat 0.6s ago
+$ ue call tether.level_summary
+/Temp/Untitled_1: 74 actors, 11 classes, PIE off
+LandscapeStreamingProxy x64, WorldDataLayers x1, WorldPartitionMiniMap x1, DirectionalLight x1, ...
+$ ue props DirectionalLight.LightComponent0 "^intensity|^temperature"
+DirectionalLight.LightComponent0 (DirectionalLightComponent, 118 props, 2 match)
+temperature: number = 6500
+intensity: number = 6
 ```
+
+## Why
+
+Compiling isn't what makes Unreal slow for agents; the round trip into the engine is. Without a live
+editor, every question about project state costs a headless commandlet boot, and every reflection change
+costs a full editor restart. Tether keeps one editor running and talks to it.
+
+| Loop | Without Tether | With Tether |
+|---|---|---|
+| Run editor Python / read project state | ~24 s headless commandlet, ~1,900 log lines | **37 ms – 0.85 s**, a few lines |
+| C++ function-body change | Live Coding by hand; the real error only appears in a separate UBT log | **~4.5 s** Live Coding via `ue build`, one-line diagnostics |
+| Reflection / `Build.cs` change | ~53 s restart plus manual clicks | **24 s** automated `ue build --restart`, zero clicks |
+| C# change ([UnrealSharp](https://github.com/UnrealSharp/UnrealSharp)) | no agent-callable reload; restart the editor | **0.6–1.2 s** hot reload via `ue build` |
+
+In a head-to-head on the same tasks against Epic's official Claude Code plugin, the agent read **629 B**
+of tool output with Tether and **~97 KB** with Epic's plugin. Epic's tools also could not reload C#: they
+reported success while the old code kept running. See [docs/COMPARISON.md](docs/COMPARISON.md).
+
+Numbers come from the author's machine (Windows 11, UE 5.8.3). They cover the bundled `Sandbox/` project
+and a private mid-size C++/Blueprint game. Methodology is in [docs/DESIGN.md](docs/DESIGN.md).
+
+## How it works
+
+```
+ agent ──shell──▶ ue (cli/ue.py) ──HTTP──▶ Epic MCP server ──▶ ToolsetRegistry
+                    │                         (in editor)       ├─ Epic's ~830 tools
+                    │                                           └─ tether toolset (Plugins/Tether)
+                    └── reads Saved/Tether/editor.json (beacon) and Saved/Logs directly
+```
+
+- **`cli/ue.py`** is the out-of-editor half. It's a single stdlib-only Python file. It launches and closes
+  the editor on a per-project port, routes builds (Live Coding when the editor is up, UBT when it isn't),
+  and prints compact, de-duplicated output. Status and logs come from files, so they keep working when the
+  editor is hung or gone.
+- **`Plugins/Tether`** is a content-only (pure Python) editor plugin. It registers a `tether` toolset into
+  Epic's registry: unrestricted Python, console commands, compact level, actor and property reads, and
+  C# reload state. It also writes a heartbeat beacon. It hot-reloads with `ue reload`.
+- **`Plugins/TetherUnrealSharp`** is optional. It's a small C++ editor plugin that makes UnrealSharp's C#
+  hot reload callable from Python with modal dialogs suppressed.
+- **`.claude/`** holds a Claude Code skill (`unreal-tether`) that teaches the workflow, plus two safety
+  hooks.
+
+## Requirements
+
+- Unreal Engine 5.8 or later. A launcher install is fine; no source build needed.
+- Python 3 on `PATH`, for the CLI. It uses the standard library only.
+- Windows. This is the only platform tested so far: build routing uses `Build.bat` and Live Coding.
+- Optional: the .NET 10 SDK and UnrealSharp, for C#.
+
+## Quickstart
+
+1. **Enable the plugins** in your `.uproject`. Add `ModelContextProtocol`, `EditorToolset` and `Tether`,
+   and point Unreal at this repo's plugins:
+
+   ```json
+   "AdditionalPluginDirectories": ["<path to this repo>/Plugins"],
+   "Plugins": [
+     { "Name": "PythonScriptPlugin", "Enabled": true },
+     { "Name": "ModelContextProtocol", "Enabled": true },
+     { "Name": "EditorToolset", "Enabled": true },
+     { "Name": "Tether", "Enabled": true }
+   ]
+   ```
+
+   - The path must point at `Plugins`, not at a plugin folder. UnrealBuildTool only searches its
+     subfolders. You can also copy `Plugins/Tether` into your project's `Plugins/` folder.
+   - Both Tether plugins are opt-in (`EnabledByDefault: false`), so list them explicitly.
+   - `AllToolsets` instead of `EditorToolset` enables all of Epic's toolsets, but it also pulls in side
+     plugins such as GameFeatures.
+
+2. **Put `cli/` on your `PATH`** (it holds `ue.cmd` for PowerShell/cmd). Then run commands from your project
+   folder, or set `UE_PROJECT`:
+
+   ```
+   ue open --headless      # launch with the MCP server and wait until ready (~10-25 s warm)
+   ue status
+   ue call tether.level_summary
+   ```
+
+3. **For Claude Code:** copy `.claude/skills/unreal-tether` into your project's `.claude/skills/`. If you
+   want the hooks, copy them from `.claude/settings.json` too.
+
+## Commands
+
+| Command | What it does |
+|---|---|
+| `ue status` | Editor state from the beacon: map, PIE, PID, port, heartbeat. No HTTP. |
+| `ue open [--headless] [--map M]` | Launch on a per-project port and wait until ready. Prints boot errors, de-duplicated. |
+| `ue close [--save\|--discard\|--force]` | Quit gracefully. Refuses to drop unsaved work unless told to. |
+| `ue build [--restart]` | Uses Live Coding if the editor is up and UBT if not, plus C# hot reload. `--restart` covers reflection and `Build.cs` changes: save, close, build, reopen the same map. |
+| `ue py "<code>"` / `-f file` / `-` | Unrestricted editor Python with a persistent namespace. A trailing expression is printed. |
+| `ue exec "<console cmd>" [--pie]` | Run a console command and print the log lines it produced. |
+| `ue actors [regex]` | Actors in the level: label, class, location. |
+| `ue props <target> [regex]` | Reflected properties with **values**, for an actor, a component or a `/Game/...` asset. |
+| `ue tools [toolset[:tool]]` | Browse Epic's and Tether's tools as one-line signatures instead of full schema dumps. |
+| `ue call <toolset>.<tool> k=v ...` | Call any registered tool. Required blank parameters are filled in for you. |
+| `ue log [--level L] [--cat C] [--grep re] [--since start]` | New log entries since the last call, de-duplicated. The cursor is kept on disk. |
+| `ue pie start\|stop\|status [--simulate]` | Play-In-Editor. Prints only new warnings and errors. |
+| `ue reload` | Hot-reload the Tether Python package in the running editor. |
+
+Exit codes: `0` ok, `1` tool or command failed, `2` editor unavailable, `3` restart required, `4` timeout.
 
 ## C# with UnrealSharp (optional)
 
-1. Clone UnrealSharp into the project's `Plugins/UnrealSharp` and enable `TetherUnrealSharp`.
-   This needs .NET SDK 10.0.5 or later. `Sandbox/` uses commit `06769c4`.
-2. Run `ue build` with the editor closed (UBT; the first build takes about 2 minutes).
+1. Clone [UnrealSharp](https://github.com/UnrealSharp/UnrealSharp) into your project's
+   `Plugins/UnrealSharp` and enable `TetherUnrealSharp`. You need the .NET SDK 10.0.5 or later; `Sandbox/`
+   is tested against UnrealSharp commit `06769c4`.
+2. Run `ue build` with the editor closed. This runs UBT; the first build takes about 2 minutes.
 3. Create the C# project without the GUI wizard:
-   `RunUAT.bat GenerateProject -ScriptDir=<proj>\Plugins\UnrealSharp\Build\Scripts -Project=<proj>\<P>.uproject -ProjectName=Managed<P> -ProjectFolder=<proj>\Script\Managed<P> -GenerateSolution=true -RunUSharpProjectSetup=true -CreateModuleClass=true`
-4. Add `AutomaticHotReloading=Off` under `[/Script/UnrealSharpEditor.CSUnrealSharpEditorSettings]`
-   in `Config/DefaultEditorPerProjectUserSettings.ini`.
-5. `ue open` pre-builds the C#. After that, `ue build` hot-reloads C# changes.
 
-Note: Epic's MCP plugin sends analytics by default. Run `ModelContextProtocol.EnableAnalytics 0` in the
-editor console to turn them off.
+   ```
+   RunUAT.bat GenerateProject -ScriptDir=<proj>\Plugins\UnrealSharp\Build\Scripts -Project=<proj>\<P>.uproject -ProjectName=Managed<P> -ProjectFolder=<proj>\Script\Managed<P> -GenerateSolution=true -RunUSharpProjectSetup=true -CreateModuleClass=true
+   ```
+
+4. Add this to `Config/DefaultEditorPerProjectUserSettings.ini`, so reloads only happen when the agent
+   asks for them:
+
+   ```ini
+   [/Script/UnrealSharpEditor.CSUnrealSharpEditorSettings]
+   AutomaticHotReloading=Off
+   ```
+
+5. `ue open` pre-builds the C# project. After that, `ue build` hot-reloads C# changes in about a second.
+
+Tether also works around several UnrealSharp issues:
+
+- **Unreloaded C# during PIE:** `ue pie start` reloads first, and a hook blocks Epic's `StartPIE` while
+  saved C# hasn't been reloaded.
+- **Save-time modal dialogs** in headless editors.
+- **.NET discovery** from Git Bash.
+
+Details are in [docs/DESIGN.md](docs/DESIGN.md) §2. Upstream reports:
+[#774](https://github.com/UnrealSharp/UnrealSharp/issues/774),
+[#775](https://github.com/UnrealSharp/UnrealSharp/issues/775),
+[#776](https://github.com/UnrealSharp/UnrealSharp/issues/776).
+
+## Repository layout
+
+| Path | Contents |
+|---|---|
+| `cli/` | `ue.py` (the CLI) and `ue.cmd` (Windows launcher) |
+| `Plugins/Tether/` | Python toolset plugin |
+| `Plugins/TetherUnrealSharp/` | Optional C++ bridge for UnrealSharp hot reload |
+| `.claude/` | Claude Code skill and hooks. `.mcp.json` wires Epic's plugin to the sandbox editor, for comparison runs. |
+| `Sandbox/` | Scratch UE 5.8 project used for development and measurements (includes a small C# coin feature) |
+| `docs/DESIGN.md` | Analysis, measurements, architecture, roadmap |
+| `docs/COMPARISON.md` | Head-to-head against Epic's official Claude Code plugin |
+
+## Status
+
+This is a working spike (roadmap phases 0 and 1). It's used daily on the bundled sandbox and on a real game
+project, but expect rough edges. Commands and output formats may still change. The roadmap and open
+design decisions are in [docs/DESIGN.md](docs/DESIGN.md) §8–9.
+
+## Notes
+
+- Epic's MCP server binds to `127.0.0.1` only, but it has no auth token, so any local process can call it,
+  including unrestricted editor Python through Tether. Be careful on shared machines. A per-session token
+  is on the roadmap.
+- Epic's MCP plugin sends analytics by default. To turn them off, run `ModelContextProtocol.EnableAnalytics 0`
+  in the editor console.
+- Tether is not affiliated with or endorsed by Epic Games. Unreal Engine is a trademark of Epic Games, Inc.
+
+## License
+
+[MIT](LICENSE)
