@@ -314,7 +314,7 @@ def catalog(ctx):
     path = os.path.join(state_dir(ctx.project), "cache", "toolsets.json")
     pid = (ctx.beacon or {}).get("pid")
     cached = read_json(path)
-    if cached and cached.get("pid") == pid and pid:
+    if cached and cached.get("pid") == pid and pid_alive(pid):  # a dead editor's list is stale
         return cached["toolsets"]
     text = "".join(c.get("text", "") for c in ctx.mcp.request("tools/call", {
         "name": "list_toolsets", "arguments": {}}).get("content", []))
@@ -330,7 +330,7 @@ def schema(ctx, toolset):
     path = os.path.join(state_dir(ctx.project), "cache", f"{safe}.json")
     pid = (ctx.beacon or {}).get("pid")
     cached = read_json(path)
-    if cached and cached.get("pid") == pid and pid:
+    if cached and cached.get("pid") == pid and pid_alive(pid):  # a dead editor's list is stale
         return cached["tools"]
     res = ctx.mcp.request("tools/call", {"name": "describe_toolset", "arguments": {"toolset_name": toolset}})
     data = unwrap("".join(c.get("text", "") for c in res.get("content", [])))
@@ -1165,7 +1165,9 @@ def cmd_test(ctx, args):
 
     call("DiscoverTests", {"bForceRediscover": True})  # picks up tests added by Live Coding
     if args.list:
-        found = call("ListTests", {"nameFilter": args.filter or "", "tagFilter": "", "limit": 0})
+        # ListTests takes a plain substring, so drop the run filter's anchors and prefixes.
+        name = re.sub(r"^(StartsWith:|\^)|\$$", "", args.filter or "")
+        found = call("ListTests", {"nameFilter": name, "tagFilter": "", "limit": 0})
         names = found.get("tests", [])
         prefix, short_names = strip_common(names)
         print(f"{len(names)} tests" + (f" under {prefix}" if prefix else "") + (f" matching '{args.filter}'" if args.filter else ""))
