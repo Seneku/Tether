@@ -107,6 +107,9 @@ broken or unsupported.
 - New tests compiled with `ue build` are picked up automatically.
 
 ## Play testing
+- Prefer `ue pie run check.py --expect '<log regex>' --reject 'Error|no subsystem'` for verifying gameplay:
+  it starts PIE, runs the script in the PIE world, waits for the log lines, stops PIE and exits 0/1.
+  Write the script once and rerun it after every change.
 - `ue pie start` / `ue pie stop` / `ue pie status`. Status explains a session that died (fatal error
   plus your source line).
 - Drive the test from Python: in PIE, `w = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_game_world()`,

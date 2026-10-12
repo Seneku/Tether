@@ -1993,8 +1993,64 @@ def cmd_log(ctx, args):
     return 0
 
 
+def pie_run(ctx, args):
+    """A scripted gameplay check: PIE, a script in the game world, log expectations, then stop. Exit 0/1."""
+    if not args.script:
+        raise CliError("give a script: ue pie run checks.py --expect '<log regex>'")
+    with open(args.script, encoding="utf-8-sig") as f:
+        code = f.read()
+    expects = [re.compile(e, re.I) for e in args.expect or []]
+    rejects = [re.compile(r, re.I) for r in args.reject or []]
+    start, started = log_end(ctx.project), time.time()
+    was_running = ctx.tether("pie", action="status") == "running" if ctx.transport == "remote" else \
+        unwrap(ctx.mcp.call(resolve_toolset(ctx, "editorapp"), "IsPIERunning", {})[0]) is True
+    if not was_running:
+        code_start = cmd_pie(ctx, argparse.Namespace(action="start", simulate=False, warmup=args.warmup,
+                                                     limit=0, script=None))
+        if code_start:
+            return code_start
+    failures = []
+    try:
+        out = ctx.tether("py", code=code)
+        if out:
+            print("script: " + out.rstrip("\n").replace("\n", "\nscript: "))
+    except CliError as exc:
+        failures.append(f"script raised: {exc}")
+    found, rejected = {}, []
+    deadline = time.time() + args.seconds
+    while True:
+        flush_editor_log(ctx)
+        with open(log_path(ctx.project), "rb") as f:
+            f.seek(start)
+            lines = f.read().decode("utf-8", "replace").splitlines()
+        for rx in expects:
+            if rx.pattern not in found:
+                hit = next((l for l in lines if rx.search(l)), None)
+                if hit:
+                    found[rx.pattern] = hit
+        rejected = [(rx.pattern, l) for rx in rejects for l in lines if rx.search(l)]
+        if rejected or len(found) == len(expects) or time.time() > deadline:
+            break
+        time.sleep(0.25)
+    if not (args.keep or was_running):
+        cmd_pie(ctx, argparse.Namespace(action="stop", simulate=False, warmup=0, limit=0, script=None))
+    for rx in expects:
+        hit = found.get(rx.pattern)
+        print(f"{'ok  ' if hit else 'MISS'} /{rx.pattern}/" + (f"  {hit.split(']', 2)[-1].strip()[:140]}" if hit else ""))
+        if not hit:
+            failures.append(f"no log line matched /{rx.pattern}/ within {args.seconds:g}s")
+    for pattern, line in rejected[:5]:
+        print(f"BAD  /{pattern}/  {line.split(']', 2)[-1].strip()[:140]}")
+        failures.append(f"rejected pattern /{pattern}/ appeared")
+    print(("PASS" if not failures else "FAIL") + f" in {time.time() - started:.1f}s"
+          + ("" if not failures else ": " + "; ".join(dict.fromkeys(failures))))
+    return 1 if failures else 0
+
+
 def cmd_pie(ctx, args):
     """Play-In-Editor through Epic's EditorAppToolset, reporting only what went wrong."""
+    if args.action == "run":
+        return pie_run(ctx, args)
     toolset = None if ctx.transport == "remote" else resolve_toolset(ctx, "editorapp")
     start = log_end(ctx.project)
     started = time.time()
@@ -2489,7 +2545,12 @@ def main(argv=None):
     s.add_argument("--cat", help="only this log category")
     s.add_argument("--grep", help="regex filter")
     s = add("pie", cmd_pie, "Play-In-Editor: start | stop | status (prints only new warnings/errors)")
-    s.add_argument("action", choices=["start", "stop", "status"])
+    s.add_argument("action", choices=["start", "stop", "status", "run"])
+    s.add_argument("script", nargs="?", help="with run: Python to execute in the PIE world")
+    s.add_argument("--expect", action="append", help="with run: log regex that must appear (repeatable)")
+    s.add_argument("--reject", action="append", help="with run: log regex that must not appear (repeatable)")
+    s.add_argument("--seconds", type=float, default=5, help="with run: how long to wait for expectations (5)")
+    s.add_argument("--keep", action="store_true", help="with run: leave PIE running afterwards")
     s.add_argument("--simulate", action="store_true", help="Simulate-In-Editor (no player pawn)")
     s.add_argument("--warmup", type=float, default=0.5, help="seconds to let BeginPlay settle (0.5)")
     s = add("bp", cmd_bp, "Blueprint graphs as text: read, --diff against the last read, --apply edited text")

@@ -166,6 +166,7 @@ The plugin's hooks stay silent outside Unreal projects, and never block a tool c
 | `ue call <toolset>.<tool> k=v ...` | Call any registered tool. Required blank parameters are filled in for you. |
 | `ue log [--level L] [--cat C] [--grep re] [--since start]` | New log entries since the last call, de-duplicated. The cursor is kept on disk. |
 | `ue pie start\|stop\|status [--simulate]` | Play-In-Editor. Prints only new warnings and errors. |
+| `ue pie run <script.py> --expect <regex> [--reject <regex>] [--seconds N]` | A scripted gameplay check: start PIE, run the script in the game world, wait for the expected log lines, fail on rejected ones or a script exception, stop PIE. Exit 0/1. |
 | `ue bp <blueprint> [graph] [--diff] [--apply FILE] [--save]` | Blueprint graphs as text (Epic's graph DSL). `--diff` shows only what changed since the last read; `--apply` writes edited text back, compiles, and prints the diff. |
 | `ue bp check [/Game/path] [--warnings]` | Compile every Blueprint under a path and list only the broken ones, with the compiler's reason (e.g. a C++ function that was renamed). Exit 1 if any fail. |
 | `ue table <datatable> [--export F] [--import F [--prune] [--dry-run]] [--save]` | DataTable round-trips through JSON or CSV. Import shows a row-level diff (`+ Row`, `~ Row.col: old -> new`) and upserts; `--prune` also removes rows missing from the file. |
