@@ -1866,6 +1866,12 @@ def cmd_watch(ctx, args):
         time.sleep(0.5)
 
 
+def cmd_asset(ctx, args):
+    for path in args.paths:
+        print(ctx.tether("asset_info", path=path))
+    return 0
+
+
 def cmd_find(ctx, args):
     print(ctx.tether("find", query=args.query or "", cls=args.cls or "", under=args.under, limit=args.limit))
     return 0
@@ -2100,6 +2106,7 @@ def cmd_selftest(ctx, args):
           ok=lambda c, o: c == 0 and "/Engine/BasicShapes/Cube" in o)
     check("refs", ["refs", "/Engine/BasicShapes/BasicShapeMaterial", "--limit", "3"],
           ok=lambda c, o: c == 0 and "reference" in o)
+    check("asset", ["asset", "/Engine/BasicShapes/Cube"], ok=lambda c, o: c == 0 and "triangles" in o)
     check("log", ["log", "--level", "Error"])
     check("changes", ["changes"], ok=lambda c, o: c == 0 and "unsaved package" in o)
     check("call tether.level_summary", ["call", "tether.level_summary", "limit=3"],
@@ -2993,6 +3000,8 @@ def main(argv=None):
     s.add_argument("--seconds", type=float, default=10, help="capture length (10)")
     s.add_argument("--editor", action="store_true", help="measure the editor as is, without starting PIE")
     s.add_argument("--no-record", action="store_true", help="do not make this capture the comparison baseline")
+    s = add("asset", cmd_asset, "a few lines about assets, by type (mesh, texture, material, Blueprint, ...)")
+    s.add_argument("paths", nargs="+", help="/Game/... asset paths")
     s = add("find", cmd_find, "search assets by name and/or class (asset registry)")
     s.add_argument("query", nargs="?", help="regex on the asset name")
     s.add_argument("--class", dest="cls", help="regex on the class name, e.g. StaticMesh or 'Material$'")

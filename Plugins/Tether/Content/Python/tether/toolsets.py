@@ -386,6 +386,14 @@ def snapshot_level(level=None):
                       for a in unreal.get_editor_subsystem(unreal.EditorActorSubsystem).get_all_level_actors()}
 
 
+def _try(fn, default=None):
+    """fn(), or `default` if the engine raises (properties and helpers vary between engine versions)."""
+    try:
+        return fn()
+    except Exception:
+        return default
+
+
 def _record_undo(before, label):
     """Note an editor-transacted change of ours for `ue undo`, if the editor recorded it."""
     if _LEGACY:
@@ -1100,6 +1108,121 @@ class TetherCore(_Base):
         wanted = [n.strip() for n in names.split(",") if n.strip()] or \
             list(json.loads(unreal.ToolsetLibrary.list_struct_properties(cls)))
         return unreal.ToolsetLibrary.get_object_properties(obj, wanted)
+
+    @_tool
+    @staticmethod
+    def asset_info(path: str) -> str:
+        """A few lines about an asset, by type: meshes (triangles per LOD, Nanite, materials, collision, size),
+        textures (size, compression, streaming, memory), materials and instances (parameters, parent chain,
+        cost), Blueprints (parent, own variables), DataTables, sounds, maps; plus disk size and references.
+
+        Args:
+            path: /Game/... (or /Engine/...) asset path.
+
+        Returns:
+            A short summary.
+        """
+        package = path.split(".")[0]
+        asset = unreal.load_asset(package)
+        if asset is None:
+            raise RuntimeError(f"no asset at {package} (ue find)")
+        kind = asset.get_class().get_name()
+        out = [f"{package} ({kind})"]
+        prop = lambda obj, name, default=None: _try(lambda: obj.get_editor_property(name), default)
+        short = lambda o: _short_path(o.get_path_name()) if o else "None"
+        if isinstance(asset, unreal.StaticMesh):
+            lods = asset.get_num_lods()
+            tris = [asset.get_num_triangles(i) for i in range(lods)]
+            out.append(f"  {lods} LOD(s), triangles " + " / ".join(f"{t:,}" for t in tris)
+                       + f", LOD0 {asset.get_num_vertices(0):,} vertices")
+            nanite = prop(prop(asset, "nanite_settings"), "enabled", False)
+            if nanite:
+                out.append(f"  Nanite on: {asset.get_num_nanite_triangles():,} triangles")
+            box = asset.get_bounds().box_extent
+            out.append(f"  size {box.x * 2:.0f} x {box.y * 2:.0f} x {box.z * 2:.0f} cm")
+            subsystem = unreal.get_editor_subsystem(unreal.StaticMeshEditorSubsystem)
+            out.append(f"  collision: {subsystem.get_simple_collision_count(asset)} simple shape(s), "
+                       f"{subsystem.get_convex_collision_count(asset)} convex, "
+                       f"{str(subsystem.get_collision_complexity(asset)).split('.')[-1].split(':')[0]}")
+            slots = prop(asset, "static_materials", []) or []
+            out.append("  materials: " + ", ".join(f"{s.material_slot_name}={short(s.material_interface)}" for s in slots[:8]))
+        elif isinstance(asset, unreal.SkeletalMesh):
+            out.append(f"  skeleton {short(prop(asset, 'skeleton'))}, physics {short(prop(asset, 'physics_asset'))}")
+            mats = prop(asset, "materials", []) or []
+            out.append("  materials: " + ", ".join(f"{m.material_slot_name}={short(m.material_interface)}" for m in mats[:8]))
+        elif isinstance(asset, unreal.Texture2D):
+            out.append(f"  {asset.blueprint_get_size_x()} x {asset.blueprint_get_size_y()}, "
+                       f"{str(prop(asset, 'compression_settings')).split('.')[-1].split(':')[0]}, "
+                       f"sRGB {prop(asset, 'srgb')}, LOD group {str(prop(asset, 'lod_group')).split('.')[-1].split(':')[0]}")
+            memory = asset.blueprint_get_memory_size()  # 0 when no render resource exists (-nullrhi)
+            out.append((f"  memory {memory / 1024 ** 2:.1f} MB, " if memory else "  ")
+                       + f"never stream {prop(asset, 'never_stream')}, virtual texture {prop(asset, 'virtual_texture_streaming')}")
+        elif isinstance(asset, unreal.MaterialInstance):
+            chain, parent = [], prop(asset, "parent")
+            while parent is not None and len(chain) < 6:
+                chain.append(short(parent))
+                parent = prop(parent, "parent") if isinstance(parent, unreal.MaterialInstance) else None
+            out.append("  parent chain: " + " <- ".join(chain))
+            for label, field, value in (("scalars", "scalar_parameter_values", "parameter_value"),
+                                        ("vectors", "vector_parameter_values", "parameter_value"),
+                                        ("textures", "texture_parameter_values", "parameter_value")):
+                items = prop(asset, field, []) or []
+                if items:
+                    shown = [f"{p.parameter_info.name}={_compact(_try(lambda: getattr(p, value).to_dict(), None) or getattr(p, value)) if not isinstance(getattr(p, value), unreal.Object) else short(getattr(p, value))}"
+                             for p in items[:8]]
+                    out.append(f"  overrides {label}: " + ", ".join(shown))
+        elif isinstance(asset, unreal.Material):
+            out.append(f"  blend {str(prop(asset, 'blend_mode')).split('.')[-1].split(':')[0]}, "
+                       f"shading {str(prop(asset, 'shading_model')).split('.')[-1].split(':')[0]}, "
+                       f"two-sided {prop(asset, 'two_sided')}")
+            lib = unreal.MaterialEditingLibrary
+            for label, getter in (("scalar", lib.get_scalar_parameter_names), ("vector", lib.get_vector_parameter_names),
+                                  ("texture", lib.get_texture_parameter_names),
+                                  ("switch", lib.get_static_switch_parameter_names)):
+                names = [str(n) for n in (_try(lambda: getter(asset), []) or [])]
+                if names:
+                    out.append(f"  {label} parameters: " + ", ".join(names[:12]) + (" ..." if len(names) > 12 else ""))
+            stats = {k: v for k, v in (_try(lambda: lib.get_statistics(asset).to_dict(), {}) or {}).items()
+                     if isinstance(v, int) and v}  # all zero without compiled shaders (-nullrhi)
+            if stats:
+                out.append("  cost: " + ", ".join(f"{k.replace('num_', '').replace('_', ' ')} {v}" for k, v in stats.items()
+                                                    if isinstance(v, int) and v)[:200])
+        elif isinstance(asset, unreal.Blueprint):
+            parent = _try(lambda: unreal.BlueprintEditorLibrary.get_blueprint_parent_class(asset))
+            generated = _try(lambda: unreal.BlueprintEditorLibrary.generated_class(asset))
+            out.append(f"  parent {parent.get_name() if parent else '?'}, class {generated.get_name() if generated else '?'}")
+            if generated and parent and not _LEGACY:
+                mine = set(_reflect(unreal.ToolsetLibrary.list_struct_properties(generated), asset)) - \
+                    set(_reflect(unreal.ToolsetLibrary.list_struct_properties(parent), asset))
+                out.append(f"  own variables/components ({len(mine)}): " + ", ".join(sorted(mine)[:15])
+                           + (" ..." if len(mine) > 15 else ""))
+        elif isinstance(asset, unreal.DataTable):
+            names = _try(lambda: unreal.DataTableFunctionLibrary.get_data_table_row_names(asset), []) or []
+            out.append(f"  row struct {short(prop(asset, 'row_struct'))}, {len(names)} rows")
+        elif isinstance(asset, unreal.SoundWave):
+            out.append(f"  {prop(asset, 'duration', 0):.2f} s, {prop(asset, 'num_channels', '?')} channel(s), "
+                       f"looping {prop(asset, 'looping')}, compression quality {prop(asset, 'compression_quality')}")
+        elif isinstance(asset, unreal.World):
+            registry = unreal.AssetRegistryHelpers.get_asset_registry()
+            root, rest = package.split("/", 2)[1], package.split("/", 2)[2]
+            actors = registry.get_assets_by_path(f"/{root}/__ExternalActors__/{rest}", recursive=True)
+            out.append(f"  map; {len(actors)} World Partition actor packages" if actors else "  map (actors stored in the map)")
+        registry = unreal.AssetRegistryHelpers.get_asset_registry()
+        options = unreal.AssetRegistryDependencyOptions(
+            include_soft_package_references=True, include_hard_package_references=True,
+            include_searchable_names=False, include_soft_management_references=False,
+            include_hard_management_references=False)
+        users = {str(n) for n in registry.get_referencers(package, options) or []} - {package}
+        deps = {str(n) for n in registry.get_dependencies(package, options) or [] if not str(n).startswith("/Script/")}
+        disk = ""
+        if package.startswith("/Game/"):
+            base = os.path.join(unreal.Paths.convert_relative_path_to_full(unreal.Paths.project_content_dir()),
+                                *package.split("/")[2:])
+            for ext in (".uasset", ".umap"):
+                if os.path.isfile(base + ext):
+                    disk = f"{os.path.getsize(base + ext) / 1024:.0f} KB on disk, "
+        out.append(f"  {disk}{len(users)} referencer(s), {len(deps)} asset dependenc{'y' if len(deps) == 1 else 'ies'}")
+        return "\n".join(out)
 
     @_tool
     @staticmethod

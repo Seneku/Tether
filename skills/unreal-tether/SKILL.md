@@ -90,6 +90,8 @@ broken or unsupported.
 - `ue call tether.cs_state` reports idle, pending or reloading.
 
 ## Blueprints, DataTables, API lookups, long jobs
+- `ue asset <path>` summarises an asset in a few lines (mesh triangles/LODs/Nanite, texture size and
+  compression, material parameters...); use it before `ue props`, which lists every property.
 - `ue find <regex> [--class StaticMesh] [--under /Game/x]` to locate assets; `ue refs <asset>` before deleting
   or renaming one (what uses it), `--deps` for what it uses.
 - `ue api <Class> [regex]` before writing editor Python: real method signatures and property names in a
