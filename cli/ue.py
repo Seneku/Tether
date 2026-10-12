@@ -1874,7 +1874,10 @@ def cmd_asset(ctx, args):
 
 def content_package(project, path):
     """A content file's package path (Content/X/Y.uasset -> /Game/X/Y, a plugin's -> /Plugin/X), or None."""
-    rel = os.path.relpath(os.path.abspath(path), os.path.dirname(project)).replace("\\", "/")
+    try:
+        rel = os.path.relpath(os.path.abspath(path), os.path.dirname(project)).replace("\\", "/")
+    except ValueError:  # another drive
+        return None
     stem, ext = os.path.splitext(rel)
     if ext.lower() not in (".uasset", ".umap"):
         return None
@@ -1890,21 +1893,28 @@ def content_package(project, path):
     return None
 
 
+def run_git(project, *argv, binary=False, check=True):
+    """git in the project folder: stdout (bytes with binary), or None on failure when check is False."""
+    try:
+        proc = subprocess.run(["git", "-C", os.path.dirname(project), *argv], capture_output=True)
+    except OSError:
+        raise CliError("git is not installed") from None
+    if proc.returncode:
+        if not check:
+            return None
+        err = proc.stderr.decode("utf-8", "replace").strip()
+        raise CliError(f"git {argv[0]}: {err.splitlines()[-1] if err else 'failed'}")
+    return proc.stdout if binary else proc.stdout.decode("utf-8", "replace")
+
+
 def git_changes(project, rev=None):
     """(changed, deleted) files under the project folder: uncommitted and untracked work, plus, with rev,
     everything committed since rev. Absolute paths."""
-    root = os.path.dirname(project)
-
     def git(*argv):
         try:
-            proc = subprocess.run(["git", "-C", root, *argv], capture_output=True, text=True, encoding="utf-8",
-                                  errors="replace")
-        except OSError:
-            raise CliError("git is not installed; pass asset paths or folders instead") from None
-        if proc.returncode:
-            raise CliError(f"git {argv[0]}: {proc.stderr.strip().splitlines()[-1] if proc.stderr.strip() else 'failed'}"
-                           " (not a git repository? pass asset paths or folders instead)")
-        return proc.stdout
+            return run_git(project, *argv)
+        except CliError as exc:
+            raise CliError(f"{exc} (not a git repository? pass asset paths or folders instead)") from None
 
     top = git("rev-parse", "--show-toplevel").strip()
     changed, deleted = set(), set()
@@ -1929,6 +1939,185 @@ def git_changes(project, rev=None):
     deleted -= changed
     absolute = lambda paths: sorted(os.path.normpath(os.path.join(top, p)) for p in paths)
     return absolute(changed), absolute(deleted)
+
+
+def package_file(project, package):
+    """The file a package path lives in (/Game/X -> Content/X.uasset or .umap), or its .uasset path if neither
+    exists on disk (it may exist in git only); None for a mount point that is not this project's."""
+    root = os.path.dirname(project)
+    mount, _, rest = package.strip("/").partition("/")
+    if mount == "Game":
+        base = os.path.join(root, "Content", *rest.split("/"))
+    else:
+        base = None
+        for dirpath, dirs, files in os.walk(os.path.join(root, "Plugins")):
+            if f"{mount}.uplugin" in files:
+                base = os.path.join(dirpath, "Content", *rest.split("/"))
+                break
+            dirs[:] = [d for d in dirs if d not in ("Binaries", "Intermediate", "Saved", "Source", "Content")]
+        if base is None:
+            return None
+    for ext in (".uasset", ".umap"):
+        if os.path.isfile(base + ext):
+            return base + ext
+    return base + ".uasset"
+
+
+def stage_copy(project, data, name, ext):
+    """Put a package's bytes under Saved/Tether/diff (mounted as /Temp/) and return its asset's object path.
+    Named by content hash, so the same version is loaded once per editor session."""
+    import hashlib
+    tag = hashlib.sha1(data).hexdigest()[:12]
+    folder = os.path.join(os.path.dirname(project), "Saved", "Tether", "diff", tag)
+    path = os.path.join(folder, name + ext)
+    if not os.path.isfile(path):
+        os.makedirs(folder, exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(data)
+    return f"/Temp/Tether/diff/{tag}/{name}.{name}"
+
+
+def bp_outline(ctx, path):
+    """Parent, variables, dispatchers and graph names of a Blueprint, through Epic's Blueprint tools; None if
+    the asset is not a Blueprint."""
+    ref = {"blueprint": {"refPath": path}}
+    try:
+        parent = mcp_tool(ctx, "blueprint", "get_parent", ref)
+    except CliError:
+        return None
+    name = lambda r: (r.get("refPath", "") if isinstance(r, dict) else str(r)).rsplit(":", 1)[-1].rsplit(".", 1)[-1]
+    return {"parent": name(parent),
+            "variables": [str(v) for v in mcp_tool(ctx, "blueprint", "list_variables", ref) or []],
+            "dispatchers": [name(d) for d in mcp_tool(ctx, "blueprint", "list_event_dispatchers", ref) or []],
+            "graphs": [name(g) for g in mcp_tool(ctx, "blueprint", "list_graphs", ref) or []]}
+
+
+def external_actor_changes(ctx, package, rev, to):
+    """World Partition actors of a map added, removed or changed between rev and `to` (or the working tree)."""
+    project = ctx.project
+    mount, _, rest = package.strip("/").partition("/")
+    folder = os.path.join(os.path.dirname(package_file(project, package)) or "", "")
+    content = os.path.join(os.path.dirname(project), "Content") if mount == "Game" else None
+    if not content:
+        return []
+    actors_dir = os.path.join(content, "__ExternalActors__", *rest.split("/"))
+    top = run_git(project, "rev-parse", "--show-toplevel").strip()
+    rel = os.path.relpath(actors_dir, top).replace("\\", "/")
+    args = ["diff", "--name-status", "-z", "--no-renames", rev] + ([to] if to else []) + ["--", rel]
+    fields = run_git(project, *args).split("\0")
+    entries = [(s, p) for s, p in zip(fields[0::2], fields[1::2]) if s]
+    if not to:  # untracked actor files are new too
+        entries += [("A", p) for p in run_git(project, "ls-files", "-z", "--others", "--exclude-standard", "--", rel)
+                    .split("\0") if p]
+    if not entries:
+        return []
+    packages = {}
+    for status, path in entries:
+        pkg = content_package(project, os.path.join(top, path))
+        if pkg:
+            packages[pkg] = status[0]
+    labels = ctx.tether("py", code=(
+        "import json\nreg = unreal.AssetRegistryHelpers.get_asset_registry()\nout = {}\n"
+        f"for p in {sorted(packages)!r}:\n"
+        "    for a in reg.get_assets_by_package_name(p):\n"
+        "        out[p] = f\"{a.get_tag_value('ActorLabel') or a.asset_name} ({a.asset_class_path.asset_name})\"\n"
+        "print(json.dumps(out))"))
+    if isinstance(labels, str):
+        labels = json.loads(labels.strip().splitlines()[-1]) if labels.strip() else {}
+    lines = []
+    for pkg, status in sorted(packages.items(), key=lambda kv: (kv[1], kv[0])):
+        mark = {"A": "+", "D": "-"}.get(status, "~")
+        lines.append(f"{mark} {labels.get(pkg, 'actor package ' + pkg.rsplit('/', 1)[-1])}")
+    return lines
+
+
+def cmd_diff(ctx, args):
+    """What changed in an asset between git revisions, or between a revision and the editor's current state."""
+    project = ctx.project
+    if not args.files and not args.asset:
+        raise CliError("give an asset: ue diff /Game/Path/Asset [rev] [--to rev], or --files OLD NEW")
+    rev, to = args.rev or "HEAD", args.to
+    if args.files:
+        old_file, new_file = args.files
+        named = args.as_path or old_file
+        name, ext = os.path.splitext(os.path.basename(named))
+        with open(old_file, "rb") as f:
+            old = stage_copy(project, f.read(), name, ext or ".uasset")
+        live = content_package(project, new_file) if os.path.isfile(new_file) else None
+        if live:  # git difftool passes the working-tree file itself when comparing with it
+            new, package = asset_ref(live), live
+        else:
+            with open(new_file, "rb") as f:
+                new = stage_copy(project, f.read(), name, ext or ".uasset")
+            package = content_package(project, os.path.abspath(args.as_path)) if args.as_path else name
+        header = f"{package}: old -> " + ("now (the editor's version, unsaved changes included)" if live else "new")
+    else:
+        target = args.asset
+        package = content_package(project, target) if target.lower().endswith((".uasset", ".umap")) else target.split(".")[0]
+        file = package_file(project, package or "")
+        if not file:
+            raise CliError(f"{target}: not a /Game/... asset of this project (or a file under its Content)")
+        top = run_git(project, "rev-parse", "--show-toplevel").strip()
+
+        def blob(revision):
+            for candidate in (file, os.path.splitext(file)[0] + (".umap" if file.endswith(".uasset") else ".uasset")):
+                rel = os.path.relpath(candidate, top).replace("\\", "/")
+                data = run_git(project, "cat-file", "--filters", f"{revision}:{rel}", binary=True, check=False)
+                if data is not None:
+                    return data, os.path.splitext(candidate)[1]
+            return None, None
+
+        name = package.rsplit("/", 1)[-1]
+        old_data, ext = blob(rev)
+        if old_data is None:
+            raise CliError(f"{package} does not exist at {rev} (added since? `git log --diff-filter=A -- <file>`)")
+        if to:
+            new_data, new_ext = blob(to)
+            if new_data is None:
+                raise CliError(f"{package} does not exist at {to}")
+            new = stage_copy(project, new_data, name, new_ext)
+        else:
+            if not os.path.isfile(file):
+                raise CliError(f"{package} was deleted since {rev}")
+            with open(file, "rb") as f:
+                same_file = f.read() == old_data
+            if same_file and not (ctx.beacon or {}).get("dirty"):
+                print(f"{package}: identical to {rev} (and nothing is unsaved in the editor)")
+                return 0
+            new = asset_ref(package)
+        old = stage_copy(project, old_data, name, ext)
+        unsaved = "" if to else " (the editor's version, unsaved changes included)"
+        header = f"{package}: {rev} -> {to or 'now'}{unsaved}"
+    print(header)
+    old_bp, new_bp = bp_outline(ctx, old), bp_outline(ctx, new)
+    if old_bp and new_bp:
+        if old_bp["parent"] != new_bp["parent"]:
+            print(f"parent: {old_bp['parent']} -> {new_bp['parent']}")
+        for key in ("variables", "dispatchers", "graphs"):
+            added = [n for n in new_bp[key] if n not in old_bp[key]]
+            removed = [n for n in old_bp[key] if n not in new_bp[key]]
+            if added or removed:
+                print(f"{key}: " + ", ".join([f"+{n}" for n in added] + [f"-{n}" for n in removed]))
+    print(ctx.tether("diff", old=old, new=new, limit=400))
+    if old_bp and new_bp:
+        old_root, new_root = old.split(".")[0], new.split(".")[0]
+        for graph in [g for g in new_bp["graphs"] if g in old_bp["graphs"]]:
+            before = mcp_tool(ctx, "blueprint", "read_graph_dsl", {"graph": {"refPath": f"{old}:{graph}"}})
+            after = mcp_tool(ctx, "blueprint", "read_graph_dsl", {"graph": {"refPath": f"{new}:{graph}"}})
+            before = (before if isinstance(before, str) else json.dumps(before)).replace(old_root, new_root)
+            after = after if isinstance(after, str) else json.dumps(after)
+            if before != after:
+                print(text_diff(before, after, graph).rstrip())
+        for graph in [g for g in new_bp["graphs"] if g not in old_bp["graphs"]]:
+            text = mcp_tool(ctx, "blueprint", "read_graph_dsl", {"graph": {"refPath": f"{new}:{graph}"}})
+            print(f"== {graph} (new)\n" + (text if isinstance(text, str) else json.dumps(text)).rstrip())
+    if not args.files and package.startswith("/Game/") and ext == ".umap":
+        actors = external_actor_changes(ctx, package, rev, to)
+        if actors:
+            print(f"World Partition actors ({len(actors)} changed; properties not compared):")
+            for line in actors[: max(args.limit, 50)]:
+                print("  " + line)
+    return 0
 
 
 MAP_CHECK = re.compile(r"Map check complete: (\d+) Error\(s\), (\d+) Warning\(s\)")
@@ -2322,6 +2511,10 @@ def cmd_selftest(ctx, args):
               ok=lambda c, o: c == 0 and o.endswith("ok"))
     else:
         check("validate", [], skip="no Blueprint under /Game")
+    blueprint_file = package_file(project, blueprint) if blueprint and blueprint.startswith("/Game/") else None
+    check("diff", ["diff", "--files", blueprint_file or "", blueprint_file or ""],
+          skip="needs UE 5.8+" if remote else None if blueprint_file and os.path.isfile(blueprint_file) else
+          "no Blueprint file under Content/", ok=lambda c, o: c == 0 and o.startswith(blueprint or "?"))
     table = None if remote else (ue("py", FIRST_ASSET.format(cls="DataTable"))[1].splitlines() or [""])[-1]
     check("table export", ["table", table or "", "--export", os.path.join(tempfile.gettempdir(), "tether-selftest.json")],
           skip="needs 5.8 (Epic's DataTableTools)" if remote else
@@ -3206,6 +3399,12 @@ def main(argv=None):
     s.add_argument("--no-record", action="store_true", help="do not make this capture the comparison baseline")
     s = add("asset", cmd_asset, "a few lines about assets, by type (mesh, texture, material, Blueprint, ...)")
     s.add_argument("paths", nargs="+", help="/Game/... asset paths")
+    s = add("diff", cmd_diff, "what changed in an asset between git revisions, or a revision and the editor now")
+    s.add_argument("asset", nargs="?", help="/Game/... asset, or its file under Content/")
+    s.add_argument("rev", nargs="?", help="git revision to compare with (default HEAD)")
+    s.add_argument("--to", metavar="REV", help="compare with this revision instead of the editor's current state")
+    s.add_argument("--files", nargs=2, metavar=("OLD", "NEW"), help="compare two files (for git difftool)")
+    s.add_argument("--as", dest="as_path", metavar="PATH", help="with --files: the asset's path in the repo ($MERGED)")
     s = add("validate", cmd_validate, "data validation + Map Check; default: assets changed in git or unsaved")
     s.add_argument("paths", nargs="*", help="assets or content folders (default: changed and unsaved assets)")
     s.add_argument("--changed", nargs="?", const="", metavar="REV",

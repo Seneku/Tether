@@ -419,6 +419,131 @@ def _dirty_packages():
     return maps, content
 
 
+_MISSING = object()
+# Bookkeeping that differs between any two loads and says nothing about the asset's content.
+_DIFF_NOISE = {"actorGuid", "actorInstanceGuid", "contentBundleGuid", "externalDataLayerAsset", "bIsEditorPreviewActor",
+               "thumbnailInfo", "status", "shouldCookPropertyGuidsValue", "blueprintGuid"}
+
+
+def _props_json(obj):
+    cls = obj if isinstance(obj, unreal.Struct) else obj.get_class()
+    names = [n for n in _reflect(unreal.ToolsetLibrary.list_struct_properties(cls), obj) if n not in _DIFF_NOISE]
+    return _reflect(unreal.ToolsetLibrary.get_object_properties(obj, names), obj) if names else {}
+
+
+def _rebase(value, old_root, new_root):
+    """References into the old copy's own package, rewritten to the new package so they compare equal."""
+    if isinstance(value, str):
+        return new_root + value[len(old_root):] if value.startswith(old_root) and value[len(old_root):][:1] in ("", ".", ":") \
+            else value
+    if isinstance(value, list):
+        return [_rebase(v, old_root, new_root) for v in value]
+    if isinstance(value, dict):
+        return {k: _rebase(v, old_root, new_root) for k, v in value.items()}
+    return value
+
+
+def _same(a, b):
+    if isinstance(a, float) or isinstance(b, float):
+        return isinstance(a, (int, float)) and isinstance(b, (int, float)) and abs(a - b) <= 1e-4 * max(1.0, abs(a), abs(b))
+    if isinstance(a, dict) and isinstance(b, dict):
+        return a.keys() == b.keys() and all(_same(a[k], b[k]) for k in a)
+    if isinstance(a, list) and isinstance(b, list):
+        return len(a) == len(b) and all(_same(x, y) for x, y in zip(a, b))
+    return a == b
+
+
+def _diff_value(path, a, b, out):
+    if _same(a, b):
+        return
+    numeric = lambda v: isinstance(v, dict) and v and all(isinstance(x, (int, float)) for x in v.values())
+    if isinstance(a, dict) and isinstance(b, dict) and set(a) != {"refPath"} and not (numeric(a) and numeric(b)):
+        for key in list(a) + [k for k in b if k not in a]:
+            _diff_value(f"{path}.{key}", a.get(key, _MISSING), b.get(key, _MISSING), out)
+        return
+    if isinstance(a, list) and isinstance(b, list) and len(a) == len(b) and len(a) <= 64:
+        for i, (x, y) in enumerate(zip(a, b)):
+            _diff_value(f"{path}[{i}]", x, y, out)
+        return
+    if isinstance(a, list) and isinstance(b, list):
+        out.append(f"{path}: {len(a)} -> {len(b)} items")
+        return
+    if a is _MISSING:
+        out.append(f"+ {path} = {_compact(b)}")
+    elif b is _MISSING:
+        out.append(f"- {path} (was {_compact(a)})")
+    else:
+        out.append(f"{path}: {_compact(a)} -> {_compact(b)}")
+
+
+def _diff_props(label, old, new, roots, out, limit=40, skip=()):
+    lines = []
+    a = _rebase(_round(_props_json(old)), *roots)
+    b = _round(_props_json(new))
+    for key in [k for k in list(a) + [k for k in b if k not in a] if k.lower() not in skip]:
+        _diff_value(key, a.get(key, _MISSING), b.get(key, _MISSING), lines)
+    if lines:
+        out.append(f"{label}:")
+        out.extend("  " + line for line in lines[:limit])
+        if len(lines) > limit:
+            out.append(f"  ... +{len(lines) - limit} more")
+
+
+def _bp_parts(bp):
+    """A Blueprint's class defaults and component templates by variable name."""
+    generated = unreal.BlueprintEditorLibrary.generated_class(bp)
+    parts = {"defaults": unreal.get_default_object(generated)} if generated else {}
+    subsystem = unreal.get_engine_subsystem(unreal.SubobjectDataSubsystem)
+    lib = unreal.SubobjectDataBlueprintFunctionLibrary
+    for handle in subsystem.k2_gather_subobject_data_for_blueprint(bp) or []:
+        data = lib.get_data(handle)
+        obj = lib.get_object(data)
+        name = str(lib.get_variable_name(data))
+        if obj is not None and name and name != "None":
+            parts[f"component {name}"] = obj
+    return parts
+
+
+def _actor_parts(actor):
+    parts = {"actor": actor}
+    for comp in actor.get_components_by_class(unreal.ActorComponent):
+        if not _try(lambda: comp.get_editor_property("is_editor_only"), False):  # billboards, arrows: editor state
+            parts[f"component {comp.get_name()}"] = comp
+    return parts
+
+
+def _diff_parts(old_parts, new_parts, roots, out):
+    added = [k for k in new_parts if k not in old_parts]
+    removed = [k for k in old_parts if k not in new_parts]
+    if added:
+        out.append("added: " + ", ".join(added))
+    if removed:
+        out.append("removed: " + ", ".join(removed))
+    # A Blueprint's class defaults hold a reference per component; the component lines already say it.
+    components = {k.split(" ", 1)[1].lower() for k in added + removed if k.startswith("component ")}
+    for key in [k for k in new_parts if k in old_parts]:
+        _diff_props(key, old_parts[key], new_parts[key], roots, out, skip=components)
+
+
+def _level_actors(world):
+    """The live actors in a map package (open or just loaded), by object name, and the names of those the
+    editor would save (None when every one would: a map loaded from disk has no transient actors)."""
+    package = world.get_outermost()
+    actors = {a.get_name(): a for a in unreal.ObjectIterator(unreal.Actor) if a.get_outermost() == package
+              and unreal.SystemLibrary.is_valid(a) and not a.get_name().startswith("Default__")}
+    editor_world = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_editor_world()
+    saved = None
+    if editor_world is not None and editor_world.get_outermost() == package:
+        # The open map also holds transient actors (nav data, debug managers); the editor's list leaves them out.
+        saved = {a.get_name() for a in unreal.get_editor_subsystem(unreal.EditorActorSubsystem).get_all_level_actors()}
+    return actors, saved
+
+
+def _table_rows(table):
+    rows = json.loads(unreal.DataTableFunctionLibrary.export_data_table_to_json_string(table) or "[]")
+    return {str(r.get("Name")): {k: v for k, v in r.items() if k != "Name"} for r in rows}
+
+
 _reload = {"handle": None}
 
 
@@ -1288,6 +1413,67 @@ class TetherCore(_Base):
                 broken.append({"path": package, "referencers": users[:20]})
         return json.dumps({"checked": len(unique), "not_validated": skipped, "problems": problems,
                            "broken_refs": broken})
+
+    @_tool
+    @staticmethod
+    def diff(old: str, new: str, limit: int = 200) -> str:
+        """What changed between two versions of an asset, e.g. an earlier revision copied under Saved/ (which
+        loads as /Temp/...) and the current one. Blueprints: class defaults and components (graphs and
+        variables come from Epic's Blueprint tools); DataTables: rows; maps: actors added, removed and changed;
+        anything else: its reflected properties.
+
+        Args:
+            old: Object or package path of the earlier version.
+            new: Object or package path of the later version.
+            limit: Maximum number of lines.
+
+        Returns:
+            One line per difference ('name: old -> new'), grouped by part.
+        """
+        if _LEGACY:
+            raise RuntimeError("needs UE 5.8+ (Epic's ToolsetLibrary)")
+        a, b = _resolve(old), _resolve(new)
+        roots = (a.get_outermost().get_name(), b.get_outermost().get_name())
+        out = []
+        if a.get_class() != b.get_class():
+            out.append(f"class: {a.get_class().get_name()} -> {b.get_class().get_name()}")
+        if isinstance(a, unreal.Blueprint) and isinstance(b, unreal.Blueprint):
+            _diff_parts(_bp_parts(a), _bp_parts(b), roots, out)
+        elif isinstance(a, unreal.DataTable) and isinstance(b, unreal.DataTable):
+            ra, rb = _table_rows(a), _table_rows(b)
+            out += [f"+ row {n}" for n in rb if n not in ra] + [f"- row {n}" for n in ra if n not in rb]
+            for name in [n for n in rb if n in ra]:
+                lines = []
+                for col in list(ra[name]) + [c for c in rb[name] if c not in ra[name]]:
+                    _diff_value(col, _rebase(ra[name].get(col, _MISSING), *roots), rb[name].get(col, _MISSING), lines)
+                if lines:
+                    out.append(f"~ row {name}: " + "; ".join(lines))
+        elif isinstance(a, unreal.World) and isinstance(b, unreal.World):
+            (old_actors, _), (new_actors, saved) = _level_actors(a), _level_actors(b)
+
+            def where(actor):
+                root = actor.root_component
+                loc = root.get_editor_property("relative_location") if root else None  # unregistered: no world transform
+                return f" at ({loc.x:.0f}, {loc.y:.0f}, {loc.z:.0f})" if loc else ""
+
+            for name in [n for n in new_actors if n not in old_actors and (saved is None or n in saved)]:
+                actor = new_actors[name]
+                out.append(f"+ {actor.get_actor_label()} ({actor.get_class().get_name()}){where(actor)}")
+            for name in [n for n in old_actors if n not in new_actors]:
+                actor = old_actors[name]
+                out.append(f"- {actor.get_actor_label()} ({actor.get_class().get_name()})")
+            for name in [n for n in new_actors if n in old_actors]:
+                lines = []
+                _diff_parts(_actor_parts(old_actors[name]), _actor_parts(new_actors[name]), roots, lines)
+                if lines:
+                    out.append(f"~ {new_actors[name].get_actor_label()} ({new_actors[name].get_class().get_name()})")
+                    out.extend("  " + line for line in lines)
+        else:
+            _diff_props("properties", a, b, roots, out, limit)
+        if not out:
+            return ("no actors added, removed or changed in the map package itself" if isinstance(b, unreal.World)
+                    else "no differences in reflected properties")
+        return "\n".join(out[:limit]) + (f"\n... +{len(out) - limit} more lines" if len(out) > limit else "")
 
     @_tool
     @staticmethod

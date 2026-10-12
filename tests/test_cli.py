@@ -662,6 +662,23 @@ class Validate(unittest.TestCase):
         self.assertIsNone(ue.content_package(self.project.uproject, os.path.join(root, "Content", "readme.txt")))
         self.assertIsNone(ue.content_package(self.project.uproject, os.path.join(root, "Source", "A.uasset")))
 
+    def test_package_file_and_stage_copy(self):
+        root = self.project.root
+        self.project.write("Content/Maps/L.umap", "map")
+        self.project.write("Plugins/Group/Feature/Feature.uplugin", "{}")
+        self.assertEqual(ue.package_file(self.project.uproject, "/Game/Maps/L"), os.path.join(root, "Content", "Maps", "L.umap"))
+        self.assertEqual(ue.package_file(self.project.uproject, "/Game/Gone/X"), os.path.join(root, "Content", "Gone", "X.uasset"))
+        self.assertEqual(ue.package_file(self.project.uproject, "/Feature/M"),
+                         os.path.join(root, "Plugins", "Group", "Feature", "Content", "M.uasset"))
+        self.assertIsNone(ue.package_file(self.project.uproject, "/Engine/BasicShapes/Cube"))
+        first = ue.stage_copy(self.project.uproject, b"v1", "BP_X", ".uasset")
+        self.assertRegex(first, r"^/Temp/Tether/diff/[0-9a-f]{12}/BP_X[.]BP_X$")
+        self.assertEqual(ue.stage_copy(self.project.uproject, b"v1", "BP_X", ".uasset"), first)  # same bytes, same copy
+        self.assertNotEqual(ue.stage_copy(self.project.uproject, b"v2", "BP_X", ".uasset"), first)
+        tag = first.split("/")[4]
+        with open(os.path.join(root, "Saved", "Tether", "diff", tag, "BP_X.uasset"), "rb") as f:
+            self.assertEqual(f.read(), b"v1")
+
     @unittest.skipUnless(__import__("shutil").which("git"), "git not installed")
     def test_git_changes(self):
         root = self.project.root

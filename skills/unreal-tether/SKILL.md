@@ -94,6 +94,10 @@ broken or unsupported.
 ## Blueprints, DataTables, API lookups, long jobs
 - `ue asset <path>` summarises an asset in a few lines (mesh triangles/LODs/Nanite, texture size and
   compression, material parameters...); use it before `ue props`, which lists every property.
+- `ue diff /Game/Path/Asset [rev]` shows what changed in a binary asset since a git revision (default HEAD,
+  compared with the editor's current version) or between two (`--to rev2`): Blueprint variables, components,
+  defaults and graph text, DataTable rows, map actors. Use it to review your own asset edits before
+  committing, and to understand someone else's commit (`ue diff X <sha>~1 --to <sha>`).
 - `ue find <regex> [--class StaticMesh] [--under /Game/x]` to locate assets; `ue refs <asset>` before deleting
   or renaming one (what uses it), `--deps` for what it uses.
 - `ue api <Class> [regex]` before writing editor Python: real method signatures and property names in a
