@@ -45,6 +45,8 @@ broken or unsupported.
 - New assets: `ue new bp /Game/X/BP_Door --parent Actor` (or a C++ class, or another Blueprint), `ue new mi
   /Game/X/MI_Rock --parent /Game/X/M_Rock`, `ue new datatable /Game/X/DT_Items --parent ItemRow`, `ue new level
   /Game/Maps/L_Test`, `ue new folder /Game/X`. Then `ue save` (or pass --save).
+- On terrain, never guess heights: `ue spawn /Game/X/SM_Rock --at 1200,-300,0 --ground` (or `ue drop Rock1 Rock2`,
+  `--align` to follow the slope) puts things on the surface below.
 - Level edits: `ue spawn PointLight --at 0,0,300 --label Lamp` (or an asset path), `ue duplicate Lamp --count 3`,
   `ue delete Lamp`. Asset moves: `ue mv /Game/A/X /Game/B/` (then `ue save`), `ue rm /Game/A/X` (refuses while
   referenced; check `ue refs` first). Prefer these to raw `ue py`: they are undoable and checked.

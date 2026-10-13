@@ -29,7 +29,7 @@ class _Lazy:
 socket, subprocess, zlib = _Lazy("socket"), _Lazy("subprocess"), _Lazy("zlib")
 
 TETHER = "tether.toolsets.TetherCore"
-GATED = {"py", "console", "set_props", "undo", "save", "spawn", "delete", "duplicate", "mv", "rm", "set_material", "pie_step", "set_config", "umg", "new_asset"}  # tools that need the session token (see beacon.session_token)
+GATED = {"py", "console", "set_props", "undo", "save", "spawn", "delete", "duplicate", "mv", "rm", "set_material", "pie_step", "set_config", "umg", "new_asset", "drop"}  # tools that need the session token (see beacon.session_token)
 LEVELS = {"Fatal": 0, "Error": 1, "Warning": 2, "Display": 3, "Log": 4, "Verbose": 5, "VeryVerbose": 6}
 NOISE = {"LogModelContextProtocol", "LogToolsetRegistry"}  # our own transport chatter
 # Epic logs this whenever a schema is generated for a class with delegates (props, set, describe_toolset).
@@ -1837,7 +1837,13 @@ def cmd_crash(ctx, args):
 
 
 def cmd_spawn(ctx, args):
-    print(ctx.tether("spawn", what=args.what, at=args.at, rot=args.rot or "", label=args.label or ""))
+    print(ctx.tether("spawn", what=args.what, at=args.at, rot=args.rot or "", label=args.label or "",
+                     ground=args.ground, align=args.align))
+    return 0
+
+
+def cmd_drop(ctx, args):
+    print(ctx.tether("drop", targets=",".join(args.actors), align=args.align))
     return 0
 
 
@@ -2914,6 +2920,8 @@ def cmd_selftest(ctx, args):
         check("undo", ["undo"], skip=probe_skip, ok=lambda c, o: c == 0 and "undone: TetherSelftestProbe" in o)
         check("set rollback", ["set", "TetherSelftestProbe", "location=0,0,0", "no_such_property_xyz=1"],
               skip=probe_skip, ok=lambda c, o: c != 0 and "no property" in o)
+    check("drop", ["drop", "TetherSelftestProbe"], skip=probe_skip,
+          ok=lambda c, o: c == 0 and ("-> " in o or "no ground below" in o))
     check("mat", ["mat", "/Engine/BasicShapes/BasicShapeMaterial"], ok=lambda c, o: c == 0 and "vector  Color" in o)
     instance = None if remote else check("mat: transient instance", ["py",
         "mi = unreal.find_object(None, '/Engine/Transient.MI_TetherSelftest') or "
@@ -4038,6 +4046,11 @@ def main(argv=None):
     s.add_argument("--at", default="0,0,0", help="location x,y,z")
     s.add_argument("--rot", help="rotation pitch,yaw,roll")
     s.add_argument("--label", help="actor label")
+    s.add_argument("--ground", action="store_true", help="drop it onto the surface below --at")
+    s.add_argument("--align", action="store_true", help="with --ground: tilt it to the surface")
+    s = add("drop", cmd_drop, "put actors on the ground below them (undoable)")
+    s.add_argument("actors", nargs="+", help="actor labels or names")
+    s.add_argument("--align", action="store_true", help="also tilt each to the surface normal")
     s = add("delete", cmd_delete, "delete actors from the level (undoable)")
     s.add_argument("actors", nargs="+", help="actor labels or names")
     s = add("duplicate", cmd_duplicate, "duplicate an actor (undoable)")

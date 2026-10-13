@@ -881,6 +881,37 @@ class _Vcs:
         return notes
 
 
+def _ground_actor(actor, align=False):
+    """Move an actor straight down (or up, if it is buried) so the bottom of its bounds rests on the first
+    blocking surface below it. Returns (old z, new z, what it landed on) or raises if there is no ground."""
+    world = actor.get_world()
+    origin, extent = actor.get_actor_bounds(False)
+    bottom = origin.z - extent.z
+
+    def trace(start_z):
+        hit = unreal.SystemLibrary.line_trace_single(
+            world, unreal.Vector(origin.x, origin.y, start_z), unreal.Vector(origin.x, origin.y, origin.z - 200000),
+            unreal.TraceTypeQuery.TRACE_TYPE_QUERY1, True, [actor], unreal.DrawDebugTrace.NONE, True)
+        return hit.to_dict() if hit and hit.to_dict().get("blocking_hit") else None
+
+    # From just above the actor first (so a roof or canopy above it is not taken for the ground), then from high
+    # above, for an actor sunk below the surface.
+    hit = trace(origin.z + extent.z + 1) or trace(origin.z + 200000)
+    if hit is None:
+        raise RuntimeError(f"no ground below {actor.get_actor_label()} (nothing with collision under it)")
+    loc = actor.get_actor_location()
+    old_z = loc.z
+    loc.z += hit["impact_point"].z - bottom
+    actor.set_actor_location(loc, False, True)
+    if align:
+        normal = hit["impact_normal"]
+        rot = actor.get_actor_rotation()
+        aligned = unreal.MathLibrary.make_rot_from_zx(normal, unreal.MathLibrary.get_forward_vector(rot))
+        actor.set_actor_rotation(aligned, True)
+    landed = hit.get("hit_actor")
+    return old_z, loc.z, (landed.get_actor_label() if landed else "?")
+
+
 _reload = {"handle": None}
 
 
@@ -1269,7 +1300,8 @@ class TetherCore(_Base):
 
     @_tool
     @staticmethod
-    def spawn(what: str, at: str = "0,0,0", rot: str = "", label: str = "", token: str = "") -> str:
+    def spawn(what: str, at: str = "0,0,0", rot: str = "", label: str = "", ground: bool = False, align: bool = False,
+              token: str = "") -> str:
         """Place an actor in the edited level (undoable): from a class (PointLight, /Script/Engine.TargetPoint,
         a Blueprint's generated class) or an asset (a StaticMesh, a Blueprint, ...).
 
@@ -1278,6 +1310,8 @@ class TetherCore(_Base):
             at: Location 'x,y,z'.
             rot: Rotation 'pitch,yaw,roll'.
             label: Actor label to give it.
+            ground: Drop it onto the first surface below `at` (its bounds' bottom on the ground).
+            align: With ground: tilt it to the surface normal.
             token: Session token from Saved/Tether/session.json (the ue CLI sends it).
 
         Returns:
@@ -1306,11 +1340,54 @@ class TetherCore(_Base):
                      else subsystem.spawn_actor_from_class(cls, location, rotation))
             if actor is not None and label:
                 actor.set_actor_label(label)
+            landed = None
+            if actor is not None and ground:
+                try:
+                    landed = _ground_actor(actor, align)[2]
+                except RuntimeError as exc:
+                    landed = f"not grounded: {exc}"
         if actor is None:
             raise RuntimeError(f"could not spawn {what} (see ue log)")
         _record_undo(before, f"spawn {actor.get_actor_label()}")
         loc = actor.get_actor_location()
-        return f"spawned {actor.get_actor_label()} ({actor.get_class().get_name()}) at ({loc.x:g}, {loc.y:g}, {loc.z:g})"
+        return f"spawned {actor.get_actor_label()} ({actor.get_class().get_name()}) at ({loc.x:g}, {loc.y:g}, {loc.z:.6g})" + \
+            (f" on {landed}" if landed and not landed.startswith("not grounded") else f" ({landed})" if landed else "")
+
+    @_tool
+    @staticmethod
+    def drop(targets: str, align: bool = False, token: str = "") -> str:
+        """Put actors on the ground: move each straight down (or up, if buried) so the bottom of its bounds rests
+        on the first blocking surface below it. One undoable step.
+
+        Args:
+            targets: Comma-separated actor labels or names.
+            align: Also tilt each to the surface normal.
+            token: Session token from Saved/Tether/session.json (the ue CLI sends it).
+
+        Returns:
+            One line per actor: old -> new height and what it landed on.
+        """
+        _authorize(token)
+        actors = []
+        for ref in [t.strip() for t in targets.split(",") if t.strip()]:
+            obj = _resolve(ref)
+            if not isinstance(obj, unreal.Actor):
+                raise RuntimeError(f"'{ref}' is not an actor")
+            actors.append(obj)
+        before = unreal.ToolsetLibrary.get_active_undo_count() if not _LEGACY else 0
+        rows = []
+        with unreal.ScopedEditorTransaction("ue drop"):
+            for actor in actors:
+                actor.modify()
+                if actor.root_component:
+                    actor.root_component.modify()
+                try:
+                    old_z, new_z, landed = _ground_actor(actor, align)
+                    rows.append(f"{actor.get_actor_label()}: z {old_z:.6g} -> {new_z:.6g} (on {landed})")
+                except RuntimeError as exc:
+                    rows.append(f"{actor.get_actor_label()}: {exc}")
+        _record_undo(before, "drop " + ", ".join(a.get_actor_label() for a in actors))
+        return "\n".join(rows)
 
     @_tool
     @staticmethod
