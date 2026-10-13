@@ -267,12 +267,18 @@ switches it on for the session anyway).
 
 | Works | Needs 5.8 |
 |---|---|
-| `status`, `open`, `close`, `build` (UBT and Live Coding), `log`, `py`, `exec`, `actors`, `props` (from the Python wrappers' property lists), `asset`, `find`, `refs`, `validate`, `size`, `mem`, `nav`, `mat` (reading), `changes`, `save`, `spawn`/`delete`/`duplicate`/`mv`/`rm`, `call tether.*`, `pie start/stop/status/do`, `reload`, `init`, `selftest`, hooks | `set`, `undo`, `mat` (writing), `diff`, `config`, `shot`, `test`, `bp`, `table`, `perf`, `tools`, and `call` for Epic's toolsets |
+| `status`, `open`, `close`, `build` (UBT and Live Coding), `log`, `py`, `exec`, `actors`, `props` (from the Python wrappers' property lists), `set` and `undo` (see below), `asset`, `find`, `refs`, `validate`, `size`, `mem`, `nav`, `mat`, `new`, `drop`, `ai`, `ui` (UMG only), `changes`, `save`, `spawn`/`delete`/`duplicate`/`mv`/`rm`, `package`, `call tether.*`, `pie start/stop/status/do`, `reload`, `init`, `selftest`, hooks | `set --from`, `diff`, `config`, `shot`, `test`, `bp`, `table`, `perf`, `tools`, and `call` for Epic's toolsets |
+
+`ue set` on 5.4–5.7 writes through `set_editor_property` in one editor transaction, parsing each value by
+the type of the property's current value (numbers, booleans, enum names, structs such as vectors and
+colours, object paths) and putting everything back if one value fails. With no undo-history depth to check
+before 5.8, `ue undo` there writes the old values back as a new transaction, and refuses if any of those
+properties changed since; it covers `ue set` only.
 
 Each call costs about 0.5 s more (UDP discovery), and the token gate adds nothing here: remote execution
 itself runs any Python sent to it, so keep its bind address at the default `127.0.0.1`.
 
-**Tested** on UE 5.7.4 (a Blueprint-only project set up with `ue init`): `ue selftest` passes 26 checks,
+**Tested** on UE 5.7.4 (a Blueprint-only project set up with `ue init`): `ue selftest` passes 33 checks,
 fails none and skips the 11 that need 5.8. 5.4–5.6 have not been run yet; if you have such a project,
 please paste its `ue selftest` output into an issue.
 

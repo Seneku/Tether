@@ -3136,28 +3136,23 @@ def cmd_selftest(ctx, args):
                     ok=lambda c, o: c == 0 and "TetherSelftestProbe" in o)
     probe_skip = None if spawned else "probe actor missing"
     check("props", ["props", "TetherSelftestProbe", "hidden"], skip=probe_skip)
-    if remote:
-        check("set", [], skip="needs UE 5.8+ (ToolsetLibrary)")
-        check("set rollback", [], skip="needs UE 5.8+")
-    else:
-        check("set", ["set", "TetherSelftestProbe", "location+=0,0,50"], skip=probe_skip,
-              ok=lambda c, o: c == 0 and "-> (0, 0, 100050)" in o)
-        check("undo", ["undo"], skip=probe_skip, ok=lambda c, o: c == 0 and "undone: TetherSelftestProbe" in o)
-        check("set rollback", ["set", "TetherSelftestProbe", "location=0,0,0", "no_such_property_xyz=1"],
-              skip=probe_skip, ok=lambda c, o: c != 0 and "no property" in o)
+    check("set", ["set", "TetherSelftestProbe", "location+=0,0,50"], skip=probe_skip,
+          ok=lambda c, o: c == 0 and "-> (0, 0, 100050)" in o)
+    check("undo", ["undo"], skip=probe_skip, ok=lambda c, o: c == 0 and "undone: TetherSelftestProbe" in o)
+    check("set rollback", ["set", "TetherSelftestProbe", "location=0,0,0", "no_such_property_xyz=1"],
+          skip=probe_skip, ok=lambda c, o: c != 0 and "no property" in o)
     check("drop", ["drop", "TetherSelftestProbe"], skip=probe_skip,
           ok=lambda c, o: c == 0 and ("-> " in o or "no ground below" in o))
     check("mat", ["mat", "/Engine/BasicShapes/BasicShapeMaterial"], ok=lambda c, o: c == 0 and "vector  Color" in o)
-    instance = None if remote else check("mat: transient instance", ["py",
+    instance = check("mat: transient instance", ["py",
         "mi = unreal.find_object(None, '/Engine/Transient.MI_TetherSelftest') or "
         "unreal.new_object(unreal.MaterialInstanceConstant, name='MI_TetherSelftest')\n"
         "unreal.MaterialEditingLibrary.set_material_instance_parent(mi, unreal.load_asset('/Engine/BasicShapes/BasicShapeMaterial'))\n"
         "mi.get_path_name()"], ok=lambda c, o: c == 0 and o.endswith("MI_TetherSelftest"))
     check("mat set", ["mat", "/Engine/Transient.MI_TetherSelftest", "Color=1,0,0"],
-          skip="needs UE 5.8+" if remote else None if instance else "no transient instance",
-          ok=lambda c, o: c == 0 and "-> (1, 0, 0, 1)" in o)
-    check("undo mat", ["undo"], skip="needs UE 5.8+" if remote else None if instance else "no transient instance",
-          ok=lambda c, o: c == 0 and "undone: mat" in o)
+          skip=None if instance else "no transient instance", ok=lambda c, o: c == 0 and "-> (1, 0, 0, 1)" in o)
+    check("undo mat", ["undo"], skip="before 5.8, ue undo covers ue set only" if remote else
+          None if instance else "no transient instance", ok=lambda c, o: c == 0 and "undone: mat" in o)
     created = check("new", ["new", "bp", "/Game/TetherSelftest/BP_SelftestNew", "--parent", "Actor"],
                     ok=lambda c, o: c == 0 and "created /Game/TetherSelftest/BP_SelftestNew" in o)
     check("rm (new asset)", ["rm", "/Game/TetherSelftest/BP_SelftestNew"], skip=None if created else "nothing created",

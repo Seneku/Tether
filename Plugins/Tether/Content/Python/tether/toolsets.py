@@ -881,6 +881,11 @@ class _Vcs:
         return notes
 
 
+_HIT_FIELDS = ("blocking_hit", "initial_overlap", "time", "distance", "location", "impact_point", "normal",
+               "impact_normal", "phys_mat", "hit_actor", "hit_component", "hit_bone_name", "bone_name", "hit_item",
+               "element_index", "face_index", "trace_start", "trace_end")
+
+
 def _ground_actor(actor, align=False):
     """Move an actor straight down (or up, if it is buried) so the bottom of its bounds rests on the first
     blocking surface below it. Returns (old z, new z, what it landed on) or raises if there is no ground."""
@@ -892,7 +897,10 @@ def _ground_actor(actor, align=False):
         hit = unreal.SystemLibrary.line_trace_single(
             world, unreal.Vector(origin.x, origin.y, start_z), unreal.Vector(origin.x, origin.y, origin.z - 200000),
             unreal.TraceTypeQuery.TRACE_TYPE_QUERY1, True, [actor], unreal.DrawDebugTrace.NONE, True)
-        return hit.to_dict() if hit and hit.to_dict().get("blocking_hit") else None
+        if not hit:
+            return None
+        fields = _try(lambda: hit.to_dict()) or dict(zip(_HIT_FIELDS, hit.to_tuple()))  # no to_dict before 5.8
+        return fields if fields.get("blocking_hit") else None
 
     # From just above the actor first (so a roof or canopy above it is not taken for the ground), then from high
     # above, for an actor sunk below the surface.
@@ -910,6 +918,179 @@ def _ground_actor(actor, align=False):
         actor.set_actor_rotation(aligned, True)
     landed = hit.get("hit_actor")
     return old_z, loc.z, (landed.get_actor_label() if landed else "?")
+
+
+def _legacy_key(name):
+    """Match 'bCastShadows', 'CastShadows' and 'cast_shadows' to the Python wrapper's 'cast_shadows'."""
+    key = name.replace("_", "").lower()
+    return key[1:] if key.startswith("b") and len(key) > 1 and name[:1] == "b" and name[1:2].isupper() else key
+
+
+def _struct_fields(value):
+    """A struct's fields as a dict, in the order positional values fill them (r,g,b,a for colours)."""
+    if isinstance(value, unreal.Color):
+        return {k: value.get_editor_property(k) for k in ("r", "g", "b", "a")}
+    fields = _try(lambda: value.to_dict())
+    if fields is None:
+        fields = {n: value.get_editor_property(n) for n in dict(_DOC_PROPERTY.findall(type(value).__doc__ or ""))}
+    return fields
+
+
+def _legacy_value(raw, old, name):
+    """Parse compact text into a value of the same Python wrapper type as the property's current value."""
+    text = raw.strip()
+    if isinstance(old, bool):
+        flag = {"true": True, "1": True, "yes": True, "on": True,
+                "false": False, "0": False, "no": False, "off": False}.get(text.lower())
+        if flag is None:
+            raise ValueError(f"expected true/false, got '{text}'")
+        return flag
+    if isinstance(old, (int, float)):
+        nums = _numbers(text)
+        if not nums or len(nums) != 1:
+            raise ValueError(f"expected a number, got '{text}'")
+        return type(old)(nums[0])
+    if isinstance(old, unreal.EnumBase):
+        member = text.split("::")[-1].split(".")[-1].upper()
+        if not hasattr(type(old), member):
+            names = [n for n in dir(type(old)) if n.isupper()]
+            raise ValueError(f"expected one of {', '.join(names[:12])}, got '{text}'")
+        return getattr(type(old), member)
+    if isinstance(old, unreal.StructBase):
+        fields = _struct_fields(old)
+        nums = _numbers(text)
+        if nums is not None:
+            if len(nums) > len(fields):
+                raise ValueError(f"{len(nums)} values for {len(fields)} fields ({', '.join(fields)})")
+            if isinstance(old, unreal.Color) and all(0 <= v <= 1 for v in nums) and any(isinstance(v, float) for v in nums):
+                nums = [round(v * 255) for v in nums]  # 0-1 colour values, as for LinearColor
+            update = dict(zip(fields, nums))
+        else:
+            try:
+                update = json.loads(text)
+            except ValueError:
+                raise ValueError(f"expected {','.join(fields)} (or JSON), got '{text}'") from None
+        value = old.copy()
+        for field, v in update.items():
+            value.set_editor_property(field, v)
+        return value
+    if isinstance(old, unreal.Name):
+        return unreal.Name(text)
+    if isinstance(old, unreal.Text):
+        return unreal.Text(text)
+    if isinstance(old, str):
+        return raw
+    if old is None or isinstance(old, unreal.Object):
+        if text.lower() in ("", "none", "null"):
+            return None
+        ref = text.split("'")[1] if "'" in text else text
+        found = unreal.find_object(None, ref) or _try(lambda: unreal.load_asset(ref.split(".")[0])) or \
+            _try(lambda: unreal.load_object(None, ref))
+        if found is None:
+            raise ValueError(f"no object at '{ref}'")
+        return found
+    raise ValueError(f"{type(old).__name__} values are not supported here; use ue py with set_editor_property")
+
+
+def _legacy_text(value):
+    if isinstance(value, unreal.StructBase):
+        return _compact(_struct_fields(value))
+    if isinstance(value, unreal.EnumBase):
+        return value.name
+    if isinstance(value, unreal.Object):
+        return _label(value)
+    return "None" if value is None else str(value).lower() if isinstance(value, bool) else _compact(value)
+
+
+def _legacy_same(a, b):
+    if isinstance(a, unreal.StructBase) and isinstance(b, unreal.StructBase):
+        return _same(_round(_struct_fields(a)), _round(_struct_fields(b)))
+    if isinstance(a, float) or isinstance(b, float):
+        return isinstance(a, (int, float)) and isinstance(b, (int, float)) and abs(a - b) <= 1e-4 * max(1.0, abs(a))
+    return a == b
+
+
+def _legacy_set(obj, requested):
+    """set_props without Epic's ToolsetLibrary (UE 5.4-5.7): set_editor_property in one editor transaction, values
+    parsed by the type of the current value, read back, and put back by hand if anything fails."""
+    schema = dict(_DOC_PROPERTY.findall(type(obj).__doc__ or ""))
+    by_key = {_legacy_key(n): n for n in schema}
+    is_actor = isinstance(obj, unreal.Actor)
+    plan = []
+    for key, raw in requested.items():
+        relative = key.endswith("+")
+        base = key[:-1] if relative else key
+        if is_actor and base.lower() in _ACTOR_POSE:
+            plan.append((base.lower(), relative, raw))
+            continue
+        name = by_key.get(_legacy_key(base))
+        if name is None:
+            import difflib
+            close = difflib.get_close_matches(_legacy_key(base), list(by_key), n=4, cutoff=0.6)
+            owners = []
+            if is_actor:  # actors usually keep the interesting properties on a component
+                for comp in obj.get_components_by_class(unreal.ActorComponent):
+                    names = {_legacy_key(n) for n in dict(_DOC_PROPERTY.findall(type(comp).__doc__ or ""))}
+                    if _legacy_key(base) in names:
+                        owners.append(f"{obj.get_actor_label()}.{comp.get_name()}")
+            raise RuntimeError(f"{_label(obj)} has no property '{base}'"
+                               + (f"; it is on {', '.join(owners[:3])}" if owners else "")
+                               + (f" (did you mean: {', '.join(by_key[c] for c in close)})" if close and not owners else ""))
+        plan.append((name, relative, raw))
+    pose_get = {"location": obj.get_actor_location, "rotation": obj.get_actor_rotation,
+                "scale": obj.get_actor_scale3d} if is_actor else {}
+    snap = lambda v: v.copy() if isinstance(v, unreal.StructBase) else v  # struct reads can be live views
+    old = {n: snap(pose_get[n]() if n in pose_get else obj.get_editor_property(n)) for n, _, _ in plan}
+    new = {}
+    for name, relative, raw in plan:
+        try:
+            value = _legacy_value(raw if isinstance(raw, str) else json.dumps(raw), old[name], name)
+            if relative:
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    value = old[name] + value
+                elif isinstance(value, unreal.StructBase):  # a delta: unspecified fields are 0, not the current value
+                    current = _struct_fields(old[name])
+                    value = old[name].copy()
+                    for field, v in _struct_fields(_legacy_value(raw, type(old[name])(), name)).items():
+                        if isinstance(v, (int, float)):
+                            value.set_editor_property(field, current[field] + v)
+                else:
+                    raise ValueError("+= needs a number or a numeric struct")
+            new[name] = value
+        except ValueError as exc:
+            raise RuntimeError(f"{name}: {exc}") from None
+    new = {n: v for n, v in new.items() if not _legacy_same(v, old[n])}
+    if not new:
+        return [], old, new
+
+    def write(values):
+        for n, v in values.items():
+            if n == "location":
+                obj.set_actor_location(v, False, True)
+            elif n == "rotation":
+                obj.set_actor_rotation(v, True)
+            elif n == "scale":
+                obj.set_actor_scale3d(v)
+            else:
+                obj.set_editor_property(n, v)
+
+    with unreal.ScopedEditorTransaction(f"ue set {_label(obj)}"):
+        obj.modify()
+        if is_actor and obj.root_component:
+            obj.root_component.modify()
+        try:
+            write(new)
+        except Exception as exc:
+            _try(lambda: write({n: old[n] for n in new}))
+            raise RuntimeError(f"could not set: {exc} (put back)") from None
+    after = {n: snap(pose_get[n]() if n in pose_get else obj.get_editor_property(n)) for n in new}
+    ignored = [n for n in new if not _legacy_same(new[n], after[n])]
+    if ignored:
+        _try(lambda: write({n: old[n] for n in new}))
+        raise RuntimeError("did not take: " + ", ".join(f"{n} stayed {_legacy_text(after[n])}" for n in ignored)
+                           + " (put back)")
+    rows = [f"{n}: {_legacy_text(old[n])} -> {_legacy_text(after[n])}" for n in new]
+    return rows, old, new
 
 
 _reload = {"handle": None}
@@ -1044,8 +1225,17 @@ class TetherCore(_Base):
         """
         _authorize(token)
         if _LEGACY:
-            raise RuntimeError("ue set needs UE 5.8+ (Epic's ToolsetLibrary); on older engines use ue py with "
-                               "obj.set_editor_property(name, value) inside unreal.ScopedEditorTransaction")
+            obj = _resolve(target, pie)
+            requested = json.loads(values)
+            if not isinstance(requested, dict) or not requested:
+                raise RuntimeError('values must be a non-empty JSON object, e.g. {"Intensity": "10"}')
+            rows, old, new = _legacy_set(obj, requested)
+            if not rows:
+                return _label(obj) + (" (PIE)" if pie else "") + "\n(no change: already set)"
+            if not pie:  # `ue undo` puts these values back (there is no undo-history depth to check before 5.8)
+                _UNDO.append({"legacy": True, "target": obj.get_path_name(), "old": {n: old[n] for n in new},
+                              "new": new, "label": f"{_label(obj)}: " + ", ".join(new)})
+            return "\n".join([_label(obj) + (" (PIE)" if pie else "")] + rows)
         obj = _resolve(target, pie)
         cls = obj if isinstance(obj, unreal.Struct) else obj.get_class()
         schema = _reflect(unreal.ToolsetLibrary.list_struct_properties(cls), obj)
@@ -1641,6 +1831,32 @@ class TetherCore(_Base):
         if not _UNDO:
             raise RuntimeError("nothing from Tether to undo in this editor session")
         last = _UNDO[-1]
+        if last.get("legacy"):  # before 5.8: write the old values back, if nothing changed them since
+            obj = unreal.find_object(None, last["target"])
+            if obj is None:
+                raise RuntimeError(f"{last['label']}: the object is gone")
+            pose = {"location": obj.get_actor_location, "rotation": obj.get_actor_rotation,
+                    "scale": obj.get_actor_scale3d} if isinstance(obj, unreal.Actor) else {}
+            now = {n: (pose[n]() if n in pose else obj.get_editor_property(n)) for n in last["new"]}
+            moved = [n for n in last["new"] if not _legacy_same(now[n], last["new"][n])]
+            if moved:
+                raise RuntimeError(f"{', '.join(moved)} changed after Tether's edit ({last['label']}), so `ue undo` will "
+                                   "not touch it; use Edit > Undo in the editor")
+            with unreal.ScopedEditorTransaction(f"ue undo {last['label']}"):
+                obj.modify()
+                if pose and obj.root_component:
+                    obj.root_component.modify()
+                for n, v in last["old"].items():  # the exact old values, not a text round trip
+                    if n == "location":
+                        obj.set_actor_location(v, False, True)
+                    elif n == "rotation":
+                        obj.set_actor_rotation(v, True)
+                    elif n == "scale":
+                        obj.set_actor_scale3d(v)
+                    else:
+                        obj.set_editor_property(n, v)
+            _UNDO.pop()
+            return f"undone: {last['label']}" + (f" ({len(_UNDO)} more Tether edit(s) can be undone)" if _UNDO else "")
         now = unreal.ToolsetLibrary.get_active_undo_count()
         if now != last["count"]:
             raise RuntimeError(f"the undo history changed after Tether's last edit ({last['label']}): another edit or "

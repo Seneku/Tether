@@ -191,3 +191,10 @@ class RevisionControl(unittest.TestCase):
         problems, _, _ = vcs.prepare([self.path("A.uasset")])
         self.assertEqual(len(problems), 1)
         self.assertIn("A.uasset is read-only (not checked out?", problems[0])
+
+
+class LegacyNames(unittest.TestCase):
+    def test_cpp_and_python_names_match(self):
+        self.assertEqual(toolsets._legacy_key("bCastShadows"), toolsets._legacy_key("cast_shadows"))
+        self.assertEqual(toolsets._legacy_key("LightColor"), toolsets._legacy_key("light_color"))
+        self.assertEqual(toolsets._legacy_key("bounds"), "bounds")  # a lowercase b is part of the name
