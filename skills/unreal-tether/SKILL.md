@@ -225,6 +225,8 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
   speed). Python cannot read state machine states; the variables the transitions use usually tell you.
 - Audio in PIE: `ue audio` lists what is playing (needs `ue open --headless --sound`, which stays silent);
   `expect-sound <regex>` as a `ue pie do` step checks a sound fires.
+- Character animation logic: `ue anim graph /Game/.../ABP_Hero` (state machines, what each state plays,
+  transition rules and blend times); `ue anim player` shows the live anim instance in PIE.
 - AI built on StateTree: `ue statetree /Game/AI/ST_Enemy` prints the whole tree as text (states, enter conditions,
   tasks, transitions); read it before changing AI behaviour. `ue statetree --pie` shows each component's run status.
 - AI in PIE: `ue ai` (one line per AI), `ue ai <pawn>` (movement, focus, perception, brain, blackboard, and the

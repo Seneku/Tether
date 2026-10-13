@@ -312,8 +312,10 @@ def build_parser():
     s.add_argument("rest", nargs="*")
     s.add_argument("--all", action="store_true", help="also images and zero-size widgets")
     s.add_argument("--submit", action="store_true", help="with type: press Enter afterwards")
-    s = add("anim", cmd_anim, "animation state in PIE: anim BP, montage, curves, its variables, movement")
-    s.add_argument("target", help="actor, 'player', or Actor.Component")
+    s = add("anim", cmd_anim, "animation state in PIE: anim BP, montage, curves, its variables, movement; "
+                              "`anim graph <ABP>`: its state machines as text")
+    s.add_argument("target", help="actor, 'player', or Actor.Component; or `graph`")
+    s.add_argument("asset", nargs="?", help="with graph: the Animation Blueprint")
     s.add_argument("--editor", action="store_true", help="read the editor level instead of PIE")
     s = add("statetree", cmd_statetree, "a StateTree as text (states, conditions, tasks, transitions); no asset: list them")
     s.add_argument("asset", nargs="?", help="/Game/.../ST_Name (default: list the project's StateTrees)")

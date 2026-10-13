@@ -1446,6 +1446,150 @@ def _statetree_lines(tree):
     return lines
 
 
+def _node_title(node):
+    title = _try(lambda: str(node.get_node_title()), "") or node.get_name()
+    return re.sub(r"\s+", " ", title).strip()
+
+
+def _t3d_graph_nodes(graph):
+    """{node name: {class, props, pins: [{name, output, links: [node name]}]}} for a graph's own nodes, from a
+    text export. State machine nodes have no pins in Python, but their copy-paste text has every link."""
+    path = os.path.join(unreal.Paths.convert_relative_path_to_full(unreal.Paths.project_saved_dir()), "Tether",
+                        "graph-export.t3d")
+    task = unreal.AssetExportTask()
+    for key, value in (("object", graph), ("filename", path), ("automated", True), ("prompt", False),
+                       ("replace_identical", True)):
+        task.set_editor_property(key, value)
+    if not unreal.Exporter.run_asset_export_task(task):
+        raise RuntimeError(f"the editor could not export {graph.get_name()} as text")
+    with open(path, encoding="utf-8-sig", errors="replace") as f:
+        text = f.read()
+    classes = {name: cls for cls, name in re.findall(r'^   Begin Object Class=(\S+) Name="([^"]+)"', text, re.M)}
+    nodes = {}
+    # The export lists the nodes twice: declared (with Class=), then defined (properties and pins).
+    for block in re.finditer(r'^   Begin Object Name="([^"]+)"[^\n]*\n(.*?)^   End Object', text, re.M | re.S):
+        name, body = block.group(1), block.group(2)
+        props = dict(re.findall(r"^      (\w+)=(.*)$", body, re.M))
+        pins = []
+        for pin in re.findall(r"^      CustomProperties Pin \((.*)\)$", body, re.M):
+            pin_name = re.search(r'PinName="([^"]*)"', pin)
+            links = re.search(r"LinkedTo=\(([^)]*)\)", pin)
+            pins.append({"name": pin_name.group(1) if pin_name else "", "output": 'Direction="EGPD_Output"' in pin,
+                         "links": [l.split()[0] for l in links.group(1).split(",") if l.strip()] if links else []})
+        nodes[name] = {"class": classes.get(name, "").rsplit(".", 1)[-1], "props": props, "pins": pins}
+    return nodes
+
+
+def _anim_graph_lines(bp):
+    """An Animation Blueprint's AnimGraph and state machines as text. Graph nodes are not listed by the
+    Blueprint graph editor for state machine graphs, so they are gathered by owner (each graph's nodes, each
+    state's and transition's inner graph)."""
+    by_outer = {}
+    for node in unreal.ObjectIterator(unreal.EdGraphNode):
+        outer = _try(lambda: node.get_outer())
+        if outer is not None and node.get_outermost() == bp.get_outermost():
+            by_outer.setdefault(outer.get_path_name(), []).append(node)
+    graphs_of = {}
+    for graph in unreal.ObjectIterator(unreal.EdGraph):
+        outer = _try(lambda: graph.get_outer())
+        if outer is not None and graph.get_outermost() == bp.get_outermost():
+            graphs_of.setdefault(outer.get_path_name(), []).append(graph)
+
+    def nodes(graph):
+        return by_outer.get(graph.get_path_name(), [])
+
+    def inputs(node):
+        """(pin name, source node or None, literal) for each input pin."""
+        out = []
+        for pin in _try(lambda: list(node.list_all_pins()), []) or []:
+            if pin.get_pin_direction() != unreal.EdGraphPinDirection.EGPD_INPUT:
+                continue
+            linked = _try(lambda: list(pin.list_connected_pins()), []) or []
+            out.append((str(pin.get_pin_name()), linked[0].get_owning_node() if linked else None,
+                        _try(lambda: str(pin.get_pin_value()), "")))
+        return out
+
+    def expr(node, depth=0):
+        """What feeds a pin, as a small expression: Title(input, input)."""
+        title = _node_title(node)
+        if depth > 6:
+            return title
+        parts = []
+        for name, source, literal in inputs(node):
+            if source is not None:
+                parts.append(expr(source, depth + 1))
+            elif literal and literal not in ("", "0", "0.0", "false", "None", "()") and name not in ("self", "execute"):
+                parts.append(f"{name}={literal}")
+        return title + (f"({', '.join(parts)})" if parts else "")
+
+    def result_expr(graph, result_kind):
+        result = next((n for n in nodes(graph) if result_kind in n.get_class().get_name()), None)
+        if result is None:
+            return "?"
+        fed = [expr(src) for _, src, _ in inputs(result) if src is not None]
+        literal = [lit for name, src, lit in inputs(result) if src is None and lit]
+        return " , ".join(fed) or (f"always {literal[0]}" if literal else "nothing")
+
+    skeleton = _try(lambda: bp.get_editor_property("target_skeleton"))
+    lines = [f"{bp.get_name()} (Animation Blueprint" + (f", skeleton {skeleton.get_name()}" if skeleton else "") + ")"]
+    machines = []
+    for graph in unreal.BlueprintEditorLibrary.list_graphs(bp):
+        if graph.get_class().get_name() != "AnimationGraph":
+            continue
+        lines.append(f"{graph.get_name()}: Output Pose <- {result_expr(graph, 'AnimGraphNode_Root')}")
+        machines += [n for n in nodes(graph) if n.get_class().get_name() == "AnimGraphNode_StateMachine"]
+    for machine in machines:
+        inner = graphs_of.get(machine.get_path_name(), [])
+        if not inner:
+            continue
+        graph = inner[0]
+        exported = _t3d_graph_nodes(graph)
+        live = {n.get_name(): n for n in nodes(graph)}
+
+        def name_of(node_name):
+            info = exported.get(node_name, {})
+            bound = re.search(r"'([^']+)'", info.get("props", {}).get("BoundGraph", ""))
+            alias = info.get("props", {}).get("StateAliasName", "").strip('"')
+            return (bound.group(1) if bound else "") or alias or node_name
+
+        def linked(info, output):
+            return [l for p in info["pins"] if p["output"] == output for l in p["links"]]
+        states = [n for n, info in exported.items() if info["class"] in ("AnimStateNode", "AnimStateConduitNode",
+                                                                             "AnimStateAliasNode")]
+        entry = next((info for info in exported.values() if info["class"] == "AnimStateEntryNode"), None)
+        first = name_of(linked(entry, True)[0]) if entry and linked(entry, True) else "?"
+        lines.append(f"state machine {graph.get_name()} ({len(states)} states, starts in {first}):")
+        leaving = {}
+        for name, info in exported.items():
+            if info["class"] != "AnimStateTransitionNode":
+                continue
+            sources, targets = linked(info, False), linked(info, True)
+            node = live.get(name)
+            rule_graph = (graphs_of.get(node.get_path_name(), []) or [None])[0] if node else None
+            rule = result_expr(rule_graph, "TransitionResult") if rule_graph else "?"
+            if info["props"].get("bAutomaticRuleBasedOnSequencePlayerInState") == "True":
+                rule = "its animation ends (automatic rule)"
+            blend = info["props"].get("CrossfadeDuration")
+            for source in sources:
+                leaving.setdefault(source, []).append(
+                    f"-> {name_of(targets[0]) if targets else '?'} when {rule}" + (f", blend {float(blend):g}s" if blend else ""))
+        for name in states:
+            info = exported[name]
+            kind = {"AnimStateConduitNode": "conduit", "AnimStateAliasNode": "alias"}.get(info["class"], "")
+            node = live.get(name)
+            bound = graphs_of.get(node.get_path_name(), []) if node else []
+            if kind == "alias":
+                covers = "any state" if info["props"].get("bGlobalAlias") == "True" else ", ".join(
+                    name_of(m) for m in re.findall(r"AnimStateNode'[^']*\.([^'.]+)'", info["props"].get("AliasedStateNodes", "")))
+                lines.append(f"  {name_of(name)} (alias for {covers or 'no states'})")
+            else:
+                plays = result_expr(bound[0], "TransitionResult" if kind == "conduit" else "StateResult") if bound else ""
+                lines.append(f"  {name_of(name)}" + (f" ({kind})" if kind else "") + (f": {plays}" if plays else ""))
+            for line in leaving.get(name, []):
+                lines.append(f"    {line}")
+    return lines
+
+
 def _rot_tuple(rot):
     return rot.pitch, rot.yaw, rot.roll
 
@@ -2216,6 +2360,23 @@ class TetherCore(_Base):
         zs = [a.get_actor_location().z for a in placed]
         return (f"placed {len(placed)} of {count} {prefix}" + (f" (z {min(zs):.0f} to {max(zs):.0f})" if zs else "")
                 + (": " + "; ".join(notes) if notes else "") + (f"; labels {prefix}_01.." if placed else ""))
+
+    @_tool
+    @staticmethod
+    def anim_graph(target: str) -> str:
+        """An Animation Blueprint's AnimGraph and state machines as text: what feeds the output pose, each state
+        machine's entry state, each state with what it plays, aliases, and every transition with its rule and blend.
+
+        Args:
+            target: AnimBlueprint path.
+
+        Returns:
+            Text.
+        """
+        bp = unreal.load_asset(target.split(".")[0])
+        if not isinstance(bp, unreal.AnimBlueprint):
+            raise RuntimeError(f"{target} is not an Animation Blueprint (ue find --class AnimBlueprint)")
+        return "\n".join(_anim_graph_lines(bp))
 
     @_tool
     @staticmethod

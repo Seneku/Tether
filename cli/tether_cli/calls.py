@@ -297,6 +297,11 @@ def cmd_config(ctx, args):
 
 
 def cmd_anim(ctx, args):
+    if args.target == "graph":
+        if not args.asset:
+            raise CliError("ue anim graph /Game/.../ABP_Name")
+        print(ctx.tether("anim_graph", target=args.asset))
+        return 0
     print(ctx.tether("anim", target=args.target, pie=not args.editor, limit=args.limit))
     return 0
 
