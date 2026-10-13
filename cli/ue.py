@@ -36,6 +36,7 @@ NOISE = {"LogModelContextProtocol", "LogToolsetRegistry"}  # our own transport c
 NOISE_MESSAGE = re.compile(r"^Property \"\w+\" type \w+ unhandled during Json schema generation")
 LOG_FRAME = re.compile(r"^\[[^\]]*\]\[\s*(\d+)\]")
 TETHER_COPY = re.compile(r"[/\\]Tether[/\\]diff[/\\]")  # Saved/Tether/diff, mounted as /Temp/Tether/diff
+TOOL_ENSURE = re.compile(r"Ensure condition failed: false \|\| !HasAnyFlags\(RF_ClassDefaultObject\).*NavigationSystem\.h")
 LOG_LINE = re.compile(r"^(?:\[[^\]]*\]\[[^\]]*\])?([A-Za-z0-9_]+): (?:(Fatal|Error|Warning|Display|Verbose|VeryVerbose): )?(.*)$")
 
 
@@ -652,6 +653,9 @@ def filter_log(lines, level="Warning", category=None, pattern=None):
     # the real asset does not; leave out compiler output from the frames that loaded one.
     frame = lambda line: (LOG_FRAME.match(line) or [None, None])[1]  # the editor's frame counter, [342]
     copy_frames = {frame(l) for l in lines if TETHER_COPY.search(l)} - {None}
+    # Python calls UNavigationSystemV1's static functions through its default object, which is Within=World: the
+    # engine raises a handled ensure about it once per session. Leave out that ensure's report (same frame).
+    ensure_frames = {frame(l) for l in lines if TOOL_ENSURE.search(l)} - {None}
     for index, line in enumerate(lines):
         m = LOG_LINE.match(line)
         if not m:
@@ -661,6 +665,8 @@ def filter_log(lines, level="Warning", category=None, pattern=None):
             continue
         if copy_frames and (TETHER_COPY.search(line) or (cat in ("BlueprintLog", "LogBlueprint", "LogK2Compiler")
                                                           and frame(line) in copy_frames)):
+            continue
+        if ensure_frames and cat in ("LogOutputDevice", "EnsureFailed", "LogStats") and frame(line) in ensure_frames:
             continue
         if lvl in ("Error", "Fatal"):
             msg += user_frame(lines, index)
@@ -3196,6 +3202,126 @@ def cmd_audio(ctx, args):
     return 0
 
 
+def process_memory_mb(pid):
+    """A process's private memory in MB (Windows: PrivateUsage; elsewhere: VmRSS), or None."""
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+
+        class Counters(ctypes.Structure):
+            _fields_ = [("cb", wintypes.DWORD), ("PageFaultCount", wintypes.DWORD)] + \
+                [(n, ctypes.c_size_t) for n in ("PeakWorkingSetSize", "WorkingSetSize", "QuotaPeakPagedPoolUsage",
+                                                "QuotaPagedPoolUsage", "QuotaPeakNonPagedPoolUsage",
+                                                "QuotaNonPagedPoolUsage", "PagefileUsage", "PeakPagefileUsage",
+                                                "PrivateUsage")]
+        kernel32, psapi = ctypes.windll.kernel32, ctypes.windll.psapi
+        kernel32.OpenProcess.restype = ctypes.c_void_p
+        handle = kernel32.OpenProcess(0x1000 | 0x0010, False, int(pid))  # query limited information | vm read
+        if not handle:
+            return None
+        counters = Counters()
+        counters.cb = ctypes.sizeof(Counters)
+        ok = psapi.GetProcessMemoryInfo(ctypes.c_void_p(handle), ctypes.byref(counters), counters.cb)
+        kernel32.CloseHandle(ctypes.c_void_p(handle))
+        return counters.PrivateUsage / 1024 ** 2 if ok else None
+    try:
+        with open(f"/proc/{int(pid)}/status") as f:
+            match = re.search(r"VmRSS:\s+(\d+) kB", f.read())
+        return int(match.group(1)) / 1024 if match else None
+    except OSError:
+        return None
+
+
+def slope_per_minute(samples):
+    """Least-squares slope of (seconds, value) samples, per minute."""
+    if len(samples) < 3:
+        return 0.0
+    n = len(samples)
+    mx, my = sum(t for t, _ in samples) / n, sum(v for _, v in samples) / n
+    var = sum((t - mx) ** 2 for t, _ in samples)
+    return 0.0 if not var else 60 * sum((t - mx) * (v - my) for t, v in samples) / var
+
+
+def cmd_soak(ctx, args):
+    """A long PIE run (a step file in a loop, or wandering) watching memory, frame rate and errors."""
+    beacon = ctx.beacon or {}
+    pid = beacon.get("pid")
+    if not editor_live(ctx.project):
+        raise CliError("the editor is not running (ue open --headless)")
+    log_start, started = log_end(ctx.project), time.time()
+    was_running = ctx.tether("pie", action="status") == "running"
+    if not was_running and cmd_pie(ctx, argparse.Namespace(action="start", simulate=False, warmup=2.0, limit=0, script=None)):
+        raise CliError("could not start PIE")
+    frames = lambda: int(str(ctx.tether("py", code="unreal.SystemLibrary.get_frame_count()")).strip().splitlines()[-1])
+    wander = ("import random\nw = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_game_world()\n"
+              "p = unreal.GameplayStatics.get_player_pawn(w, 0)\n"
+              # with navigation off there is no navigation system, and querying one trips an engine ensure
+              "nav = unreal.NavigationSystemV1.get_navigation_system(w)\n"
+              "goal = unreal.NavigationSystemV1.get_random_reachable_point_in_radius(w, p.get_actor_location(), 3000) "
+              "if nav else None\n"
+              "if goal is None:\n    loc = p.get_actor_location()\n"
+              "    goal = unreal.Vector(loc.x + random.uniform(-800, 800), loc.y + random.uniform(-800, 800), loc.z)\n"
+              "    p.set_actor_location(goal, False, True)\n"
+              "else:\n    unreal.AIHelperLibrary.simple_move_to_location(unreal.GameplayStatics.get_player_controller(w, 0), goal)\n"
+              "print('walk' if goal else 'hop')")
+    samples, fps, failures, crashed, iterations = [], [], [], None, 0
+    deadline = started + args.minutes * 60
+    next_sample, last_frames, last_time = time.time(), frames(), time.time()
+    try:
+        while time.time() < deadline:
+            if args.file:
+                code = pie_do(ctx, argparse.Namespace(script=[], file=args.file, reject=None, warmup=0, keep=True,
+                                                      keep_going=False, quiet=True))
+                if code:
+                    failures.append(f"iteration {iterations + 1}: the step file failed")
+                    if not args.keep_going:
+                        break
+            else:
+                ctx.tether("py", code=wander)
+                time.sleep(min(args.sample, 5))
+            iterations += 1
+            if time.time() >= next_sample:
+                memory = process_memory_mb(pid)
+                now, count = time.time(), frames()
+                if memory is not None:
+                    samples.append((now - started, memory))
+                fps.append((count - last_frames) / max(now - last_time, 1e-3))
+                last_frames, last_time, next_sample = count, now, now + args.sample
+    except CliError as exc:
+        crashed = recent_crash(ctx.project, started - 5)
+        failures.append(f"stopped: {exc}")
+    finally:
+        if not crashed and not was_running and editor_live(ctx.project):
+            with __import__("contextlib").suppress(CliError):
+                cmd_pie(ctx, argparse.Namespace(action="stop", simulate=False, warmup=0, limit=0, script=None))
+    elapsed = (time.time() - started) / 60
+    errors = []
+    if os.path.isfile(log_path(ctx.project)):
+        with open(log_path(ctx.project), "rb") as f:
+            f.seek(log_start)
+            errors = filter_log(f.read().decode("utf-8", "replace").splitlines(), level="Error")
+    growth = slope_per_minute(samples[1:])  # the first sample includes PIE start-up
+    print(f"soak {elapsed:.1f} min, {iterations} iteration(s)" + (f" of {os.path.basename(args.file)}" if args.file else " of wandering"))
+    if samples:
+        print(f"  memory {samples[0][1]:.0f} -> {samples[-1][1]:.0f} MB (peak {max(v for _, v in samples):.0f}), "
+              f"trend {growth:+.1f} MB/min over {len(samples)} samples")
+    if fps:
+        print(f"  frame rate avg {sum(fps) / len(fps):.0f} fps, lowest window {min(fps):.0f} fps")
+    print(f"  {len(errors)} error line(s) logged" + (":" if errors else ""))
+    for line in errors[: args.limit]:
+        print("    " + line)
+    if crashed:
+        print("  CRASHED: " + crash_summary(crashed) + " (ue crash)")
+    for failure in failures[:5]:
+        print("  " + failure)
+    leaking = len(samples) >= 4 and growth > args.max_growth
+    if leaking:
+        print(f"  memory grows {growth:.1f} MB/min, over --max-growth {args.max_growth:g}")
+    failed = bool(crashed or failures or leaking)
+    print("FAIL" if failed else "PASS")
+    return 1 if failed else 0
+
+
 def cmd_find(ctx, args):
     print(ctx.tether("find", query=args.query or "", cls=args.cls or "", under=args.under, limit=args.limit))
     return 0
@@ -4209,7 +4335,8 @@ def pie_do(ctx, args):
                 ok, detail = run(step.strip())
             except CliError as exc:
                 ok, detail = False, str(exc)
-            print(f"{number:>2} {'ok  ' if ok else 'FAIL'} {step}" + (f"  ({detail})" if detail else ""))
+            if not ok or not getattr(args, "quiet", False):
+                print(f"{number:>2} {'ok  ' if ok else 'FAIL'} {step}" + (f"  ({detail})" if detail else ""))
             bad = [(rx.pattern, l) for rx in rejects for l in log_lines() if rx.search(l)] if rejects else []
             if bad:
                 print(f"   BAD  /{bad[0][0]}/  {bad[0][1].split(']', 2)[-1].strip()[:140]}")
@@ -4227,8 +4354,9 @@ def pie_do(ctx, args):
                 pass
         if not (args.keep or was_running):
             cmd_pie(ctx, argparse.Namespace(action="stop", simulate=False, warmup=0, limit=0, script=None))
-    print(("PASS" if not failures else "FAIL") + f" in {time.time() - started:.1f}s"
-          + ("" if not failures else ": " + "; ".join(failures)))
+    if failures or not getattr(args, "quiet", False):
+        print(("PASS" if not failures else "FAIL") + f" in {time.time() - started:.1f}s"
+              + ("" if not failures else ": " + "; ".join(failures)))
     return 1 if failures else 0
 
 
@@ -4908,6 +5036,12 @@ def main(argv=None):
     s.add_argument("--wait", type=float, default=1800, help="seconds to wait for nav or lighting (1800)")
     s = add("audio", cmd_audio, "sounds playing in PIE: sound, owner, distance, volume, attenuation")
     s.add_argument("match", nargs="?", help="regex filter")
+    s = add("soak", cmd_soak, "long PIE run (a step file in a loop, or wandering): memory trend, fps, errors, crashes")
+    s.add_argument("--minutes", type=float, default=5, help="how long (5)")
+    s.add_argument("-f", "--file", help="a `ue pie do` step file to loop (default: wander the player)")
+    s.add_argument("--sample", type=float, default=10, help="seconds between memory/fps samples (10)")
+    s.add_argument("--max-growth", type=float, default=20, help="MB/min of memory growth that fails the run (20)")
+    s.add_argument("--keep-going", action="store_true", help="keep looping after a failing iteration")
     s = add("find", cmd_find, "search assets by name and/or class (asset registry)")
     s.add_argument("query", nargs="?", help="regex on the asset name")
     s.add_argument("--class", dest="cls", help="regex on the class name, e.g. StaticMesh or 'Material$'")

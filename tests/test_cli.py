@@ -1060,3 +1060,18 @@ class Audio(unittest.TestCase):
         self.assertEqual(sounds[0]["waves"], [{"wave": "Wind_Wave", "volume": 0.8}])
         self.assertEqual(sounds[1]["component"], "None")
         self.assertIsNone(ue.parse_active_sounds(["nothing"]))
+
+
+class Soak(unittest.TestCase):
+    def test_memory_trend(self):
+        self.assertAlmostEqual(ue.slope_per_minute([(0, 100), (60, 110), (120, 120)]), 10.0)
+        self.assertEqual(ue.slope_per_minute([(0, 100), (60, 200)]), 0.0)  # too few samples to call a trend
+        self.assertIsNotNone(ue.process_memory_mb(os.getpid()))
+
+    def test_navigation_ensure_from_python_calls_is_left_out(self):
+        lines = ["[x][103]LogOutputDevice: Error: === Handled ensure: ===",
+                 "[x][103]LogOutputDevice: Error: Ensure condition failed: false || !HasAnyFlags(RF_ClassDefaultObject)"
+                 "  [File:D:\build\Engine\Source\Runtime\NavigationSystem\Public\NavigationSystem.h] [Line: 293]",
+                 "[x][103]LogOutputDevice: Error: [Callstack] 0x1 UnrealEditor-NavigationSystem.dll!UnknownFunction []",
+                 "[x][104]LogTemp: Error: a real one"]
+        self.assertEqual(ue.filter_log(lines, level="Error"), ["E LogTemp: a real one"])

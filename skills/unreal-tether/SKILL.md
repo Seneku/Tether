@@ -178,6 +178,8 @@ broken or unsupported.
   and says what it changed. `ue world build lighting|hlod` for lightmaps and World Partition HLODs.
 - AI that does not move: `ue nav` (is there a navmesh, and if not why), `ue nav check` (spawn/patrol points
   off the navmesh), `ue nav path <a> <b>` (reachable? how long?); add `--pie` for runtime-generated navmeshes.
+- Leaks and rare failures: `ue soak --minutes 10 -f tests/play/x.txt` loops a step file (or wanders) and
+  reports the memory trend, frame rate and errors. Run it in the background (it blocks for the duration).
 - `ue pie start` / `ue pie stop` / `ue pie status`. Status explains a session that died (fatal error
   plus your source line).
 - Drive the test from Python: in PIE, `w = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_game_world()`,
