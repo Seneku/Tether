@@ -1,5 +1,7 @@
 """Unit tests for the ue CLI (cli/tether_cli): the parts that need no editor (parsing, filtering, routing, hooks)."""
 import argparse
+import contextlib
+import io
 import json
 import os
 import sys
@@ -1095,6 +1097,36 @@ class Soak(unittest.TestCase):
                  "[x][103]LogOutputDevice: Error: [Callstack] 0x1 UnrealEditor-NavigationSystem.dll!UnknownFunction []",
                  "[x][104]LogTemp: Error: a real one"]
         self.assertEqual(ue.filter_log(lines, level="Error"), ["E LogTemp: a real one"])
+
+
+class JsonEnvelope(unittest.TestCase):
+    def run_json(self, project, *argv):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            code = ue.main(["--project", project.uproject, *argv, "--json"])
+        return code, json.loads(out.getvalue())
+
+    def test_success_carries_lines_and_data(self):
+        project = Project()
+        try:
+            code, doc = self.run_json(project, "overview")
+            self.assertEqual(code, 0)
+            self.assertEqual((doc["command"], doc["ok"], doc["exit"], doc["error"]), ("overview", True, 0, None))
+            self.assertTrue(any("startup map" in line for line in doc["lines"]))
+            self.assertEqual(doc["data"]["content"], "0 packages, 0 B")
+        finally:
+            project.close()
+
+    def test_failure_is_still_one_document(self):
+        project = Project()
+        try:
+            code, doc = self.run_json(project, "props", "NoSuchActor")
+            self.assertNotEqual(code, 0)
+            self.assertFalse(doc["ok"])
+            self.assertEqual(doc["exit"], code)
+            self.assertTrue(doc["error"])
+        finally:
+            project.close()
 
 
 class Batch(unittest.TestCase):

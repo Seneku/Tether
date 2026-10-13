@@ -404,6 +404,7 @@ class Ctx:
     def __init__(self, args):
         self.args = args
         self._project = self._mcp = self._rex = self._transport = None
+        self.data = None  # structured result a command offers for --json
 
     @property
     def project(self):
@@ -730,6 +731,7 @@ def cmd_status(ctx, args):
     else:
         link = f"mcp :{port} " + ("up" if alive and port and port_open(port) else "down")
     dirty = beacon.get("dirty") if alive else None
+    ctx.data = dict(beacon, state=state, alive=bool(alive), heartbeat_age=round(age, 1))
     print(f"{name} | {state} | UE {beacon.get('engine', '?').split('+')[0]} | pid {beacon.get('pid')} | "
           f"map {beacon.get('map')} | {link} | heartbeat {age:.1f}s ago"
           + (f" | {dirty} unsaved (ue changes)" if dirty else "")
@@ -2595,6 +2597,8 @@ def cmd_validate(ctx, args):
         for line in other[: min(args.limit, 10)]:
             print(f"  {short(line, 200)}")
     warnings = len(problems) - invalid
+    ctx.data = dict(report, map_check=[{"level": l, "message": m} for l, m in map_lines if l in ("Error", "Warning")],
+                    logged=other, errors=errors)
     write_json(os.path.join(state_dir(ctx.project), "validated.json"), {"time": time.time(), "errors": errors})
     return 1 if errors or (args.strict and (warnings or other)) else 0
 
@@ -2714,6 +2718,9 @@ def cmd_size(ctx, args):
         print("by folder: " + ", ".join(f"{k[len(prefix):] if prefix and k.startswith(prefix) else k} {human_bytes(b)} ({n})"
                                         for k, (b, n) in groups[:top]))
     biggest = sorted(sizes.items(), key=lambda kv: -kv[1])[:top]
+    ctx.data = {"total_bytes": sum(sizes.values()), "packages": len(sizes),
+                "folders": {k: {"bytes": b, "count": n} for k, (b, n) in groups},
+                "biggest": [{"package": p, "bytes": b} for p, b in biggest]}
     if not classes and editor_live(project):
         try:
             graph = ctx.tether("package_graph", packages=",".join(p for p, _ in biggest))
@@ -2980,6 +2987,7 @@ def cmd_ui(ctx, args):
         print(ctx.tether("umg"))
         return 0
     lines = ui_lines(nodes, args.all, match or None)
+    ctx.data = [{k: n[k] for k in ("role", "label", "ref", "flags")} for n in nodes]
     print(f"{len(lines)} widget(s) on screen" + (f" matching /{match}/" if match else "") + (":" if lines else ""))
     for line in lines[: args.limit if args.limit != 30 else 200]:
         print(line)
@@ -3100,6 +3108,7 @@ def cmd_usages(ctx, args):
     if len(hits) > args.limit:
         print(f"  ... +{len(hits) - args.limit} more (--limit)")
     assets, skipped = asset_files_mentioning(project, stem, args.max_mb)
+    ctx.data = {"code": [{"file": p, "line": n, "text": t} for p, n, t in hits], "assets": sorted(assets)}
     names = sorted(assets)
     levels = {}
     plain = []
@@ -3256,7 +3265,9 @@ def project_overview(project, full=True):
 
 
 def cmd_overview(ctx, args):
-    for line in project_overview(ctx.project, full=not args.brief):
+    lines = project_overview(ctx.project, full=not args.brief)
+    ctx.data = {line.split(": ", 1)[0]: line.split(": ", 1)[-1] for line in lines[1:] if ": " in line}
+    for line in lines:
         print(line)
     return 0
 
@@ -3410,6 +3421,7 @@ def cmd_audio(ctx, args):
                + (f", attenuation {comp['attenuation']}" if comp and comp.get("attenuation") else ""))
         if not rx or rx.search(row):
             rows.append(row)
+    ctx.data = {"sounds": sounds, "components": comps}
     print(f"{len(rows)} sound(s) playing" + (f" matching /{args.match}/" if args.match else "") + (":" if rows else ""))
     for row in rows[: args.limit]:
         print("  " + row)
@@ -3657,6 +3669,7 @@ def cmd_doctor(ctx, args):
     free = shutil.disk_usage(os.path.dirname(project)).free / 1024 ** 3
     report("ok" if free >= 20 else "WARN", f"{free:.0f} GB free on the project's drive",
            "" if free >= 20 else "builds, cooks and the DDC need room: free some space")
+    ctx.data = [{"status": s, "check": w, "fix": f} for s, w, f in results]
     return doctor_print(results)
 
 
@@ -4462,6 +4475,7 @@ def cmd_perf(ctx, args):
     if last:
         print(f"  (+/- vs last capture, {time.strftime('%H:%M', time.localtime(last.get('time', 0)))})")
     print(f"  csv: {path}")
+    ctx.data = dict(stats, frames=len(frames), hitches=len(hitches), bound=bound, capped=capped, csv=path)
     if not args.no_record:  # the baseline the next capture compares with
         write_json(last_file, dict(stats, time=time.time(), csv=path))
     if args.trace:
@@ -5255,7 +5269,7 @@ def build_parser():
     common.add_argument("--port", type=int, default=argparse.SUPPRESS,
                         help="MCP port (default: beacon, UE_MCP_PORT, then 8000)")
     common.add_argument("--timeout", type=float, default=argparse.SUPPRESS, help="seconds to wait (120)")
-    common.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="raw JSON output")
+    common.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="one JSON document: {command, ok, exit, error, lines, data}")
     common.add_argument("--limit", type=int, default=argparse.SUPPRESS, help="max rows to print (30)")
     common.add_argument("--time", action="store_true", default=argparse.SUPPRESS, help="elapsed time to stderr")
 
@@ -5616,6 +5630,12 @@ def main(argv=None):
             stream.reconfigure(encoding="utf-8", errors="replace")
     args = parse_command(build_parser(), undo_msys_paths(sys.argv[1:] if argv is None else argv))
     started, started_wall = time.perf_counter(), time.time()
+    # --json: one JSON document for any command (its own JSON for those that have one, below).
+    envelope = args.json and args.fn not in (cmd_call, cmd_test, cmd_selftest)
+    captured, real_stdout, ctx, error = None, sys.stdout, None, None
+    if envelope:
+        import io
+        captured = sys.stdout = io.StringIO()
     try:
         ctx = Ctx(args)
         try:
@@ -5637,8 +5657,19 @@ def main(argv=None):
                 message += f"; editor {report}" if report else ""
             except CliError:
                 pass
-        print(f"error: {message}", file=sys.stderr)
+        if envelope:
+            error = message
+        else:
+            print(f"error: {message}", file=sys.stderr)
         code = exc.code
+    except BaseException:
+        sys.stdout = real_stdout  # a crash or Ctrl+C prints its traceback, not a half-written envelope
+        raise
+    if envelope:
+        sys.stdout = real_stdout
+        lines = captured.getvalue().splitlines()
+        print(json.dumps({"command": args.cmd, "ok": not code, "exit": code or 0, "error": error, "lines": lines,
+                          "data": getattr(ctx, "data", None)}, default=str))
     if args.time:
         sys.stdout.flush()
         print(f"({(time.perf_counter() - started) * 1000:.0f} ms)", file=sys.stderr)

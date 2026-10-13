@@ -222,6 +222,10 @@ The plugin's hooks stay silent outside Unreal projects, and never block a tool c
 
 Exit codes: `0` ok, `1` tool or command failed, `2` editor unavailable, `3` restart required, `4` timeout.
 
+`--json` works on every command: it prints a single document, `{"command", "ok", "exit", "error", "lines",
+"data"}`, where `lines` is the text output and `data` is structured for status, doctor, validate, audio,
+usages, size, ui, perf and overview. `ue call`, `ue test` and `ue selftest` keep their own JSON.
+
 ## Revision control (Perforce and others)
 
 `ue save`, `ue mv` and `ue rm` go through the revision control provider the editor is connected to

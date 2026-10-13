@@ -206,8 +206,11 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
 ## Output and exit codes
 - If the editor dies (`ue status` says "crashed", or a call reports "the editor crashed"), run `ue crash`
   before restarting: it shows the error, whether your modules were on the stack, and what ran last.
-Output is compact text, capped at 30 rows (`--limit N`; `--json` for raw). Exit codes: 0 ok, 1 tool
+Output is compact text, capped at 30 rows (`--limit N`). Exit codes: 0 ok, 1 tool
 error (one-line message), 2 editor unavailable, 3 restart required, 4 timeout.
+- `--json` on any command prints one JSON document: `{command, ok, exit, error, lines, data}`; `data` is
+  structured where it helps (status, doctor, validate, audio, usages, size, ui, perf, overview), and
+  `ue call`/`test`/`selftest` print their own JSON. Use it when a script reads the result.
 - On UE 5.4–5.7 (`ue status` says "via python remote execution"), Epic's toolsets are missing: no `shot`,
   `test`, `bp`, `table`, `diff`, `config`, `perf` or `ue call` of Epic tools. `ue set` works (undo there
   covers `ue set` only); `ue selftest` lists what is available.
