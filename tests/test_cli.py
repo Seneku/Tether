@@ -496,7 +496,7 @@ class Ci(unittest.TestCase):
             return types.SimpleNamespace(returncode=code, stdout=out, stderr="")
         project = Project()
         try:
-            args = argparse.Namespace(tests=None, bp=None, validate=validate, cook=False, cook_timeout=60, report=report, verbose=False)
+            args = argparse.Namespace(tests=None, bp=None, validate=validate, play=None, cook=False, cook_timeout=60, report=report, verbose=False)
             ctx = argparse.Namespace(project=project.uproject)
             with unittest.mock.patch.object(ue, "editor_live", return_value={"pid": 1}), \
                     unittest.mock.patch.object(ue.subprocess, "run", side_effect=fake_run), \

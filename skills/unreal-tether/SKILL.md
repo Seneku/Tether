@@ -159,6 +159,7 @@ broken or unsupported.
   Steps: at, look, move, press/tap/hold/release (Enhanced Input actions: asset names, or actions the
   character creates in C++), call, expect/until (`= != < > <= >= ~`), log, exists/gone, wait, exec, shot.
   Each step prints ok/FAIL; it stops at the first failure. Write the step file once and rerun it after changes.
+  Keep step files in `tests/play/` with a `# map: /Game/...` line: `ue ci --play` runs them all as regression tests.
 - Game UI in PIE: `ue ui` lists what is on screen (Slate and UMG texts, buttons, text boxes); `ue ui click
   "Close"`, `ue ui type "Name" hello`, `ue ui key Escape`. In `ue pie do`: `click <label>`, `expect-ui <text>`,
   `ui-gone <text>`. Clicks are real mouse clicks at the widget, so whatever is on top receives them; labels are

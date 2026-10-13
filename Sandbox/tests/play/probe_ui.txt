@@ -1,0 +1,7 @@
+# map: /Game/TetherFixtures/L_TetherProbe
+# The probe UI appears, counts a click on its UMG button, and goes away when PIE stops.
+call /Script/Sandbox.Default__TetherProbeUILibrary ShowProbeUI
+expect-ui Tether probe panel
+click UMG Probe Button
+expect-ui UMG clicks:
+exists ProbeLight

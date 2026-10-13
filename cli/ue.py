@@ -3537,6 +3537,16 @@ def cmd_ci(ctx, args):
         else:
             print(f"SKIP  tests        no tests match {test_filter}" + (" (--tests to choose)" if not args.tests else ""))
         step("blueprints", ["bp", "check", args.bp or "/Game"])
+        if args.play is not None:  # scripted play tests: `ue pie do` step files
+            import glob
+            root = os.path.dirname(project)
+            pattern = args.play or next((p for p in ("tests/play/*.txt", "Tests/Play/*.txt")
+                                         if glob.glob(os.path.join(root, p))), "tests/play/*.txt")
+            files = sorted(glob.glob(pattern if os.path.isabs(pattern) else os.path.join(root, pattern)))
+            if not files:
+                print(f"SKIP  play         no step files match {pattern}")
+            for path in files:
+                step(f"play {os.path.splitext(os.path.basename(path))[0]}", ["pie", "do", "-f", path], timeout=900)
         if args.validate:
             step("validate", ["validate", args.validate, "--map-check"])
         if args.cook:
@@ -3899,16 +3909,28 @@ WITHIN = re.compile(r"\s+within\s+([\d.]+)\s*s?\s*$", re.I)
 
 def pie_do(ctx, args):
     """Drive the player through a list of steps in PIE and check the results. Exit 0/1."""
-    steps = list(args.script or [])
+    steps, wanted_map = list(args.script or []), None
     if args.file:
         with open(args.file, encoding="utf-8-sig") as f:
-            steps += [l.strip() for l in f if l.strip() and not l.strip().startswith("#")]
+            for line in f:
+                header = re.match(r"\s*#\s*map:\s*(\S+)", line)
+                if header:
+                    wanted_map = header.group(1).split(".")[0]
+                elif line.strip() and not line.strip().startswith("#"):
+                    steps.append(line.strip())
     if not steps:
         raise CliError('give steps: ue pie do "at PlayerStart" "tap IA_Jump" "until player.location ~ ..." '
                        "(or -f steps.txt, one per line)")
     rejects = [re.compile(r, re.I) for r in args.reject or []]
     log_start, started = log_end(ctx.project), time.time()
     was_running = ctx.tether("pie", action="status") == "running"
+    if wanted_map and not was_running and (ctx.beacon or {}).get("map") != wanted_map:  # the file's '# map:' header
+        dirty = ctx.tether("py", code="len([p for p in unreal.EditorLoadingAndSavingUtils.get_dirty_map_packages() "
+                                      "if not p.get_name().startswith('/Temp/')])")  # an untitled map is always dirty
+        if str(dirty).strip() not in ("0", ""):
+            raise CliError(f"{args.file} plays on {wanted_map}, but the open map has unsaved changes (ue changes)")
+        ctx.tether("py", code=f"unreal.EditorLoadingAndSavingUtils.load_map({wanted_map!r})")
+        print(f"loaded {wanted_map}")
     if not was_running:
         code = cmd_pie(ctx, argparse.Namespace(action="start", simulate=False, warmup=args.warmup, limit=0, script=None))
         if code:
@@ -4713,6 +4735,8 @@ def main(argv=None):
     s = add("ci", cmd_ci, "project checks in one pass/fail: open if needed, tests, Blueprint compile, validation, cook, close")
     s.add_argument("--tests", help="test filter (default ^<Project>.)")
     s.add_argument("--bp", help="content path for the Blueprint check (default /Game)")
+    s.add_argument("--play", nargs="?", const="", metavar="GLOB",
+                   help="also run `ue pie do` step files (default tests/play/*.txt or Tests/Play/*.txt)")
     s.add_argument("--validate", nargs="?", const="/Game", metavar="PATH",
                    help="also run data validation on PATH (default /Game; ~0.1 s per asset) and Map Check")
     s.add_argument("--cook", action="store_true", help="also cook for this platform")
