@@ -41,6 +41,10 @@
 		{
 			"Name": "TetherUnrealSharp",
 			"Enabled": true
+		},
+		{
+			"Name": "SlateInspectorToolset",
+			"Enabled": true
 		}
 	]
 }
