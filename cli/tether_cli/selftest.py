@@ -6,6 +6,7 @@ import time
 
 from .core import CliError, UE_SCRIPT, editor_live, host_platform, read_json, state_dir, subprocess, write_json
 from .transport import catalog
+from .images import png_write
 from .assets import package_file
 from .setup import tether_plugins_dir
 
@@ -166,6 +167,12 @@ def cmd_selftest(ctx, args):
                                     "StaticMesh", "StaticMesh=/Engine/BasicShapes/Cube"],
           skip=edit_skip, ok=lambda c, o: c == 0 and "added Body" in o and "BasicShapes/Cube" in o)
     check("rm (new asset)", ["rm", "/Game/TetherSelftest/BP_SelftestNew"], skip=None if created else "nothing created",
+          ok=lambda c, o: c == 0 and "deleted" in o)
+    png = os.path.join(tempfile.gettempdir(), "T_TetherSelftestImport.png")
+    png_write(png, 8, 8, bytes(range(192)))
+    imported = check("import", ["import", png, "/Game/TetherSelftest"],
+                     ok=lambda c, o: c == 0 and "Texture2D" in o)
+    check("rm (imported)", ["rm", "/Game/TetherSelftest/T_TetherSelftestImport"], skip=None if imported else "nothing imported",
           ok=lambda c, o: c == 0 and "deleted" in o)
     ue("py", "unreal.EditorAssetLibrary.delete_directory('/Game/TetherSelftest')")
     scattered = check("scatter", ["scatter", "/Engine/BasicShapes/Cube", "--count", "3", "--area", "0,0,400",

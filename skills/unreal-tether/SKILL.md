@@ -49,6 +49,10 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
 - New assets: `ue new bp /Game/X/BP_Door --parent Actor` (or a C++ class, or another Blueprint), `ue new mi
   /Game/X/MI_Rock --parent /Game/X/M_Rock`, `ue new datatable /Game/X/DT_Items --parent ItemRow`, `ue new level
   /Game/Maps/L_Test`, `ue new folder /Game/X`. Then `ue save` (or pass --save).
+- Files into the project (from Blender, a generator, a download): `ue import Art/Crate.fbx Art/Textures /Game/Props
+  --collision box --lods 3 --save` (meshes, textures, sounds; folders keep their subfolders; no dialogs; not
+  while PIE runs). Names ending in _ORM/_Mask/_AO/... become linear mask textures. After the source files
+  change: `ue import --reimport /Game/Props` reimports the changed ones and re-applies those options.
 - On terrain, never guess heights: `ue spawn /Game/X/SM_Rock --at 1200,-300,0 --ground` (or `ue drop Rock1 Rock2`,
   `--align` to follow the slope) puts things on the surface below.
 - Many props at once: `ue scatter /Game/X/SM_Rock --count 30 --area 1200,-300,2000 --spacing 250 --scale 0.7,1.4

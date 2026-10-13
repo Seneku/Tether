@@ -1200,6 +1200,24 @@ class PieRecord(unittest.TestCase):
         self.assertEqual(ue.playtest._apply_modifiers((1, 0, 0), ["scalar:0.5,1,1"]), [0.5, 0, 0])
 
 
+class ImportPlan(unittest.TestCase):
+    def test_folders_keep_their_structure_and_skip_other_files(self):
+        project = Project()
+        try:
+            for rel in ("Art/Rock.fbx", "Art/Rock_D.png", "Art/notes.txt", "Art/Sub/Hit.wav", "Art/.git/x.png", "Lone.obj"):
+                project.write(rel)
+            art, lone = os.path.join(project.root, "Art"), os.path.join(project.root, "Lone.obj")
+            plan = ue.import_plan([art, lone], "/Game/Props/")
+            self.assertEqual({k: [os.path.relpath(f, project.root).replace(os.sep, "/") for f in v] for k, v in plan.items()},
+                             {"/Game/Props": ["Art/Rock.fbx", "Art/Rock_D.png", "Lone.obj"], "/Game/Props/Sub": ["Art/Sub/Hit.wav"]})
+            with self.assertRaises(ue.CliError):
+                ue.import_plan([os.path.join(project.root, "missing.fbx")], "/Game")
+            with self.assertRaises(ue.CliError):
+                ue.import_plan([os.path.join(project.root, "Art", "notes.txt")[:-9] + "Sub2"], "/Game")
+        finally:
+            project.close()
+
+
 class JsonEnvelope(unittest.TestCase):
     def run_json(self, project, *argv):
         out = io.StringIO()

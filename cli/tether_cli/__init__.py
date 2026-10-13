@@ -15,6 +15,7 @@ Modules, lowest layer first (each imports only from those above it):
   images     screenshots, ue look, PNG read/write/diff
   testing    ue test
   assets     Blueprints, data tables, diff, validate, size, usages, overview
+  content    ue import
   jobs       ue job, ue package
   play       pie, ui, perf, mem, world, audio, soak
   playtest   ue input, pie record, pie watch
@@ -34,6 +35,7 @@ from .calls import *  # noqa: F401,F403
 from .images import *  # noqa: F401,F403
 from .testing import *  # noqa: F401,F403
 from .assets import *  # noqa: F401,F403
+from .content import *  # noqa: F401,F403
 from .jobs import *  # noqa: F401,F403
 from .play import *  # noqa: F401,F403
 from .playtest import *  # noqa: F401,F403

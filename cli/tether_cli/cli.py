@@ -17,6 +17,7 @@ from .calls import (
 from .images import cmd_look, cmd_shot
 from .testing import cmd_test
 from .assets import cmd_bp, cmd_diff, cmd_overview, cmd_size, cmd_table, cmd_usages, cmd_validate
+from .content import cmd_import
 from .jobs import cmd_job, cmd_package
 from .play import cmd_audio, cmd_mem, cmd_perf, cmd_soak, cmd_ui, cmd_world
 from .playtest import cmd_input, pie_command
@@ -311,6 +312,20 @@ def build_parser():
     s.add_argument("slot", nargs="?", help="slot name (default: list the slots)")
     s.add_argument("rest", nargs="*", metavar="regex|Name=value")
     s.add_argument("--user", type=int, default=0, help="user index (0)")
+    s = add("import", cmd_import, "import files (mesh, texture, sound) into /Game without dialogs; --reimport changed ones")
+    s.add_argument("paths", nargs="+", metavar="PATH", help="files or folders, then the content folder (/Game/...); "
+                                                            "with --reimport: assets or content folders")
+    s.add_argument("--reimport", action="store_true", help="reimport these assets from their source files if changed")
+    s.add_argument("--force", action="store_true", help="with --reimport: also when the source is unchanged")
+    s.add_argument("--name", help="asset name (one file only)")
+    s.add_argument("--collision", choices=["none", "box", "sphere", "capsule", "convex", "complex"],
+                   help="static meshes: replace the collision")
+    s.add_argument("--lods", type=int, help="static meshes: generate this many LODs (halving triangles each)")
+    s.add_argument("--nanite", dest="nanite", action="store_true", default=None, help="static meshes: Nanite on")
+    s.add_argument("--no-nanite", dest="nanite", action="store_false", help="static meshes: Nanite off")
+    s.add_argument("--texture-group", help="textures: LOD group, e.g. World, Character, UI, Effects")
+    s.add_argument("--no-replace", action="store_true", help="skip files whose asset already exists")
+    s.add_argument("--save", action="store_true", help="save the imported assets")
     s = add("find", cmd_find, "search assets by name and/or class (asset registry)")
     s.add_argument("query", nargs="?", help="regex on the asset name")
     s.add_argument("--class", dest="cls", help="regex on the class name, e.g. StaticMesh or 'Material$'")

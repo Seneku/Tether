@@ -898,6 +898,80 @@ def _rec_tick(_delta):
                        [round(rot.pitch, 1), round(rot.yaw, 1)], [round(eye.x), round(eye.y), round(eye.z)]])
 
 
+_MASK_SUFFIX = re.compile(r"_(ORM|ARM|MRA|RMA|ORD|Masks?|AO|Rough(ness)?|Metal(lic)?|Height)$", re.I)
+
+
+_IMPORT_TAG = "TetherImport"  # asset metadata: the options `ue import` applied, re-applied on reimport
+
+
+def _after_import(asset, opts):
+    """Apply import options to a freshly imported asset and describe it in one line."""
+    kept = {k: v for k, v in opts.items() if k in ("collision", "lods", "nanite", "texture_group") and v is not None}
+    if kept:
+        unreal.EditorAssetLibrary.set_metadata_tag(asset, _IMPORT_TAG, json.dumps(kept))
+    if isinstance(asset, unreal.StaticMesh):
+        lib = unreal.EditorStaticMeshLibrary
+        collision = (opts.get("collision") or "").lower()
+        if collision:
+            lib.remove_collisions(asset)
+            if collision in ("box", "sphere", "capsule"):
+                lib.add_simple_collisions(asset, getattr(unreal.ScriptCollisionShapeType, collision.upper()))
+            elif collision == "convex":
+                lib.set_convex_decomposition_collisions(asset, 4, 16, 100000)
+            elif collision == "complex":
+                setup = asset.get_editor_property("body_setup")
+                setup.set_editor_property("collision_trace_flag", unreal.CollisionTraceFlag.CTF_USE_COMPLEX_AS_SIMPLE)
+            elif collision != "none":
+                raise RuntimeError(f"collision must be none, box, sphere, capsule, convex or complex, not '{collision}'")
+        if opts.get("nanite") is not None:
+            nanite = asset.get_editor_property("nanite_settings")
+            nanite.set_editor_property("enabled", bool(opts["nanite"]))
+            asset.set_editor_property("nanite_settings", nanite)
+        lods = int(opts.get("lods") or 0)
+        if lods > 1:
+            Options = getattr(unreal, "StaticMeshReductionOptions", None) or unreal.EditorScriptingMeshReductionOptions
+            Settings = getattr(unreal, "StaticMeshReductionSettings", None) or unreal.EditorScriptingMeshReductionSettings
+            settings = []
+            for i in range(lods):
+                s = Settings()
+                s.set_editor_property("percent_triangles", 0.5 ** i)
+                s.set_editor_property("screen_size", 1.0 if i == 0 else 0.5 ** i)
+                settings.append(s)
+            options = Options()
+            options.set_editor_property("auto_compute_lod_screen_size", True)
+            options.set_editor_property("reduction_settings", settings)
+            lib.set_lods(asset, options)
+        tris = _try(lambda: lib.get_number_verts(asset, 0), 0)
+        nanite_on = _try(lambda: asset.get_editor_property("nanite_settings").enabled, False)
+        complexity = str(_try(lambda: lib.get_collision_complexity(asset), "")).split(".")[-1].split(":")[0]
+        simple = _try(lambda: lib.get_simple_collision_count(asset), 0) + _try(lambda: lib.get_convex_collision_count(asset), 0)
+        box = _try(lambda: asset.get_bounding_box())
+        size = f", {box.max.x - box.min.x:.0f} x {box.max.y - box.min.y:.0f} x {box.max.z - box.min.z:.0f} cm" if box else ""
+        return (f"{tris} vertices, {asset.get_num_lods()} LOD(s)" + (", Nanite" if nanite_on else "") + size
+                + f", collision {simple} shape(s)" + (" + complex as simple" if "COMPLEX_AS_SIMPLE" in complexity else ""))
+    if isinstance(asset, unreal.Texture2D):
+        group = opts.get("texture_group")
+        if group:
+            key = "TEXTUREGROUP_" + re.sub(r"(?<!^)(?=[A-Z])", "_", group).upper().replace("TEXTUREGROUP__", "")
+            value = getattr(unreal.TextureGroup, key, None)
+            if value is None:
+                raise RuntimeError(f"no texture group '{group}' (World, WorldNormalMap, Character, UI, Effects, ...)")
+            asset.set_editor_property("lod_group", value)
+        # the name says packed or single-channel data; the importer guesses from pixels (blue-ish reads as normal map)
+        mask = bool(_MASK_SUFFIX.search(asset.get_name())) and asset.get_editor_property("compression_settings") in (
+            unreal.TextureCompressionSettings.TC_DEFAULT, unreal.TextureCompressionSettings.TC_NORMALMAP)
+        if mask:  # packed or single-channel data: linear, not colour
+            asset.set_editor_property("srgb", False)
+            asset.set_editor_property("compression_settings", unreal.TextureCompressionSettings.TC_MASKS)
+        compression = str(asset.get_editor_property("compression_settings")).split(".")[-1].split(":")[0]
+        lod_group = str(asset.get_editor_property("lod_group")).split(".")[-1].split(":")[0].replace("TEXTUREGROUP_", "")
+        return (f"{asset.blueprint_get_size_x()} x {asset.blueprint_get_size_y()}, {compression}, sRGB "
+                f"{asset.get_editor_property('srgb')}, group {lod_group}" + (" (mask: set linear)" if mask else ""))
+    if isinstance(asset, unreal.SoundWave):
+        return f"{asset.get_editor_property('duration'):.2f} s, {asset.get_editor_property('num_channels')} channel(s)"
+    return ""
+
+
 _COMPARE = re.compile(r"^(?P<lhs>\S+)\s*(?P<op>==|!=|<=|>=|=|<|>|~)\s*(?P<rhs>.*)$")
 
 
@@ -3310,6 +3384,126 @@ class TetherCore(_Base):
         running = state.get("handle") is not None
         return (f"watching {len(state['specs'])} value(s), {len(state['samples'])} sample(s)" if running
                 else "no watch running")
+
+    @_tool
+    @staticmethod
+    def import_files(files: str, dest: str, options: str = "{}", token: str = "") -> str:
+        """Import files (meshes, textures, sounds, anything the editor imports) without dialogs, then apply the
+        settings given: collision, LODs and Nanite for static meshes; texture group and mask handling for textures.
+
+        Args:
+            files: JSON list of absolute file paths.
+            dest: Content folder, e.g. /Game/Props/Crates.
+            options: JSON {name: str (single file), collision: none|box|sphere|capsule|convex|complex,
+                lods: int, nanite: bool, texture_group: e.g. World|UI|Character, replace: bool, save: bool}.
+            token: Session token from Saved/Tether/session.json (the ue CLI sends it).
+
+        Returns:
+            JSON list of {file, assets: [{path, class, detail}], error}.
+        """
+        _authorize(token)
+        if _game_world() is not None:
+            raise RuntimeError("PIE is running, and the editor builds no meshes in play mode (ue pie stop)")
+        paths, opts = json.loads(files), json.loads(options or "{}")
+        tasks = []
+        for path in paths:
+            if not os.path.isfile(path):
+                raise RuntimeError(f"no such file: {path}")
+            task = unreal.AssetImportTask()
+            task.set_editor_property("filename", path)
+            task.set_editor_property("destination_path", dest.rstrip("/"))
+            if opts.get("name") and len(paths) == 1:
+                task.set_editor_property("destination_name", opts["name"])
+            task.set_editor_property("automated", True)  # no option dialogs
+            task.set_editor_property("replace_existing", bool(opts.get("replace", True)))
+            task.set_editor_property("save", False)
+            tasks.append(task)
+        unreal.AssetToolsHelpers.get_asset_tools().import_asset_tasks(tasks)
+        results = []
+        for task in tasks:
+            assets = []
+            for object_path in task.get_editor_property("imported_object_paths") or []:
+                asset = unreal.load_asset(str(object_path))
+                if asset is None:
+                    continue
+                detail = _after_import(asset, opts)
+                if opts.get("save"):
+                    unreal.EditorAssetLibrary.save_loaded_asset(asset, False)
+                assets.append({"path": asset.get_path_name().split(".")[0], "class": asset.get_class().get_name(),
+                               "detail": detail})
+            results.append({"file": task.get_editor_property("filename"), "assets": assets,
+                            "error": None if assets else "nothing imported (ue log says why)"})
+        return json.dumps(results)
+
+    @_tool
+    @staticmethod
+    def reimport_assets(paths: str, force: bool = False, save: bool = False, token: str = "") -> str:
+        """Reimport assets from the files they were imported from, when those changed since the asset was saved.
+
+        Args:
+            paths: JSON list of asset paths or content folders (searched recursively).
+            force: Reimport even when the source file is not newer than the saved asset.
+            save: Save the reimported assets.
+            token: Session token from Saved/Tether/session.json (the ue CLI sends it).
+
+        Returns:
+            JSON list of {path, source, state: reimported|unchanged|source missing|no source|failed, detail}.
+        """
+        _authorize(token)
+        if _game_world() is not None:
+            raise RuntimeError("PIE is running, and the editor builds no meshes in play mode (ue pie stop)")
+        registry = unreal.AssetRegistryHelpers.get_asset_registry()
+        packages = []
+        for path in json.loads(paths):
+            path = path.split(".")[0].rstrip("/")
+            found = registry.get_assets_by_package_name(path)
+            if found:
+                packages.append(path)
+            else:
+                packages += sorted({str(d.package_name) for d in registry.get_assets_by_path(path, recursive=True)})
+        if not packages:
+            raise RuntimeError("no assets at those paths (ue find)")
+        rows, by_source = [], {}
+        for package in packages:
+            asset = unreal.load_asset(package)
+            data = _try(lambda: asset.get_editor_property("asset_import_data")) if asset else None
+            source = _try(lambda: data.get_first_filename(), "") if data else ""
+            row = {"path": package, "source": source, "detail": ""}
+            rows.append(row)
+            saved = _package_file(package)
+            if not source:
+                row["state"] = "no source"
+            elif not os.path.isfile(source):
+                row["state"] = "source missing"
+            elif not os.path.isfile(saved) and not force:
+                row["state"] = "unsaved"  # nothing on disk to be newer than: it was just imported
+            elif not force and os.path.getmtime(source) <= os.path.getmtime(saved):
+                row["state"] = "unchanged"
+            else:
+                by_source.setdefault(os.path.normcase(source), []).append(row)
+        for group in by_source.values():
+            # One import per file: a mesh file also brings its materials, so reimport through the asset named
+            # after the file (or the first), and let the others ride along.
+            stem = os.path.splitext(os.path.basename(group[0]["source"]))[0].lower()
+            lead = next((r for r in group if r["path"].rsplit("/", 1)[1].lower() == stem), group[0])
+            task = unreal.AssetImportTask()
+            task.set_editor_property("filename", lead["source"])
+            task.set_editor_property("destination_path", lead["path"].rsplit("/", 1)[0])
+            task.set_editor_property("destination_name", lead["path"].rsplit("/", 1)[1])
+            task.set_editor_property("automated", True)
+            task.set_editor_property("replace_existing", True)
+            task.set_editor_property("replace_existing_settings", False)  # keep the asset's own settings
+            unreal.AssetToolsHelpers.get_asset_tools().import_asset_tasks([task])
+            done = bool(task.get_editor_property("imported_object_paths"))
+            for row in group:
+                row["state"] = "reimported" if done else "failed"
+                fresh = unreal.load_asset(row["path"]) if done else None
+                if fresh:
+                    tag = unreal.EditorAssetLibrary.get_metadata_tag(fresh, _IMPORT_TAG)
+                    row["detail"] = _after_import(fresh, json.loads(tag) if tag else {})
+                    if save:
+                        unreal.EditorAssetLibrary.save_loaded_asset(fresh, False)
+        return json.dumps(rows)
 
     @_tool
     @staticmethod
