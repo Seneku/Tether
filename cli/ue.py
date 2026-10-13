@@ -3036,6 +3036,97 @@ def cmd_overview(ctx, args):
     return 0
 
 
+WP_BUILDERS = {"hlod": "WorldPartitionHLODsBuilder", "minimap": "WorldPartitionMiniMapBuilder",
+               "nav-wp": "WorldPartitionNavigationDataBuilder", "resave": "WorldPartitionResaveActorsBuilder"}
+LIGHTING_DONE = re.compile(r"LogStaticLightingSystem: (?:Warning: )?(Illumination: .*|Failed to build lighting.*|"
+                           r".*Skipping Lighting Build.*|Failed to (?:initialize|connect to) Swarm.*)")
+
+
+DIRTY_PACKAGES = ("import json\nU = unreal.EditorLoadingAndSavingUtils\n"
+                  "print(json.dumps([p.get_name() for p in U.get_dirty_map_packages() + U.get_dirty_content_packages()]))")
+
+
+def py_json(ctx, code):
+    """Run editor Python that prints JSON last, and decode it (ue py output may already be decoded)."""
+    out = ctx.tether("py", code=code)
+    return out if not isinstance(out, str) else json.loads(out.strip().splitlines()[-1])
+
+
+def new_log_lines(ctx, start):
+    flush_editor_log(ctx)
+    with open(log_path(ctx.project), "rb") as f:
+        f.seek(start)
+        return f.read().decode("utf-8", "replace").splitlines()
+
+
+def cmd_world(ctx, args):
+    """World builds: navmesh and lighting in the live editor; HLODs and other World Partition builders as jobs."""
+    what = args.what.lower()
+    if what == "nav":
+        dirty_before = set(py_json(ctx, DIRTY_PACKAGES))
+        started = time.time()
+        ctx.tether("console", command="RebuildNavigation")
+        building = "unreal.NavigationSystemV1.is_navigation_being_built(unreal.get_editor_subsystem(" \
+                   "unreal.UnrealEditorSubsystem).get_editor_world())"
+        time.sleep(0.5)
+        while str(ctx.tether("py", code=building)).strip().endswith("True"):
+            if time.time() - started > args.wait:
+                raise CliError(f"navigation still building after {args.wait:g}s", 4)
+            time.sleep(0.5)
+        print(f"navigation rebuilt in {time.time() - started:.1f}s")
+        print(ctx.tether("nav", action="status", start="", end="", match="", pie=False, limit=args.limit))
+        dirty_after = py_json(ctx, DIRTY_PACKAGES)
+        changed = [p for p in dirty_after if p not in dirty_before and not p.startswith("/Temp/")]
+        if changed and args.save:
+            print(ctx.tether("save", paths=",".join(changed)))
+        elif changed:
+            print(f"{len(changed)} package(s) changed, unsaved (--save, or ue save): " + ", ".join(changed[:5]))
+        return 0
+    if what == "lighting":
+        start, started = log_end(ctx.project), time.time()
+        quality = {"preview": "QUALITY_PREVIEW", "medium": "QUALITY_MEDIUM", "high": "QUALITY_HIGH",
+                   "production": "QUALITY_PRODUCTION"}[args.quality.lower()]
+        ctx.tether("py", code=f"unreal.get_editor_subsystem(unreal.LevelEditorSubsystem).build_light_maps("
+                              f"unreal.LightingBuildQuality.{quality}, True)")
+        result = None
+        while result is None:
+            for line in new_log_lines(ctx, start):
+                m = LIGHTING_DONE.search(line)
+                if m:
+                    result = m.group(1)
+            if result is None:
+                if time.time() - started > args.wait:
+                    raise CliError(f"no lighting result after {args.wait:g}s (Lightmass may still run; ue log)", 4)
+                time.sleep(1)
+        problems = [l for l in filter_log(new_log_lines(ctx, start), level="Warning")
+                    if "Lighting" in l or "Lightmass" in l or "MapCheck" in l]
+        print(f"lighting ({args.quality}) in {time.time() - started:.0f}s: {result}")
+        for line in problems[: args.limit]:
+            print("  " + line)
+        return 0 if result.startswith("Illumination") else 1
+    builder = WP_BUILDERS.get(what, args.what)
+    target_map = args.map or (ctx.beacon or {}).get("map")
+    if not target_map:
+        raise CliError("give the map: ue world build hlod --map /Game/Maps/L")
+    live = editor_live(ctx.project)
+    if live and live.get("map") == target_map and not args.force:
+        raise CliError(f"{target_map} is open in the editor; a builder commandlet would write the same packages. "
+                       "Close the editor (ue close) or pass --force")
+    engine = engine_root(ctx.project)
+    exe = editor_executable(engine)
+    cmd_exe = exe.replace("UnrealEditor.exe", "UnrealEditor-Cmd.exe") if os.path.isfile(
+        exe.replace("UnrealEditor.exe", "UnrealEditor-Cmd.exe")) else exe
+    command = [cmd_exe, ctx.project, target_map, "-run=WorldPartitionBuilderCommandlet", f"-Builder={builder}",
+               "-AllowCommandletRendering", "-unattended", "-nosplash", "-SCCProvider=None"]
+    cmd_job(ctx, argparse.Namespace(action="start", platform=None, id=None, name=f"{builder} {target_map}",
+                                    limit=args.limit, project=args.project, job_command=command))
+    if args.no_wait:
+        return 0
+    jobs = sorted(f[:-5] for f in os.listdir(jobs_dir(ctx.project)) if f.endswith(".json"))
+    return cmd_job(ctx, argparse.Namespace(action="wait", id=jobs[-1], wait=args.wait, verbose=False,
+                                           limit=args.limit, project=args.project))
+
+
 def cmd_find(ctx, args):
     print(ctx.tether("find", query=args.query or "", cls=args.cls or "", under=args.under, limit=args.limit))
     return 0
@@ -3166,6 +3257,9 @@ def cmd_job(ctx, args):
         errors += [l.strip() for l in lines if re.search(r"\bError:", l) and l.strip() not in errors
                    and not l.startswith("LogInit: Display:")][:10]  # skip the commandlet's own error summary
         print(job_line(folder, job_id))
+        summary = [m.group(1) for m in (JOB_SUMMARY.search(l) for l in lines) if m]
+        for line in summary[-6:]:  # what a commandlet or builder says it did
+            print("  " + line.strip())
         print_diagnostics(errors, warnings if args.verbose else [], args.limit)
         if meta["exit"] and not errors:
             for line in lines[-5:]:
@@ -3263,6 +3357,7 @@ def cmd_package(ctx, args):
     return boot_test(ctx, exe, args.seconds, args.nullrhi, args.strict)
 
 
+JOB_SUMMARY = re.compile(r"(?:LogInit: Display: |Display: )((?:Success|Failure) - \d+ error\(s\).*|#### (?:Built|World contains) .*)")
 COMMANDLET_LOG = re.compile(r"Commandlet log file is (.+)$", re.M)
 
 
@@ -4724,6 +4819,15 @@ def main(argv=None):
     s.add_argument("--budget", type=float, default=20, help="seconds to spend reading Blueprint graphs (20)")
     s = add("overview", cmd_overview, "one-screen project brief from its files: modules, key classes, maps, input, content")
     s.add_argument("--brief", action="store_true", help="the short version the session-start hook uses")
+    s = add("world", cmd_world, "world builds: build nav|lighting (live editor), hlod|minimap|nav-wp|<Builder> (job)")
+    s.add_argument("action", choices=["build"])
+    s.add_argument("what", help="nav, lighting, hlod, minimap, nav-wp, resave, or a WorldPartition builder class")
+    s.add_argument("--map", help="with builders: the map (default: the editor's)")
+    s.add_argument("--quality", default="Preview", help="with lighting: Preview, Medium, High, Production")
+    s.add_argument("--save", action="store_true", help="with nav: save the packages the build changed")
+    s.add_argument("--force", action="store_true", help="run a builder even though the map is open in the editor")
+    s.add_argument("--no-wait", action="store_true", help="with builders: start the job and return")
+    s.add_argument("--wait", type=float, default=1800, help="seconds to wait for nav or lighting (1800)")
     s = add("find", cmd_find, "search assets by name and/or class (asset registry)")
     s.add_argument("query", nargs="?", help="regex on the asset name")
     s.add_argument("--class", dest="cls", help="regex on the class name, e.g. StaticMesh or 'Material$'")

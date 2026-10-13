@@ -172,6 +172,8 @@ broken or unsupported.
 - AI in PIE: `ue ai` (one line per AI), `ue ai <pawn>` (movement, focus, perception, brain, blackboard, and the
   project's getters). State a C++ class keeps in plain members is invisible: suggest exposing it as a
   `UFUNCTION(BlueprintPure)` getter.
+- No navmesh in the editor (headless editors do not build it by themselves): `ue world build nav` rebuilds it
+  and says what it changed. `ue world build lighting|hlod` for lightmaps and World Partition HLODs.
 - AI that does not move: `ue nav` (is there a navmesh, and if not why), `ue nav check` (spawn/patrol points
   off the navmesh), `ue nav path <a> <b>` (reachable? how long?); add `--pie` for runtime-generated navmeshes.
 - `ue pie start` / `ue pie stop` / `ue pie status`. Status explains a session that died (fatal error

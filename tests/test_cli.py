@@ -1032,3 +1032,15 @@ class TetherCopyNoise(unittest.TestCase):
         ]
         self.assertEqual(ue.filter_log(lines), ["W BlueprintLog: Blueprint failed to compile:  BP_Real",
                                                 "W LogTemp: unrelated"])
+
+
+class WorldBuilds(unittest.TestCase):
+    def test_result_lines(self):
+        line = "[2026.10.13-10.11.12:870][  0]LogInit: Display: Success - 0 error(s), 0 warning(s)"
+        self.assertEqual(ue.JOB_SUMMARY.search(line).group(1), "Success - 0 error(s), 0 warning(s)")
+        line = "[x][  0]LogWorldPartitionHLODsBuilder: Display: #### Built 12 HLOD actors ####"
+        self.assertEqual(ue.JOB_SUMMARY.search(line).group(1), "#### Built 12 HLOD actors ####")
+        line = "[x][ 1]LogStaticLightingSystem: Warning: WorldSettings.bForceNoPrecomputedLighting is true, Skipping Lighting Build!"
+        self.assertIn("Skipping Lighting Build", ue.LIGHTING_DONE.search(line).group(1))
+        line = "[x][ 1]LogStaticLightingSystem: Illumination: 12.3 s (1 s encoding lightmaps, 0 s encoding shadowmaps)"
+        self.assertTrue(ue.LIGHTING_DONE.search(line).group(1).startswith("Illumination"))
