@@ -1,5 +1,6 @@
 """Play-in-editor and runtime checks: pie, ui, perf, mem, world, audio, soak."""
 import argparse
+import contextlib
 import json
 import os
 import re
@@ -532,6 +533,25 @@ def cmd_soak(ctx, args):
     return 1 if failed else 0
 
 
+@contextlib.contextmanager
+def unthrottled(ctx):
+    """Lift "Use Less CPU when in Background" for a while. A headless or background editor otherwise runs PIE at a
+    few frames per second, game time included. Set directly, not with set_props: an editor setting is not level
+    work, and a transaction would put it in the undo history (`ue undo` would then "undo" the restore)."""
+    throttle = ("s = unreal.find_object(None, '/Script/UnrealEd.Default__EditorPerformanceSettings')\n"
+                "s.set_editor_property('bThrottleCPUWhenNotForeground', {})\n"
+                "s.get_editor_property('bThrottleCPUWhenNotForeground')")
+    throttled = str(ctx.tether("py", code=throttle.format("s.get_editor_property('bThrottleCPUWhenNotForeground')"))
+                    ).strip().endswith("True")
+    if throttled:
+        ctx.tether("py", code=throttle.format(False))
+    try:
+        yield
+    finally:
+        if throttled:
+            ctx.tether("py", code=throttle.format(True))
+
+
 def read_profile_csv(path):
     """{column: [floats per frame]} from a CsvProfiler capture (the header repeats at the end)."""
     import csv
@@ -569,18 +589,9 @@ def cmd_perf(ctx, args):
     before = set(os.listdir(folder)) if os.path.isdir(folder) else set()
     # A world context routes the command to the PIE world, where CsvProfile does nothing; None reaches it.
     path, complete = None, False
-    # A headless or background editor throttles itself to a few fps ("Use Less CPU when in Background"),
-    # which makes frame time meaningless; lift that for the capture and restore it afterwards.
-    # Set directly, not with set_props: an editor setting is not level work, and a transaction would put it in
-    # the undo history (`ue undo` would then "undo" the restore below).
-    throttle = ("s = unreal.find_object(None, '/Script/UnrealEd.Default__EditorPerformanceSettings')\n"
-                "s.set_editor_property('bThrottleCPUWhenNotForeground', {})\n"
-                "s.get_editor_property('bThrottleCPUWhenNotForeground')")
-    throttled = str(ctx.tether("py", code=throttle.format("s.get_editor_property('bThrottleCPUWhenNotForeground')"))
-                    ).strip().endswith("True")
+    unthrottle = unthrottled(ctx)
+    unthrottle.__enter__()  # frame times mean nothing at a background editor's few fps
     try:
-        if throttled:
-            ctx.tether("py", code=throttle.format(False))
         if args.trace:  # an Unreal Insights trace over the same window, for per-scope timings
             trace_dir = os.path.join(state_dir(ctx.project), "traces")
             os.makedirs(trace_dir, exist_ok=True)
@@ -612,8 +623,7 @@ def cmd_perf(ctx, args):
                     pass
             time.sleep(0.5)
     finally:
-        if throttled:
-            ctx.tether("py", code=throttle.format(True))
+        unthrottle.__exit__(None, None, None)
         if started_pie:
             cmd_pie(ctx, argparse.Namespace(action="stop", simulate=False, warmup=0, limit=0, script=None))
     if not path or not complete:
@@ -794,7 +804,8 @@ def pie_run(ctx, args):
     except CliError as exc:
         failures.append(f"script raised: {exc}")
     found, rejected = {}, []
-    deadline = time.time() + args.seconds
+    seconds = args.seconds or 5
+    deadline = time.time() + seconds
     while True:
         flush_editor_log(ctx)
         with open(log_path(ctx.project), "rb") as f:
@@ -815,7 +826,7 @@ def pie_run(ctx, args):
         hit = found.get(rx.pattern)
         print(f"{'ok  ' if hit else 'MISS'} /{rx.pattern}/" + (f"  {hit.split(']', 2)[-1].strip()[:140]}" if hit else ""))
         if not hit:
-            failures.append(f"no log line matched /{rx.pattern}/ within {args.seconds:g}s")
+            failures.append(f"no log line matched /{rx.pattern}/ within {seconds:g}s")
     for pattern, line in rejected[:5]:
         print(f"BAD  /{pattern}/  {line.split(']', 2)[-1].strip()[:140]}")
         failures.append(f"rejected pattern /{pattern}/ appeared")

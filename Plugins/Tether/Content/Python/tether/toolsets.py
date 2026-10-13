@@ -14,6 +14,7 @@ import json
 import os
 import re
 import sys
+import time
 import traceback
 
 import unreal
@@ -736,6 +737,85 @@ def _hold(action, vector):
 
 def _release(action):
     _HELD["actions"].pop(action.get_path_name(), None)
+
+
+# `ue pie watch`: properties sampled on the editor tick (CLI round trips are too slow for 10 Hz). Stashed on sys
+# like _HELD, so a hot reload neither loses a running watch nor leaves a second callback behind.
+_WATCH = getattr(sys, "_tether_watch", None) or {"handle": None}
+sys._tether_watch = _WATCH
+_WATCH_LIMIT = 20000
+
+
+def _watch_value(value):
+    """A sampled value as JSON: numbers and booleans as is, vectors/rotators as lists, the rest as short text."""
+    if isinstance(value, (bool, int, float)) or value is None:
+        return value
+    if isinstance(value, unreal.Vector):
+        return [round(value.x, 1), round(value.y, 1), round(value.z, 1)]
+    if isinstance(value, unreal.Rotator):
+        return [round(value.pitch, 1), round(value.yaw, 1), round(value.roll, 1)]
+    if isinstance(value, dict) and set(value) >= {"x", "y", "z"}:
+        return [round(value["x"], 1), round(value["y"], 1), round(value["z"], 1)]
+    if isinstance(value, unreal.Object):
+        return _label(value)
+    if isinstance(value, unreal.EnumBase):
+        return str(value.name)
+    if isinstance(value, (unreal.StructBase,)):
+        value = _try(lambda: value.to_dict(), str(value))
+    return _short(_compact(value) if isinstance(value, (dict, list, tuple)) else str(value), 80)
+
+
+def _watch_reader(spec, pawn, controller):
+    """A function reading one watched value: 'Actor' (its location), 'Actor.Prop', 'player.Comp.Prop'."""
+    target, _, prop = spec.rpartition(".")
+    if not target:
+        target, prop = spec, "location"
+    obj = _pie_object(target, pawn, controller)
+    key = prop.lower()
+    if key in ("location", "rotation"):
+        actor = obj if isinstance(obj, unreal.Actor) else obj.get_owner()
+        return lambda: actor.get_actor_location() if key == "location" else actor.get_actor_rotation()
+    library = getattr(unreal, "ToolsetLibrary", None)
+    name = prop
+    if library:
+        schema = _reflect(library.list_struct_properties(obj.get_class()), obj)
+        name = {n.lower(): n for n in schema}.get(key)
+        if name is None:
+            raise RuntimeError(f"{_label(obj)} has no property '{prop}'")
+    if _try(lambda: obj.get_editor_property(name), _WATCH) is not _WATCH:
+        return lambda: obj.get_editor_property(name)
+    if library:  # a plain UPROPERTY() Python cannot see: Epic's reflection reads it
+        return lambda: _reflect(library.get_object_properties(obj, [name]), obj).get(name)
+    raise RuntimeError(f"{_label(obj)}.{prop} is not readable from Python")
+
+
+def _watch_tick(_delta):
+    state = _WATCH
+    game = _game_world()
+    if game is None or game != state.get("world"):
+        state["ended"] = state.get("ended") or "PIE ended"
+        unreal.unregister_slate_post_tick_callback(state["handle"])
+        state["handle"] = None
+        return
+    now = time.time()
+    if now - state["last"] < state["every"] or len(state["samples"]) >= _WATCH_LIMIT:
+        return
+    state["last"] = now
+    row = [round(now - state["start"], 3), round(unreal.GameplayStatics.get_time_seconds(game), 3)]
+    for i, spec in enumerate(state["specs"]):
+        reader = state["readers"][i]
+        if reader is None and now - state["retry"][i] > 1.0:  # not there (yet): spawned later, or destroyed
+            state["retry"][i] = now
+            _, pawn, controller = _try(_pie_player, (None, None, None))
+            state["readers"][i] = reader = _try(lambda: _watch_reader(spec, pawn, controller)) if pawn else None
+        value = None
+        if reader is not None:
+            try:
+                value = _watch_value(reader())
+            except Exception:  # the object went away mid-session
+                state["readers"][i] = None
+        row.append(value)
+    state["samples"].append(row)
 
 
 _COMPARE = re.compile(r"^(?P<lhs>\S+)\s*(?P<op>==|!=|<=|>=|=|<|>|~)\s*(?P<rhs>.*)$")
@@ -3099,6 +3179,57 @@ class TetherCore(_Base):
             if len(rows) >= limit:
                 break
         return json.dumps(rows)
+
+    @_tool
+    @staticmethod
+    def pie_watch(action: str = "status", targets: str = "[]", every: float = 0.1) -> str:
+        """Sample properties of PIE objects on every editor tick (at most every `every` seconds) until stopped.
+
+        Args:
+            action: 'start' (replaces a running watch), 'stop' (ends it and returns the samples), or 'status'.
+            targets: With start: JSON list like ["player.Health", "BP_Enemy_C_1.State", "BP_Door_2"] (an actor
+                alone means its location; 'player', 'controller' and 'player.<Component>' work as in pie_step).
+            every: With start: seconds between samples (0.1).
+
+        Returns:
+            start/status: a line of text. stop: JSON {targets, columns, samples: [[real s, game s, values...]],
+            ended, missing}.
+        """
+        state = _WATCH
+        if action == "start":
+            if state.get("handle") is not None:
+                unreal.unregister_slate_post_tick_callback(state["handle"])
+            specs = json.loads(targets) if targets.strip().startswith("[") else [t for t in targets.split(",") if t]
+            if not specs:
+                raise RuntimeError("give properties to watch, e.g. player.Health BP_Enemy_C_1.State")
+            game, pawn, controller = _pie_player()
+            readers, missing = [], []
+            for spec in specs:
+                try:
+                    readers.append(_watch_reader(spec, pawn, controller))
+                except RuntimeError as exc:
+                    if "has no property" in str(exc) or "not readable" in str(exc):
+                        raise
+                    readers.append(None)  # an actor that may spawn later
+                    missing.append(f"{spec}: {exc}")
+            now = time.time()
+            state.update(world=game, specs=specs, readers=readers, retry=[now] * len(specs), every=max(0.0, every),
+                         samples=[], start=now, last=0.0, ended=None, missing=missing)
+            state["handle"] = unreal.register_slate_post_tick_callback(_watch_tick)
+            return f"watching {len(specs)} value(s) every {every:g}s" + (f"; not found yet: {'; '.join(missing)}"
+                                                                        if missing else "")
+        if action == "stop":
+            if state.get("handle") is not None:
+                unreal.unregister_slate_post_tick_callback(state["handle"])
+                state["handle"] = None
+            if "specs" not in state:
+                raise RuntimeError("no watch was started (ue pie watch)")
+            return json.dumps({"targets": state["specs"], "columns": ["real", "game"] + state["specs"],
+                               "samples": state["samples"], "ended": state.get("ended"),
+                               "missing": state.get("missing", []), "capped": len(state["samples"]) >= _WATCH_LIMIT})
+        running = state.get("handle") is not None
+        return (f"watching {len(state['specs'])} value(s), {len(state['samples'])} sample(s)" if running
+                else "no watch running")
 
     @_tool
     @staticmethod

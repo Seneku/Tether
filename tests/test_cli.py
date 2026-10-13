@@ -1127,6 +1127,39 @@ class InputMap(unittest.TestCase):
         self.assertEqual(lines, ["IA_Move  Axis2D: W (swizzle) [IMC_Default]"])
 
 
+class PieWatch(unittest.TestCase):
+    RESULT = {"targets": ["player.Health", "BP_Enemy", "BP_Enemy.State", "Ghost"],
+              "samples": [[0.0, 0.0, 100, None, None, None],
+                          [0.5, 0.5, 100, [0, 0, 0], "Idle", None],
+                          [1.0, 1.0, 60, [300, 400, 0], "Chase", None],
+                          [1.5, 1.5, 35, [300, 400, 0], "Attack", None],
+                          [2.0, 2.0, 35, None, None, None]]}
+
+    def test_summaries_by_kind(self):
+        lines, summary = ue.watch_summary(self.RESULT)
+        self.assertEqual(lines[0], "player.Health  100 -> 35  (min 35 at 1.5s, max 100 at 0.0s, 2 changes)")
+        self.assertEqual(lines[1], "BP_Enemy  moved 500 cm: (0, 0, 0) -> (300, 400, 0), top speed 1000 cm/s"
+                                   "  [appeared at 0.5s; gone after 1.5s]")
+        self.assertTrue(lines[2].startswith("BP_Enemy.State  Idle (0.5s) -> Chase (1.0s) -> Attack (1.5s)"))
+        self.assertEqual(lines[3], "Ghost  never found")
+        self.assertEqual(summary["player.Health"]["min"], 35)
+        self.assertEqual(summary["BP_Enemy"]["travelled"], 500)
+
+    def test_constant_values_say_throughout(self):
+        lines, _ = ue.watch_summary({"targets": ["A.b", "A.s"], "samples": [[0, 0, 1.5, "x"], [1, 1, 1.5, "x"]]})
+        self.assertEqual(lines, ["A.b  1.5 throughout", "A.s  x throughout"])
+
+    def test_csv_splits_vectors(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "w.csv")
+            ue.write_watch_csv(path, self.RESULT)
+            with open(path, encoding="utf-8") as f:
+                rows = f.read().splitlines()
+        self.assertEqual(rows[0], "real_s,game_s,player.Health,BP_Enemy.x,BP_Enemy.y,BP_Enemy.z,BP_Enemy.State,Ghost")
+        self.assertEqual(rows[1], "0.0,0.0,100,,,,,")
+        self.assertEqual(rows[3], "1.0,1.0,60,300,400,0,Chase,")
+
+
 class JsonEnvelope(unittest.TestCase):
     def run_json(self, project, *argv):
         out = io.StringIO()

@@ -235,6 +235,8 @@ def cmd_selftest(ctx, args):
     check("actors --pie", ["actors", "--pie", "--limit", "1"])
     check("pie do", ["pie", "do", "at 100,200,300", "near 100,200,300 50", "expect player.location ~ ."],
           ok=lambda c, o: c == 0 and "PASS" in o)
+    check("pie watch", ["pie", "watch", "player", "--seconds", "1"],
+          ok=lambda c, o: c == 0 and "sample(s)" in o and "player  " in o)
     check("ui", ["ui"], ok=lambda c, o: c == 0)
     check("ai", ["ai"], ok=lambda c, o: c == 0 and ("AI" in o))
     check("audio", ["audio"], skip=None if launch.get("sound", not launch.get("headless")) else "no audio device (ue open --headless --sound)",
