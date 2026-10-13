@@ -916,3 +916,19 @@ class InsightsTraces(unittest.TestCase):
         split = ue.cpu_only({"game": {"Tick": (10, 0.5, 0.4), "Lumen": (5, 0.2, 0.2)}, "gpu": {"Lumen": (5, 0.2, 0.2)}})
         self.assertEqual(split["game"], {"Tick": (10, 0.5, 0.4)})
         self.assertEqual(split["gpu"], {"Lumen": (5, 0.2, 0.2)})
+
+
+class Packaging(unittest.TestCase):
+    @unittest.skipUnless(os.name == "nt", "Windows executables")
+    def test_finds_the_launcher_executable_not_the_binaries_one(self):
+        project = Project()
+        try:
+            root = ue.package_dir(project.uproject, "Win64")
+            for rel in ("Windows/Game.exe", "Windows/Game/Binaries/Win64/Game-Win64-Shipping.exe", "Windows/Readme.txt"):
+                path = os.path.join(root, *rel.split("/"))
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                open(path, "w").close()
+            self.assertEqual(ue.packaged_executable(project.uproject, "Win64"), os.path.join(root, "Windows", "Game.exe"))
+            self.assertIsNone(ue.packaged_executable(project.uproject, "Linux"))
+        finally:
+            project.close()

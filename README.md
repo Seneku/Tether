@@ -202,6 +202,7 @@ The plugin's hooks stay silent outside Unreal projects, and never block a tool c
 | `ue find [regex] [--class C] [--under /Game/x]` | Search assets by name and class through the asset registry. |
 | `ue refs <asset> [--deps]` | What references an asset (or what it depends on); World Partition actors are grouped per level. Check before deleting or renaming. |
 | `ue api <Class[.member]> [regex]` | The `unreal` Python API in a few lines: method signatures, editor properties with types, enum values, or one member's docs. |
+| `ue package [--config C] [--seconds N] [--boot-only] [--strict]` | Package the game (BuildCookRun build/cook/stage/pak/archive as a background job, archived under `Saved/Tether/package/`), then boot the packaged executable headless for N seconds (20) and report a crash (with its module chain), fatal errors, an early exit, and logged errors. Exit 0/1. |
 | `ue job start -- <cmd>` / `cook` / `status` / `wait` / `log` | Long work (cooks, commandlets, any command) in the background, with a log and exit code; `wait` prints only the errors. |
 | `ue reload` | Hot-reload the Tether Python package in the running editor. |
 

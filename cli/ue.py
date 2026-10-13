@@ -2675,8 +2675,16 @@ def cmd_job(ctx, args):
                 code = 127
         write_json(os.path.join(folder, f"{args.id}.json"), dict(meta, child=child, exit=code, ended=time.time()))
         return 0
-    if args.action in ("start", "cook"):
-        if args.action == "cook":
+    if args.action in ("start", "cook", "package"):
+        if args.action == "package":
+            platform = args.platform or host_platform()
+            config = getattr(args, "config", None) or "Development"
+            command = uat_command(engine_root(ctx.project)) + [
+                "BuildCookRun", f"-project={ctx.project}", f"-platform={platform}", f"-clientconfig={config}",
+                "-build", "-cook", "-stage", "-pak", "-archive", f"-archivedirectory={package_dir(ctx.project, platform)}",
+                "-unattended", "-utf8output", "-nocompileeditor"]
+            name = f"package {platform} {config}"
+        elif args.action == "cook":
             command = uat_command(engine_root(ctx.project)) + [
                 "BuildCookRun", f"-project={ctx.project}", f"-platform={args.platform or host_platform()}",
                 "-clientconfig=Development", "-cook", "-skipstage", "-unattended", "-utf8output", "-nocompileeditor"]
@@ -2762,6 +2770,95 @@ def cmd_job(ctx, args):
                 print("  " + line)
         return 0 if meta["exit"] == 0 else 1
     raise CliError(f"unknown job action {args.action}")
+
+
+def package_dir(project, platform):
+    return os.path.join(state_dir(project), "package", platform)
+
+
+def packaged_executable(project, platform):
+    """The archived game's launcher executable (<archive>/<Platform dir>/<Project>[-...].exe), or None."""
+    root = package_dir(project, platform)
+    name = os.path.splitext(os.path.basename(project))[0]
+    found = []
+    for dirpath, dirs, files in os.walk(root):
+        depth = os.path.relpath(dirpath, root).count(os.sep)
+        if depth > 1:
+            dirs[:] = []
+            continue
+        for f in files:
+            stem, ext = os.path.splitext(f)
+            if stem.startswith(name) and (ext.lower() == ".exe" if os.name == "nt" else ext in ("", ".sh")):
+                found.append(os.path.join(dirpath, f))
+    return min(found, key=len) if found else None
+
+
+def boot_test(ctx, exe, seconds, nullrhi=False, strict=False):
+    """Run a packaged game headless for a while and report crashes, fatal errors and logged errors."""
+    project_name = os.path.splitext(os.path.basename(ctx.project))[0]
+    game_dir = os.path.join(os.path.dirname(exe), project_name)
+    fake_project = os.path.join(game_dir, project_name + ".uproject")  # crash_reports looks next to a .uproject
+    log = os.path.join(game_dir, "Saved", "Logs", project_name + ".log")
+    started = time.time()
+    flags = ["-nullrhi"] if nullrhi else ["-RenderOffscreen"]
+    proc = subprocess.Popen([exe, *flags, "-nosound", "-unattended", "-log", "-ResX=640", "-ResY=360", "-windowed"],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
+    exited = None
+    while time.time() - started < seconds:
+        if proc.poll() is not None:
+            exited = proc.returncode
+            break
+        time.sleep(0.5)
+    if exited is None:  # still running: it booted; stop it (and anything it started)
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"], capture_output=True)
+        else:
+            proc.kill()
+        proc.wait(timeout=30)
+    time.sleep(1)
+    lines = []
+    if os.path.isfile(log) and os.path.getmtime(log) >= started - 1:
+        with open(log, encoding="utf-8", errors="replace") as f:
+            lines = f.read().splitlines()
+    shown = filter_log(lines, level="Error")
+    crash = recent_crash(fake_project, started - 1)
+    fatal = [l for l in lines if re.search(r"\bFatal\b|Assertion failed", l)]
+    maps = [m.group(1) for m in (re.search(r"LoadMap: (\S+)", l) for l in lines) if m]
+    alive = exited is None
+    print(f"boot: {'ran' if alive else f'exited with code {exited} after'} {min(seconds, time.time() - started):.0f}s"
+          + (f", loaded {maps[-1].split('?')[0]}" if maps else "") + f", {len(shown)} error line(s)")
+    if crash:
+        for line in describe_crash(fake_project, crash).splitlines()[:6]:
+            print("  " + line)
+    for line in shown[:10]:
+        print("  " + line)
+    if not lines:
+        print(f"  (no log at {log})")
+    failed = bool(crash or fatal or (not alive and exited != 0) or (strict and shown))
+    print(("PASS" if not failed else "FAIL") + f"  {exe}")
+    return 1 if failed else 0
+
+
+def cmd_package(ctx, args):
+    """Package the game (BuildCookRun as a background job), then boot-test the result."""
+    platform = args.platform or host_platform()
+    if not args.boot_only:
+        cmd_job(ctx, argparse.Namespace(action="package", platform=platform, config=args.config, id=None,
+                                        name=None, limit=args.limit, project=args.project, job_command=[]))
+        if args.no_wait:
+            return 0
+        jobs = sorted(f[:-5] for f in os.listdir(jobs_dir(ctx.project)) if f.endswith(".json"))
+        code = cmd_job(ctx, argparse.Namespace(action="wait", id=jobs[-1], wait=args.wait, verbose=False,
+                                               limit=args.limit, project=args.project))
+        if code:
+            return code
+    exe = packaged_executable(ctx.project, platform)
+    if not exe:
+        raise CliError(f"no packaged game under {package_dir(ctx.project, platform)} (ue package first)")
+    if args.no_boot:
+        print(f"packaged: {exe}")
+        return 0
+    return boot_test(ctx, exe, args.seconds, args.nullrhi, args.strict)
 
 
 COMMANDLET_LOG = re.compile(r"Commandlet log file is (.+)$", re.M)
@@ -4187,12 +4284,22 @@ def main(argv=None):
     s.add_argument("name", help="class or class.member, e.g. EditorActorSubsystem or Actor.set_actor_location")
     s.add_argument("match", nargs="?", help="regex filter on member names")
     s = add("job", cmd_job, "background jobs for long work: start -- <cmd>, cook, status, wait, log")
-    s.add_argument("action", choices=["start", "cook", "status", "wait", "log", "stop", "_run"])
+    s.add_argument("action", choices=["start", "cook", "package", "status", "wait", "log", "stop", "_run"])
     s.add_argument("id", nargs="?", help="job id (default: the latest)")
     s.add_argument("--name", help="label for a started job")
     s.add_argument("--platform", help="with cook: target platform (default: this host)")
     s.add_argument("--wait", type=float, default=7200, help="with wait: seconds before giving up (7200)")
     s.add_argument("-v", "--verbose", action="store_true", help="with wait: also print warnings")
+    s = add("package", cmd_package, "package the game (background job), then boot it headless and report crashes")
+    s.add_argument("--platform", help="target platform (default: this host)")
+    s.add_argument("--config", default="Development", help="Development (default), Shipping, DebugGame")
+    s.add_argument("--seconds", type=float, default=20, help="how long the boot test runs (20)")
+    s.add_argument("--wait", type=float, default=7200, help="seconds to allow the packaging job (7200)")
+    s.add_argument("--no-wait", action="store_true", help="start the packaging job and return")
+    s.add_argument("--no-boot", action="store_true", help="package only")
+    s.add_argument("--boot-only", action="store_true", help="boot-test the last package without rebuilding")
+    s.add_argument("--nullrhi", action="store_true", help="boot without rendering (-nullrhi)")
+    s.add_argument("--strict", action="store_true", help="fail on logged errors too")
     s = add("ci", cmd_ci, "project checks in one pass/fail: open if needed, tests, Blueprint compile, validation, cook, close")
     s.add_argument("--tests", help="test filter (default ^<Project>.)")
     s.add_argument("--bp", help="content path for the Blueprint check (default /Game)")

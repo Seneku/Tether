@@ -127,6 +127,9 @@ broken or unsupported.
 - `ue table /Game/Path/DT_X` shows rows; `--export rows.json|.csv`, edit, then `--import rows.json
   --dry-run` to see the diff and `--import rows.json --save` to apply (upsert; `--prune` deletes missing
   rows).
+- Does the shipped game boot? `ue package` (minutes to an hour: it is a background job it waits on) packages,
+  then runs the packaged game headless for 20 s and reports crashes and errors; `--boot-only` re-tests the last
+  package.
 - Cooks and other long commands: `ue job cook` or `ue job start -- <cmd>`, then `ue job wait` (errors only)
   or `ue job status`. Do not block a shell on them.
 
