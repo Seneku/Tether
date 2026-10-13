@@ -3061,6 +3061,59 @@ class TetherCore(_Base):
 
     @_tool
     @staticmethod
+    def look_stage(asset: str, action: str = "place", token: str = "") -> str:
+        """Stage an asset for `ue look`: place it (a mesh, a Blueprint, or a material on a sphere) as transient
+        actors high above the level with a light, or remove them again. Transient actors are never saved.
+
+        Args:
+            asset: /Game/... (or /Engine/...) asset path.
+            action: place or remove.
+            token: Session token from Saved/Tether/session.json (the ue CLI sends it).
+
+        Returns:
+            JSON {"center": [x, y, z], "radius": r} after place.
+        """
+        _authorize(token)
+        subsystem = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
+        world = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_editor_world()
+        staged = [a for a in unreal.GameplayStatics.get_all_actors_of_class(world, unreal.Actor)
+                  if a.get_actor_label().startswith("TetherLook_")]
+        if staged:
+            subsystem.destroy_actors(staged)
+        if action == "remove":
+            return json.dumps({"removed": len(staged)})
+        obj = unreal.load_asset(asset.split(".")[0])
+        if obj is None:
+            raise RuntimeError(f"no asset at {asset} (ue find)")
+        spot = unreal.Vector(0, 0, 500000)  # far above the level: nothing else in the shot
+        if isinstance(obj, unreal.MaterialInterface):
+            actor = subsystem.spawn_actor_from_object(unreal.load_asset("/Engine/BasicShapes/Sphere"), spot,
+                                                      unreal.Rotator(), transient=True)
+            actor.static_mesh_component.set_material(0, obj)
+        elif isinstance(obj, unreal.Blueprint):
+            actor = subsystem.spawn_actor_from_class(unreal.BlueprintEditorLibrary.generated_class(obj), spot,
+                                                     unreal.Rotator(), transient=True)
+        else:
+            actor = subsystem.spawn_actor_from_object(obj, spot, unreal.Rotator(), transient=True)
+        if actor is None:
+            raise RuntimeError(f"cannot place a {obj.get_class().get_name()} in a level (meshes, Blueprints, materials)")
+        actor.set_actor_label("TetherLook_Subject")
+        center, extent = actor.get_actor_bounds(False)
+        radius = max(extent.length(), 10.0)
+        light = subsystem.spawn_actor_from_class(unreal.PointLight, center + unreal.Vector(-radius * 2, -radius * 2,
+                                                                                            radius * 2),
+                                                 unreal.Rotator(), transient=True)
+        light.set_actor_label("TetherLook_Light")
+        comp = light.get_component_by_class(unreal.PointLightComponent)
+        comp.set_editor_property("attenuation_radius", radius * 20)
+        comp.set_editor_property("intensity", 150.0 * max(1.0, (radius / 100.0) ** 2))  # a fill, not a spotlight
+        for sprite in light.get_components_by_class(unreal.BillboardComponent):  # the editor's light icon
+            sprite.set_visibility(False)
+        return json.dumps({"center": [center.x, center.y, center.z], "radius": radius,
+                           "class": obj.get_class().get_name()})
+
+    @_tool
+    @staticmethod
     def find(query: str = "", cls: str = "", under: str = "/Game", limit: int = 50) -> str:
         """Search the asset registry by name and/or class.
 

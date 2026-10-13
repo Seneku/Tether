@@ -1125,3 +1125,15 @@ class Batch(unittest.TestCase):
 
     def test_stop_on_error(self):
         self.assertEqual(self.run_batch("actors bad\nactors two\n", stop=True), (1, ["bad"]))
+
+
+class ContactSheet(unittest.TestCase):
+    def test_tiles_are_scaled_and_placed(self):
+        red = (4, 2, 3, bytes([255, 0, 0] * 8))
+        blue = (4, 2, 4, bytes([0, 0, 255, 255] * 8))
+        w, h, rgb = ue.contact_sheet([red, blue], columns=2, tile_width=2, gap=1)
+        self.assertEqual((w, h), (2 * 2 + 3, 1 + 2))
+        px = lambda x, y: rgb[(y * w + x) * 3:(y * w + x) * 3 + 3]
+        self.assertEqual(px(1, 1), b"\xff\x00\x00")  # first tile starts after the gap
+        self.assertEqual(px(4, 1), b"\x00\x00\xff")  # second tile, RGBA reduced to RGB
+        self.assertEqual(px(0, 0), b"\x18\x18\x18")  # background

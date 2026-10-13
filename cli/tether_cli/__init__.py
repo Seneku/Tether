@@ -31,7 +31,7 @@ socket, subprocess, zlib = _Lazy("socket"), _Lazy("subprocess"), _Lazy("zlib")
 CLI_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # cli/
 UE_SCRIPT = os.path.join(CLI_DIR, "ue.py")  # the entry point, for the CLI's own child processes
 TETHER = "tether.toolsets.TetherCore"
-GATED = {"py", "console", "set_props", "undo", "save", "spawn", "delete", "duplicate", "mv", "rm", "set_material", "pie_step", "set_config", "umg", "new_asset", "drop", "pie_net"}  # tools that need the session token (see beacon.session_token)
+GATED = {"py", "console", "set_props", "undo", "save", "spawn", "delete", "duplicate", "mv", "rm", "set_material", "pie_step", "set_config", "umg", "new_asset", "drop", "pie_net", "look_stage"}  # tools that need the session token (see beacon.session_token)
 LEVELS = {"Fatal": 0, "Error": 1, "Warning": 2, "Display": 3, "Log": 4, "Verbose": 5, "VeryVerbose": 6}
 NOISE = {"LogModelContextProtocol", "LogToolsetRegistry"}  # our own transport chatter
 # Epic logs this whenever a schema is generated for a class with delegates (props, set, describe_toolset).
@@ -1412,6 +1412,92 @@ def pie_screenshot(ctx, args):
     raise CliError("the PIE screenshot did not appear within 15 s (ue log --level Warning)", 4)
 
 
+def capture_viewport(ctx, pose, annotations=None, ui=False):
+    """PNG bytes of the level viewport rendered from `pose` (Epic's CaptureViewport)."""
+    text, is_error = ctx.mcp.call("EditorToolset.EditorAppToolset", "CaptureViewport",
+                                  {"captureTransform": pose, "annotations": annotations or NO_ANNOTATIONS, "bShowUI": ui})
+    if is_error:
+        hint = " (the viewport is not rendering: minimised window or -nullrhi?)" if "zero size" in text else ""
+        raise CliError(compact_error(text) + hint)
+    value = unwrap(text)
+    image = value.get("image") if isinstance(value, dict) else None
+    if not image or not image.get("data"):
+        raise CliError("CaptureViewport returned no image")
+    import base64
+    return base64.b64decode(image["data"])
+
+
+def contact_sheet(tiles, columns=3, tile_width=400, gap=4):
+    """Tile decoded images (width, height, channels, bytes) into one RGB image, each scaled to tile_width
+    (nearest neighbour). Returns (width, height, rgb bytes)."""
+    scaled = []
+    for w, h, c, px in tiles:
+        tw, th = tile_width, max(1, round(h * tile_width / w))
+        out = bytearray(tw * th * 3)
+        for y in range(th):
+            sy = min(h - 1, y * h // th) * w
+            for x in range(tw):
+                si = (sy + min(w - 1, x * w // tw)) * c
+                o = (y * tw + x) * 3
+                out[o:o + 3] = px[si:si + 3] if c >= 3 else bytes([px[si]] * 3)
+        scaled.append((tw, th, out))
+    rows = (len(scaled) + columns - 1) // columns
+    th = max(t[1] for t in scaled)
+    width, height = columns * tile_width + (columns + 1) * gap, rows * th + (rows + 1) * gap
+    sheet = bytearray([24, 24, 24] * (width * height))
+    for i, (tw, tht, px) in enumerate(scaled):
+        x0, y0 = gap + (i % columns) * (tile_width + gap), gap + (i // columns) * (th + gap)
+        for y in range(tht):
+            start = ((y0 + y) * width + x0) * 3
+            sheet[start:start + tw * 3] = px[y * tw * 3:(y + 1) * tw * 3]
+    return width, height, bytes(sheet)
+
+
+# Camera yaw/pitch per view: an asset faces +X, so "front" looks back along -X from +X.
+LOOK_VIEWS = (("front", 180, -10), ("right", 270, -10), ("back", 0, -10), ("left", 90, -10), ("top", 180, -89),
+              ("3/4", 225, -25))
+
+
+def cmd_look(ctx, args):
+    """Render an asset from six angles into one contact sheet (front, right, back / left, top, three-quarter)."""
+    import math
+    launch = read_json(os.path.join(state_dir(ctx.project), "launch.json")) or {}
+    if launch.get("headless") and not launch.get("render"):
+        raise CliError("this editor runs headless with -nullrhi and cannot render; reopen it with "
+                       "`ue open --headless --render`")
+    if (ctx.beacon or {}).get("pie"):
+        raise CliError("stop PIE first (ue pie stop): the asset is staged in the editor level")
+    stage = ctx.tether("look_stage", asset=args.asset, action="place")
+    stage = json.loads(stage) if isinstance(stage, str) else stage
+    tiles = []
+    try:
+        cx, cy, cz = stage["center"]
+        distance = stage["radius"] * args.distance
+        for name, yaw, pitch in LOOK_VIEWS:
+            yr, pr = math.radians(yaw), math.radians(pitch)
+            forward = (math.cos(pr) * math.cos(yr), math.cos(pr) * math.sin(yr), math.sin(pr))
+            pose = {"location": {"x": cx - forward[0] * distance, "y": cy - forward[1] * distance,
+                                 "z": cz - forward[2] * distance},
+                    "rotation": {"pitch": pitch, "yaw": yaw, "roll": 0}, "scale": {"x": 1, "y": 1, "z": 1}}
+            tiles.append(png_read(capture_viewport(ctx, pose)))
+    finally:
+        with __import__("contextlib").suppress(CliError):
+            ctx.tether("look_stage", asset=args.asset, action="remove")
+    width, height, rgb = contact_sheet(tiles, columns=3, tile_width=args.tile)
+    if args.output:
+        path = os.path.abspath(args.output)
+    else:
+        folder = os.path.join(state_dir(ctx.project), "shots")
+        os.makedirs(folder, exist_ok=True)
+        path = os.path.join(folder, f"look-{args.asset.rstrip('/').rsplit('/', 1)[-1].split('.')[0]}-"
+                                    f"{time.strftime('%Y%m%d-%H%M%S')}.png")
+    png_write(path, width, height, rgb)
+    print(f"{path}  {width}x{height}")
+    print(f"{args.asset} ({stage.get('class')}, about {stage['radius'] * 2 / 100:.1f} m across): "
+          "top row front, right, back; bottom row left, top, three-quarter")
+    return 0
+
+
 def cmd_shot(ctx, args):
     """Capture the viewport (or the player's view during PIE) to a PNG and print its path."""
     launch = read_json(os.path.join(state_dir(ctx.project), "launch.json")) or {}
@@ -1435,17 +1521,7 @@ def cmd_shot(ctx, args):
         raw = pie_screenshot(ctx, args)
     else:  # editor, or Simulate-In-Editor, whose simulation the level viewport shows
         annotations = dict(ANNOTATIONS, gridHeight=args.grid_z) if args.annotate else NO_ANNOTATIONS
-        text, is_error = ctx.mcp.call("EditorToolset.EditorAppToolset", "CaptureViewport",
-                                      {"captureTransform": pose, "annotations": annotations, "bShowUI": args.ui})
-        if is_error:
-            hint = " (the viewport is not rendering: minimised window or -nullrhi?)" if "zero size" in text else ""
-            raise CliError(compact_error(text) + hint)
-        value = unwrap(text)
-        image = value.get("image") if isinstance(value, dict) else None
-        if not image or not image.get("data"):
-            raise CliError("CaptureViewport returned no image")
-        import base64
-        raw = base64.b64decode(image["data"])
+        raw = capture_viewport(ctx, pose, annotations, args.ui)
     width, height = (int.from_bytes(raw[16:20], "big"), int.from_bytes(raw[20:24], "big")) if raw[:4] == b"\x89PNG" else (0, 0)
     if args.output:
         path = os.path.abspath(args.output)
@@ -3911,6 +3987,10 @@ def cmd_selftest(ctx, args):
         for ext in (".png", ".json"):
             with __import__("contextlib").suppress(OSError):
                 os.remove(os.path.join(state_dir(project), "shots", "baselines", "tether_selftest" + ext))
+    check("look", ["look", "/Engine/BasicShapes/Cube", "-o", os.path.join(tempfile.gettempdir(), "tether-selftest-look.png")],
+          skip="needs 5.8 (CaptureViewport)" if remote else None if rendering else
+          "headless with -nullrhi; reopen with `ue open --headless --render`",
+          ok=lambda c, o: c == 0 and ".png" in o)
     tests_available = not remote and "AutomationTestToolset.AutomationTestToolset" in catalog(ctx)
     check("test", ["test", "StartsWith:System.Core.Math.Evaluate"], timeout=600,
           skip=None if tests_available else "needs Epic's AutomationTestToolset (UE 5.8+, `ue init` enables it)",
@@ -5115,6 +5195,11 @@ def build_parser():
     s.add_argument("--compare", metavar="NAME", help="re-shoot a baseline's camera and report what changed (exit 1)")
     s.add_argument("--tolerance", type=float, default=0.5, help="with --compare: changed pixels allowed, %% (0.5)")
     s.add_argument("--threshold", type=int, default=32, help="with --compare: per-channel difference that counts (32)")
+    s = add("look", cmd_look, "render an asset (mesh, Blueprint, material) from six angles into one contact sheet")
+    s.add_argument("asset", help="/Game/... asset path")
+    s.add_argument("--tile", type=int, default=400, help="width of each view in pixels (400)")
+    s.add_argument("--distance", type=float, default=2.6, help="camera distance in bounds radii (2.6)")
+    s.add_argument("-o", "--output", help="PNG path (default Saved/Tether/shots/look-<asset>-<time>.png)")
     s = add("test", cmd_test, "run automation tests in the live editor; prints failures only (exit 1 on failure)")
     s.add_argument("filter", nargs="?", help="Epic filter: substring, ^Prefix, Suffix$, StartsWith:X, Group:Name; '+' joins")
     s.add_argument("--list", action="store_true", help="list matching tests instead of running them")

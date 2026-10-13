@@ -140,6 +140,8 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
   or `ue job status`. Do not block a shell on them.
 
 ## Visual checks
+- To see what an asset looks like before using or changing it: `ue look /Game/Path/SM_Rock` (mesh, Blueprint or
+  material) writes one PNG with six views; open it only if you need to.
 - Before a change that should not alter a view (refactors, optimisations), `ue shot --at ... --look-at ... --baseline
   NAME`; after it, `ue shot --compare NAME` reports what changed and where (diff image in red). Animated things
   (clouds, water, particles) show up as separate areas; judge by the largest.
