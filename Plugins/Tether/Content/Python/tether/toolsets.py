@@ -30,6 +30,12 @@ except ImportError:  # before UE 5.8
 _LEGACY = not hasattr(unreal, "ToolsetLibrary") or bool(os.environ.get("TETHER_LEGACY"))
 
 
+def _play_saved():
+    """Where the play settings a multiplayer `ue pie start --clients` replaced are kept (see pie_net)."""
+    return os.path.join(unreal.Paths.convert_relative_path_to_full(unreal.Paths.project_saved_dir()),
+                        "Tether", "play-settings.json")
+
+
 _RAW = {}  # tool name -> plain Python function, for callers outside MCP (Python remote execution)
 
 
@@ -816,6 +822,80 @@ def _watch_tick(_delta):
                 state["readers"][i] = None
         row.append(value)
     state["samples"].append(row)
+
+
+# `ue pie record`: the keys of every mapping context (Python cannot read Enhanced Input action values, but the
+# controller's key state is public), the pawn's pose and the camera, sampled on the editor tick.
+_REC = getattr(sys, "_tether_rec", None) or {"handle": None}
+sys._tether_rec = _REC
+_REC_LIMIT = 50000
+_LOOK_KEYS = re.compile(r"^(Mouse(X|Y|2D|WheelAxis)|Gamepad_Right(X|Y|2D)|MotionController)", re.I)
+
+
+def _mapping_rows(imc):
+    holder = _try(lambda: imc.get_editor_property("default_key_mappings"))
+    mappings = _try(lambda: holder.get_editor_property("mappings"), None) if holder else None
+    return mappings if mappings is not None else _try(lambda: imc.get_editor_property("mappings"), [])
+
+
+def _modifier_text(modifier):
+    """A modifier as the converter needs it: negate (with axes), swizzle (with order), scalar (with factor)."""
+    kind = modifier.get_class().get_name().replace("InputModifier", "").lower()
+    if kind == "negate":
+        axes = "".join(a for a in "xyz" if _try(lambda: modifier.get_editor_property(a), True))
+        return f"negate:{axes}"
+    if kind == "swizzleaxis":
+        order = str(_try(lambda: modifier.get_editor_property("order"), "YXZ")).split(".")[-1].split(":")[0]
+        return f"swizzle:{order.upper()}"
+    if kind == "scalar":
+        s = _try(lambda: modifier.get_editor_property("scalar"))
+        return f"scalar:{s.x:g},{s.y:g},{s.z:g}" if s else "scalar"
+    return kind
+
+
+def _rec_tick(_delta):
+    state = _REC
+    game = _game_world()
+    if game is None or game != state.get("world"):
+        state["ended"] = state.get("ended") or "PIE ended"
+        unreal.unregister_slate_post_tick_callback(state["handle"])
+        state["handle"] = None
+        return
+    controller, pawn = state["controller"], unreal.GameplayStatics.get_player_pawn(game, 0)
+    now = time.time() - state["start"]
+    events = state["events"]
+    if len(events) >= _REC_LIMIT:
+        return
+    for name, key, analog in state["keys"]:
+        if analog:
+            if analog == "2d":
+                value = _try(lambda: controller.get_input_vector_key_state(key))
+                vec = (round(value.x, 2), round(value.y, 2)) if value else (0.0, 0.0)
+            else:
+                vec = (round(_try(lambda: controller.get_input_analog_key_state(key), 0.0), 2), 0.0)
+            last = state["analog"].get(name, (0.0, 0.0))
+            if abs(vec[0] - last[0]) > 0.15 or abs(vec[1] - last[1]) > 0.15 or (vec != last and vec == (0.0, 0.0)):
+                state["analog"][name] = vec
+                events.append([round(now, 3), "axis", name, list(vec)])
+            continue
+        down = bool(_try(lambda: controller.is_input_key_down(key), False))
+        was = name in state["down"]
+        if down and not was:
+            state["down"].add(name)
+            events.append([round(now, 3), "down", name])
+        elif not down and was:
+            state["down"].discard(name)
+            events.append([round(now, 3), "up", name])
+        elif not down and _try(lambda: controller.was_input_key_just_pressed(key), False):
+            events.append([round(now, 3), "down", name])  # pressed and released between two ticks
+            events.append([round(now, 3), "up", name])
+    if pawn and now - state["last_pose"] >= state["every"]:
+        state["last_pose"] = now
+        camera = unreal.GameplayStatics.get_player_camera_manager(game, 0)
+        loc, rot = pawn.get_actor_location(), controller.get_control_rotation()
+        eye = camera.get_camera_location() if camera else loc
+        events.append([round(now, 3), "pose", [round(loc.x), round(loc.y), round(loc.z)],
+                       [round(rot.pitch, 1), round(rot.yaw, 1)], [round(eye.x), round(eye.y), round(eye.z)]])
 
 
 _COMPARE = re.compile(r"^(?P<lhs>\S+)\s*(?P<op>==|!=|<=|>=|=|<|>|~)\s*(?P<rhs>.*)$")
@@ -3233,6 +3313,66 @@ class TetherCore(_Base):
 
     @_tool
     @staticmethod
+    def pie_record(action: str = "status", every: float = 0.25) -> str:
+        """Record a play session in PIE: key presses for every key a mapping context uses, analog sticks, and
+        the player's position and view. The ue CLI's `pie record` turns this into a `pie do` step file.
+
+        Args:
+            action: 'start' (replaces a running recording), 'stop' (ends it and returns the events), or 'status'.
+            every: With start: seconds between position/view samples (0.25).
+
+        Returns:
+            start/status: a line of text. stop: JSON {mappings: [{context, action, type, key, modifiers}],
+            active: [context names], events: [[t, 'down'|'up', key] | [t, 'axis', key, [x, y]] |
+            [t, 'pose', [x, y, z], [pitch, yaw], [camera x, y, z]]], ended, seconds}.
+        """
+        state = _REC
+        if action == "start":
+            if state.get("handle") is not None:
+                unreal.unregister_slate_post_tick_callback(state["handle"])
+            game, pawn, controller = _pie_player()
+            subsystem = _try(lambda: _input_subsystem(game))
+            registry = unreal.AssetRegistryHelpers.get_asset_registry()
+            mappings, keys, active = [], {}, []
+            for data in registry.get_assets_by_class(unreal.TopLevelAssetPath("/Script/EnhancedInput", "InputMappingContext")):
+                imc = _try(lambda: unreal.load_asset(str(data.package_name)))
+                if not isinstance(imc, unreal.InputMappingContext):
+                    continue
+                if subsystem and _try(lambda: subsystem.has_mapping_context(imc)) not in (None, False):
+                    active.append(imc.get_name())
+                for m in _mapping_rows(imc):
+                    act, key = m.get_editor_property("action"), m.get_editor_property("key")
+                    name = key.export_text()
+                    if not act or not name or name == "None":
+                        continue
+                    value_type = str(_try(lambda: act.get_editor_property("value_type"), "")).split(".")[-1].split(":")[0]
+                    mappings.append({"context": imc.get_name(), "action": act.get_name(), "type": value_type.lower(),
+                                     "key": name, "modifiers": [_modifier_text(x) for x in m.get_editor_property("modifiers") if x]})
+                    if not _LOOK_KEYS.match(name) and name not in keys:
+                        analog = ("2d" if _try(lambda: unreal.InputLibrary.key_is_axis2d(key), False) else
+                                  "1d" if _try(lambda: unreal.InputLibrary.key_is_analog(key), False) else "")
+                        keys[name] = (name, key, analog)
+            if not keys:
+                raise RuntimeError("no keys to record: no Enhanced Input mapping contexts in the project (ue input)")
+            state.update(world=game, controller=controller, keys=list(keys.values()), mappings=mappings, active=active,
+                         down=set(), analog={}, events=[], start=time.time(), last_pose=-1.0, every=max(0.05, every),
+                         ended=None)
+            state["handle"] = unreal.register_slate_post_tick_callback(_rec_tick)
+            return f"recording {len(keys)} key(s) from {len({m['context'] for m in mappings})} mapping context(s)"
+        if action == "stop":
+            if state.get("handle") is not None:
+                unreal.unregister_slate_post_tick_callback(state["handle"])
+                state["handle"] = None
+            if "events" not in state:
+                raise RuntimeError("nothing was recorded (ue pie record)")
+            return json.dumps({"mappings": state["mappings"], "active": state["active"],
+                               "events": state["events"], "ended": state.get("ended"),
+                               "seconds": round(time.time() - state["start"], 2)})
+        running = state.get("handle") is not None
+        return (f"recording, {len(state['events'])} event(s) so far" if running else "not recording")
+
+    @_tool
+    @staticmethod
     def input_map(limit: int = 400) -> str:
         """Enhanced Input: actions (value type, triggers), mapping contexts with their key mappings and what
         references them, and in PIE which contexts are active and which keys reach each action.
@@ -3323,19 +3463,24 @@ class TetherCore(_Base):
             mode = {"standalone": "PIE_Standalone", "listen": "PIE_ListenServer", "client": "PIE_Client"}.get(net.lower())
             if mode is None:
                 raise RuntimeError("net must be standalone, listen or client")
-            if getattr(sys, "_tether_play_saved", None) is None:  # what to put back afterwards
-                sys._tether_play_saved = unreal.ToolsetLibrary.get_object_properties(settings, keys)
+            # What to put back afterwards, also on disk: these settings are saved to the user's per-project config,
+            # so an editor killed before `pie stop` would otherwise keep starting multiplayer sessions.
+            if not os.path.exists(_play_saved()):
+                original = unreal.ToolsetLibrary.get_object_properties(settings, keys)
+                os.makedirs(os.path.dirname(_play_saved()), exist_ok=True)
+                with open(_play_saved(), "w", encoding="utf-8") as f:
+                    f.write(original if isinstance(original, str) else json.dumps(original))
             unreal.ToolsetLibrary.set_object_properties(settings, json.dumps(
                 {"playNumberOfClients": max(1, clients), "playNetMode": mode, "runUnderOneProcess": True}))
             return f"next PIE: {clients} client(s), {mode}"
         if action == "restore":
             _authorize(token)
-            saved = getattr(sys, "_tether_play_saved", None)
             sys._tether_pie_target = None
-            if saved is None:
+            if not os.path.exists(_play_saved()):
                 return "nothing to restore"
-            unreal.ToolsetLibrary.set_object_properties(settings, saved)
-            sys._tether_play_saved = None
+            with open(_play_saved(), encoding="utf-8") as f:
+                unreal.ToolsetLibrary.set_object_properties(settings, f.read())
+            os.remove(_play_saved())
             return "play settings restored"
         if action == "target":
             sys._tether_pie_target = None if target < 0 else target

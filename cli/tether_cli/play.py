@@ -995,6 +995,9 @@ def cmd_pie(ctx, args):
         return 0
     if args.action == "start" and getattr(args, "clients", None):
         print(pie_net(ctx, "configure", clients=args.clients, net=args.net or "listen"))
+    elif args.action == "start" and os.path.exists(os.path.join(state_dir(ctx.project), "play-settings.json")):
+        # a multiplayer start whose `pie stop` never came (editor killed or crashed) left its settings in config
+        print(f"note: {pie_net(ctx, 'restore')} (left over from an earlier `pie start --clients`)")
     toolset = None if ctx.transport == "remote" else resolve_toolset(ctx, "editorapp")
     start = log_end(ctx.project)
     started = time.time()
