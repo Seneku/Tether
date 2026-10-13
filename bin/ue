@@ -3,8 +3,13 @@
 # (Git Bash rewrites /Game/... arguments into Windows paths; ue.py undoes that for Unreal roots and
 # keeps the conversion for real file paths such as /c/Users/...)
 here="$(dirname "$0")"
+script="$here/../cli/ue.py"
+if [ "$1" = "hook" ] && [ ! -f "$script" ]; then
+  exit 0  # a hook must never block the agent because Tether itself cannot start
+fi
 for py in python python3; do
-  command -v "$py" >/dev/null 2>&1 && exec "$py" "$here/../cli/ue.py" "$@"
+  command -v "$py" >/dev/null 2>&1 && exec "$py" "$script" "$@"
 done
+[ "$1" = "hook" ] && exit 0
 echo "ue: Python 3 not found on PATH" >&2
 exit 2

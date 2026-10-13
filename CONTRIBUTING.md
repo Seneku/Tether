@@ -48,7 +48,7 @@ The iteration loop for each part:
 
 | You changed | Make it live with |
 |---|---|
-| `cli/ue.py` | nothing: each call is a fresh process |
+| `cli/tether_cli/` | nothing: each call is a fresh process |
 | `Plugins/Tether/Content/Python/tether/*.py` | `ue reload` (no editor restart) |
 | `Plugins/TetherUnrealSharp` C++ (function bodies) | `ue build` (Live Coding) |
 | `.uplugin`, `Build.cs`, new `UPROPERTY`/`UFUNCTION` | `ue build --restart` |

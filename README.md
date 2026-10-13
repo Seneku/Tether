@@ -57,7 +57,7 @@ and a private mid-size C++/Blueprint game. Methodology is in [docs/DESIGN.md](do
                     └── reads Saved/Tether/editor.json (beacon) and Saved/Logs directly
 ```
 
-- **`cli/ue.py`** is the out-of-editor half. It's a single stdlib-only Python file. It launches and closes
+- **`cli/ue.py`** is the out-of-editor half: a launcher for the stdlib-only `cli/tether_cli` package. It launches and closes
   the editor on a per-project port, routes builds (Live Coding when the editor is up, UBT when it isn't),
   and prints compact, de-duplicated output. Status and logs come from files, so they keep working when the
   editor is hung or gone.
@@ -212,6 +212,7 @@ The plugin's hooks stay silent outside Unreal projects, and never block a tool c
 | `ue api <Class[.member]> [regex]` | The `unreal` Python API in a few lines: method signatures, editor properties with types, enum values, or one member's docs. |
 | `ue package [--config C] [--seconds N] [--boot-only] [--strict]` | Package the game (BuildCookRun build/cook/stage/pak/archive as a background job, archived under `Saved/Tether/package/`), then boot the packaged executable headless for N seconds (20) and report a crash (with its module chain), fatal errors, an early exit, and logged errors. Exit 0/1. |
 | `ue job start -- <cmd>` / `cook` / `status` / `wait` / `log` | Long work (cooks, commandlets, any command) in the background, with a log and exit code; `wait` prints only the errors. |
+| `ue batch [file]` | Run many `ue` command lines (from a file or stdin, `#` comments) in one process and one editor session: about 0.04 s per command instead of about 0.15 s. `--stop-on-error`; exit code is the worst. |
 | `ue reload` | Hot-reload the Tether Python package in the running editor. |
 
 Exit codes: `0` ok, `1` tool or command failed, `2` editor unavailable, `3` restart required, `4` timeout.
@@ -293,7 +294,7 @@ please paste its `ue selftest` output into an issue.
 
 | Path | Contents |
 |---|---|
-| `cli/` | `ue.py`, the CLI (one stdlib-only file) |
+| `cli/` | `ue.py` (the entry point) and `tether_cli/`, the stdlib-only CLI package |
 | `bin/` | `ue` and `ue.cmd` launchers; the Claude Code plugin puts this folder on the agent's PATH |
 | `.claude-plugin/`, `skills/`, `hooks/` | Claude Code plugin manifest (the repo is also its own marketplace), the `unreal-tether` skill, and the hooks |
 | `tests/` | Unit tests for the editor-free parts (`python -m unittest discover -s tests`) |

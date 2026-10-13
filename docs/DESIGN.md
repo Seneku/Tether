@@ -26,7 +26,7 @@ project used for dogfooding.
 
 ## 2. Proof of concept (measured on `Sandbox/`, 2026-10-09)
 
-`Plugins/Tether` (content-only, pure Python) + `cli/ue.py` (stdlib only), against Epic's MCP
+`Plugins/Tether` (content-only, pure Python) + `cli/ue.py` / `cli/tether_cli` (stdlib only), against Epic's MCP
 server with `AllToolsets` enabled:
 
 | Command | Time | Output |

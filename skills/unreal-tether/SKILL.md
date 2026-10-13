@@ -9,6 +9,9 @@ Run `ue` from the project folder (or set `UE_PROJECT`). The Tether Claude Code p
 if `ue` is not found, use `python "${CLAUDE_PLUGIN_ROOT}/cli/ue.py"` instead. If `ue status` exits 2,
 start the editor with `ue open --headless` (`--render` if you need `ue shot`).
 
+Several reads or edits in a row? Put them in one `ue batch` (one command per line, from stdin or a file):
+one process and one editor session for all of them.
+
 Once the editor is running, talk to it; do not boot it again. Each `ue` call takes tens of
 milliseconds. A `-run=pythonscript` commandlet takes ~25 s and floods the log.
 

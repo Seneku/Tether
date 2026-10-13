@@ -1,4 +1,4 @@
-"""Unit tests for cli/ue.py: the parts that need no editor (parsing, filtering, routing, hooks)."""
+"""Unit tests for the ue CLI (cli/tether_cli): the parts that need no editor (parsing, filtering, routing, hooks)."""
 import argparse
 import json
 import os
@@ -10,7 +10,7 @@ import unittest
 import unittest.mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "cli"))
-import ue  # noqa: E402
+import tether_cli as ue  # noqa: E402
 
 
 def stamped(text):
@@ -1075,3 +1075,33 @@ class Soak(unittest.TestCase):
                  "[x][103]LogOutputDevice: Error: [Callstack] 0x1 UnrealEditor-NavigationSystem.dll!UnknownFunction []",
                  "[x][104]LogTemp: Error: a real one"]
         self.assertEqual(ue.filter_log(lines, level="Error"), ["E LogTemp: a real one"])
+
+
+class Batch(unittest.TestCase):
+    def run_batch(self, text, stop=False):
+        ran = []
+
+        def fake(ctx, args):
+            ran.append(args.match)
+            if args.match == "bad":
+                raise ue.CliError("nope")
+            return 0
+
+        parser = ue.build_parser()
+        for action in parser._subparsers._group_actions[0].choices.values():
+            if action.get_default("fn") is ue.cmd_actors:
+                action.set_defaults(fn=fake)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "cmds.txt")
+            with open(path, "w") as f:
+                f.write(text)
+            with unittest.mock.patch.object(ue, "build_parser", return_value=parser), \
+                    unittest.mock.patch("builtins.print"):
+                code = ue.cmd_batch(None, argparse.Namespace(file=path, stop_on_error=stop))
+        return code, ran
+
+    def test_runs_every_line_and_returns_the_worst_code(self):
+        self.assertEqual(self.run_batch("actors one\n# skip\nue actors bad\nactors three\n"), (1, ["one", "bad", "three"]))
+
+    def test_stop_on_error(self):
+        self.assertEqual(self.run_batch("actors bad\nactors two\n", stop=True), (1, ["bad"]))
