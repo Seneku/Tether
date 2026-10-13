@@ -67,6 +67,8 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
   change: `ue import --reimport /Game/Props` reimports the changed ones and re-applies those options.
 - On terrain, never guess heights: `ue spawn /Game/X/SM_Rock --at 1200,-300,0 --ground` (or `ue drop Rock1 Rock2`,
   `--align` to follow the slope) puts things on the surface below.
+- After placing or scattering things: `ue level check` finds floating or buried props, stacked duplicates,
+  invisible walls and overlapping stationary lights; `ue drop <actor>` fixes a floating one.
 - Terrain: `ue landscape` (size, layers), `ue landscape at x,y` (height, slope, layer weights: use it before placing
   things), `ue landscape map` (a PNG of the shape). `ue landscape flatten x,y,r [--height z]` (a pad for a
   building), `raise x,y,r --by cm`, `smooth x,y,r`; each prints a backup for `ue landscape restore --backup`.

@@ -1390,6 +1390,17 @@ class LandscapePicture(unittest.TestCase):
         self.assertEqual(pixel(0, 0), (255, 0, 255))    # no landscape there
 
 
+class LevelCheck(unittest.TestCase):
+    def test_grouped_by_kind_in_a_fixed_order(self):
+        data = {"actors": 9, "issues": [{"kind": "stacked", "actor": "B", "detail": "same as A"},
+                                         {"kind": "floating", "actor": "Lamp", "detail": "bottom is 40 cm above Floor"},
+                                         {"kind": "floating", "actor": "Crate", "detail": "bottom is 9 cm above Floor"}]}
+        self.assertEqual(ue.level_lines(data, per_kind=1),
+                         ["9 actors checked: 2 floating, 1 stacked", "floating:", "  Lamp  bottom is 40 cm above Floor",
+                          "  ... +1 more (--limit N)", "stacked:", "  B  same as A"])
+        self.assertEqual(ue.level_lines({"actors": 3, "issues": []}), ["3 actors checked: nothing to report"])
+
+
 class JsonEnvelope(unittest.TestCase):
     def run_json(self, project, *argv):
         out = io.StringIO()

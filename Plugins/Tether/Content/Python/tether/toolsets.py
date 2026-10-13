@@ -1304,6 +1304,14 @@ def _png_rgba8(width, height, rgba):
             + chunk(b"IDAT", zlib.compress(rows)) + chunk(b"IEND", b""))
 
 
+def _rot_tuple(rot):
+    return rot.pitch, rot.yaw, rot.roll
+
+
+def _vec_tuple(vec):
+    return vec.x, vec.y, vec.z
+
+
 def _slope_degrees(normal):
     import math
     return math.degrees(math.acos(max(-1.0, min(1.0, normal.z))))
@@ -2066,6 +2074,104 @@ class TetherCore(_Base):
         zs = [a.get_actor_location().z for a in placed]
         return (f"placed {len(placed)} of {count} {prefix}" + (f" (z {min(zs):.0f} to {max(zs):.0f})" if zs else "")
                 + (": " + "; ".join(notes) if notes else "") + (f"; labels {prefix}_01.." if placed else ""))
+
+    @_tool
+    @staticmethod
+    def level_check(gap: float = 5.0, limit: int = 400) -> str:
+        """Problems with placed actors in the edited level that Map Check does not report: props floating above
+        or buried under the ground, identical actors stacked in the same place, actors below Kill Z or far outside
+        the landscape, hidden actors that still block, and more than 4 shadowing stationary lights overlapping.
+
+        Args:
+            gap: How far above the surface below counts as floating, cm.
+            limit: Maximum issues to return.
+
+        Returns:
+            JSON {actors: n checked, issues: [{kind, actor, detail}]}.
+        """
+        world = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_editor_world()
+        actors = [a for a in unreal.get_editor_subsystem(unreal.EditorActorSubsystem).get_all_level_actors()
+                  if a and not isinstance(a, (unreal.Brush, unreal.WorldSettings, unreal.LandscapeProxy))]
+        issues = []
+
+        def report(kind, actor, detail):
+            if len(issues) < limit:
+                issues.append({"kind": kind, "actor": _label(actor), "detail": detail})
+
+        settings = world.get_world_settings()
+        kill_z = _try(lambda: settings.get_editor_property("kill_z"), -1e9) if settings else -1e9
+        lands = list(unreal.GameplayStatics.get_all_actors_of_class(world, unreal.LandscapeProxy))
+        land_box = None
+        if lands:
+            boxes = [l.get_actor_bounds(False) for l in lands]
+            land_box = (min(o.x - e.x for o, e in boxes), min(o.y - e.y for o, e in boxes),
+                        max(o.x + e.x for o, e in boxes), max(o.y + e.y for o, e in boxes))
+        seen = {}
+        for actor in actors:
+            meshes = [c for c in actor.get_components_by_class(unreal.StaticMeshComponent)
+                      if c.get_editor_property("static_mesh") and not isinstance(c, unreal.InstancedStaticMeshComponent)]
+            loc = actor.get_actor_location()
+            if loc.z < kill_z:
+                report("below kill z", actor, f"z {loc.z:.0f} is under Kill Z {kill_z:.0f}: it is destroyed when play starts")
+            if land_box and not isinstance(actor, (unreal.Light, unreal.SkyLight, unreal.SkyAtmosphere)) and (
+                    loc.x < land_box[0] - 20000 or loc.y < land_box[1] - 20000 or loc.x > land_box[2] + 20000
+                    or loc.y > land_box[3] + 20000):
+                report("outside", actor, f"at ({loc.x:.0f}, {loc.y:.0f}), more than 200 m beyond the landscape")
+            if not meshes:
+                continue
+            hidden = bool(_try(lambda: actor.get_editor_property("hidden"), False)) or all(
+                _try(lambda: c.get_editor_property("hidden_in_game"), False) or not _try(lambda: c.is_visible(), True)
+                for c in meshes)
+            blocking = any(c.get_collision_enabled() != unreal.CollisionEnabled.NO_COLLISION and
+                           c.get_collision_response_to_channel(unreal.CollisionChannel.ECC_PAWN) == unreal.CollisionResponseType.ECR_BLOCK
+                           for c in meshes)
+            if hidden and blocking and not isinstance(actor, unreal.Volume):
+                report("invisible blocker", actor, "hidden in game but blocks pawns: an invisible wall")
+            key = (tuple(sorted(c.get_editor_property("static_mesh").get_path_name() for c in meshes)),
+                   round(loc.x), round(loc.y), round(loc.z), tuple(round(v) for v in _rot_tuple(actor.get_actor_rotation())),
+                   tuple(round(v, 2) for v in _vec_tuple(actor.get_actor_scale3d())))
+            if key in seen:
+                report("stacked", actor, f"same mesh, place, rotation and scale as {_label(seen[key])}")
+            else:
+                seen[key] = actor
+            if actor.get_attach_parent_actor() is not None or _try(lambda: meshes[0].is_simulating_physics(), False):
+                continue
+            mobility = str(_try(lambda: meshes[0].get_editor_property("mobility"), "")).split(".")[-1].split(":")[0]
+            origin, extent = actor.get_actor_bounds(False)
+            if extent.z < 1 or extent.x > 5000 or extent.y > 5000:  # flat decals and huge pieces (floors, terrain)
+                continue
+            top, bottom = origin.z + extent.z, origin.z - extent.z
+            # From inside the actor's top, so a prop sunk partly into the ground reads as resting on it.
+            ground = _trace_down(world, origin.x, origin.y, ignore=[actor], top=top - 1)
+            above = _trace_down(world, origin.x, origin.y, ignore=[actor], top=origin.z + 200000)
+            if ground is None and above is None:
+                continue
+            if ground is not None:
+                height = bottom - ground["impact_point"].z
+                mounted = unreal.SystemLibrary.line_trace_single(
+                    world, unreal.Vector(origin.x, origin.y, top - 1), unreal.Vector(origin.x, origin.y, top + 15),
+                    unreal.TraceTypeQuery.TRACE_TYPE_QUERY1, True, [actor], unreal.DrawDebugTrace.NONE, True)
+                if gap < height < 2000 and not mounted and mobility != "MOVABLE":
+                    report("floating", actor, f"bottom is {height:.0f} cm above {_label(ground.get('hit_actor')) if ground.get('hit_actor') else 'the surface'} below")
+            if above is not None and isinstance(above.get("hit_actor"), unreal.LandscapeProxy) and \
+                    above["impact_point"].z > top + 1:
+                report("buried", actor, f"top is {above['impact_point'].z - top:.0f} cm under the landscape")
+        lights = [a for a in actors if isinstance(a, unreal.Light)]
+        stationary = []
+        for light in lights:
+            comp = _try(lambda: light.get_editor_property("light_component"))
+            if comp is None or isinstance(comp, unreal.DirectionalLightComponent):
+                continue
+            mobility = str(_try(lambda: comp.get_editor_property("mobility"), "")).split(".")[-1].split(":")[0]
+            if mobility == "STATIONARY" and _try(lambda: comp.get_editor_property("cast_shadows"), True):
+                radius = _try(lambda: comp.get_editor_property("attenuation_radius"), 1000.0)
+                stationary.append((light, light.get_actor_location(), radius))
+        for light, loc, radius in stationary:
+            overlapping = [o for o, oloc, orad in stationary if o != light and loc.distance(oloc) < radius + orad]
+            if len(overlapping) >= 4:
+                report("stationary lights", light, f"overlaps {len(overlapping)} other shadowing stationary lights "
+                                                   "(only 4 get shadow channels; the rest lose shadows)")
+        return json.dumps({"actors": len(actors), "issues": issues, "capped": len(issues) >= limit})
 
     @_tool
     @staticmethod

@@ -12,7 +12,7 @@ from .editor import cmd_build, cmd_close, cmd_crash, cmd_open, cmd_status
 from .calls import (
     cmd_actors, cmd_ai, cmd_anim, cmd_api, cmd_asset, cmd_call, cmd_changes, cmd_config, cmd_delete, cmd_drop,
     cmd_duplicate, cmd_exec, cmd_find, cmd_log, cmd_mat, cmd_mv, cmd_nav, cmd_new, cmd_props, cmd_py, cmd_refs,
-    cmd_foliage, cmd_rm, cmd_save, cmd_savegame, cmd_scatter, cmd_set, cmd_spawn, cmd_tools, cmd_undo, cmd_watch,
+    cmd_foliage, cmd_level, cmd_rm, cmd_save, cmd_savegame, cmd_scatter, cmd_set, cmd_spawn, cmd_tools, cmd_undo, cmd_watch,
 )
 from .images import cmd_look, cmd_shot
 from .testing import cmd_test
@@ -139,6 +139,10 @@ def build_parser():
     s.add_argument("--px", type=int, default=128, help="map: pixels per side (128, max 256)")
     s.add_argument("-o", "--output", help="map: PNG path (default Saved/Tether/shots/)")
     s.add_argument("--backup", help="restore: the backup file an edit printed")
+    s = add("level", cmd_level, "level check: floating/buried props, stacked duplicates, invisible blockers, lights")
+    s.add_argument("action", choices=["check"])
+    s.add_argument("--gap", type=float, default=5, help="cm above the surface that counts as floating (5)")
+    s.add_argument("--strict", action="store_true", help="exit 1 when anything is reported")
     s = add("foliage", cmd_foliage, "foliage instances: list by type, add over an area (snapped to the ground), remove")
     s.add_argument("action", nargs="?", default="list", choices=["list", "add", "remove"])
     s.add_argument("what", nargs="?", help="a FoliageType asset or a static mesh (add: required; remove: default all)")

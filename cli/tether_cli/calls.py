@@ -393,3 +393,32 @@ def cmd_foliage(ctx, args):
                      folder=args.folder))
     return 0
 
+
+LEVEL_KINDS = ("floating", "buried", "stacked", "invisible blocker", "below kill z", "outside", "stationary lights")
+
+
+def level_lines(data, per_kind=10):
+    """`ue level check` output: a count line, then the issues grouped by kind."""
+    by_kind = {}
+    for issue in data["issues"]:
+        by_kind.setdefault(issue["kind"], []).append(issue)
+    kinds = sorted(by_kind, key=lambda k: LEVEL_KINDS.index(k) if k in LEVEL_KINDS else 99)
+    lines = [f"{data['actors']} actors checked: " + (", ".join(f"{len(by_kind[k])} {k}" for k in kinds) if kinds
+                                                     else "nothing to report") + (" (capped)" if data.get("capped") else "")]
+    for kind in kinds:
+        lines.append(f"{kind}:")
+        for issue in by_kind[kind][:per_kind]:
+            lines.append(f"  {issue['actor']}  {issue['detail']}")
+        if len(by_kind[kind]) > per_kind:
+            lines.append(f"  ... +{len(by_kind[kind]) - per_kind} more (--limit N)")
+    return lines
+
+
+def cmd_level(ctx, args):
+    data = ctx.tether("level_check", gap=args.gap, limit=400)
+    data = json.loads(data) if isinstance(data, str) else data
+    for line in level_lines(data, args.limit if args.limit != 30 else 10):
+        print(line)
+    ctx.data = data
+    return 1 if data["issues"] and args.strict else 0
+
