@@ -153,6 +153,10 @@ def cmd_selftest(ctx, args):
           skip=probe_skip, ok=lambda c, o: c != 0 and "no property" in o)
     check("drop", ["drop", "TetherSelftestProbe"], skip=probe_skip,
           ok=lambda c, o: c == 0 and ("-> " in o or "no ground below" in o))
+    check("collision", ["collision", "TetherSelftestProbe"], skip=probe_skip,
+          ok=lambda c, o: c == 0 and "profile" in o and "Block:" in o)
+    check("trace --editor", ["trace", "--editor", "--from", "0,0,5000", "--to", "0,0,-5000"],
+          ok=lambda c, o: c == 0 and "line trace on Visibility" in o)
     check("undo --editor", ["undo", "--editor"], skip=probe_skip, ok=lambda c, o: c == 0 and "undone:" in o)
     check("redo", ["redo"], skip=probe_skip, ok=lambda c, o: c == 0 and "redone:" in o)
     check("mat", ["mat", "/Engine/BasicShapes/BasicShapeMaterial"], ok=lambda c, o: c == 0 and "vector  Color" in o)
@@ -271,6 +275,7 @@ def cmd_selftest(ctx, args):
           ok=lambda c, o: c == 0 and "sample(s)" in o and "player  " in o)
     check("pie record", ["pie", "record", "--seconds", "1", "-o", os.path.join(tempfile.gettempdir(), "tether-selftest-rec.txt")],
           ok=lambda c, o: (c == 0 and "recorded" in o) or "no keys to record" in o)
+    check("trace (player view)", ["trace", "--distance", "2000"], ok=lambda c, o: c == 0 and "trace on Visibility" in o)
     check("ui", ["ui"], ok=lambda c, o: c == 0)
     check("ai", ["ai"], ok=lambda c, o: c == 0 and ("AI" in o))
     check("audio", ["audio"], skip=None if launch.get("sound", not launch.get("headless")) else "no audio device (ue open --headless --sound)",

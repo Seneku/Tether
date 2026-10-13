@@ -1456,6 +1456,21 @@ class Budget(unittest.TestCase):
         self.assertEqual(ue.memreport_numbers(text), {"process_mb": 5120.5, "peak_mb": 6000.0, "textures_mb": 812.31})
 
 
+class TraceOutput(unittest.TestCase):
+    def test_blocking_and_passing_hits(self):
+        data = {"start": [0, 0, 150], "end": [1000, 0, 150], "channel": "Interact", "sphere": 0,
+                "hits": [{"actor": "Trigger", "component": "Box", "distance": 120.0, "blocking": False, "profile": "Trigger",
+                          "response": "overlap", "phys_mat": None},
+                         {"actor": "Door_2", "component": "Mesh", "distance": 312.5, "blocking": True, "profile": "BlockAll",
+                          "response": "block", "phys_mat": "PM_Wood"}]}
+        self.assertEqual(ue.trace_lines(data), [
+            "line trace on Interact from (0, 0, 150) to (1000, 0, 150):",
+            "  passes Trigger (Box) at 120 cm, profile Trigger, overlap on Interact",
+            "  BLOCKED by Door_2 (Mesh) at 312.5 cm, profile BlockAll, block on Interact, PM_Wood"])
+        self.assertEqual(ue.trace_lines(dict(data, hits=[], sphere=20.0))[0],
+                         "sphere 20 cm trace on Interact from (0, 0, 150) to (1000, 0, 150): nothing hit")
+
+
 class JsonEnvelope(unittest.TestCase):
     def run_json(self, project, *argv):
         out = io.StringIO()

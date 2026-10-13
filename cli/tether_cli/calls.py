@@ -464,3 +464,31 @@ def cmd_statetree(ctx, args):
     print(ctx.tether("statetree", target=args.asset or "-", pie=args.pie))
     return 0
 
+
+def trace_lines(data):
+    """`ue trace` output: the first blocking hit, then what the trace passed through."""
+    hits = data["hits"]
+    head = (f"{'sphere ' + format(data['sphere'], 'g') + ' cm' if data['sphere'] else 'line'} trace on {data['channel']} "
+            f"from ({', '.join(map(str, data['start']))}) to ({', '.join(map(str, data['end']))})")
+    lines = [head + (": nothing hit" if not hits else ":")]
+    for hit in hits:
+        what = f"{hit['actor']} ({hit['component']}) at {hit['distance']:g} cm, profile {hit['profile'] or '?'}"
+        what += f", {hit['response'] or '?'} on {data['channel']}" + (f", {hit['phys_mat']}" if hit["phys_mat"] else "")
+        lines.append(("  BLOCKED by " if hit["blocking"] else "  passes ") + what)
+    return lines
+
+
+def cmd_trace(ctx, args):
+    data = ctx.tether("trace", start=args.start, end=args.to, distance=args.distance, channel=args.channel,
+                      sphere=args.sphere, pie=not args.editor, complex=not args.simple)
+    data = json.loads(data) if isinstance(data, str) else data
+    for line in trace_lines(data):
+        print(line)
+    ctx.data = data
+    return 0
+
+
+def cmd_collision(ctx, args):
+    print(ctx.tether("collision", target=args.actor, pie=args.pie))
+    return 0
+

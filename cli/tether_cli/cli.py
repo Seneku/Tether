@@ -12,7 +12,7 @@ from .editor import cmd_build, cmd_close, cmd_crash, cmd_open, cmd_status
 from .calls import (
     cmd_actors, cmd_ai, cmd_anim, cmd_api, cmd_asset, cmd_call, cmd_changes, cmd_config, cmd_delete, cmd_drop,
     cmd_duplicate, cmd_exec, cmd_find, cmd_log, cmd_mat, cmd_mv, cmd_nav, cmd_new, cmd_props, cmd_py, cmd_refs,
-    cmd_foliage, cmd_level, cmd_rm, cmd_statetree, cmd_save, cmd_savegame, cmd_scatter, cmd_set, cmd_spawn, cmd_tools, cmd_undo, cmd_watch,
+    cmd_collision, cmd_foliage, cmd_level, cmd_rm, cmd_statetree, cmd_trace, cmd_save, cmd_savegame, cmd_scatter, cmd_set, cmd_spawn, cmd_tools, cmd_undo, cmd_watch,
 )
 from .images import cmd_look, cmd_shot
 from .testing import cmd_test
@@ -143,6 +143,17 @@ def build_parser():
     s.add_argument("--px", type=int, default=128, help="map: pixels per side (128, max 256)")
     s.add_argument("-o", "--output", help="map: PNG path (default Saved/Tether/shots/)")
     s.add_argument("--backup", help="restore: the backup file an edit printed")
+    s = add("trace", cmd_trace, "what a trace hits (PIE by default): from the player's view, or between points/actors")
+    s.add_argument("--from", dest="start", default="player", help="player (PIE camera), camera (editor view), an actor, or x,y,z")
+    s.add_argument("--to", default="look", help="look (along the view), an actor, or x,y,z")
+    s.add_argument("--distance", type=float, default=5000, help="with --to look: how far, cm (5000)")
+    s.add_argument("--channel", default="Visibility", help="trace channel: Visibility, Camera, or the project's (e.g. Interact)")
+    s.add_argument("--sphere", type=float, default=0, help="sweep a sphere of this radius")
+    s.add_argument("--simple", action="store_true", help="trace simple collision only (default: complex)")
+    s.add_argument("--editor", action="store_true", help="trace the edited level instead of PIE")
+    s = add("collision", cmd_collision, "an actor's collision: profiles, object types, responses per channel")
+    s.add_argument("actor")
+    s.add_argument("--pie", action="store_true", help="the PIE world's actor")
     s = add("level", cmd_level, "level check: floating/buried props, stacked duplicates, invisible blockers, lights")
     s.add_argument("action", choices=["check"])
     s.add_argument("--gap", type=float, default=5, help="cm above the surface that counts as floating (5)")

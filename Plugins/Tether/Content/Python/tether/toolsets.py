@@ -1590,6 +1590,59 @@ def _anim_graph_lines(bp):
     return lines
 
 
+_ENGINE_CHANNELS = [("ECC_WORLD_STATIC", "WorldStatic", False), ("ECC_WORLD_DYNAMIC", "WorldDynamic", False),
+                    ("ECC_PAWN", "Pawn", False), ("ECC_VISIBILITY", "Visibility", True), ("ECC_CAMERA", "Camera", True),
+                    ("ECC_PHYSICS_BODY", "PhysicsBody", False), ("ECC_VEHICLE", "Vehicle", False),
+                    ("ECC_DESTRUCTIBLE", "Destructible", False)]
+
+
+def _collision_channels():
+    """[(CollisionChannel enum name, display name, is a trace channel)]: the engine's, then the project's own
+    from [/Script/Engine.CollisionProfile] in DefaultEngine.ini."""
+    path = os.path.join(unreal.Paths.convert_relative_path_to_full(unreal.Paths.project_config_dir()), "DefaultEngine.ini")
+    try:
+        with open(path, encoding="utf-8-sig", errors="replace") as f:
+            return _parse_channels(f.read())
+    except OSError:
+        return list(_ENGINE_CHANNELS)
+
+
+def _parse_channels(text):
+    """The engine's channels plus those a DefaultEngine.ini declares, in channel order."""
+    channels = list(_ENGINE_CHANNELS)
+    custom = []
+    for line in re.findall(r"^\+DefaultChannelResponses=\((.*)\)\s*$", text, re.M):
+        channel = re.search(r"Channel=ECC_GameTraceChannel(\d+)", line)
+        name = re.search(r'Name="([^"]+)"', line)
+        if channel and name:
+            custom.append((int(channel.group(1)), name.group(1), "bTraceType=True" in line))
+    for number, name, trace in sorted(custom):
+        channels.append((f"ECC_GAME_TRACE_CHANNEL{number}", name, trace))
+    return channels
+
+
+def _trace_type(channel_name):
+    """The TraceTypeQuery for a trace channel's name: Visibility, Camera, then the project's trace channels in
+    channel order, as the engine numbers them."""
+    traces = [c for c in _collision_channels() if c[2]]
+    for index, (_, name, _) in enumerate(traces):
+        if name.lower() == channel_name.lower():
+            return getattr(unreal.TraceTypeQuery, f"TRACE_TYPE_QUERY{index + 1}"), name
+    raise RuntimeError(f"no trace channel '{channel_name}' (trace channels: {', '.join(c[1] for c in traces)})")
+
+
+def _responses(component):
+    """'Block: Pawn, Visibility; Overlap: ...; Ignore: ...' for a primitive component."""
+    groups = {}
+    for enum_name, name, _ in _collision_channels():
+        channel = getattr(unreal.CollisionChannel, enum_name, None)
+        if channel is None:
+            continue
+        response = _enum_name(_try(lambda: component.get_collision_response_to_channel(channel), "?"))
+        groups.setdefault(response.replace("ecr", ""), []).append(name)
+    return "; ".join(f"{kind.title()}: {', '.join(names)}" for kind, names in groups.items() if names)
+
+
 def _rot_tuple(rot):
     return rot.pitch, rot.yaw, rot.roll
 
@@ -2360,6 +2413,118 @@ class TetherCore(_Base):
         zs = [a.get_actor_location().z for a in placed]
         return (f"placed {len(placed)} of {count} {prefix}" + (f" (z {min(zs):.0f} to {max(zs):.0f})" if zs else "")
                 + (": " + "; ".join(notes) if notes else "") + (f"; labels {prefix}_01.." if placed else ""))
+
+    @_tool
+    @staticmethod
+    def trace(start: str = "player", end: str = "look", distance: float = 5000.0, channel: str = "Visibility",
+              sphere: float = 0.0, pie: bool = True, complex: bool = True) -> str:
+        """Trace like gameplay code does and say what it hits: every hit along the way and the first blocking one,
+        with each hit component's collision profile and response to the channel.
+
+        Args:
+            start: 'player' (the PIE player's camera), 'camera' (the editor viewport), an actor, or 'x,y,z'.
+            end: 'look' (along the view, distance cm), an actor, or 'x,y,z'.
+            distance: With end 'look': how far, cm.
+            channel: Trace channel name: Visibility, Camera, or one of the project's (e.g. Interact).
+            sphere: Sweep a sphere of this radius instead of a line.
+            pie: Trace in the PIE world (else the edited level).
+            complex: Trace against complex (per-triangle) collision.
+
+        Returns:
+            JSON {start, end, channel, hits: [{actor, component, distance, blocking, profile, response, phys_mat}]}.
+        """
+        world = _game_world() if pie else unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_editor_world()
+        if world is None:
+            raise RuntimeError("PIE is not running (ue pie start, or --editor for the edited level)")
+        trace_type, channel_name = _trace_type(channel)
+        ignore, forward = [], None
+        if start in ("player", "camera"):
+            if start == "player":
+                if not pie:
+                    raise RuntimeError("'player' needs PIE; use 'camera' for the editor viewport")
+                _, pawn, _ = _pie_player()
+                camera = unreal.GameplayStatics.get_player_camera_manager(world, 0)
+                origin, rotation = camera.get_camera_location(), camera.get_camera_rotation()
+                ignore.append(pawn)
+            else:
+                info = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_level_viewport_camera_info()
+                if not info:
+                    raise RuntimeError("no level viewport camera (a -nullrhi editor has none)")
+                origin, rotation = info
+            forward = rotation.get_forward_vector()
+        else:
+            origin = _point(start, pie)
+            if not _numbers(start):
+                ignore.append(_resolve(start, pie))
+        if end == "look":
+            if forward is None:
+                raise RuntimeError("'look' needs start 'player' or 'camera'; give an end point or actor")
+            target = origin + forward * distance
+        else:
+            target = _point(end, pie)
+        args = (world, origin, target) + ((sphere,) if sphere > 0 else ()) + (trace_type, complex, ignore,
+                                                                               unreal.DrawDebugTrace.NONE, True)
+        hits = (unreal.SystemLibrary.sphere_trace_multi if sphere > 0 else unreal.SystemLibrary.line_trace_multi)(*args) or []
+        channel_enum = next((getattr(unreal.CollisionChannel, e, None) for e, n, _ in _collision_channels()
+                             if n == channel_name), None)
+        rows = []
+        for hit in hits:
+            fields = _try(lambda: hit.to_dict()) or dict(zip(_HIT_FIELDS, hit.to_tuple()))
+            comp, actor = fields.get("hit_component"), fields.get("hit_actor")
+            phys = fields.get("phys_mat")
+            rows.append({"actor": _label(actor) if actor else None, "component": comp.get_name() if comp else None,
+                         "distance": round(fields.get("distance") or 0.0, 1), "blocking": bool(fields.get("blocking_hit")),
+                         "point": [round(v) for v in _vec_tuple(fields["impact_point"])],
+                         "profile": str(_try(lambda: comp.get_collision_profile_name(), "")) if comp else "",
+                         "response": _enum_name(_try(lambda: comp.get_collision_response_to_channel(channel_enum), "")).replace("ecr", "")
+                         if comp and channel_enum is not None else "",
+                         "phys_mat": phys.get_name() if phys else None})
+        return json.dumps({"start": [round(v) for v in _vec_tuple(origin)], "end": [round(v) for v in _vec_tuple(target)],
+                           "channel": channel_name, "sphere": sphere, "hits": rows})
+
+    @_tool
+    @staticmethod
+    def collision(target: str, pie: bool = False) -> str:
+        """An actor's collision, component by component: profile, enabled state, object type, the response to
+        every channel (the project's own included), overlap events, physics, and for static meshes whether they
+        have simple collision and how complex collision is used.
+
+        Args:
+            target: Actor label or name.
+            pie: Read the PIE world's actor.
+
+        Returns:
+            Text.
+        """
+        obj = _resolve(target, pie)
+        actor = obj if isinstance(obj, unreal.Actor) else obj.get_owner()
+        comps = actor.get_components_by_class(unreal.PrimitiveComponent)
+        lines = [f"{_label(actor)} ({actor.get_class().get_name()}), {len(comps)} primitive component(s)"
+                 + ("" if actor.get_actor_enable_collision() else "; collision disabled on the actor")]
+        for comp in comps:
+            enabled = _enum_name(_try(lambda: comp.get_collision_enabled(), "?"))
+            obj_enum = _enum_name(_try(lambda: comp.get_collision_object_type(), "?"))
+            obj_type = next((n for e, n, _ in _collision_channels() if _enum_name(e) == obj_enum), obj_enum)
+            state = {"queryandphysics": "query and physics", "queryonly": "query only", "physicsonly": "physics only",
+                     "nocollision": "no collision", "probeonly": "probe only", "queryandprobe": "query and probe"}
+            head = (f"  {comp.get_name()} ({comp.get_class().get_name()}): profile {comp.get_collision_profile_name()}, "
+                    f"{state.get(enabled, enabled)}, object type {obj_type}")
+            extra = []
+            if _try(lambda: comp.get_editor_property("generate_overlap_events"), False):
+                extra.append("overlap events")
+            if _try(lambda: comp.is_simulating_physics(), False):
+                extra.append("simulates physics")
+            if isinstance(comp, unreal.StaticMeshComponent) and comp.get_editor_property("static_mesh"):
+                mesh = comp.get_editor_property("static_mesh")
+                simple = _try(lambda: unreal.EditorStaticMeshLibrary.get_simple_collision_count(mesh), 0) + \
+                    _try(lambda: unreal.EditorStaticMeshLibrary.get_convex_collision_count(mesh), 0)
+                flag = _enum_name(_try(lambda: unreal.EditorStaticMeshLibrary.get_collision_complexity(mesh), ""))
+                extra.append(f"{simple} simple shape(s)" + (", complex as simple" if "complexassimple" in flag else
+                                                            ", simple as complex" if "simpleascomplex" in flag else ""))
+            lines.append(head + (f" ({', '.join(extra)})" if extra else ""))
+            if enabled not in ("nocollision", "?"):
+                lines.append(f"    {_responses(comp)}")
+        return "\n".join(lines)
 
     @_tool
     @staticmethod

@@ -198,3 +198,16 @@ class LegacyNames(unittest.TestCase):
         self.assertEqual(toolsets._legacy_key("bCastShadows"), toolsets._legacy_key("cast_shadows"))
         self.assertEqual(toolsets._legacy_key("LightColor"), toolsets._legacy_key("light_color"))
         self.assertEqual(toolsets._legacy_key("bounds"), "bounds")  # a lowercase b is part of the name
+
+
+class CollisionChannels(unittest.TestCase):
+    def test_project_channels_follow_the_engine_ones(self):
+        ini = """[/Script/Engine.CollisionProfile]
++DefaultChannelResponses=(Channel=ECC_GameTraceChannel2,DefaultResponse=ECR_Block,bTraceType=True,bStaticObject=False,Name="Interact")
++DefaultChannelResponses=(Channel=ECC_GameTraceChannel1,Name="Projectile",DefaultResponse=ECR_Block,bTraceType=False,bStaticObject=False)
+"""
+        channels = toolsets._parse_channels(ini)
+        self.assertEqual(channels[-2:], [("ECC_GAME_TRACE_CHANNEL1", "Projectile", False),
+                                         ("ECC_GAME_TRACE_CHANNEL2", "Interact", True)])
+        self.assertEqual([c[1] for c in channels if c[2]], ["Visibility", "Camera", "Interact"])
+

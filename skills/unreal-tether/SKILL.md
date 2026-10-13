@@ -75,6 +75,9 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
 - Terrain: `ue landscape` (size, layers), `ue landscape at x,y` (height, slope, layer weights: use it before placing
   things), `ue landscape map` (a PNG of the shape). `ue landscape flatten x,y,r [--height z]` (a pad for a
   building), `raise x,y,r --by cm`, `smooth x,y,r`; each prints a backup for `ue landscape restore --backup`.
+- "Can't interact with / pick up / shoot X": `ue pie start`, aim with `ue pie do "look X"`, then `ue trace --channel
+  <the channel the code traces on>` (what blocks first, and each component's response); `ue collision X` shows its
+  profiles and per-channel responses.
 - Took a wrong step? `ue undo --editor` (or `ue undo --editor 3`) reverts the editor's last edits of any kind and
   names each; `ue redo` puts them back. Plain `ue undo` only covers `ue set`.
 - Grass, bushes, trees: `ue foliage add /Game/Foliage/FT_Fern --area 1200,-300,2000 --density 40` (real foliage
