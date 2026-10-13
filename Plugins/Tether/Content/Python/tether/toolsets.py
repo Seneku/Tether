@@ -2363,6 +2363,42 @@ class TetherCore(_Base):
 
     @_tool
     @staticmethod
+    def editor_undo(action: str = "status", count: int = 1, token: str = "") -> str:
+        """The editor's own undo history (every transacted edit, not only Tether's): undo or redo the last N
+        entries. Their titles go to the log (LogEditorTransaction: Undo/Redo <title>); the ue CLI prints them.
+
+        Args:
+            action: status, undo or redo.
+            count: How many entries.
+            token: Session token from Saved/Tether/editors/<pid>.token (the ue CLI sends it).
+
+        Returns:
+            JSON {undoable, done}.
+        """
+        lib = unreal.ToolsetLibrary
+        if action == "status":
+            return json.dumps({"undoable": lib.get_active_undo_count(), "done": 0})
+        _authorize(token)
+        if _game_world() is not None:
+            raise RuntimeError("PIE is running; stop it first (ue pie stop): undo during play is not safe")
+        done = 0
+        for _ in range(max(1, count)):
+            if action == "undo":
+                if lib.get_active_undo_count() == 0 or not lib.undo_transaction(True):
+                    break
+            elif action == "redo":
+                before = lib.get_active_undo_count()
+                unreal.SystemLibrary.execute_console_command(None, "TRANSACTION REDO")
+                if lib.get_active_undo_count() <= before:
+                    break
+            else:
+                raise RuntimeError("action: status, undo or redo")
+            done += 1
+        _UNDO.clear()  # Tether's own undo records no longer match the level
+        return json.dumps({"undoable": lib.get_active_undo_count(), "done": done})
+
+    @_tool
+    @staticmethod
     def anim_graph(target: str) -> str:
         """An Animation Blueprint's AnimGraph and state machines as text: what feeds the output pose, each state
         machine's entry state, each state with what it plays, aliases, and every transition with its rule and blend.

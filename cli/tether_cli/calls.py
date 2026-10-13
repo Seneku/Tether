@@ -199,8 +199,29 @@ def cmd_save(ctx, args):
 
 
 def cmd_undo(ctx, args):
+    if getattr(args, "editor", False) or args.cmd == "redo":
+        return editor_undo(ctx, "redo" if args.cmd == "redo" else "undo", args.count)
     print(ctx.tether("undo"))
     return 0
+
+
+def editor_undo(ctx, action, count):
+    """Undo or redo entries of the editor's own history, naming each from the log."""
+    start = log_end(ctx.project)
+    result = ctx.tether("editor_undo", action=action, count=count)
+    result = json.loads(result) if isinstance(result, str) else result
+    flush_editor_log(ctx)
+    with open(log_path(ctx.project), "rb") as f:
+        f.seek(start)
+        titles = [m.group(1) for m in re.finditer(rf"LogEditorTransaction: {action.title()} (.*)",
+                                                  f.read().decode("utf-8", "replace"))]
+    for title in titles:
+        print(f"{ {'undo': 'undone', 'redo': 'redone'}[action]}: {title.strip()}")
+    if not result["done"]:
+        print(f"nothing to {action}")
+    print(f"{result['undoable']} more undoable step(s) in the editor's history")
+    ctx.data = dict(result, titles=titles)
+    return 0 if result["done"] else 1
 
 
 def cmd_watch(ctx, args):

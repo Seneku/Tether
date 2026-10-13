@@ -153,6 +153,8 @@ def cmd_selftest(ctx, args):
           skip=probe_skip, ok=lambda c, o: c != 0 and "no property" in o)
     check("drop", ["drop", "TetherSelftestProbe"], skip=probe_skip,
           ok=lambda c, o: c == 0 and ("-> " in o or "no ground below" in o))
+    check("undo --editor", ["undo", "--editor"], skip=probe_skip, ok=lambda c, o: c == 0 and "undone:" in o)
+    check("redo", ["redo"], skip=probe_skip, ok=lambda c, o: c == 0 and "redone:" in o)
     check("mat", ["mat", "/Engine/BasicShapes/BasicShapeMaterial"], ok=lambda c, o: c == 0 and "vector  Color" in o)
     check("mat graph", ["mat", "graph", "/Engine/BasicShapes/BasicShapeMaterial"],
           ok=lambda c, o: c == 0 and "BaseColor <- #1" in o)
