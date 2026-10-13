@@ -2358,6 +2358,122 @@ class TetherCore(_Base):
 
     @_tool
     @staticmethod
+    def ai(target: str = "", limit: int = 40) -> str:
+        """AI-controlled pawns in PIE: movement and path following, focus, what they perceive, their brain
+        (behavior tree or StateTree), blackboard values, and the state their project classes expose through
+        no-argument getters (get_*, is_*, has_*). One line per AI, or a block for one (or a single) AI.
+
+        Args:
+            target: A pawn or controller label/name ('' for all AIs).
+            limit: Maximum number of AIs listed.
+
+        Returns:
+            Summary lines, or a detailed block.
+        """
+        game = _game_world()
+        if game is None:
+            raise RuntimeError("PIE is not running (ue pie start)")
+        controllers = list(unreal.GameplayStatics.get_all_actors_of_class(game, unreal.AIController))
+        pawn_of = lambda c: _try(lambda: c.k2_get_pawn()) or _try(lambda: c.get_controlled_pawn())
+        if target:
+            key = target.lower()
+            controllers = [c for c in controllers if key in (c.get_actor_label().lower(), c.get_name().lower())
+                           or (pawn_of(c) and key in (pawn_of(c).get_actor_label().lower(), pawn_of(c).get_name().lower()))] \
+                or [c for c in controllers if pawn_of(c) and key in pawn_of(c).get_actor_label().lower()]
+            if not controllers:
+                raise RuntimeError(f"no AI-controlled pawn '{target}' in PIE")
+        if not controllers:
+            return "no AI controllers in the PIE world"
+        enum = lambda v: str(v).split(".")[-1].split(":")[0].lower()
+        vec = lambda v: f"({v.x:.0f}, {v.y:.0f}, {v.z:.0f})"
+
+        def facts(controller):
+            pawn = pawn_of(controller)
+            out = {"pawn": pawn, "controller": controller}
+            status = _try(lambda: controller.get_move_status())
+            out["move"] = enum(status) if status is not None else "?"
+            if out["move"] == "moving" and pawn:
+                dest = controller.get_immediate_move_destination()
+                out["move"] += f" to {vec(dest)}, {pawn.get_actor_location().distance(dest):.0f} cm" + \
+                    (" (partial path)" if _try(lambda: controller.has_partial_path(), False) else "")
+            focus = _try(lambda: controller.get_focus_actor())
+            out["focus"] = _label(focus) if focus else ""
+            perception = _try(lambda: controller.get_ai_perception_component())
+            seen = _try(lambda: perception.get_currently_perceived_actors(None), []) if perception else []
+            out["perceives"] = [_label(a) for a in seen or []]
+            brain = _try(lambda: controller.get_editor_property("brain_component"))
+            out["brain"] = (f"{brain.get_class().get_name()} " + ("running" if _try(lambda: brain.is_running(), False)
+                                                                  else "stopped")) if brain else ""
+            return out
+
+        if len(controllers) > 1 and not target:
+            rows = []
+            for controller in controllers[:limit]:
+                f = facts(controller)
+                pawn = f["pawn"]
+                where = vec(pawn.get_actor_location()) if pawn else "(no pawn)"
+                rows.append(f"{_label(pawn) if pawn else controller.get_actor_label()} at {where}: {f['move']}"
+                            + (f", focus {f['focus']}" if f["focus"] else "")
+                            + (f", perceives {', '.join(f['perceives'][:3])}" if f["perceives"] else "")
+                            + (f", {f['brain']}" if f["brain"] else ""))
+            return _capped(f"{len(controllers)} AI(s) (ue ai <name> for one in detail)", rows, limit)
+
+        blocks = []
+        for controller in controllers[:limit]:
+            f = facts(controller)
+            pawn = f["pawn"]
+            lines = [f"{_label(pawn) if pawn else '(no pawn)'} ({pawn.get_class().get_name() if pawn else '-'})"
+                     + (f" at {vec(pawn.get_actor_location())}, speed {pawn.get_velocity().length():.0f} cm/s" if pawn else "")]
+            lines.append(f"  controller {controller.get_actor_label()} ({controller.get_class().get_name()})")
+            lines.append(f"  move: {f['move']}")
+            lines.append(f"  focus: {f['focus'] or 'none'}")
+            lines.append(f"  perceives: {', '.join(f['perceives']) or 'nothing'}")
+            if f["brain"]:
+                lines.append(f"  brain: {f['brain']}")
+            board = _try(lambda: controller.get_editor_property("blackboard"))
+            data = _try(lambda: board.get_editor_property("default_blackboard_asset")) if board else None
+            keys = _try(lambda: data.get_editor_property("keys"), []) if data else []
+            values = []
+            for entry in keys or []:
+                name = str(entry.get_editor_property("entry_name"))
+                kind = entry.get_editor_property("key_type").get_class().get_name().replace("BlackboardKeyType_", "")
+                getter = {"Object": "get_value_as_object", "Vector": "get_value_as_vector", "Float": "get_value_as_float",
+                          "Int": "get_value_as_int", "Bool": "get_value_as_bool", "Name": "get_value_as_name",
+                          "String": "get_value_as_string", "Enum": "get_value_as_enum",
+                          "Rotator": "get_value_as_rotator"}.get(kind)
+                value = _try(lambda: getattr(board, getter)(name)) if getter else "?"
+                values.append(f"{name}={_label(value) if isinstance(value, unreal.Object) else vec(value) if isinstance(value, unreal.Vector) else _short(value, 40)}")
+            if values:
+                lines.append("  blackboard: " + ", ".join(values))
+            for owner, base in ((pawn, unreal.Character if isinstance(pawn, unreal.Character) else unreal.Pawn),
+                                (controller, unreal.AIController)):
+                if owner is None:
+                    continue
+                getters = sorted(n for n in set(dir(type(owner))) - set(dir(base))
+                                 if n.startswith(("get_", "is_", "has_")) and callable(getattr(type(owner), n, None)))
+                shown = []
+                for name in getters:
+                    value = _try(lambda: getattr(owner, name)(), _MISSING)
+                    if value is _MISSING or value is None:
+                        continue
+                    if isinstance(value, unreal.StructBase):
+                        value = _try(lambda: _compact(value.to_dict()), str(value))
+                    elif isinstance(value, unreal.Object):
+                        value = _label(value)
+                    elif isinstance(value, unreal.EnumBase):
+                        value = enum(value)
+                    elif isinstance(value, bool):
+                        value = str(value).lower()
+                    elif isinstance(value, float):
+                        value = _round(value)
+                    shown.append(f"{name}={_short(value, 40)}")
+                if shown:
+                    lines.append(f"  {owner.get_class().get_name()} getters: " + ", ".join(shown))
+            blocks.append("\n".join(lines))
+        return "\n".join(blocks)
+
+    @_tool
+    @staticmethod
     def find(query: str = "", cls: str = "", under: str = "/Game", limit: int = 50) -> str:
         """Search the asset registry by name and/or class.
 

@@ -2618,6 +2618,11 @@ def cmd_ui(ctx, args):
     return 0
 
 
+def cmd_ai(ctx, args):
+    print(ctx.tether("ai", target=args.target or "", limit=args.limit))
+    return 0
+
+
 def cmd_find(ctx, args):
     print(ctx.tether("find", query=args.query or "", cls=args.cls or "", under=args.under, limit=args.limit))
     return 0
@@ -2962,6 +2967,7 @@ def cmd_selftest(ctx, args):
     check("pie do", ["pie", "do", "at 100,200,300", "near 100,200,300 50", "expect player.location ~ ."],
           ok=lambda c, o: c == 0 and "PASS" in o)
     check("ui", ["ui"], ok=lambda c, o: c == 0)
+    check("ai", ["ai"], ok=lambda c, o: c == 0 and ("AI" in o))
     fixture = (ue("py", "hasattr(unreal, 'TetherProbeUILibrary')")[1].splitlines() or [""])[-1] == "True"
     check("ui click (Sandbox fixture)", ["pie", "do", "call /Script/Sandbox.Default__TetherProbeUILibrary ShowProbeUI",
                                          "expect-ui Tether probe panel", "click UMG Probe Button", "expect-ui UMG clicks: "],
@@ -4013,6 +4019,8 @@ def main(argv=None):
     s.add_argument("rest", nargs="*")
     s.add_argument("--all", action="store_true", help="also images and zero-size widgets")
     s.add_argument("--submit", action="store_true", help="with type: press Enter afterwards")
+    s = add("ai", cmd_ai, "AI in PIE: movement/path, focus, perception, brain, blackboard, project getters")
+    s.add_argument("target", nargs="?", help="a pawn or controller (default: one line per AI)")
     s = add("find", cmd_find, "search assets by name and/or class (asset registry)")
     s.add_argument("query", nargs="?", help="regex on the asset name")
     s.add_argument("--class", dest="cls", help="regex on the class name, e.g. StaticMesh or 'Material$'")
