@@ -889,6 +889,13 @@ class SlateSnapshots(unittest.TestCase):
         with self.assertRaises(ue.CliError):
             ue.find_ui(nodes, "Lit")  # the editor's own control is not game UI
 
+    def test_the_viewport_wins_over_a_stale_client_window_unless_that_client_is_targeted(self):
+        stale = ('window "Game Preview [NetMode: Client 1]  (64-bit)" [ref=w9]\n'
+                 '  button "Close" [size=10,10] [src=SWindow.cpp:1] [ref=b9]\n')
+        nodes = ue.parse_snapshot(stale + self.SNAPSHOT)
+        self.assertIn('text "INVENTORY"', ue.ui_lines(ue.game_ui(nodes)))
+        self.assertEqual(ue.ui_lines(ue.game_ui(nodes, client=1)), ['button "Close"  (b9)'])
+
     def test_a_pie_window_is_all_game(self):
         text = 'window "Game Preview [NetMode: Standalone 0]" [ref=w2]\n  button "Play" [size=10,10] [src=SMenu.cpp:1] [ref=b1]'
         self.assertEqual(ue.ui_lines(ue.game_ui(ue.parse_snapshot(text))), ['button "Play"  (b1)'])

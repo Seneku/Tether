@@ -2681,12 +2681,18 @@ def subtree(nodes, i):
     return nodes[i + 1:end]
 
 
-def game_ui(nodes):
-    """The game's widgets in a whole-editor Slate snapshot: a PIE window's content, or the level viewport's panel
-    minus the editor's own controls (told apart by the source file that created each widget)."""
-    for i, node in enumerate(nodes):
-        if node["role"] == "window" and re.search(r"Preview \[NetMode|\(PIE\)", node["label"]):
-            return subtree(nodes, i)
+def game_ui(nodes, client=0):
+    """The game's widgets in a whole-editor Slate snapshot: the level viewport's panel minus the editor's own
+    controls (told apart by the source file that created each widget), or for a multiplayer client (or PIE in
+    a new window) that client's PIE window. Stale windows of earlier sessions are not taken for the game."""
+    def pie_window(wanted):
+        for i, node in enumerate(nodes):
+            if node["role"] == "window" and re.search(wanted, node["label"]):
+                return subtree(nodes, i)
+        return None
+
+    if client:
+        return pie_window(rf"NetMode: Client {client}\]") or []
     for i, node in enumerate(nodes):
         if node["role"] != "tab" or not node["label"].startswith("Viewport") or not node["src"].startswith("SLevelEditor"):
             continue
@@ -2701,7 +2707,7 @@ def game_ui(nodes):
                 game.append(n)
         if game:
             return game
-    return []
+    return pie_window(r"Preview \[NetMode|\(PIE\)") or []
 
 
 def ui_nodes(ctx):
@@ -2709,7 +2715,9 @@ def ui_nodes(ctx):
     if ctx.transport == "remote" or UI_TOOLSET not in catalog(ctx):
         return None, False
     text = mcp_tool(ctx, "SlateInspectorToolset", "Snapshot", {"ref": "", "maxDepth": 120, "bIncludeSourceLocations": True})
-    return game_ui(parse_snapshot(text if isinstance(text, str) else json.dumps(text))), True
+    target = re.search(r"^\* (\d+):", pie_net(ctx, "status"), re.M)  # `ue pie target` picks a client's window
+    return game_ui(parse_snapshot(text if isinstance(text, str) else json.dumps(text)),
+                   int(target.group(1)) if target else 0), True
 
 
 def ui_lines(nodes, show_all=False, match=None):
