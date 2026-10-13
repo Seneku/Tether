@@ -901,6 +901,51 @@ def _rec_tick(_delta):
 _MASK_SUFFIX = re.compile(r"_(ORM|ARM|MRA|RMA|ORD|Masks?|AO|Rough(ness)?|Metal(lic)?|Height)$", re.I)
 
 
+def _dependency_options():
+    return unreal.AssetRegistryDependencyOptions(
+        include_soft_package_references=True, include_hard_package_references=True, include_searchable_names=False,
+        include_soft_management_references=False, include_hard_management_references=False)
+
+
+def _fixup_redirector(package, vcs):
+    """Point everything that references a redirector at its target, then delete it. Python has no
+    fixup_referencers in 5.8, so do what it does: load each referencer (which follows the redirector) and save
+    it (which stores the target). Returns (referencers saved, problems)."""
+    registry = unreal.AssetRegistryHelpers.get_asset_registry()
+    referencers = sorted({str(n) for n in registry.get_referencers(package, _dependency_options()) or []} - {package})
+    files = [_package_file(r) for r in referencers]
+    problems, _, _ = vcs.prepare(files)
+    if problems:
+        return 0, problems
+    saved = 0
+    for ref in referencers:  # external actor packages have no asset of their own name, so save packages
+        pkg = _try(lambda: unreal.load_package(ref))
+        if pkg and unreal.EditorLoadingAndSavingUtils.save_packages([pkg], False):
+            saved += 1
+        else:
+            problems.append(f"could not resave {ref}")
+    left = sorted({str(n) for n in registry.get_referencers(package, _dependency_options()) or []} - {package})
+    if left:
+        problems.append(f"{package} is still referenced by {', '.join(left[:3])}")
+        return saved, problems
+    # Delete the file itself: Python cannot see redirector objects (no unreal.ObjectRedirector), and
+    # EditorAssetLibrary.delete_asset only marks the package deleted in memory, so it would come back.
+    file = _package_file(package)
+    issues, _, _ = vcs.prepare([file])
+    if issues:
+        return saved, problems + issues
+    loaded = unreal.find_package(package)
+    if loaded:
+        unreal.EditorLoadingAndSavingUtils.unload_packages([loaded])
+    try:
+        os.remove(file)
+    except OSError as exc:
+        return saved, problems + [f"could not delete {file}: {exc}"]
+    vcs.deleted([file])
+    unreal.AssetRegistryHelpers.get_asset_registry().scan_files_synchronous([file], True)
+    return saved, problems
+
+
 _IMPORT_TAG = "TetherImport"  # asset metadata: the options `ue import` applied, re-applied on reimport
 
 
@@ -2025,8 +2070,9 @@ class TetherCore(_Base):
             raise RuntimeError("the rename failed (see ue log)")
         leftover = unreal.load_asset(source) if library.does_asset_exist(source) else None
         if leftover is not None and leftover.get_class().get_name() == "ObjectRedirector":
-            unreal.AssetToolsHelpers.get_asset_tools().fixup_referencers([leftover])  # repoint, drop redirector
-            notes.append("redirector fixed up")
+            saved, problems = _fixup_redirector(source, vcs)  # repoint the referencers, drop the redirector
+            notes.append(f"redirector fixed up, {saved} referencer(s) saved" if not problems
+                         else "redirector left: " + "; ".join(problems))
         notes += vcs.added([_package_file(target, source_file.endswith(".umap"))]) + vcs.deleted([source_file])
         maps, content = _dirty_packages()
         touched = [p for p in maps + content if p != target and p not in dirty_before]
@@ -3384,6 +3430,77 @@ class TetherCore(_Base):
         running = state.get("handle") is not None
         return (f"watching {len(state['specs'])} value(s), {len(state['samples'])} sample(s)" if running
                 else "no watch running")
+
+    @_tool
+    @staticmethod
+    def unused(path: str = "/Game", roots: str = "[]") -> str:
+        """Assets nothing uses: everything not reachable through the asset registry's dependencies (hard and
+        soft) from the roots. Roots: every map under /Game, Primary Asset Labels, editor utilities, and the
+        packages or 'dir:/Game/Folder' prefixes given (the CLI adds what the config and code name).
+
+        Args:
+            path: Content folder to report on.
+            roots: JSON list of extra root packages, or 'dir:/Game/X' for every asset under a folder.
+
+        Returns:
+            JSON {unused: [[package, class]], redirectors: [package], roots: {kind: count}, total: int}.
+        """
+        registry = unreal.AssetRegistryHelpers.get_asset_registry()
+        classes = {}
+        for data in registry.get_assets_by_path("/Game", recursive=True):
+            classes.setdefault(str(data.package_name), str(data.asset_class_path.asset_name))
+        extra = json.loads(roots or "[]")
+        dirs = [r[4:].rstrip("/") + "/" for r in extra if r.startswith("dir:")]
+        named = {r.split(".")[0] for r in extra if not r.startswith("dir:")}
+        counts = {"maps": 0, "labels and editor tools": 0, "named in config/code": 0, "always-cook folders": 0}
+        queue = []
+        for package, cls in classes.items():
+            kind = ("maps" if cls == "World" else
+                    "labels and editor tools" if cls == "PrimaryAssetLabel" or cls.startswith("EditorUtility") else
+                    "named in config/code" if package in named else
+                    "always-cook folders" if any(package.startswith(d) for d in dirs) else None)
+            if kind:
+                counts[kind] += 1
+                queue.append(package)
+        reached, options = set(queue), _dependency_options()
+        while queue:
+            package = queue.pop()
+            for dep in registry.get_dependencies(package, options) or []:
+                dep = str(dep)
+                if dep not in reached and dep.startswith("/Game/"):
+                    reached.add(dep)
+                    queue.append(dep)
+        prefix = path.rstrip("/") + "/"
+        skip = ("/Game/Developers/", "/Game/Collections/", "/Game/__ExternalActors__/", "/Game/__ExternalObjects__/")
+        unused, redirectors = [], []
+        for package, cls in sorted(classes.items()):
+            if not package.startswith(prefix) or package.startswith(skip) or "/__External" in package:
+                continue
+            if cls == "ObjectRedirector":
+                redirectors.append(package)
+            elif package not in reached:
+                unused.append([package, cls])
+        return json.dumps({"unused": unused, "redirectors": redirectors, "roots": counts,
+                           "total": sum(1 for p in classes if p.startswith(prefix))})
+
+    @_tool
+    @staticmethod
+    def fix_redirectors(paths: str, token: str = "") -> str:
+        """Fix up redirectors: resave what references each one (now pointing at the real asset), then delete it.
+
+        Args:
+            paths: JSON list of redirector packages.
+            token: Session token from Saved/Tether/session.json (the ue CLI sends it).
+
+        Returns:
+            One line per redirector.
+        """
+        _authorize(token)
+        vcs, lines = _Vcs(), []
+        for package in json.loads(paths):
+            saved, problems = _fixup_redirector(package, vcs)
+            lines.append(f"{package}: " + ("; ".join(problems) if problems else f"fixed, {saved} referencer(s) resaved"))
+        return "\n".join(lines)
 
     @_tool
     @staticmethod

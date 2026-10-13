@@ -1,9 +1,11 @@
-"""Content hygiene and intake: ue import."""
+"""Content hygiene and intake: ue import, ue unused."""
 import json
 import os
+import re
 
-from .core import CliError, filter_log, log_end, log_path
+from .core import CliError, filter_log, human_bytes, log_end, log_path
 from .calls import flush_editor_log
+from .assets import SKIP_DIRS, SOURCE_EXTS, package_bytes, project_code_roots
 
 IMPORT_EXTS = {
     "mesh": (".fbx", ".obj", ".glb", ".gltf", ".usd", ".usda", ".usdc", ".usdz", ".abc"),
@@ -98,3 +100,82 @@ def cmd_import(ctx, args):
         if more:
             print(f"  ... +{more} more (ue log --since start)")
     return code
+
+
+GAME_PATH = re.compile(r"/Game/[\w/\-]+(?:\.[\w\-]+)?")
+ROOT_DIR_LINE = re.compile(r"DirectoriesToAlwaysCook|PrimaryAssetTypesToScan|DirectoriesToNeverCook")
+ROOT_DIR = re.compile(r'Path="(/Game/[^"]*)"')
+
+
+def unused_roots(project):
+    """Roots the asset registry cannot see: /Game paths the config and code name, and the folders the
+    Asset Manager scans or always cooks (as 'dir:' entries)."""
+    roots, folders = set(), set()
+    for top in project_code_roots(project):
+        for dirpath, dirs, files in os.walk(top):
+            dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+            for name in files:
+                if not name.endswith(SOURCE_EXTS + (".ini",)):
+                    continue
+                try:
+                    with open(os.path.join(dirpath, name), encoding="utf-8", errors="replace") as f:
+                        for line in f:
+                            if "/Game/" not in line:
+                                continue
+                            if name.endswith(".ini") and ROOT_DIR_LINE.search(line):
+                                if "NeverCook" not in line:
+                                    folders.update(ROOT_DIR.findall(line))
+                                continue
+                            roots.update(m.split(".")[0] for m in GAME_PATH.findall(line))
+                except OSError:
+                    continue
+    return sorted(roots) + sorted("dir:" + f for f in folders)
+
+
+def cmd_unused(ctx, args):
+    """Assets nothing reaches from the maps, config, code and cook settings, biggest first; redirectors."""
+    if args.redirectors:
+        data = ctx.tether("unused", path=args.path, roots="[]")
+        found = data["redirectors"]
+        if not found:
+            print(f"no redirectors under {args.path}")
+            return 0
+        if not args.fix:
+            print(f"{len(found)} redirector(s) under {args.path} (ue unused --redirectors --fix resaves their "
+                  "referencers and deletes them):")
+            for package in found[: args.limit]:
+                print("  " + package)
+            ctx.data = found
+            return 0
+        out = ctx.tether("fix_redirectors", paths=json.dumps(found))
+        print(out)
+        return 1 if any(not line.split(": ", 1)[-1].startswith("fixed") for line in out.splitlines()) else 0
+    roots = unused_roots(ctx.project)
+    data = ctx.tether("unused", path=args.path, roots=json.dumps(roots))
+    rows = [(package, cls, package_bytes(ctx.project, package) or 0) for package, cls in data["unused"]]
+    rows.sort(key=lambda r: -r[2])
+    total = sum(r[2] for r in rows)
+    root_text = ", ".join(f"{n} {kind}" for kind, n in data["roots"].items() if n)
+    print(f"{len(rows)} of {data['total']} asset(s) under {args.path} are unused, {human_bytes(total)} on disk"
+          f" (reached from: {root_text or 'nothing'})")
+    for package, cls, size in rows[: args.top]:
+        print(f"  {human_bytes(size):>9}  {package}  {cls}")
+    if len(rows) > args.top:
+        print(f"  ... +{len(rows) - args.top} more (--top N)")
+    folders = {}
+    for package, _, size in rows:
+        folder = package.rsplit("/", 1)[0]
+        count, total_size = folders.get(folder, (0, 0))
+        folders[folder] = (count + 1, total_size + size)
+    if len(folders) > 1:
+        print("by folder:")
+        for folder, (count, size) in sorted(folders.items(), key=lambda kv: -kv[1][1])[:8]:
+            print(f"  {human_bytes(size):>9}  {folder}  ({count})")
+    if data["redirectors"]:
+        print(f"{len(data['redirectors'])} redirector(s) too (ue unused --redirectors)")
+    if rows:
+        print("note: an asset loaded only by a path built at runtime looks unused here; `ue usages <asset>` "
+              "before deleting")
+    ctx.data = {"unused": [{"package": p, "class": c, "bytes": b} for p, c, b in rows],
+                "redirectors": data["redirectors"], "roots": data["roots"]}
+    return 0

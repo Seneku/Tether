@@ -1218,6 +1218,29 @@ class ImportPlan(unittest.TestCase):
             project.close()
 
 
+class UnusedRoots(unittest.TestCase):
+    def test_config_and_code_paths_and_cook_folders(self):
+        project = Project()
+        try:
+            project.write("Config/DefaultEngine.ini", """[/Script/EngineSettings.GameMapsSettings]
+GameDefaultMap=/Game/Maps/MainMenu.MainMenu
+GlobalDefaultGameMode=/Game/Core/BP_GameMode.BP_GameMode_C
+""")
+            project.write("Config/DefaultGame.ini", """[/Script/UnrealEd.ProjectPackagingSettings]
++DirectoriesToAlwaysCook=(Path="/Game/UI")
++DirectoriesToNeverCook=(Path="/Game/Dev")
+[/Script/Engine.AssetManagerSettings]
++PrimaryAssetTypesToScan=(PrimaryAssetType="Map",AssetBaseClass=/Script/Engine.World,Directories=((Path="/Game/Maps")))
+""")
+            project.write("Source/Game/Hero.cpp",
+                          'static ConstructorHelpers::FObjectFinder<USoundBase> Hit(TEXT("/Game/Audio/S_Hit.S_Hit"));')
+            roots = ue.unused_roots(project.uproject)
+            self.assertEqual(roots, ["/Game/Audio/S_Hit", "/Game/Core/BP_GameMode", "/Game/Maps/MainMenu",
+                                     "dir:/Game/Maps", "dir:/Game/UI"])
+        finally:
+            project.close()
+
+
 class JsonEnvelope(unittest.TestCase):
     def run_json(self, project, *argv):
         out = io.StringIO()

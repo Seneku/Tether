@@ -17,7 +17,7 @@ from .calls import (
 from .images import cmd_look, cmd_shot
 from .testing import cmd_test
 from .assets import cmd_bp, cmd_diff, cmd_overview, cmd_size, cmd_table, cmd_usages, cmd_validate
-from .content import cmd_import
+from .content import cmd_import, cmd_unused
 from .jobs import cmd_job, cmd_package
 from .play import cmd_audio, cmd_mem, cmd_perf, cmd_soak, cmd_ui, cmd_world
 from .playtest import cmd_input, pie_command
@@ -31,8 +31,8 @@ UNREAL_ROOTS = ("Game", "Script", "Engine", "Temp", "Memory")
 
 def undo_msys_paths(argv):
     """Git Bash (MSYS) rewrites arguments that look like POSIX paths when it starts a Windows program, so
-    `/Game/Maps/L` arrives as `C:/Program Files/Git/Game/Maps/L` (also after `key=`). Undo that for
-    Unreal package roots, bare (`/Game`) or with a path."""
+    `/Game/Maps/L` arrives as `C:/Program Files/Git/Game/Maps/L` (also after `key=`, and inside Python code
+    passed to `ue py`). Undo that for Unreal package roots, bare (`/Game`) or with a path."""
     if os.name != "nt" or not os.environ.get("MSYSTEM"):
         return argv
     import shutil
@@ -40,8 +40,8 @@ def undo_msys_paths(argv):
     if not bash:
         return argv
     root = os.path.dirname(os.path.dirname(os.path.dirname(bash))).replace("\\", "/")  # ...\Git\usr\bin\bash
-    rx = re.compile("(^|=)" + re.escape(root) + "(?=/(?:" + "|".join(UNREAL_ROOTS) + r")(?:[/,]|$))", re.I)
-    return [rx.sub(r"\1", a) for a in argv]
+    rx = re.compile(re.escape(root) + "(?=/(?:" + "|".join(UNREAL_ROOTS) + r")(?!\w))", re.I)
+    return [rx.sub("", a) for a in argv]
 
 
 def build_parser():
@@ -326,6 +326,11 @@ def build_parser():
     s.add_argument("--texture-group", help="textures: LOD group, e.g. World, Character, UI, Effects")
     s.add_argument("--no-replace", action="store_true", help="skip files whose asset already exists")
     s.add_argument("--save", action="store_true", help="save the imported assets")
+    s = add("unused", cmd_unused, "assets nothing uses (from maps, config, code, cook settings), biggest first; redirectors")
+    s.add_argument("path", nargs="?", default="/Game", help="content folder to report on (default /Game)")
+    s.add_argument("--top", type=int, default=20, help="rows in the biggest list (20)")
+    s.add_argument("--redirectors", action="store_true", help="list redirectors instead")
+    s.add_argument("--fix", action="store_true", help="with --redirectors: resave their referencers and delete them")
     s = add("find", cmd_find, "search assets by name and/or class (asset registry)")
     s.add_argument("query", nargs="?", help="regex on the asset name")
     s.add_argument("--class", dest="cls", help="regex on the class name, e.g. StaticMesh or 'Material$'")
