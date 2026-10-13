@@ -629,7 +629,8 @@ and the UBT log under `~/Library/Application Support/Epic` or `~/.config/Epic`. 
 Windows-only, so `ue build` asks for `--restart` there. Running the suite on Linux (WSL) found three
 real bugs: the log cursor keyed on `st_ctime` (it changes on every write on POSIX; the inode is used
 there now), C# frame file names taken with `basename` (Windows paths in the log), and a
-case-sensitive `Source/` check in the post-edit hook. CI now runs the tests on Windows, Linux and macOS.
+case-sensitive `Source/` check in the post-edit hook. The tests pass on Windows, Linux and macOS (hosted CI ran them until 2026-10-13; it was removed to keep the
+repository free of GitHub billing).
 Not yet driven against a real Mac or Linux editor.
 
 ## 9. Decisions

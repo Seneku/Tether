@@ -75,8 +75,8 @@ and a private mid-size C++/Blueprint game. Methodology is in [docs/DESIGN.md](do
   A launcher install is fine; no source build needed.
 - Python 3 on `PATH`, for the CLI. It uses the standard library only.
 - Windows is the tested platform. macOS and Linux are supported by the CLI (engine discovery,
-  `Build.sh`/`RunUAT.sh`, the editor binary, clang diagnostics, detached launch), and CI runs the unit
-  tests there, but they have not been driven against a real Mac or Linux editor yet. Live Coding is
+  `Build.sh`/`RunUAT.sh`, the editor binary, clang diagnostics, detached launch), and the unit tests
+  pass there, but they have not been driven against a real Mac or Linux editor yet. Live Coding is
   Windows-only in UE, so C++ changes there go through `ue build --restart`.
 - Optional: the .NET 10 SDK and UnrealSharp, for C#.
 
@@ -277,7 +277,7 @@ reports welcome.
 | `cli/` | `ue.py`, the CLI (one stdlib-only file) |
 | `bin/` | `ue` and `ue.cmd` launchers; the Claude Code plugin puts this folder on the agent's PATH |
 | `.claude-plugin/`, `skills/`, `hooks/` | Claude Code plugin manifest (the repo is also its own marketplace), the `unreal-tether` skill, and the hooks |
-| `tests/` | Unit tests for the editor-free parts; CI runs them on every push |
+| `tests/` | Unit tests for the editor-free parts (`python -m unittest discover -s tests`) |
 | `Plugins/Tether/` | Python toolset plugin |
 | `Plugins/TetherUnrealSharp/` | Optional C++ bridge for UnrealSharp hot reload |
 | `.claude/`, `.mcp.json` | This repo's own Claude Code settings: Epic's plugin, wired to the sandbox editor for comparison runs |

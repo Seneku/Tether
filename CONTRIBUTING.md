@@ -59,8 +59,8 @@ Close the editor with `ue close` when you're done.
 ## Testing
 
 Unit tests cover the parts that need no editor: log filtering, diagnostics, change classification,
-hooks, and the toolset's value parsing (with `unreal` stubbed). CI runs them on Windows for Python 3.11
-(the version bundled with UE 5.8) and 3.13. Before opening a PR:
+hooks, and the toolset's value parsing (with `unreal` stubbed). There is no hosted CI: run them yourself, ideally
+on Python 3.11 (the version bundled with UE 5.8) and a current 3.x. Before opening a PR:
 
 1. `python -m unittest discover -s tests`, and add tests for new parsing or routing logic.
 2. Against the Sandbox editor (`ue open --headless --render`), run the commands your change touches, then
