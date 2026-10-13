@@ -1,0 +1,11 @@
+{
+  "map": "/Game/TetherFixtures/L_TetherTerrain",
+  "frame_ms_p95": 33.3,
+  "hitches": 5,
+  "memory_mb": 12000,
+  "map_mb": 5,
+  "content_mb": 50,
+  "pie_start_s": 5,
+  "streaming_s": 10,
+  "seconds": 3
+}

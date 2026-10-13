@@ -1443,6 +1443,19 @@ class WatchBaseline(unittest.TestCase):
             "P/tests/play/baselines/door.json"))
 
 
+class Budget(unittest.TestCase):
+    def test_rows_in_a_fixed_order_with_verdicts(self):
+        rows = ue.budget_rows({"memory_mb": 8000, "frame_ms_p95": 16.7, "pie_start_s": 5},
+                              {"frame_ms_p95": 21.4, "memory_mb": 6400.0})
+        self.assertEqual(rows, [("frame time p95", "21.4 ms", 16.7, "OVER"), ("editor + PIE memory", "6400.0 MB", 8000, "OK"),
+                                ("PIE start", "not measured", 5, "n/a")])
+
+    def test_memreport_numbers(self):
+        text = ("MemReport: Begin command \"Mem FromReport\"\nProcess Physical Memory: 5120.50 MB used, 6000.00 MB peak\n"
+                "MemReport: End command\nTotal size: InMem= 812.31 MB  OnDisk= 900.00 MB\n")
+        self.assertEqual(ue.memreport_numbers(text), {"process_mb": 5120.5, "peak_mb": 6000.0, "textures_mb": 812.31})
+
+
 class JsonEnvelope(unittest.TestCase):
     def run_json(self, project, *argv):
         out = io.StringIO()

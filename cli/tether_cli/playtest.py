@@ -1,4 +1,4 @@
-"""Play testing: input maps, recording a play session, watching properties over time, load hitches."""
+"""Play testing: input maps, recording and watching play, regression baselines, load hitches, budgets."""
 import argparse
 import csv
 import datetime
@@ -11,8 +11,8 @@ import time
 
 from .core import CliError, editor_mode, log_end, log_path, read_json, state_dir
 from .calls import flush_editor_log
-from .assets import cmd_bp, code_usages
-from .play import cmd_perf, cmd_pie, insights_exe, insights_export, pie_do, unthrottled
+from .assets import cmd_bp, cmd_size, code_usages, folder_packages, package_bytes
+from .play import cmd_mem, cmd_perf, cmd_pie, insights_exe, insights_export, pie_do, unthrottled
 
 
 def input_lines(data, match=None, code_refs=None):
@@ -703,3 +703,97 @@ def pie_command(ctx, args):
     if args.action == "record":
         return pie_record(ctx, args)
     return cmd_pie(ctx, args)
+
+
+# Config/Tether/budget.json: limits, and what to measure them on.
+BUDGET_KEYS = {
+    "frame_ms_p95": ("frame time p95", "ms"), "game_ms_p95": ("game thread p95", "ms"),
+    "render_ms_p95": ("render thread p95", "ms"), "gpu_ms_p95": ("GPU p95", "ms"), "hitches": ("hitches", ""),
+    "memory_mb": ("editor + PIE memory", "MB"), "textures_mb": ("texture memory", "MB"),
+    "map_mb": ("map on disk", "MB"), "content_mb": ("content on disk", "MB"),
+    "pie_start_s": ("PIE start", "s"), "streaming_s": ("streaming done", "s"), "load_hitches": ("load hitches", ""),
+}
+PERF_STATS = {"frame_ms_p95": "FrameTime", "game_ms_p95": "GameThreadTime", "render_ms_p95": "RenderThreadTime",
+              "gpu_ms_p95": "GPUTime"}
+
+
+def budget_rows(limits, measured):
+    """(label, value text, limit, verdict) per limit, in BUDGET_KEYS order; verdict OK, OVER or n/a."""
+    rows = []
+    for key, (label, unit) in BUDGET_KEYS.items():
+        if key not in limits:
+            continue
+        value = measured.get(key)
+        if value is None:
+            rows.append((label, "not measured", limits[key], "n/a"))
+            continue
+        text = f"{value:.1f} {unit}".strip() if isinstance(value, float) else f"{value} {unit}".strip()
+        rows.append((label, text, limits[key], "OVER" if value > limits[key] else "OK"))
+    return rows
+
+
+def _quietly(fn, ctx, args):
+    """Run a command for its data, keeping its own output out of the budget table."""
+    import contextlib
+    import io
+    saved, ctx.data = ctx.data, None
+    with contextlib.redirect_stdout(io.StringIO()):
+        code = fn(ctx, args)
+    data, ctx.data = ctx.data, saved
+    return code, data or {}
+
+
+def cmd_budget(ctx, args):
+    """Measure what Config/Tether/budget.json limits and compare. Exit 1 when anything is over."""
+    path = os.path.join(os.path.dirname(ctx.project), "Config", "Tether", "budget.json")
+    try:
+        with open(path, encoding="utf-8") as f:
+            config = json.load(f)
+    except OSError:
+        raise CliError(f"no {os.path.relpath(path, os.path.dirname(ctx.project))}: write one, e.g. "
+                       '{"map": "/Game/Maps/Main", "frame_ms_p95": 16.7, "memory_mb": 8000, "pie_start_s": 5}')
+    except ValueError as exc:
+        raise CliError(f"{path}: {exc}")
+    limits = {k: v for k, v in config.items() if k in BUDGET_KEYS}
+    unknown = [k for k in config if k not in BUDGET_KEYS and k not in ("map", "route", "seconds")]
+    if unknown:
+        print(f"note: ignoring unknown keys {', '.join(unknown)} (known: {', '.join(BUDGET_KEYS)})")
+    measured, seconds = {}, float(config.get("seconds", 10))
+    wanted = set(limits)
+    if config.get("map") or wanted & {"pie_start_s", "streaming_s", "load_hitches"}:
+        load_args = argparse.Namespace(action="load", map=config.get("map"), file=config.get("route"), hitch=50.0, top=8,
+                                       seconds=None if config.get("route") else 3)
+        _, data = _quietly(perf_load, ctx, load_args)
+        measured.update(pie_start_s=data.get("pie_start_s"), streaming_s=data.get("streaming_done_s"),
+                        load_hitches=len(data.get("hitches", [])))
+    if wanted & (set(PERF_STATS) | {"hitches"}):
+        _, data = _quietly(cmd_perf, ctx, argparse.Namespace(seconds=seconds, editor=False, no_record=True, trace=False,
+                                                             top=6, limit=0, action=None))
+        for key, stat in PERF_STATS.items():
+            if isinstance(data.get(stat), dict):
+                measured[key] = round(data[stat].get("p95", 0.0), 1)
+        measured["hitches"] = data.get("hitches")
+    if wanted & {"memory_mb", "textures_mb"}:
+        _, data = _quietly(cmd_mem, ctx, argparse.Namespace(full="textures_mb" in wanted, top=3, timeout=args.timeout))
+        measured.update(memory_mb=data.get("process_mb"), textures_mb=data.get("textures_mb"))
+    if "content_mb" in wanted:
+        _, data = _quietly(cmd_size, ctx, argparse.Namespace(path="/Game", deps=False, top=1, limit=1))
+        measured["content_mb"] = round(data.get("total_bytes", 0) / 1048576, 1)
+    if "map_mb" in wanted:
+        level = config.get("map") or (ctx.beacon or {}).get("map") or ""
+        if level.startswith("/Game/"):  # the map package and, with World Partition, its actors' packages
+            try:
+                actors = folder_packages(ctx.project, "/Game/__ExternalActors__/" + level[len("/Game/"):])
+            except CliError:  # not a World Partition map
+                actors = {}
+            measured["map_mb"] = round(((package_bytes(ctx.project, level) or 0) + sum(actors.values())) / 1048576, 1)
+    rows = budget_rows(limits, measured)
+    width = max(len(r[0]) for r in rows) if rows else 0
+    print(f"budget ({os.path.relpath(path, os.path.dirname(ctx.project))}" + (f", map {config['map']}" if config.get("map") else "") + "):")
+    for label, text, limit, verdict in rows:
+        print(f"  {verdict:<4} {label:<{width}}  {text} (limit {limit:g})")
+    over = [r for r in rows if r[3] == "OVER"]
+    print(f"{len(over)} over budget" if over else "within budget")
+    ctx.data = [{"limit": lim, "label": lab, "value": text, "verdict": v} for lab, text, lim, v in rows]
+    return 1 if over else 0
+

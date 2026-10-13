@@ -78,6 +78,18 @@ def memreport_summary(text, top=8):
     return out
 
 
+def memreport_numbers(text):
+    """{process_mb, peak_mb, textures_mb} from a memreport (textures only with -full)."""
+    numbers = {}
+    process = re.search(r"Process Physical Memory: ([\d.]+) MB used, ([\d.]+) MB peak", text)
+    if process:
+        numbers.update(process_mb=float(process.group(1)), peak_mb=float(process.group(2)))
+    textures = re.search(r"^Total size: InMem= ([\d.]+) MB", text, re.M)
+    if textures:
+        numbers["textures_mb"] = float(textures.group(1))
+    return numbers
+
+
 def cmd_mem(ctx, args):
     """Memory of the running editor (and PIE), from a memreport, in a few lines."""
     folder = os.path.join(os.path.dirname(ctx.project), "Saved", "Profiling", "MemReports")
@@ -99,7 +111,9 @@ def cmd_mem(ctx, args):
     if not new:
         raise CliError("memreport wrote no file (ue log --grep MemReport)")
     with open(new[-1], encoding="utf-8", errors="replace") as f:
-        lines = memreport_summary(f.read(), args.top)
+        text = f.read()
+    lines = memreport_summary(text, args.top)
+    ctx.data = dict(memreport_numbers(text), report=new[-1])
     beacon = ctx.beacon or {}
     if beacon.get("pie"):
         lines.insert(0, "(PIE is running: the numbers include the play session)")

@@ -18,7 +18,7 @@ Modules, lowest layer first (each imports only from those above it):
   content    ue import, unused, lint, landscape
   jobs       ue job, ue package
   play       pie, ui, perf, mem, world, audio, soak
-  playtest   ue input, pie record, pie watch
+  playtest   ue input, pie record/watch, baselines, perf load, bp trace, budget
   hooks      Claude Code hooks
   setup      ue init, reload, doctor
   selftest   ue selftest, ue ci

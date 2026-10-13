@@ -20,7 +20,7 @@ from .assets import cmd_diff, cmd_overview, cmd_size, cmd_table, cmd_usages, cmd
 from .content import cmd_import, cmd_landscape, cmd_lint, cmd_unused
 from .jobs import cmd_job, cmd_package
 from .play import cmd_audio, cmd_mem, cmd_soak, cmd_ui, cmd_world
-from .playtest import bp_command, cmd_input, perf_command, pie_command
+from .playtest import bp_command, cmd_budget, cmd_input, perf_command, pie_command
 from .hooks import cmd_hook
 from .setup import cmd_doctor, cmd_init, cmd_reload
 from .selftest import cmd_ci, cmd_selftest
@@ -278,6 +278,7 @@ def build_parser():
     s.add_argument("--no-record", action="store_true", help="do not make this capture the comparison baseline")
     s.add_argument("--trace", action="store_true", help="also an Unreal Insights trace: top CPU scopes per thread")
     s.add_argument("--top", type=int, default=6, help="with --trace: scopes per thread (6)")
+    add("budget", cmd_budget, "measure what Config/Tether/budget.json limits (frame time, memory, sizes, load) and compare")
     s = add("asset", cmd_asset, "a few lines about assets, by type (mesh, texture, material, Blueprint, ...)")
     s.add_argument("paths", nargs="+", help="/Game/... asset paths")
     s = add("diff", cmd_diff, "what changed in an asset between git revisions, or a revision and the editor now")
@@ -419,6 +420,7 @@ def build_parser():
                    help="also run `ue pie do` step files (default tests/play/*.txt or Tests/Play/*.txt)")
     s.add_argument("--validate", nargs="?", const="/Game", metavar="PATH",
                    help="also run data validation on PATH (default /Game; ~0.1 s per asset) and Map Check")
+    s.add_argument("--budget", action="store_true", help="also check Config/Tether/budget.json (ue budget)")
     s.add_argument("--cook", action="store_true", help="also cook for this platform")
     s.add_argument("--cook-timeout", type=float, default=3600, help="seconds to allow the cook (3600)")
     s.add_argument("--report", metavar="FILE", help="write a JSON report (for CI artifacts)")

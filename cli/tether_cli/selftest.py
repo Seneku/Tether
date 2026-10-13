@@ -257,6 +257,9 @@ def cmd_selftest(ctx, args):
           ok=lambda c, o: c == 0 and "top scopes" in o)
     check("perf load", ["perf", "load", "--seconds", "1"], timeout=300, skip="needs 5.8" if remote else None,
           ok=lambda c, o: c == 0 and "PIE start:" in o and "frames, median" in o)
+    has_budget = os.path.isfile(os.path.join(os.path.dirname(project), "Config", "Tether", "budget.json"))
+    check("budget", ["budget"], timeout=900, skip=None if has_budget else "no Config/Tether/budget.json",
+          ok=lambda c, o: c in (0, 1) and ("within budget" in o or "over budget" in o))
     check("pie start", ["pie", "start"], ok=lambda c, o: c == 0 and "OK" in o, timeout=300)
     check("pie status", ["pie", "status"], ok=lambda c, o: c == 0 and "running" in o)
     check("actors --pie", ["actors", "--pie", "--limit", "1"])
@@ -348,6 +351,8 @@ def cmd_ci(ctx, args):
                 print(f"SKIP  play         no step files match {pattern}")
             for path in files:
                 step(f"play {os.path.splitext(os.path.basename(path))[0]}", ["pie", "do", "-f", path], timeout=900)
+        if getattr(args, "budget", False):
+            step("budget", ["budget"], timeout=1800)
         if args.validate:
             step("validate", ["validate", args.validate, "--map-check"])
         if args.cook:

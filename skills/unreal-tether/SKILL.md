@@ -194,6 +194,8 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
 ## Play testing
 - Performance: `ue perf` before and after a change; each run prints the difference from the previous one.
   `ue perf --trace` adds which scopes (functions, Blueprint events, render passes) take the time per thread.
+  Limits the project must stay within live in Config/Tether/budget.json; `ue budget` checks them all (exit 1
+  when over), and `ue ci --budget` makes CI fail on a regression.
   Stutter while moving through a level: `ue perf load [/Game/Maps/L] -f tests/play/route.txt` lists hitches
   with the packages that finished loading in each (and sync-load flushes), plus World Partition streaming time.
   Run it on a freshly opened editor: packages already in memory do not load again.
