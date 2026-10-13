@@ -154,6 +154,7 @@ The plugin's hooks stay silent outside Unreal projects, and never block a tool c
 
 | Command | What it does |
 |---|---|
+| `ue overview [--brief]` | A one-screen brief of the project from its files (no editor needed): modules and their game mode, controller, character, AI, HUD, subsystem and component classes, startup map and game mode, maps (World Partition marked), input actions, plugins, content size by folder, last commit. The session-start hook adds the brief version. |
 | `ue status` | Editor state from the beacon: map, PIE, PID, port, heartbeat. No HTTP. Names the dialog a hung windowed editor is waiting on. |
 | `ue init [--dry-run]` | Set up the project: enable the engine plugins Tether needs, copy the Tether editor plugin into `Plugins/`. |
 | `ue ci [--tests F] [--bp PATH] [--validate [PATH]] [--cook] [--report FILE]` | A project's checks in one pass/fail command: opens the editor headless if needed, runs the project's tests (`^<Project>.` by default), compiles all Blueprints, optionally validates content and cooks, closes again. IslandHorror: 64 s. Example GitHub Actions workflow (self-hosted runner): [docs/ci/unreal-ci.yml](docs/ci/unreal-ci.yml). |

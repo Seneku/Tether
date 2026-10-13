@@ -2924,6 +2924,104 @@ def cmd_usages(ctx, args):
     return 0
 
 
+CPP_CLASS = re.compile(r"^\s*class\s+(?:\w+_API\s+)?([AU]\w+)\s*(?:final\s*)?:\s*public\s+([AU]\w+)", re.M)
+ROLE_BASES = (("game mode", ("GameModeBase", "GameMode")), ("game state", ("GameStateBase", "GameState")),
+              ("player controller", ("PlayerController",)), ("character", ("Character",)), ("pawn", ("Pawn",)),
+              ("AI controller", ("AIController",)), ("HUD", ("HUD",)), ("game instance", ("GameInstance",)),
+              ("subsystem", ("GameInstanceSubsystem", "WorldSubsystem", "LocalPlayerSubsystem", "EngineSubsystem")),
+              ("component", ("ActorComponent", "SceneComponent")))
+
+
+def ini_value(project, ini, key):
+    path = os.path.join(os.path.dirname(project), "Config", ini)
+    try:
+        with open(path, encoding="utf-8-sig", errors="replace") as f:
+            match = re.search(rf"^{re.escape(key)}=(.*)$", f.read(), re.M)
+    except OSError:
+        return None
+    return match.group(1).strip() if match else None
+
+
+def project_overview(project, full=True):
+    """Lines describing the project from its files: engine, modules and key classes, maps, input, plugins, content."""
+    root, name = os.path.dirname(project), os.path.splitext(os.path.basename(project))[0]
+    data = read_json(project) or {}
+    out = [f"{name}: UE {data.get('EngineAssociation') or '?'}"]
+    modules = [m.get("Name") for m in data.get("Modules", [])]
+    classes, by_module = [], {}
+    for module in modules:
+        folder = os.path.join(root, "Source", module)
+        for dirpath, dirs, files in os.walk(folder):
+            dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+            for f in files:
+                if f.endswith(".h"):
+                    try:
+                        with open(os.path.join(dirpath, f), encoding="utf-8", errors="replace") as h:
+                            found = CPP_CLASS.findall(h.read())
+                    except OSError:
+                        continue
+                    classes += found
+                    by_module[module] = by_module.get(module, 0) + len(found)
+    if modules:
+        out.append("modules: " + ", ".join(f"{m} ({by_module.get(m, 0)} classes)" for m in modules))
+    bases = dict(classes)
+
+    def derives(cls, wanted, depth=0):
+        base = bases.get(cls)
+        return bool(base) and depth < 8 and (base[1:] in wanted or derives(base, wanted, depth + 1))
+
+    roles = []
+    for role, wanted in ROLE_BASES:
+        hits = [c for c, b in classes if b[1:] in wanted or derives(c, wanted)]
+        if hits and (full or role not in ("component", "subsystem")):
+            roles.append(f"{role}: " + ", ".join(hits[:5]) + (f" +{len(hits) - 5}" if len(hits) > 5 else ""))
+    if roles:
+        out.append("classes: " + " | ".join(roles))
+    if os.path.isdir(os.path.join(root, "Script")):
+        cs = sum(1 for _, _, files in os.walk(os.path.join(root, "Script")) for f in files if f.endswith(".cs"))
+        out.append(f"C# (UnrealSharp): {cs} .cs files under Script/")
+    short_path = lambda v: (v or "").split(".")[0] or "-"
+    out.append(f"startup map {short_path(ini_value(project, 'DefaultEngine.ini', 'EditorStartupMap'))}, game default "
+               f"{short_path(ini_value(project, 'DefaultEngine.ini', 'GameDefaultMap'))}, game mode "
+               f"{short_path(ini_value(project, 'DefaultEngine.ini', 'GlobalDefaultGameMode')).rsplit('/', 1)[-1]}")
+    maps, inputs = [], []
+    content = os.path.join(root, "Content")
+    for dirpath, dirs, files in os.walk(content):
+        dirs[:] = [d for d in dirs if not d.startswith("__External")]
+        for f in files:
+            if f.endswith(".umap"):
+                package = content_package(project, os.path.join(dirpath, f))
+                rest = package.split("/", 2)[2] if package else ""
+                wp = os.path.isdir(os.path.join(content, "__ExternalActors__", *rest.split("/")))
+                maps.append(package.rsplit("/", 1)[-1] + (" (WP)" if wp else ""))
+            elif f.startswith(("IA_", "IMC_")) and f.endswith(".uasset"):
+                inputs.append(f[:-7])
+    if maps:
+        out.append(f"maps ({len(maps)}): " + ", ".join(sorted(maps)[:12]) + (" ..." if len(maps) > 12 else ""))
+    if inputs:
+        out.append("input: " + ", ".join(sorted(inputs)[:12]) + (" ..." if len(inputs) > 12 else ""))
+    plugins = [p["Name"] for p in data.get("Plugins", []) if p.get("Enabled")]
+    own = sorted({f[:-8] for d, _, files in os.walk(os.path.join(root, "Plugins")) for f in files if f.endswith(".uplugin")})
+    if plugins or own:
+        out.append(f"plugins: {len(plugins)} enabled in the .uproject" + (f"; in Plugins/: {', '.join(own[:8])}" if own else ""))
+    if full:
+        sizes = folder_packages(project, "/Game") if os.path.isdir(content) else {}
+        groups = sorted(size_groups(sizes, 1).items(), key=lambda kv: -kv[1][0])
+        out.append(f"content: {len(sizes)} packages, {human_bytes(sum(sizes.values()))}"
+                   + (" (" + ", ".join(f"{k.rsplit('/', 1)[-1]} {human_bytes(b)}" for k, (b, n) in groups[:6]) + ")"
+                      if groups else ""))
+        head = run_git(project, "log", "-1", "--format=%h %s (%cr)", check=False)
+        if head:
+            out.append(f"git: {head.strip()[:120]}")
+    return out
+
+
+def cmd_overview(ctx, args):
+    for line in project_overview(ctx.project, full=not args.brief):
+        print(line)
+    return 0
+
+
 def cmd_find(ctx, args):
     print(ctx.tether("find", query=args.query or "", cls=args.cls or "", under=args.under, limit=args.limit))
     return 0
@@ -4070,19 +4168,26 @@ def project_in(cwd):
 
 
 def hook_session_start(payload):
-    """Two lines of editor state for the start of a session, so the agent need not ask."""
+    """Editor state plus a brief project overview at the start of a session, so the agent need not explore."""
     project = project_in(payload.get("cwd"))
     if not project:
         return None
     name = os.path.splitext(os.path.basename(project))[0]
+    try:
+        brief = "\n".join(project_overview(project, full=False)[1:])
+    except Exception:  # a hook must never fail
+        brief = ""
     beacon = read_json(os.path.join(state_dir(project), "editor.json")) or {}
     if not pid_alive(beacon.get("pid")):
-        return (f"Unreal project {name}: editor not running. Use the `ue` CLI (unreal-tether skill); "
+        head = (f"Unreal project {name}: editor not running. Use the `ue` CLI (unreal-tether skill); "
                 "start it with `ue open --headless` (`--render` if you need `ue shot`).")
-    report = stall_report(project)
-    state = report or ("PIE running" if beacon.get("pie") else "ready")
-    return (f"Unreal project {name}: editor {state} | map {beacon.get('map')} | UE {beacon.get('engine', '?').split('+')[0]} "
-            f"| mcp :{beacon.get('mcp_port')}\nUse the `ue` CLI (unreal-tether skill); `ue status` refreshes this.")
+    else:
+        report = stall_report(project)
+        state = report or ("PIE running" if beacon.get("pie") else "ready")
+        head = (f"Unreal project {name}: editor {state} | map {beacon.get('map')} | UE "
+                f"{beacon.get('engine', '?').split('+')[0]} | mcp :{beacon.get('mcp_port')}\n"
+                "Use the `ue` CLI (unreal-tether skill); `ue status` refreshes this.")
+    return head + (f"\nProject (ue overview for more):\n{brief}" if brief else "")
 
 
 RESTART_MACROS = re.compile(r"\b(UPROPERTY|UCLASS|USTRUCT|UENUM|UINTERFACE|GENERATED_BODY|GENERATED_UCLASS_BODY)\b")
@@ -4576,6 +4681,8 @@ def main(argv=None):
     s.add_argument("symbol", help="e.g. TryAttack, AEnemyCharacter, Health, or /Game/Path/Asset")
     s.add_argument("--max-mb", type=float, default=32, help="skip asset files bigger than this (32)")
     s.add_argument("--budget", type=float, default=20, help="seconds to spend reading Blueprint graphs (20)")
+    s = add("overview", cmd_overview, "one-screen project brief from its files: modules, key classes, maps, input, content")
+    s.add_argument("--brief", action="store_true", help="the short version the session-start hook uses")
     s = add("find", cmd_find, "search assets by name and/or class (asset registry)")
     s.add_argument("query", nargs="?", help="regex on the asset name")
     s.add_argument("--class", dest="cls", help="regex on the class name, e.g. StaticMesh or 'Material$'")

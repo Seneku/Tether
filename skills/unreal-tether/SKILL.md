@@ -16,6 +16,7 @@ If something behaves unexpectedly, `ue selftest` checks every capability in ~35 
 broken or unsupported.
 
 ## First moves
+- New to the project? `ue overview` (key classes, maps, input, content) before exploring files by hand.
 - `ue status`: is the editor up, which map, PIE on/off, heartbeat. Exit code 2 = not available.
 - `ue call tether.level_summary`: what is in the level (counts by class).
 - `ue actors <regex>`: label, class, location. `ue props <Actor|Actor.Component|/Game/Path> [regex]`:

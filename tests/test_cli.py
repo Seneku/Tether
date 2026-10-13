@@ -602,7 +602,7 @@ class LifecycleHooks(unittest.TestCase):
         self.live()
         text = ue.hook_session_start({"cwd": self.project.root})
         self.assertTrue(text.startswith("Unreal project Game: editor ready | map /Game/L | UE 5.8.3-1 | mcp :18000"))
-        self.assertEqual(len(text.splitlines()), 2)
+        self.assertEqual(text.splitlines()[1], "Use the `ue` CLI (unreal-tether skill); `ue status` refreshes this.")
         with tempfile.TemporaryDirectory() as elsewhere:
             self.assertIsNone(ue.hook_session_start({"cwd": elsewhere}))
 
@@ -975,6 +975,32 @@ class Pngs(unittest.TestCase):
         self.assertEqual((w, h, c), (2, 2, 4))
         self.assertEqual(px[:8], bytes([10, 20, 30, 255, 15, 25, 35, 255]))  # Sub adds the pixel to the left
         self.assertEqual(px[8:], bytes([11, 21, 31, 255, 17, 27, 37, 255]))  # Paeth predicts from above/left
+
+
+class Overview(unittest.TestCase):
+    def test_overview_from_files(self):
+        project = Project()
+        try:
+            with open(project.uproject, "w") as f:
+                f.write('{"EngineAssociation": "5.8", "Modules": [{"Name": "Game"}], "Plugins": [{"Name": "X", "Enabled": true}]}')
+            project.write("Source/Game/MyMode.h", "class GAME_API AMyMode : public AGameModeBase {};")
+            project.write("Source/Game/Hero.h", "class GAME_API AHero : public ABaseHero {};\nclass AbaseX;\n"
+                          "class GAME_API ABaseHero : public ACharacter {};")
+            project.write("Config/DefaultEngine.ini", "[/Script/EngineSettings.GameMapsSettings]\n"
+                          "EditorStartupMap=/Game/Maps/L.L\nGlobalDefaultGameMode=/Script/Game.MyMode\n")
+            project.write("Content/Maps/L.umap", "x")
+            project.write("Content/__ExternalActors__/Maps/L/0/AB/X.uasset", "x")
+            project.write("Content/Input/IA_Jump.uasset", "x")
+            lines = ue.project_overview(project.uproject)
+            text = "\n".join(lines)
+            self.assertIn("modules: Game (3 classes)", text)
+            self.assertIn("game mode: AMyMode", text)
+            self.assertIn("character: AHero, ABaseHero", text)
+            self.assertIn("maps (1): L (WP)", text)
+            self.assertIn("input: IA_Jump", text)
+            self.assertIn("startup map /Game/Maps/L", text)
+        finally:
+            project.close()
 
 
 class Usages(unittest.TestCase):
