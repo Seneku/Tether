@@ -18,7 +18,8 @@ from .images import cmd_look, cmd_shot
 from .testing import cmd_test
 from .assets import cmd_bp, cmd_diff, cmd_overview, cmd_size, cmd_table, cmd_usages, cmd_validate
 from .jobs import cmd_job, cmd_package
-from .play import cmd_audio, cmd_mem, cmd_perf, cmd_pie, cmd_soak, cmd_ui, cmd_world
+from .play import cmd_audio, cmd_mem, cmd_perf, cmd_soak, cmd_ui, cmd_world
+from .playtest import cmd_input, pie_command
 from .hooks import cmd_hook
 from .setup import cmd_doctor, cmd_init, cmd_reload
 from .selftest import cmd_ci, cmd_selftest
@@ -54,7 +55,7 @@ def build_parser():
     common.add_argument("--limit", type=int, default=argparse.SUPPRESS, help="max rows to print (30)")
     common.add_argument("--time", action="store_true", default=argparse.SUPPRESS, help="elapsed time to stderr")
 
-    p = argparse.ArgumentParser(prog="ue", description=__doc__.split("\n\n")[0], parents=[common])
+    p = argparse.ArgumentParser(prog="ue", description=sys.modules[__package__].__doc__.split("\n\n")[0], parents=[common])
     sub = p.add_subparsers(dest="cmd", required=True)
 
     def add(name, fn, help_text):
@@ -186,7 +187,7 @@ def build_parser():
     s.add_argument("--level", default="Warning", help="Error, Warning, Display, Log, Verbose")
     s.add_argument("--cat", help="only this log category")
     s.add_argument("--grep", help="regex filter")
-    s = add("pie", cmd_pie, "Play-In-Editor: start | stop | status | run <script> | do <steps...>")
+    s = add("pie", pie_command, "Play-In-Editor: start | stop | status | run <script> | do <steps...>")
     s.add_argument("action", choices=["start", "stop", "status", "run", "do", "target"])
     s.add_argument("script", nargs="*", help="with run: Python file to execute in the PIE world; with do: steps")
     s.add_argument("-f", "--file", help="with do: a file of steps, one per line (# comments)")
@@ -298,6 +299,8 @@ def build_parser():
     s.add_argument("--sample", type=float, default=10, help="seconds between memory/fps samples (10)")
     s.add_argument("--max-growth", type=float, default=20, help="MB/min of memory growth that fails the run (20)")
     s.add_argument("--keep-going", action="store_true", help="keep looping after a failing iteration")
+    s = add("input", cmd_input, "Enhanced Input: actions and their keys by mapping context; in PIE, what is active")
+    s.add_argument("action", nargs="?", help="regex: only these actions")
     s = add("savegame", cmd_savegame, "save slots: list, show one (regex filter), or Name=value to edit and save (.bak kept)")
     s.add_argument("slot", nargs="?", help="slot name (default: list the slots)")
     s.add_argument("rest", nargs="*", metavar="regex|Name=value")

@@ -896,11 +896,11 @@ def pie_do(ctx, args):
             name, _, hold_for = rest.partition(" ")
             if not hold_for:
                 return tool(f"tap {name}")
-            tool(f"hold {name}")
+            _, detail = tool(f"hold {name}")
             held.add(name)
             time.sleep(float(hold_for))
             held.discard(name)
-            return tool(f"release {name}")
+            return tool(f"release {name}")[0], detail.replace("hold ", "held ", 1) + f" for {hold_for}s"
         if verb == "hold":
             held.add(rest.split()[0])
         elif verb == "release":

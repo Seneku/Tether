@@ -17,6 +17,7 @@ Modules, lowest layer first (each imports only from those above it):
   assets     Blueprints, data tables, diff, validate, size, usages, overview
   jobs       ue job, ue package
   play       pie, ui, perf, mem, world, audio, soak
+  playtest   ue input, pie record, pie watch
   hooks      Claude Code hooks
   setup      ue init, reload, doctor
   selftest   ue selftest, ue ci
@@ -35,6 +36,7 @@ from .testing import *  # noqa: F401,F403
 from .assets import *  # noqa: F401,F403
 from .jobs import *  # noqa: F401,F403
 from .play import *  # noqa: F401,F403
+from .playtest import *  # noqa: F401,F403
 from .hooks import *  # noqa: F401,F403
 from .setup import *  # noqa: F401,F403
 from .selftest import *  # noqa: F401,F403

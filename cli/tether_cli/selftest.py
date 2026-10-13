@@ -122,6 +122,7 @@ def cmd_selftest(ctx, args):
     check("config", ["config", "Project/Project/Maps", "DefaultMap"], skip="needs UE 5.8+" if remote else None,
           ok=lambda c, o: c == 0 and "gameDefaultMap" in o)
     check("usages", ["usages", "PrintString", "--budget", "5"], ok=lambda c, o: c == 0 and "line(s)" in o)
+    check("input", ["input"], ok=lambda c, o: c == 0 and ("input action" in o or "no Enhanced Input" in o))
     saved = check("savegame: make a slot", ["py", SAVE_PROBE.format(make=True)], ok=lambda c, o: c == 0 and o.endswith("True"))
     check("savegame", ["savegame", "TetherSelftest"], skip=None if saved else "no slot",
           ok=lambda c, o: c == 0 and "score = 7" in o)

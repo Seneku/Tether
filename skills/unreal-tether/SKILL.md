@@ -170,6 +170,9 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
   character creates in C++), call, expect/until (`= != < > <= >= ~`), log, exists/gone, wait, exec, shot.
   Each step prints ok/FAIL; it stops at the first failure. Write the step file once and rerun it after changes.
   Keep step files in `tests/play/` with a `# map: /Game/...` line: `ue ci --play` runs them all as regression tests.
+- Which input actions exist and what keys reach them: `ue input` (by mapping context, and who adds each context);
+  in PIE it also says which contexts are active. `ue input Move` shows matching actions only. A `pie do` step
+  that presses an action no active context maps still works, but warns: a player could not do it.
 - Game UI in PIE: `ue ui` lists what is on screen (Slate and UMG texts, buttons, text boxes); `ue ui click
   "Close"`, `ue ui type "Name" hello`, `ue ui key Escape`. In `ue pie do`: `click <label>`, `expect-ui <text>`,
   `ui-gone <text>`. Clicks are real mouse clicks at the widget, so whatever is on top receives them; labels are

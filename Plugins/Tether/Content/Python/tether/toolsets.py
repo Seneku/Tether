@@ -2446,6 +2446,8 @@ class TetherCore(_Base):
             else:
                 _release(action)
             detail = f"{verb} {action.get_name()}"
+            if verb != "release" and not _try(lambda: subsystem.query_keys_mapped_to_action(action), [1]):
+                detail += " (warning: no active mapping context maps it, so a player could not press it; ue input)"
         elif verb == "call":
             parts = rest.split(None, 2)
             if len(parts) < 2:
@@ -3097,6 +3099,73 @@ class TetherCore(_Base):
             if len(rows) >= limit:
                 break
         return json.dumps(rows)
+
+    @_tool
+    @staticmethod
+    def input_map(limit: int = 400) -> str:
+        """Enhanced Input: actions (value type, triggers), mapping contexts with their key mappings and what
+        references them, and in PIE which contexts are active and which keys reach each action.
+
+        Args:
+            limit: Maximum number of mappings per context.
+
+        Returns:
+            JSON {actions: [{name, path, type, triggers}], contexts: [{name, path, mappings: [{action, key,
+            modifiers, triggers}], referencers, active}], pie: bool, live: {action path: [keys]}}.
+        """
+        registry = unreal.AssetRegistryHelpers.get_asset_registry()
+        actions, contexts = {}, []
+
+        def kinds(objs, prefix):
+            return [o.get_class().get_name().replace(prefix, "").lower().replace("swizzleaxis", "swizzle")
+                    for o in (objs or []) if o]
+
+        def add_action(action):
+            path = action.get_path_name()
+            if path not in actions:
+                value_type = str(_try(lambda: action.get_editor_property("value_type"), "")).split(".")[-1].split(":")[0]
+                actions[path] = {"name": action.get_name(), "path": path, "type": value_type.title().replace("_", ""),
+                                 "triggers": kinds(_try(lambda: action.get_editor_property("triggers")), "InputTrigger")}
+        for data in registry.get_assets_by_class(unreal.TopLevelAssetPath("/Script/EnhancedInput", "InputAction")):
+            action = _try(lambda: unreal.load_asset(str(data.package_name)))
+            if isinstance(action, unreal.InputAction):
+                add_action(action)
+        options = unreal.AssetRegistryDependencyOptions(
+            include_soft_package_references=True, include_hard_package_references=True, include_searchable_names=False,
+            include_soft_management_references=False, include_hard_management_references=False)
+        game = _game_world()
+        subsystem = _try(lambda: _input_subsystem(game)) if game else None
+        for data in registry.get_assets_by_class(unreal.TopLevelAssetPath("/Script/EnhancedInput", "InputMappingContext")):
+            imc = _try(lambda: unreal.load_asset(str(data.package_name)))
+            if not isinstance(imc, unreal.InputMappingContext):
+                continue
+            holder = _try(lambda: imc.get_editor_property("default_key_mappings"))
+            mappings = _try(lambda: holder.get_editor_property("mappings"), None) if holder else None
+            if mappings is None:  # before 5.6 the mappings sat on the context itself
+                mappings = _try(lambda: imc.get_editor_property("mappings"), [])
+            rows = []
+            for m in list(mappings)[:limit]:
+                action = m.get_editor_property("action")
+                if action:
+                    add_action(action)
+                rows.append({"action": action.get_name() if action else None,
+                             "key": m.get_editor_property("key").export_text(),
+                             "modifiers": kinds(m.get_editor_property("modifiers"), "InputModifier"),
+                             "triggers": kinds(m.get_editor_property("triggers"), "InputTrigger")})
+            package = str(data.package_name)
+            refs = sorted({str(n) for n in registry.get_referencers(package, options) or []} - {package})
+            active = _try(lambda: subsystem.has_mapping_context(imc)) if subsystem else None
+            contexts.append({"name": imc.get_name(), "path": package, "mappings": rows, "referencers": refs,
+                             "active": active is not None and active is not False, "priority": active})
+        live = {}
+        if subsystem:
+            for path in actions:
+                action = unreal.find_object(None, path)
+                if action:
+                    live[path] = [k.export_text() for k in _try(lambda: subsystem.query_keys_mapped_to_action(action), [])]
+        return json.dumps({"actions": sorted(actions.values(), key=lambda a: a["name"].lower()),
+                           "contexts": sorted(contexts, key=lambda c: c["name"].lower()),
+                           "pie": bool(subsystem), "live": live})
 
     @_tool
     @staticmethod

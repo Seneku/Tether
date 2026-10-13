@@ -1099,6 +1099,34 @@ class Soak(unittest.TestCase):
         self.assertEqual(ue.filter_log(lines, level="Error"), ["E LogTemp: a real one"])
 
 
+class InputMap(unittest.TestCase):
+    DATA = {
+        "actions": [{"name": "IA_Jump", "path": "/Game/IA_Jump.IA_Jump", "type": "Boolean", "triggers": ["pressed"]},
+                    {"name": "IA_Move", "path": "/Game/IA_Move.IA_Move", "type": "Axis2D", "triggers": []},
+                    {"name": "IA_Unused", "path": "/Game/IA_Unused.IA_Unused", "type": "Boolean", "triggers": []}],
+        "contexts": [{"name": "IMC_Default", "path": "/Game/IMC_Default", "active": True, "priority": 0,
+                      "referencers": ["/Game/BP_Player"],
+                      "mappings": [{"action": "IA_Jump", "key": "SpaceBar", "modifiers": [], "triggers": []},
+                                   {"action": "IA_Move", "key": "W", "modifiers": ["swizzle"], "triggers": []}]},
+                     {"name": "IMC_UI", "path": "/Game/IMC_UI", "active": False, "priority": None, "referencers": [],
+                      "mappings": [{"action": "IA_Jump", "key": "Enter", "modifiers": [], "triggers": ["hold"]}]}],
+        "pie": True, "live": {"/Game/IA_Jump.IA_Jump": ["SpaceBar"]},
+    }
+
+    def test_actions_list_keys_by_context_and_live_state(self):
+        lines = ue.input_lines(self.DATA, code_refs={"IMC_UI": ["Source/UI.cpp:12"]})
+        self.assertEqual(lines[0], "IA_Jump  Boolean, pressed: SpaceBar [IMC_Default], Enter (on hold) [IMC_UI]"
+                                   "  | in PIE: SpaceBar")
+        self.assertIn("W (swizzle) [IMC_Default]  | in PIE: no active context maps it", lines[1])
+        self.assertIn("IA_Unused  Boolean: not in any mapping context", lines[2])
+        self.assertIn("IMC_Default  2 mapping(s)  added by: BP_Player  active in PIE (priority 0)", lines[4])
+        self.assertIn("IMC_UI  1 mapping(s)  added by: Source/UI.cpp:12  not active in PIE", lines[5])
+
+    def test_match_shows_only_those_actions(self):
+        lines = ue.input_lines(dict(self.DATA, pie=False), "move")
+        self.assertEqual(lines, ["IA_Move  Axis2D: W (swizzle) [IMC_Default]"])
+
+
 class JsonEnvelope(unittest.TestCase):
     def run_json(self, project, *argv):
         out = io.StringIO()
