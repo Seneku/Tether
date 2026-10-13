@@ -112,6 +112,7 @@ def cmd_selftest(ctx, args):
     check("py", ["py", "6*7"], ok=lambda c, o: c == 0 and o.endswith("42"))
     check("exec", ["exec", "stat fps"], ok=lambda c, o: c == 0 and "Cmd: stat fps" in o)
     check("actors", ["actors", "--limit", "3"], ok=lambda c, o: c == 0 and "actors" in o.splitlines()[0])
+    check("class", ["class", "Character"], ok=lambda c, o: c == 0 and ": Pawn : Actor" in o and "own functions" in o)
     check("api", ["api", "Actor", "set_actor_location"], ok=lambda c, o: c == 0 and "set_actor_location" in o)
     check("find", ["find", "Cube", "--class", "StaticMesh", "--under", "/Engine/BasicShapes"],
           ok=lambda c, o: c == 0 and "/Engine/BasicShapes/Cube" in o)
@@ -179,6 +180,8 @@ def cmd_selftest(ctx, args):
     check("bp edit add-component", ["bp", "edit", "/Game/TetherSelftest/BP_SelftestNew", "add-component", "Body",
                                     "StaticMesh", "StaticMesh=/Engine/BasicShapes/Cube"],
           skip=edit_skip, ok=lambda c, o: c == 0 and "added Body" in o and "BasicShapes/Cube" in o)
+    check("class (Blueprint)", ["class", "/Game/TetherSelftest/BP_SelftestNew"], skip=None if created else "nothing created",
+          ok=lambda c, o: c == 0 and "Health" in o and ": Actor (C++)" in o)
     check("rm (new asset)", ["rm", "/Game/TetherSelftest/BP_SelftestNew"], skip=None if created else "nothing created",
           ok=lambda c, o: c == 0 and "deleted" in o)
     check("anim graph", ["anim", "graph", "/Engine/Tutorial/SubEditors/TutorialAssets/Character/TutorialTPP_AnimBlueprint"],

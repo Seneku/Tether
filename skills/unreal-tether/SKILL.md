@@ -75,6 +75,8 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
 - Terrain: `ue landscape` (size, layers), `ue landscape at x,y` (height, slope, layer weights: use it before placing
   things), `ue landscape map` (a PNG of the shape). `ue landscape flatten x,y,r [--height z]` (a pad for a
   building), `raise x,y,r --by cm`, `smooth x,y,r`; each prints a backup for `ue landscape restore --backup`.
+- Before changing a class or Blueprint: `ue class AEnemyCharacter` (or `ue class BP_Door`) shows its parents, own
+  properties and functions, a Blueprint's components/variables/events, what derives from it and what uses it.
 - "Can't interact with / pick up / shoot X": `ue pie start`, aim with `ue pie do "look X"`, then `ue trace --channel
   <the channel the code traces on>` (what blocks first, and each component's response); `ue collision X` shows its
   profiles and per-channel responses.

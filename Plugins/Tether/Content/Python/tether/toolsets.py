@@ -2416,6 +2416,135 @@ class TetherCore(_Base):
 
     @_tool
     @staticmethod
+    def class_info(name: str, limit: int = 40) -> str:
+        """A class at a glance, C++ or Blueprint: parent chain, its own properties (with Blueprint access) and
+        functions, a Blueprint's variables, components, functions and events, the classes and Blueprints that
+        derive from it, and (for a Blueprint) what references it.
+
+        Args:
+            name: A class name (Character, AMyEnemy, UMyComponent), /Script/Module.Class, a Blueprint asset path,
+                or a Blueprint's name (BP_Door).
+            limit: Maximum rows per list.
+
+        Returns:
+            Text.
+        """
+        registry = unreal.AssetRegistryHelpers.get_asset_registry()
+        bp, cls = None, None
+        if name.startswith("/Script/"):
+            cls = unreal.load_class(None, name)
+        elif name.startswith("/"):
+            bp = unreal.load_asset(name.split(".")[0])
+        else:
+            for candidate in (name, name[1:] if name[:1] in "AUF" and name[1:2].isupper() else None):
+                py_type = getattr(unreal, candidate, None) if candidate else None
+                if isinstance(py_type, type) and hasattr(py_type, "static_class"):
+                    cls = py_type.static_class()
+                    break
+            if cls is None:
+                stem = name[:-2] if name.endswith("_C") else name
+                found = [d for d in registry.get_assets_by_class(unreal.TopLevelAssetPath("/Script/Engine", "Blueprint"), True)
+                         if str(d.asset_name) == stem]
+                if found:
+                    bp = unreal.load_asset(str(found[0].package_name))
+        if bp is not None:
+            if not isinstance(bp, unreal.Blueprint):
+                raise RuntimeError(f"{name} is a {bp.get_class().get_name()}, not a Blueprint or class")
+            cls = unreal.BlueprintEditorLibrary.generated_class(bp)
+        if cls is None:
+            raise RuntimeError(f"no class or Blueprint '{name}' (ue find {name}, ue api {name})")
+
+        def py_type_of(c):
+            return getattr(unreal, c.get_name(), None)
+
+        def doc_props(py_type):
+            return {m.group(1): m.group(2) for m in _DOC_PROPERTY.finditer(py_type.__doc__ or "")} if py_type else {}
+        chain, current, parent_bp = [], bp, None
+        while current is not None:  # Blueprint parents first, then the native chain
+            parent = unreal.BlueprintEditorLibrary.get_blueprint_parent_class(current)
+            if parent is None:
+                break
+            if parent.get_path_name().startswith("/Script/"):
+                chain.append(f"{parent.get_name()} (C++)")
+                native = py_type_of(parent)
+                chain += [t.__name__ for t in (native.__mro__[1:] if native else ()) if t.__name__ not in ("_ObjectBase", "_WrapperBase", "object")]
+                break
+            parent_bp = unreal.load_asset(parent.get_path_name().split(".")[0])
+            chain.append(f"{parent_bp.get_name()} (Blueprint)" if parent_bp else parent.get_name())
+            current = parent_bp
+        if bp is None:
+            native = py_type_of(cls)
+            chain = [t.__name__ for t in (native.__mro__[1:] if native else ()) if t.__name__ not in ("_ObjectBase", "_WrapperBase", "object")]
+        where = bp.get_path_name().split(".")[0] if bp else cls.get_path_name().rsplit(".", 1)[0]
+        lines = [f"{bp.get_name() if bp else cls.get_name()} ({'Blueprint ' + where if bp else 'C++, ' + where})"
+                 + (" : " + " : ".join(chain) if chain else "")]
+        native = None if bp else py_type_of(cls)
+        if native is not None:
+            summary = (native.__doc__ or "").strip().splitlines()
+            if summary:
+                lines.append("  " + summary[0][:200])
+            own = doc_props(native)
+            for base in native.__mro__[1:2]:
+                for key in doc_props(base):
+                    own.pop(key, None)
+            if own:
+                lines.append(f"own properties ({len(own)}): " + ", ".join(f"{k} ({v})" for k, v in list(own.items())[:limit]))
+            methods = sorted(k for k, v in vars(native).items() if callable(v) and not k.startswith("_")
+                             and k not in ("static_class", "cast", "get_default_object"))
+            if methods:
+                lines.append(f"own functions ({len(methods)}): " + ", ".join(methods[:limit])
+                             + (f" +{len(methods) - limit}" if len(methods) > limit else ""))
+        if bp is not None:
+            parts = _bp_parts(bp)
+            comps = [k.split(" ", 1)[1] + f" ({v.get_class().get_name()})" for k, v in parts.items() if k.startswith("component ")]
+            if comps:
+                lines.append(f"components ({len(comps)}): " + ", ".join(comps[:limit]))
+            variables = []
+            for var in _try(lambda: list(unreal.BlueprintEditorLibrary.get_blueprint_variables(bp)), None) or []:
+                variables.append(str(var))
+            if not variables:  # read the new variables from the class itself: props not on the parent
+                parent_props = set(_try(lambda: _reflect(unreal.ToolsetLibrary.list_struct_properties(
+                    unreal.BlueprintEditorLibrary.get_blueprint_parent_class(bp)), None), {}) or {})
+                mine = _try(lambda: _reflect(unreal.ToolsetLibrary.list_struct_properties(cls), None), {}) or {}
+                comp_names = {k.split(" ", 1)[1].lower() for k in parts if k.startswith("component ")}
+                variables = [f"{k} ({_type_name(v)})" for k, v in mine.items() if k not in parent_props
+                             and not k.lower().startswith("ubergraph") and k.lower() not in comp_names]
+            if variables:
+                lines.append(f"variables ({len(variables)}): " + ", ".join(variables[:limit]))
+            graphs = list(unreal.BlueprintEditorLibrary.list_graphs(bp))
+            functions = [g.get_name() for g in graphs if g.get_class().get_name() == "EdGraph"
+                         and g.get_name() not in ("EventGraph", "UserConstructionScript")]
+            events = []
+            for g in graphs:
+                if g.get_name() == "EventGraph":
+                    for node in _try(lambda: list(unreal.BlueprintGraphEditor.get_graph_editor(g).list_all_nodes()), []) or []:
+                        if node.get_class().get_name() in ("K2Node_Event", "K2Node_CustomEvent", "K2Node_ComponentBoundEvent",
+                                                           "K2Node_InputAction", "K2Node_EnhancedInputAction"):
+                            events.append(_node_title(node))
+            if functions:
+                lines.append(f"functions ({len(functions)}): " + ", ".join(functions[:limit]))
+            if events:
+                lines.append(f"events ({len(events)}): " + ", ".join(events[:limit]))
+        derived = {(str(p.package_name), str(p.asset_name)) for p in _try(lambda: list(registry.get_derived_class_names(
+            [unreal.TopLevelAssetPath(cls.get_path_name())], [])), []) or []}
+        own_path = cls.get_path_name()
+        derived_native = [n for pkg, n in derived if pkg.startswith("/Script/") and f"{pkg}.{n}" != own_path]
+        derived_bp = sorted(pkg for pkg, n in derived if not pkg.startswith("/Script/") and pkg != where)
+        if derived_native:
+            lines.append(f"derived C++ classes ({len(derived_native)}): " + ", ".join(sorted(derived_native)[:limit]))
+        if derived_bp:
+            lines.append(f"derived Blueprints ({len(derived_bp)}): " + ", ".join(derived_bp[:limit])
+                         + (f" +{len(derived_bp) - limit}" if len(derived_bp) > limit else ""))
+        if bp is not None:
+            refs = sorted({str(n) for n in registry.get_referencers(where, _dependency_options()) or []} - {where})
+            maps = [r for r in refs if "/__ExternalActors__/" in r or r.endswith(("Map", "Lvl")) or "/Maps/" in r]
+            if refs:
+                lines.append(f"referenced by {len(refs)} package(s)" + (f", {len(maps)} in maps" if maps else "")
+                             + ": " + ", ".join(r.rsplit("/", 1)[-1] for r in refs[:12]) + (" ..." if len(refs) > 12 else ""))
+        return "\n".join(lines)
+
+    @_tool
+    @staticmethod
     def trace(start: str = "player", end: str = "look", distance: float = 5000.0, channel: str = "Visibility",
               sphere: float = 0.0, pie: bool = True, complex: bool = True) -> str:
         """Trace like gameplay code does and say what it hits: every hit along the way and the first blocking one,

@@ -12,7 +12,7 @@ from .editor import cmd_build, cmd_close, cmd_crash, cmd_open, cmd_status
 from .calls import (
     cmd_actors, cmd_ai, cmd_anim, cmd_api, cmd_asset, cmd_call, cmd_changes, cmd_config, cmd_delete, cmd_drop,
     cmd_duplicate, cmd_exec, cmd_find, cmd_log, cmd_mat, cmd_mv, cmd_nav, cmd_new, cmd_props, cmd_py, cmd_refs,
-    cmd_collision, cmd_foliage, cmd_level, cmd_rm, cmd_statetree, cmd_trace, cmd_save, cmd_savegame, cmd_scatter, cmd_set, cmd_spawn, cmd_tools, cmd_undo, cmd_watch,
+    cmd_class, cmd_collision, cmd_foliage, cmd_level, cmd_rm, cmd_statetree, cmd_trace, cmd_save, cmd_savegame, cmd_scatter, cmd_set, cmd_spawn, cmd_tools, cmd_undo, cmd_watch,
 )
 from .images import cmd_look, cmd_shot
 from .testing import cmd_test
@@ -408,6 +408,8 @@ def build_parser():
     s = add("refs", cmd_refs, "what references an asset (--deps: what it depends on)")
     s.add_argument("asset", help="/Game/Path/Asset")
     s.add_argument("--deps", action="store_true", help="list dependencies instead of referencers")
+    s = add("class", cmd_class, "a class at a glance: parents, own properties/functions, Blueprint parts, subclasses, references")
+    s.add_argument("name", help="Character, AMyEnemy, /Script/Module.Class, BP_Door or /Game/.../BP_Door")
     s = add("api", cmd_api, "the unreal Python API: a class's methods and properties, or one member's doc")
     s.add_argument("name", help="class or class.member, e.g. EditorActorSubsystem or Actor.set_actor_location")
     s.add_argument("match", nargs="?", help="regex filter on member names")

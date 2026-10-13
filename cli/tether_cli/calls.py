@@ -492,3 +492,8 @@ def cmd_collision(ctx, args):
     print(ctx.tether("collision", target=args.actor, pie=args.pie))
     return 0
 
+
+def cmd_class(ctx, args):
+    print(ctx.tether("class_info", name=args.name, limit=args.limit))
+    return 0
+
