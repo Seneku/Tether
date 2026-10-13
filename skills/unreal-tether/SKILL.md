@@ -180,6 +180,9 @@ broken or unsupported.
   off the navmesh), `ue nav path <a> <b>` (reachable? how long?); add `--pie` for runtime-generated navmeshes.
 - Leaks and rare failures: `ue soak --minutes 10 -f tests/play/x.txt` loops a step file (or wanders) and
   reports the memory trend, frame rate and errors. Run it in the background (it blocks for the duration).
+- Multiplayer: `ue pie start --clients 2` (listen server; `--net client` for a dedicated one), `ue pie status`
+  for the worlds, `ue pie target 1` to make `--pie` reads, `pie do` and `ai` act on client 1 (0 = server).
+  Compare a value on the server and a client to check replication.
 - `ue pie start` / `ue pie stop` / `ue pie status`. Status explains a session that died (fatal error
   plus your source line).
 - Drive the test from Python: in PIE, `w = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_game_world()`,

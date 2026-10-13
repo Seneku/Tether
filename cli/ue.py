@@ -29,7 +29,7 @@ class _Lazy:
 socket, subprocess, zlib = _Lazy("socket"), _Lazy("subprocess"), _Lazy("zlib")
 
 TETHER = "tether.toolsets.TetherCore"
-GATED = {"py", "console", "set_props", "undo", "save", "spawn", "delete", "duplicate", "mv", "rm", "set_material", "pie_step", "set_config", "umg", "new_asset", "drop"}  # tools that need the session token (see beacon.session_token)
+GATED = {"py", "console", "set_props", "undo", "save", "spawn", "delete", "duplicate", "mv", "rm", "set_material", "pie_step", "set_config", "umg", "new_asset", "drop", "pie_net"}  # tools that need the session token (see beacon.session_token)
 LEVELS = {"Fatal": 0, "Error": 1, "Warning": 2, "Display": 3, "Log": 4, "Verbose": 5, "VeryVerbose": 6}
 NOISE = {"LogModelContextProtocol", "LogToolsetRegistry"}  # our own transport chatter
 # Epic logs this whenever a schema is generated for a class with delegates (props, set, describe_toolset).
@@ -3792,6 +3792,12 @@ def cmd_selftest(ctx, args):
                                          "expect-ui Tether probe panel", "click UMG Probe Button", "expect-ui UMG clicks: "],
           skip=None if fixture else "no UI fixture (Sandbox's TetherProbeUILibrary)", ok=lambda c, o: c == 0 and "PASS" in o)
     check("pie stop", ["pie", "stop"], ok=lambda c, o: c == 0 and "OK" in o)
+    clients = check("pie --clients 2", ["pie", "start", "--clients", "2"], timeout=300, skip="needs UE 5.8+" if remote else None,
+                    ok=lambda c, o: c == 0 and "1: client" in o)
+    check("pie target 1", ["pie", "target", "1"], skip=None if clients else "no multiplayer session",
+          ok=lambda c, o: c == 0 and "PIE world 1" in o)
+    check("pie stop (restores)", ["pie", "stop"], skip=None if clients else "no multiplayer session",
+          ok=lambda c, o: c == 0 and "restored" in o)
     if args.reload:
         check("reload", ["reload"])
         time.sleep(1.5)
@@ -4366,6 +4372,12 @@ def cmd_pie(ctx, args):
         return pie_run(ctx, args)
     if args.action == "do":
         return pie_do(ctx, args)
+    if args.action == "target":
+        index = int(args.script[0]) if args.script else -1
+        print(pie_net(ctx, "target", target=index))
+        return 0
+    if args.action == "start" and getattr(args, "clients", None):
+        print(pie_net(ctx, "configure", clients=args.clients, net=args.net or "listen"))
     toolset = None if ctx.transport == "remote" else resolve_toolset(ctx, "editorapp")
     start = log_end(ctx.project)
     started = time.time()
@@ -4414,6 +4426,9 @@ def cmd_pie(ctx, args):
             raise CliError(compact_error(text))
         if unwrap(text) is True:
             print("pie: running")
+            net = pie_net(ctx, "status")
+            if net.count(": ") > 1:  # several PIE worlds: multiplayer
+                print(net)
             return 0
         # Say why the last session ended if it died rather than being stopped.
         with open(log_path(ctx.project), "rb") as f:
@@ -4431,7 +4446,19 @@ def cmd_pie(ctx, args):
     print(f"pie {args.action}: OK in {time.time() - started:.1f}s" + (f", {len(issues)} warnings/errors" if issues else ""))
     for line in issues[: args.limit]:
         print("  " + line)
+    if args.action == "stop":  # put back play settings a `--clients` start changed, and the world target
+        with __import__("contextlib").suppress(CliError):
+            note = pie_net(ctx, "restore")
+            if note != "nothing to restore":
+                print(note)
+    elif args.action == "start" and getattr(args, "clients", None):
+        print(pie_net(ctx, "status"))
     return 0
+
+
+def pie_net(ctx, action, clients=1, net="", target=-1):
+    # Epic's MCP layer treats a string parameter with an empty default as required, so pass them all.
+    return ctx.tether("pie_net", action=action, clients=clients, net=net or "-", target=target)
 
 
 def editor_live(project):
@@ -4940,10 +4967,13 @@ def main(argv=None):
     s.add_argument("--cat", help="only this log category")
     s.add_argument("--grep", help="regex filter")
     s = add("pie", cmd_pie, "Play-In-Editor: start | stop | status | run <script> | do <steps...>")
-    s.add_argument("action", choices=["start", "stop", "status", "run", "do"])
+    s.add_argument("action", choices=["start", "stop", "status", "run", "do", "target"])
     s.add_argument("script", nargs="*", help="with run: Python file to execute in the PIE world; with do: steps")
     s.add_argument("-f", "--file", help="with do: a file of steps, one per line (# comments)")
     s.add_argument("--keep-going", action="store_true", help="with do: run every step even after a failure")
+    s.add_argument("--clients", type=int, help="with start: multiplayer PIE with this many clients")
+    s.add_argument("--net", choices=["listen", "client", "standalone"],
+                   help="with --clients: listen server (default), client (dedicated server), or standalone")
     s.add_argument("--expect", action="append", help="with run: log regex that must appear (repeatable)")
     s.add_argument("--reject", action="append", help="with run/do: log regex that must not appear (repeatable)")
     s.add_argument("--seconds", type=float, default=5, help="with run: how long to wait for expectations (5)")

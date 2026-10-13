@@ -74,7 +74,24 @@ def _run_python(code):
     return out
 
 
+def _pie_worlds():
+    """{PIE instance index: world} for every running PIE world (UEDPIE_<n>_<map>)."""
+    worlds = {}
+    for world in unreal.ObjectIterator(unreal.World):
+        package = _try(lambda: world.get_outermost().get_name(), "")
+        match = re.match(r"UEDPIE_(\d+)_", package.rsplit("/", 1)[-1])  # the package carries the prefix
+        if match and _try(lambda: world.get_name(), "") == package.rsplit("/", 1)[-1][len(match.group(0)):]:
+            worlds[int(match.group(1))] = world
+    return worlds
+
+
 def _game_world():
+    """The PIE world the tools act on: the one `ue pie target` picked, else the editor's (the first)."""
+    target = getattr(sys, "_tether_pie_target", None)
+    if target is not None:
+        world = _pie_worlds().get(target)
+        if world is not None:
+            return world
     return unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_game_world()
 
 
@@ -1167,7 +1184,7 @@ class TetherCore(_Base):
         """
         _authorize(token)
         editor = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem)
-        game = editor.get_game_world()  # checked first: get_editor_world() logs an error during PIE
+        game = _game_world()  # checked first: get_editor_world() logs an error during PIE
         if pie and game is None:
             raise RuntimeError("PIE is not running")
         world = game if game is not None else editor.get_editor_world()
@@ -2979,6 +2996,68 @@ class TetherCore(_Base):
             if len(rows) >= limit:
                 break
         return json.dumps(rows)
+
+    @_tool
+    @staticmethod
+    def pie_net(action: str = "status", clients: int = 1, net: str = "listen", target: int = -1, token: str = "") -> str:
+        """Multiplayer PIE: configure the next session's clients and net mode (restorable), pick which PIE world
+        the other tools act on, or list the running PIE worlds with their net mode and players.
+
+        Args:
+            action: status, configure, restore or target.
+            clients: With configure: number of clients.
+            net: With configure: standalone, listen (listen server + clients) or client (dedicated server + clients).
+            target: With target: the PIE instance index to act on (0 = the first world), or -1 for the default.
+            token: Session token from Saved/Tether/session.json (the ue CLI sends it).
+
+        Returns:
+            What was done, or one line per PIE world.
+        """
+        settings = unreal.find_object(None, "/Script/UnrealEd.Default__LevelEditorPlaySettings")
+        keys = ["playNumberOfClients", "playNetMode", "runUnderOneProcess"]
+        if action == "configure":
+            _authorize(token)
+            if _LEGACY:
+                raise RuntimeError("needs UE 5.8+ (Epic's ToolsetLibrary)")
+            mode = {"standalone": "PIE_Standalone", "listen": "PIE_ListenServer", "client": "PIE_Client"}.get(net.lower())
+            if mode is None:
+                raise RuntimeError("net must be standalone, listen or client")
+            if getattr(sys, "_tether_play_saved", None) is None:  # what to put back afterwards
+                sys._tether_play_saved = unreal.ToolsetLibrary.get_object_properties(settings, keys)
+            unreal.ToolsetLibrary.set_object_properties(settings, json.dumps(
+                {"playNumberOfClients": max(1, clients), "playNetMode": mode, "runUnderOneProcess": True}))
+            return f"next PIE: {clients} client(s), {mode}"
+        if action == "restore":
+            _authorize(token)
+            saved = getattr(sys, "_tether_play_saved", None)
+            sys._tether_pie_target = None
+            if saved is None:
+                return "nothing to restore"
+            unreal.ToolsetLibrary.set_object_properties(settings, saved)
+            sys._tether_play_saved = None
+            return "play settings restored"
+        if action == "target":
+            sys._tether_pie_target = None if target < 0 else target
+            if target >= 0 and target not in _pie_worlds():
+                sys._tether_pie_target = None
+                raise RuntimeError(f"no PIE world {target} (running: {sorted(_pie_worlds()) or 'none'})")
+            return "tools act on " + (f"PIE world {target}" if target >= 0 else "the first PIE world")
+        worlds = _pie_worlds()
+        if not worlds:
+            return "PIE is not running"
+        current = getattr(sys, "_tether_pie_target", None)
+        rows = []
+        for index, world in sorted(worlds.items()):
+            lib = unreal.SystemLibrary
+            mode = "dedicated server" if _try(lambda: lib.is_dedicated_server(world), False) else \
+                "listen server" if _try(lambda: lib.is_server(world), False) and not _try(lambda: lib.is_standalone(world), False) else \
+                "standalone" if _try(lambda: lib.is_standalone(world), False) else "client"
+            state = _try(lambda: unreal.GameplayStatics.get_game_state(world))
+            players = len(_try(lambda: state.get_editor_property("player_array"), []) or []) if state else 0
+            pawn = _try(lambda: unreal.GameplayStatics.get_player_pawn(world, 0))
+            rows.append(f"{'*' if index == (current if current is not None else min(worlds)) else ' '} {index}: {mode}, "
+                        f"{players} player(s)" + (f", pawn {_label(pawn)}" if pawn else ""))
+        return "\n".join(rows) + "\n(* = the world ue props/actors/pie do --pie act on; ue pie target <n> to switch)"
 
     @_tool
     @staticmethod
