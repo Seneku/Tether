@@ -130,6 +130,9 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
   `ue bp ... --diff` shows only what changed since the last read; `ue bp --docs` is the syntax reference.
 - Before renaming or removing C++ functions, properties or classes, `ue usages <Name>` lists the C++ lines and
   the Blueprints (with their graph lines) that use them.
+- Build a Blueprint's shape in one-liners: `ue bp edit /Game/X/BP_Door add-var IsOpen bool false
+  --instance-editable`, `... add-component Mesh StaticMesh StaticMesh=/Game/X/SM_Door`, `... add-function Open`,
+  `... set-default IsOpen=true`; then write graph bodies with `ue bp ... --apply`.
 - After renaming or removing C++ functions, properties or classes (and `ue build --restart`), run
   `ue bp check` (or `ue bp check /Game/Some/Folder`): it lists only Blueprints that no longer compile, with why.
 - `ue table /Game/Path/DT_X` shows rows; `--export rows.json|.csv`, edit, then `--import rows.json

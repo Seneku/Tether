@@ -31,7 +31,7 @@ socket, subprocess, zlib = _Lazy("socket"), _Lazy("subprocess"), _Lazy("zlib")
 CLI_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # cli/
 UE_SCRIPT = os.path.join(CLI_DIR, "ue.py")  # the entry point, for the CLI's own child processes
 TETHER = "tether.toolsets.TetherCore"
-GATED = {"py", "console", "set_props", "undo", "save", "spawn", "delete", "duplicate", "mv", "rm", "set_material", "pie_step", "set_config", "umg", "new_asset", "drop", "pie_net", "look_stage", "scatter"}  # tools that need the session token (see beacon.session_token)
+GATED = {"py", "console", "set_props", "undo", "save", "spawn", "delete", "duplicate", "mv", "rm", "set_material", "pie_step", "set_config", "umg", "new_asset", "drop", "pie_net", "look_stage", "scatter", "bp_component"}  # tools that need the session token (see beacon.session_token)
 LEVELS = {"Fatal": 0, "Error": 1, "Warning": 2, "Display": 3, "Log": 4, "Verbose": 5, "VeryVerbose": 6}
 NOISE = {"LogModelContextProtocol", "LogToolsetRegistry"}  # our own transport chatter
 # Epic logs this whenever a schema is generated for a class with delegates (props, set, describe_toolset).
@@ -1827,6 +1827,101 @@ def bp_check(ctx, path, args):
     return 1 if any(p["status"] == "error" for p in problems) else 0
 
 
+BP_BASIC_TYPES = {"bool": "bool", "int": "int", "float": "float", "byte": "byte", "name": "name", "string": "string",
+                  "text": "text", "vector": "Vector", "rotator": "Rotator", "transform": "Transform",
+                  "vector2d": "Vector2D", "linearcolor": "LinearColor"}
+BP_TYPE_LOOKUP = """
+import json
+t = {type!r}
+found = unreal.load_object(None, t) if t.startswith('/') else None
+if found is None:
+    w = getattr(unreal, t, None)
+    found = w.static_class() if hasattr(w, 'static_class') else w.static_struct() if hasattr(w, 'static_struct') else None
+print(json.dumps({{'path': found.get_path_name() if found else None,
+                   'struct': isinstance(found, unreal.ScriptStruct)}}))
+"""
+
+
+def bp_compile_status(ctx, package):
+    status = py_json(ctx, f"import json\nbp = unreal.load_asset({package!r})\nunreal.BlueprintEditorLibrary.compile_blueprint(bp)\n"
+                          "print(json.dumps(str(bp.get_editor_property('status')).split('.')[-1].split(':')[0]))")
+    return {"BS_UP_TO_DATE": "compiled", "BS_UP_TO_DATE_WITH_WARNINGS": "compiled with warnings",
+            "BS_ERROR": "COMPILE ERROR (ue bp check for why)"}.get(status, status.lower())
+
+
+def bp_edit(ctx, path, ops, args):
+    """One Blueprint authoring step: add-var, set-default, add-component, add-function, add-dispatcher, remove-var."""
+    if not path or not ops:
+        raise CliError("ue bp edit <blueprint> add-var Name Type [default] | set-default Name=value ... | "
+                       "add-component Name Class [prop=value ...] | add-function Name | add-dispatcher Name | remove-var Name")
+    bp, package = asset_ref(path), path.split(".")[0]
+    cdo = f"{package}.Default__{package.rsplit('/', 1)[-1]}_C"
+    ref = {"blueprint": {"refPath": bp}}
+    op, rest = ops[0].lower(), ops[1:]
+    need = {"add-var": 2, "set-default": 1, "add-component": 2, "add-function": 1, "add-dispatcher": 1, "remove-var": 1}
+    if op not in need:
+        raise CliError(f"unknown edit '{op}' (add-var, set-default, add-component, add-function, add-dispatcher, remove-var)")
+    if len(rest) < need[op]:
+        raise CliError(f"{op} needs {need[op]} argument(s)")
+    lines = []
+    if op == "add-var":
+        name, kind, default = rest[0], rest[1], (rest[2] if len(rest) > 2 else None)
+        existing = [str(v) for v in mcp_tool(ctx, "blueprint", "list_variables", ref) or []]
+        if name.lower() in {v.lower() for v in existing}:
+            raise CliError(f"{package} already has a variable '{name}'")
+        payload = dict(ref, name=name)
+        if args.array:
+            payload["container_type"] = "ARRAY"
+        if kind.lower() in BP_BASIC_TYPES:
+            mcp_tool(ctx, "blueprint", "add_variable", dict(payload, type_name=BP_BASIC_TYPES[kind.lower()]))
+        else:
+            found = py_json(ctx, BP_TYPE_LOOKUP.format(type=kind))
+            if not found.get("path"):
+                raise CliError(f"unknown type '{kind}': a basic type ({', '.join(BP_BASIC_TYPES)}), a class or a struct")
+            if found["struct"]:
+                mcp_tool(ctx, "blueprint", "add_struct_variable", dict(payload, struct_type={"refPath": found["path"]}))
+            else:
+                mcp_tool(ctx, "blueprint", "add_object_variable", dict(payload, object_class={"refPath": found["path"]}))
+        if args.category:
+            mcp_tool(ctx, "blueprint", "set_variable_category", dict(ref, variable_name=name, category=args.category))
+        if args.instance_editable:
+            mcp_tool(ctx, "blueprint", "set_variable_instance_editable", dict(ref, variable_name=name, instance_editable=True))
+        lines.append(f"added variable {name}: {'array of ' if args.array else ''}{kind}"
+                     + (f", category {args.category}" if args.category else "") + (", instance editable" if args.instance_editable else ""))
+        if default is not None:
+            bp_compile_status(ctx, package)
+            lines.append(ctx.tether("set_props", target=cdo, values=json.dumps({name: default}), pie=False).split("\n", 1)[-1])
+    elif op == "set-default":
+        values = {}
+        for pair in rest:
+            key, eq, value = pair.partition("=")
+            if not eq:
+                raise CliError(f"expected Name=value, got '{pair}'")
+            values[key] = value
+        bp_compile_status(ctx, package)
+        lines.append(ctx.tether("set_props", target=cdo, values=json.dumps(values), pie=False))
+    elif op == "add-component":
+        values = dict(p.partition("=")[::2] for p in rest[2:])
+        lines.append(ctx.tether("bp_component", blueprint=package, name=rest[0], cls=rest[1], parent=args.parent or "",
+                                values=json.dumps(values)))
+    elif op == "add-function":
+        mcp_tool(ctx, "blueprint", "add_function_graph", dict(ref, graph_name=rest[0]))
+        lines.append(f"added function {rest[0]} (ue bp {package} {rest[0]} --apply file.dsl to give it a body)")
+    elif op == "add-dispatcher":
+        mcp_tool(ctx, "blueprint", "add_event_dispatcher", dict(ref, name=rest[0]))
+        lines.append(f"added event dispatcher {rest[0]}")
+    elif op == "remove-var":
+        mcp_tool(ctx, "blueprint", "remove_variable", dict(ref, name=rest[0]))
+        lines.append(f"removed variable {rest[0]}")
+    status = bp_compile_status(ctx, package)
+    for line in lines:
+        print(line)
+    print(f"{package}: {status}" + ("" if args.save else " (unsaved: --save, or ue save)"))
+    if args.save:
+        ctx.tether("save", paths=package)
+    return 1 if status.startswith("COMPILE ERROR") else 0
+
+
 def cmd_bp(ctx, args):
     """Blueprint graphs as text (Epic's graph DSL): read, diff against the last read, apply edited text."""
     if args.docs:
@@ -1834,6 +1929,8 @@ def cmd_bp(ctx, args):
         return 0
     if args.blueprint == "check":
         return bp_check(ctx, args.graph or "/Game", args)
+    if args.blueprint == "edit":
+        return bp_edit(ctx, args.graph, args.rest, args)
     if not args.blueprint:
         raise CliError("give a Blueprint: ue bp /Game/Path/BP_Name [graph]")
     bp = asset_ref(args.blueprint)
@@ -3971,6 +4068,12 @@ def cmd_selftest(ctx, args):
           None if instance else "no transient instance", ok=lambda c, o: c == 0 and "undone: mat" in o)
     created = check("new", ["new", "bp", "/Game/TetherSelftest/BP_SelftestNew", "--parent", "Actor"],
                     ok=lambda c, o: c == 0 and "created /Game/TetherSelftest/BP_SelftestNew" in o)
+    edit_skip = "needs UE 5.8+ (Epic's BlueprintTools)" if remote else None if created else "nothing created"
+    check("bp edit add-var", ["bp", "edit", "/Game/TetherSelftest/BP_SelftestNew", "add-var", "Health", "float", "75"],
+          skip=edit_skip, ok=lambda c, o: c == 0 and "-> 75" in o and ": compiled" in o)
+    check("bp edit add-component", ["bp", "edit", "/Game/TetherSelftest/BP_SelftestNew", "add-component", "Body",
+                                    "StaticMesh", "StaticMesh=/Engine/BasicShapes/Cube"],
+          skip=edit_skip, ok=lambda c, o: c == 0 and "added Body" in o and "BasicShapes/Cube" in o)
     check("rm (new asset)", ["rm", "/Game/TetherSelftest/BP_SelftestNew"], skip=None if created else "nothing created",
           ok=lambda c, o: c == 0 and "deleted" in o)
     ue("py", "unreal.EditorAssetLibrary.delete_directory('/Game/TetherSelftest')")
@@ -5256,7 +5359,13 @@ def build_parser():
     s.add_argument("--warmup", type=float, default=0.5, help="seconds to let BeginPlay settle (0.5)")
     s = add("bp", cmd_bp, "Blueprint graphs as text: read, --diff against the last read, --apply edited text")
     s.add_argument("blueprint", nargs="?", help="/Game/Path/BP_Name, or `check [/Game/path]` to compile all and list the broken")
-    s.add_argument("graph", nargs="?", help="graph name (default: all)")
+    s.add_argument("graph", nargs="?", help="graph name (default: all); with edit: the Blueprint")
+    s.add_argument("rest", nargs="*", help="with edit: add-var Name Type [default] | set-default Name=v ... | "
+                                           "add-component Name Class [prop=v ...] | add-function Name | add-dispatcher Name | remove-var Name")
+    s.add_argument("--category", help="with edit add-var: the variable's category")
+    s.add_argument("--instance-editable", action="store_true", help="with edit add-var: editable on placed instances")
+    s.add_argument("--array", action="store_true", help="with edit add-var: an array of the type")
+    s.add_argument("--parent", help="with edit add-component: attach under this component (default: the root)")
     s.add_argument("--diff", action="store_true", help="show only what changed since the last ue bp read")
     s.add_argument("--apply", metavar="FILE", help="write this DSL into the graph (compiles), then show the diff")
     s.add_argument("--save", action="store_true", help="save the Blueprint afterwards")

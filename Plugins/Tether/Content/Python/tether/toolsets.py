@@ -279,6 +279,8 @@ def _parse(raw, entry, old):
     if value is not None:
         return value
     if props and "refPath" in props:
+        if text.startswith("/") and "." not in text.rsplit("/", 1)[-1] and ":" not in text:
+            text = f"{text}.{text.rsplit('/', 1)[-1]}"  # a package path names its asset: /Game/X/A -> /Game/X/A.A
         return {"refPath": text}
     if props:
         raise ValueError(f"expected {','.join(props)} (or JSON), got '{text}'")
@@ -3205,6 +3207,71 @@ class TetherCore(_Base):
             sprite.set_visibility(False)
         return json.dumps({"center": [center.x, center.y, center.z], "radius": radius,
                            "class": obj.get_class().get_name()})
+
+    @_tool
+    @staticmethod
+    def bp_component(blueprint: str, name: str, cls: str, parent: str = "", values: str = "{}", token: str = "") -> str:
+        """Add a component to a Blueprint: of a class, attached under a parent component (default: the root),
+        renamed, and with property values set on its template. Compiles the Blueprint.
+
+        Args:
+            blueprint: /Game/... Blueprint path.
+            name: Component (variable) name.
+            cls: Component class: a name (StaticMeshComponent, PointLightComponent) or /Script/Module.Class.
+            parent: Name of the component to attach under ('' = the root component).
+            values: JSON object of property name to value text, as for ue set (e.g. {"StaticMesh": "/Game/X"}).
+            token: Session token from Saved/Tether/session.json (the ue CLI sends it).
+
+        Returns:
+            What was added, and the values set.
+        """
+        _authorize(token)
+        bp = unreal.load_asset(blueprint.split(".")[0])
+        if not isinstance(bp, unreal.Blueprint):
+            raise RuntimeError(f"no Blueprint at {blueprint}")
+        # 'StaticMesh' names the asset class too: try the component spelling first.
+        klass = unreal.load_class(None, cls) if cls.startswith("/Script/") else \
+            (getattr(unreal, cls + "Component", None) if not cls.endswith("Component") else None) or getattr(unreal, cls, None)
+        klass = klass.static_class() if isinstance(klass, type) and hasattr(klass, "static_class") else klass
+        if not isinstance(klass, unreal.Class) or not unreal.MathLibrary.class_is_child_of(klass, unreal.ActorComponent.static_class()):
+            raise RuntimeError(f"no component class '{cls}' (e.g. StaticMeshComponent, /Script/Module.MyComponent)")
+        subsystem = unreal.get_engine_subsystem(unreal.SubobjectDataSubsystem)
+        lib = unreal.SubobjectDataBlueprintFunctionLibrary
+        handles = subsystem.k2_gather_subobject_data_for_blueprint(bp)
+        by_name = {str(lib.get_variable_name(lib.get_data(h))): h for h in handles}
+        if name in by_name:
+            raise RuntimeError(f"{bp.get_name()} already has a component '{name}'")
+        if parent:
+            if parent not in by_name:
+                raise RuntimeError(f"no component '{parent}' (have: {', '.join(n for n in by_name if n != 'None')})")
+            parent_handle = by_name[parent]
+        else:  # the root component, or the actor itself when there is none
+            parent_handle = next((h for h in handles if lib.is_root_component(lib.get_data(h))), handles[0])
+        params = unreal.AddNewSubobjectParams(parent_handle=parent_handle, new_class=klass, blueprint_context=bp)
+        handle, failure = subsystem.add_new_subobject(params)
+        if not lib.is_handle_valid(handle):
+            raise RuntimeError(f"could not add the component: {failure}")
+        subsystem.rename_subobject(handle, unreal.Text(name))
+        unreal.BlueprintEditorLibrary.compile_blueprint(bp)
+        rows = [f"added {name} ({klass.get_name()}) under {parent or 'the root'}"]
+        requested = json.loads(values or "{}")
+        # A bad object path makes the engine log a script error, which fails the whole MCP call even though the
+        # component was added; check paths first and leave those out.
+        for key, text in list(requested.items()):
+            ref = str(text)
+            # (find_object alone is not enough: a failed load leaves an empty package object behind)
+            found = unreal.find_object(None, ref) if ":" in ref else _try(lambda: unreal.load_asset(ref.split(".")[0]))
+            if ref.startswith("/") and (found is None or isinstance(found, unreal.Package)):
+                rows.append(f"skipped {key}: nothing at {ref}")
+                del requested[key]
+        if requested:
+            template = lib.get_object(lib.get_data(handle))
+            try:
+                rows.append(_RAW["set_props"](template.get_path_name(), json.dumps(requested), False, token))
+            except Exception as exc:  # the component is there; say which values did not go in
+                rows.append(f"but its values were not set: {exc}")
+            unreal.BlueprintEditorLibrary.compile_blueprint(bp)
+        return "\n".join(rows)
 
     @_tool
     @staticmethod
