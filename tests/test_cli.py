@@ -892,3 +892,27 @@ class SlateSnapshots(unittest.TestCase):
     def test_a_pie_window_is_all_game(self):
         text = 'window "Game Preview [NetMode: Standalone 0]" [ref=w2]\n  button "Play" [size=10,10] [src=SMenu.cpp:1] [ref=b1]'
         self.assertEqual(ue.ui_lines(ue.game_ui(ue.parse_snapshot(text))), ['button "Play"  (b1)'])
+
+
+class InsightsTraces(unittest.TestCase):
+    def test_timer_stats_merge_same_names_and_rank_without_waits(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "game.csv")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("Name,Count,C.Avg,Incl,I.Min,I.Max,I.Avg,I.Med,Excl,E.Min,E.Max,E.Avg,E.Med\n"
+                        "SceneRender,100,100,0.5,0,0,0,0,0.4,0,0,0,0\n"
+                        "SceneRender,50,50,0.1,0,0,0,0,0.1,0,0,0,0\n"
+                        "TSR(sg.AntiAliasingQuality=%d) %dx%d,100,100,0.2,0,0,0,0,0.2,0,0,0,0\n"
+                        "WaitForTasks,10,10,0.3,0,0,0,0,0.3,0,0,0,0\n"
+                        "Frame,100,100,1.0,0,0,0,0,0.01,0,0,0,0\n")
+            stats = ue.read_timer_stats(path)
+        self.assertEqual(stats["SceneRender"], (150, 0.6, 0.5))
+        self.assertIn("TSR", stats)
+        lines, data = ue.trace_scopes({"game": stats}, 100, top=2, last={"game": {"SceneRender": 4.0}})
+        self.assertEqual(lines, ["  game: SceneRender 5.00 (+1.00), TSR 2.00 | waiting 3.0"])
+        self.assertEqual(data["game"], {"SceneRender": 5.0, "TSR": 2.0})
+
+    def test_gpu_passes_are_taken_out_of_the_cpu_threads(self):
+        split = ue.cpu_only({"game": {"Tick": (10, 0.5, 0.4), "Lumen": (5, 0.2, 0.2)}, "gpu": {"Lumen": (5, 0.2, 0.2)}})
+        self.assertEqual(split["game"], {"Tick": (10, 0.5, 0.4)})
+        self.assertEqual(split["gpu"], {"Lumen": (5, 0.2, 0.2)})

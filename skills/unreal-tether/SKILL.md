@@ -136,6 +136,7 @@ broken or unsupported.
 
 ## Play testing
 - Performance: `ue perf` before and after a change; each run prints the difference from the previous one.
+  `ue perf --trace` adds which scopes (functions, Blueprint events, render passes) take the time per thread.
   When it says the frame rate is capped, compare the per-frame game/render/GPU work, not the fps.
 - To play the game like a player would: `ue pie do "at ItemPickup_Key -150,0,100" "look ItemPickup_Key"
   "tap InteractAction" "until player.Inventory.Items ~ Key within 2" "gone ItemPickup_Key"` (or `-f steps.txt`).

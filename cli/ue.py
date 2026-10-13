@@ -2961,6 +2961,9 @@ def cmd_selftest(ctx, args):
           ok=lambda c, o: c == 0 and "exported" in o)
     check("perf", ["perf", "--seconds", "2", "--no-record"], timeout=300, skip="needs 5.8" if remote else None,
           ok=lambda c, o: c == 0 and "frames in" in o)
+    check("perf --trace", ["perf", "--seconds", "2", "--no-record", "--trace"], timeout=600,
+          skip="needs 5.8" if remote else None if rendering else "headless with -nullrhi (no render timings)",
+          ok=lambda c, o: c == 0 and "top scopes" in o)
     check("pie start", ["pie", "start"], ok=lambda c, o: c == 0 and "OK" in o, timeout=300)
     check("pie status", ["pie", "status"], ok=lambda c, o: c == 0 and "running" in o)
     check("actors --pie", ["actors", "--pie", "--limit", "1"])
@@ -3141,9 +3144,23 @@ def cmd_perf(ctx, args):
     try:
         if throttled:
             ctx.tether("py", code=throttle.format(False))
+        if args.trace:  # an Unreal Insights trace over the same window, for per-scope timings
+            trace_dir = os.path.join(state_dir(ctx.project), "traces")
+            os.makedirs(trace_dir, exist_ok=True)
+            trace_path = os.path.join(trace_dir, time.strftime("perf-%Y%m%d-%H%M%S.utrace")).replace("\\", "/")
+            ctx.tether("py", code=f"unreal.SystemLibrary.execute_console_command(None, 'trace.file \"{trace_path}\" cpu,frame')")
         ctx.tether("py", code="unreal.SystemLibrary.execute_console_command(None, 'CsvProfile Start')")
+        # The editor keeps recent trace data in a ring buffer and trace.file writes that history too, so the
+        # capture window is marked as a region and the export is limited to it.
+        region = time.strftime("TetherPerf%H%M%S")
+        if args.trace:
+            ctx.tether("py", code=f"unreal.SystemLibrary.execute_console_command(None, 'Trace.RegionBegin {region}')")
         time.sleep(args.seconds)
+        if args.trace:
+            ctx.tether("py", code=f"unreal.SystemLibrary.execute_console_command(None, 'Trace.RegionEnd {region}')")
         ctx.tether("py", code="unreal.SystemLibrary.execute_console_command(None, 'CsvProfile Stop')")
+        if args.trace:
+            ctx.tether("py", code="unreal.SystemLibrary.execute_console_command(None, 'trace.stop')")
         deadline = time.time() + 30
         while time.time() < deadline and not complete:  # the writer finishes the file with a metadata footer
             new = [f for f in (os.listdir(folder) if os.path.isdir(folder) else [])
@@ -3204,7 +3221,115 @@ def cmd_perf(ctx, args):
     print(f"  csv: {path}")
     if not args.no_record:  # the baseline the next capture compares with
         write_json(last_file, dict(stats, time=time.time(), csv=path))
+    if args.trace:
+        perf_trace_report(ctx, trace_path, region, len(frames), args)
     return 0
+
+
+# Insights adds the GPU queues to every timer-statistics export whatever the thread filter, so "gpu" (a filter
+# matching no CPU thread) yields the GPU passes alone, and they are subtracted from the CPU threads.
+TRACE_THREADS = (("game", "GameThread"), ("render", "RenderThread*"), ("rhi", "RHIThread"), ("gpu", "NoCpuThread"))
+TIMER_FORMAT = re.compile(r"\(|\s=\s|\s%")  # 'TSR(sg.AntiAliasingQuality=%d) %dx%d' -> 'TSR'
+WAIT_SCOPE = re.compile(r"Wait|Sleep|Idle|UpdateTimeAndHandleMaxTickRate|Stall", re.I)  # time spent not working
+
+
+def read_timer_stats(path):
+    """{timer: (count, inclusive s, exclusive s)} from an Insights ExportTimerStatistics CSV."""
+    import csv
+    stats = {}
+    try:
+        with open(path, encoding="utf-8", errors="replace", newline="") as f:
+            for row in csv.DictReader(f):
+                try:
+                    name = TIMER_FORMAT.split(row["Name"], 1)[0].strip() or row["Name"]
+                    count, incl, excl = stats.get(name, (0, 0.0, 0.0))  # same-named timers add up
+                    stats[name] = (count + int(float(row["Count"])), incl + float(row["Incl"]), excl + float(row["Excl"]))
+                except (KeyError, ValueError):
+                    continue
+    except OSError:
+        pass
+    return stats
+
+
+def cpu_only(by_thread):
+    """Each CPU thread's timers minus the GPU passes that Insights mixes into every export."""
+    gpu = by_thread.get("gpu") or {}
+    out = {"gpu": gpu}
+    for key, stats in by_thread.items():
+        if key == "gpu":
+            continue
+        out[key] = {}
+        for name, (count, incl, excl) in stats.items():
+            g = gpu.get(name, (0, 0.0, 0.0))
+            left = (count - g[0], incl - g[1], excl - g[2])
+            if left[0] > 0 and left[2] > 1e-9:
+                out[key][name] = left
+    return out
+
+
+def trace_scopes(by_thread, frames, top=6, last=None):
+    """Lines naming each thread's most expensive scopes by exclusive ms per frame, and the per-frame data."""
+    frames = max(frames, 1)
+    lines, data = [], {}
+    for key, _ in TRACE_THREADS:
+        stats = by_thread.get(key) or {}
+        ranked = sorted(((excl * 1000 / frames, name) for name, (count, incl, excl) in stats.items()
+                         if name != "Frame" and excl > 0 and not WAIT_SCOPE.search(name)), reverse=True)
+        waiting = sum(excl for name, (_, _, excl) in stats.items() if WAIT_SCOPE.search(name)) * 1000 / frames
+        data[key] = {name: round(ms, 3) for ms, name in ranked[:40]}
+        if not ranked:
+            continue
+        before = (last or {}).get(key, {})
+        parts = [f"{name} {ms:.2f}" + (f" ({ms - before[name]:+.2f})" if name in before and abs(ms - before[name]) >= 0.05
+                                       else "") for ms, name in ranked[:top]]
+        label = "gpu passes (timer totals, queues may overlap)" if key == "gpu" else key
+        lines.append(f"  {label}: " + ", ".join(parts) + (f" | waiting {waiting:.1f}" if waiting >= 0.05 else ""))
+    return lines, data
+
+
+def perf_trace_report(ctx, trace_path, region, frames, args):
+    """Export the trace's timer statistics with Unreal Insights (headless) and print the top scopes."""
+    deadline = time.time() + 30
+    while time.time() < deadline and not os.path.isfile(trace_path):
+        time.sleep(0.5)
+    exe = os.path.join(engine_root(ctx.project), "Engine", "Binaries", host_platform(),
+                       "UnrealInsights" + (".exe" if os.name == "nt" else ""))
+    if not os.path.isfile(trace_path) or not os.path.isfile(exe):
+        print("  trace: " + ("no trace was written (ue log --grep Trace)" if not os.path.isfile(trace_path)
+                             else f"UnrealInsights not found at {exe}"))
+        return
+    out_dir = os.path.splitext(trace_path)[0]
+    os.makedirs(out_dir, exist_ok=True)
+    commands = os.path.join(out_dir, "export.txt")
+    with open(commands, "w", encoding="utf-8") as f:
+        for key, threads in TRACE_THREADS:
+            f.write(f'TimingInsights.ExportTimerStatistics "{out_dir}/{key}.csv" -threads={threads} -region={region}\n')
+    try:
+        subprocess.run([exe, f"-OpenTraceFile={trace_path}", "-AutoQuit", "-NoUI", f"-ExecOnAnalysisCompleteCmd=@={commands}",
+                        f"-ABSLOG={os.path.join(out_dir, 'insights.log')}", "-unattended"],
+                       capture_output=True, timeout=600)
+    except subprocess.TimeoutExpired:
+        print("  trace: Unreal Insights did not finish the export within 10 minutes")
+        return
+    by_thread = {key: read_timer_stats(os.path.join(out_dir, f"{key}.csv")) for key, _ in TRACE_THREADS}
+    by_thread = cpu_only(by_thread)
+    last_file = os.path.join(state_dir(ctx.project), "perf", "last-trace.json")
+    last = read_json(last_file)
+    lines, data = trace_scopes(by_thread, frames, args.top, last)
+    if not lines:
+        print(f"  trace: no CPU scopes in the export (see {os.path.join(out_dir, 'insights.log')})")
+        return
+    print(f"  top scopes, exclusive ms per frame over {frames} frames" + (" (+/- vs last trace)" if last else "") + ":")
+    for line in lines:
+        print(line)
+    print(f"  trace: {trace_path} (open it in Unreal Insights for the full timeline)")
+    if not args.no_record:
+        write_json(last_file, data)
+    old_traces = sorted(f for f in os.listdir(os.path.dirname(trace_path)) if f.startswith("perf-") and f.endswith(".utrace"))
+    for name in old_traces[:-3]:  # ~10 MB a second: keep the last three
+        with __import__("contextlib").suppress(OSError):
+            os.remove(os.path.join(os.path.dirname(trace_path), name))
+            __import__("shutil").rmtree(os.path.join(os.path.dirname(trace_path), name[:-7]), ignore_errors=True)
 
 
 def pie_run(ctx, args):
@@ -3981,6 +4106,8 @@ def main(argv=None):
     s.add_argument("--seconds", type=float, default=10, help="capture length (10)")
     s.add_argument("--editor", action="store_true", help="measure the editor as is, without starting PIE")
     s.add_argument("--no-record", action="store_true", help="do not make this capture the comparison baseline")
+    s.add_argument("--trace", action="store_true", help="also an Unreal Insights trace: top CPU scopes per thread")
+    s.add_argument("--top", type=int, default=6, help="with --trace: scopes per thread (6)")
     s = add("asset", cmd_asset, "a few lines about assets, by type (mesh, texture, material, Blueprint, ...)")
     s.add_argument("paths", nargs="+", help="/Game/... asset paths")
     s = add("diff", cmd_diff, "what changed in an asset between git revisions, or a revision and the editor now")
