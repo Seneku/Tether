@@ -6,12 +6,13 @@ import json
 import math
 import os
 import re
+import shutil
 import time
 
 from .core import CliError, log_end, log_path, read_json, state_dir
 from .calls import flush_editor_log
-from .assets import code_usages
-from .play import cmd_perf, cmd_pie, pie_do, unthrottled
+from .assets import cmd_bp, code_usages
+from .play import cmd_perf, cmd_pie, insights_exe, insights_export, pie_do, unthrottled
 
 
 def input_lines(data, match=None, code_refs=None):
@@ -482,6 +483,110 @@ def perf_load(ctx, args):
                 streaming_done_s=round(done_at - began, 3) if done_at else None)
     ctx.data = data
     return code
+
+
+# With named events on, every UFunction call through ProcessEvent is a CPU scope named after the function object:
+# 'Function/Game/Doors/BP_Door.BP_Door_C.OnInteract'. A class ending in _C is a Blueprint's.
+BP_FUNCTION = re.compile(r"^Function(/[^.]+)\.(\w+)_C\.(\w+)$")
+
+
+def bp_calls(timers, events):
+    """Blueprint functions and events from an Insights timing export taken with named events on:
+    [(first start relative to the export's first event, Blueprint, function, count)], in order."""
+    functions = {}
+    for timer in timers:
+        m = BP_FUNCTION.match(timer["Name"])
+        if m and not m.group(1).startswith("/Script/") and not m.group(3).startswith("ExecuteUbergraph_"):
+            functions[timer["Id"]] = (m.group(2), m.group(3))
+    calls, origin = {}, None
+    for e in events:
+        start = float(e["StartTime"])
+        origin = start if origin is None else min(origin, start)
+        key = functions.get(e["TimerId"])
+        if key:
+            first, count = calls.get(key, (start, 0))
+            calls[key] = (min(first, start), count + 1)
+    return sorted(((first - origin, bp, fn, count) for (bp, fn), (first, count) in calls.items()), key=lambda c: c[0])
+
+
+def bp_trace(ctx, args):
+    """Which Blueprint events and functions ran during a PIE session, in order with counts."""
+    exe = insights_exe(ctx.project)
+    if not os.path.isfile(exe):
+        raise CliError(f"needs Unreal Insights ({exe})")
+    was_running = ctx.tether("pie", action="status") == "running"
+    region = time.strftime("TetherBp%H%M%S")
+    trace_dir = os.path.join(state_dir(ctx.project), "traces")
+    os.makedirs(trace_dir, exist_ok=True)
+    trace_path = os.path.join(trace_dir, f"bp-{region[8:]}.utrace").replace("\\", "/")
+
+    def console(command):
+        ctx.tether("py", code=f"unreal.SystemLibrary.execute_console_command(None, {command!r})")
+    code = 0
+    with unthrottled(ctx):
+        console("stat namedevents")  # object and function names on CPU scopes; a toggle, off by default
+        try:
+            console(f'trace.file "{trace_path}" cpu,frame')
+            console(f"Trace.RegionBegin {region}")
+            if not was_running:  # start inside the region, so BeginPlay is in it
+                code = cmd_pie(ctx, argparse.Namespace(action="start", simulate=False, warmup=0, limit=0, script=None))
+            if not code and args.do:
+                code = pie_do(ctx, argparse.Namespace(script=[], file=args.do, reject=None, keep=True,
+                                                      keep_going=False, warmup=0, quiet=True))
+            if not code:
+                time.sleep(args.seconds if args.seconds is not None else (0 if args.do else 5))
+        finally:
+            console(f"Trace.RegionEnd {region}")
+            console("trace.stop")
+            console("stat namedevents")
+            if not (args.keep or was_running):
+                cmd_pie(ctx, argparse.Namespace(action="stop", simulate=False, warmup=0, limit=0, script=None))
+    deadline = time.time() + 30
+    while time.time() < deadline and not os.path.isfile(trace_path):
+        time.sleep(0.5)
+    out_dir = os.path.splitext(trace_path)[0]
+    problem = insights_export(exe, trace_path, out_dir, [
+        f'TimingInsights.ExportTimers "{out_dir}/timers.csv"',
+        f'TimingInsights.ExportTimingEvents "{out_dir}/events.csv" -threads=GameThread -region={region}'])
+    if problem:
+        raise CliError(problem)
+    try:
+        with open(os.path.join(out_dir, "timers.csv"), encoding="utf-8") as f:
+            timers = list(csv.DictReader(f))
+        with open(os.path.join(out_dir, "events.csv"), encoding="utf-8") as f:
+            events = list(csv.DictReader(f))
+    except OSError:
+        raise CliError(f"the trace export failed (see {os.path.join(out_dir, 'insights.log')})")
+    calls = bp_calls(timers, events)
+    if args.match:
+        calls = [c for c in calls if re.search(args.match, f"{c[1]}.{c[2]}", re.I)]
+    named = any(t["Name"].startswith("Function/") for t in timers)
+    print(f"{len(calls)} Blueprint function(s)/event(s) ran" + (f" matching /{args.match}/" if args.match else "")
+          + " (first call, count):")
+    for first, bp, fn, count in calls[: args.limit]:
+        print(f"  +{first:6.2f}s  {bp}.{fn}" + (f"  x{count}" if count > 1 else ""))
+    if len(calls) > args.limit:
+        print(f"  ... +{len(calls) - args.limit} more (--limit N, --match REGEX)")
+    if not named:
+        print("note: the trace has no object names; `stat namedevents` is a toggle and may have been on already. "
+              "Run again.")
+    print(f"trace: {trace_path}")
+    ctx.data = [{"at": round(t, 3), "blueprint": bp, "function": fn, "count": n} for t, bp, fn, n in calls]
+    old = sorted(f for f in os.listdir(trace_dir) if f.startswith("bp-") and f.endswith(".utrace"))
+    for name in old[:-3]:  # tens of MB each: keep the last three
+        try:
+            os.remove(os.path.join(trace_dir, name))
+        except OSError:
+            pass
+        shutil.rmtree(os.path.join(trace_dir, name[:-7]), ignore_errors=True)
+    return code
+
+
+def bp_command(ctx, args):
+    """`ue bp`: trace lives here; reading, editing and checking graphs is assets.cmd_bp."""
+    if args.blueprint == "trace":
+        return bp_trace(ctx, args)
+    return cmd_bp(ctx, args)
 
 
 def perf_command(ctx, args):

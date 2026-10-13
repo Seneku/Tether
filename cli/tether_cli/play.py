@@ -736,29 +736,42 @@ def trace_scopes(by_thread, frames, top=6, last=None):
     return lines, data
 
 
+def insights_exe(project):
+    return os.path.join(engine_root(project), "Engine", "Binaries", host_platform(),
+                        "UnrealInsights" + (".exe" if os.name == "nt" else ""))
+
+
+def insights_export(exe, trace_path, out_dir, commands):
+    """Run Unreal Insights headless on a trace with these export commands; None, or what went wrong."""
+    os.makedirs(out_dir, exist_ok=True)
+    script = os.path.join(out_dir, "export.txt")
+    with open(script, "w", encoding="utf-8") as f:
+        f.write("\n".join(commands) + "\n")
+    try:
+        subprocess.run([exe, f"-OpenTraceFile={trace_path}", "-AutoQuit", "-NoUI", f"-ExecOnAnalysisCompleteCmd=@={script}",
+                        f"-ABSLOG={os.path.join(out_dir, 'insights.log')}", "-unattended"],
+                       capture_output=True, timeout=600)
+    except subprocess.TimeoutExpired:
+        return "Unreal Insights did not finish the export within 10 minutes"
+    return None
+
+
 def perf_trace_report(ctx, trace_path, region, frames, args):
     """Export the trace's timer statistics with Unreal Insights (headless) and print the top scopes."""
     deadline = time.time() + 30
     while time.time() < deadline and not os.path.isfile(trace_path):
         time.sleep(0.5)
-    exe = os.path.join(engine_root(ctx.project), "Engine", "Binaries", host_platform(),
-                       "UnrealInsights" + (".exe" if os.name == "nt" else ""))
+    exe = insights_exe(ctx.project)
     if not os.path.isfile(trace_path) or not os.path.isfile(exe):
         print("  trace: " + ("no trace was written (ue log --grep Trace)" if not os.path.isfile(trace_path)
                              else f"UnrealInsights not found at {exe}"))
         return
     out_dir = os.path.splitext(trace_path)[0]
-    os.makedirs(out_dir, exist_ok=True)
-    commands = os.path.join(out_dir, "export.txt")
-    with open(commands, "w", encoding="utf-8") as f:
-        for key, threads in TRACE_THREADS:
-            f.write(f'TimingInsights.ExportTimerStatistics "{out_dir}/{key}.csv" -threads={threads} -region={region}\n')
-    try:
-        subprocess.run([exe, f"-OpenTraceFile={trace_path}", "-AutoQuit", "-NoUI", f"-ExecOnAnalysisCompleteCmd=@={commands}",
-                        f"-ABSLOG={os.path.join(out_dir, 'insights.log')}", "-unattended"],
-                       capture_output=True, timeout=600)
-    except subprocess.TimeoutExpired:
-        print("  trace: Unreal Insights did not finish the export within 10 minutes")
+    problem = insights_export(exe, trace_path, out_dir, [
+        f'TimingInsights.ExportTimerStatistics "{out_dir}/{key}.csv" -threads={threads} -region={region}'
+        for key, threads in TRACE_THREADS])
+    if problem:
+        print("  trace: " + problem)
         return
     by_thread = {key: read_timer_stats(os.path.join(out_dir, f"{key}.csv")) for key, _ in TRACE_THREADS}
     by_thread = cpu_only(by_thread)

@@ -261,6 +261,8 @@ def cmd_selftest(ctx, args):
     check("ui click (Sandbox fixture)", ["pie", "do", "call /Script/Sandbox.Default__TetherProbeUILibrary ShowProbeUI",
                                          "expect-ui Tether probe panel", "click UMG Probe Button", "expect-ui UMG clicks: "],
           skip=None if fixture else "no UI fixture (Sandbox's TetherProbeUILibrary)", ok=lambda c, o: c == 0 and "PASS" in o)
+    check("bp trace", ["bp", "trace", "--seconds", "1", "--keep"], timeout=600, skip="needs 5.8" if remote else None,
+          ok=lambda c, o: c == 0 and "Blueprint function(s)/event(s) ran" in o)
     check("pie stop", ["pie", "stop"], ok=lambda c, o: c == 0 and "OK" in o)
     clients = check("pie --clients 2", ["pie", "start", "--clients", "2"], timeout=300, skip="needs UE 5.8+" if remote else None,
                     ok=lambda c, o: c == 0 and "1: client" in o)

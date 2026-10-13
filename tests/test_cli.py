@@ -1309,6 +1309,23 @@ class PerfLoad(unittest.TestCase):
         self.assertEqual(data["hitches"][0]["loaded"], ["/Game/A"])
 
 
+class BpTrace(unittest.TestCase):
+    def test_blueprint_functions_in_order_with_counts(self):
+        timers = [{"Id": "1", "Name": "Function/Game/Doors/BP_Door.BP_Door_C.ReceiveBeginPlay", "File": "x.h"},
+                  {"Id": "2", "Name": "Function/Game/Doors/BP_Door.BP_Door_C.OnInteract", "File": "x.h"},
+                  {"Id": "3", "Name": "Function/Game/Doors/BP_Door.BP_Door_C.ExecuteUbergraph_BP_Door", "File": "x.h"},
+                  {"Id": "4", "Name": "Function/Script/Engine.Actor.ReceiveTick", "File": "x.h"},
+                  {"Id": "5", "Name": "UWorld::Tick", "File": "World.cpp"},
+                  {"Id": "6", "Name": "Function/Game/AI/BP_Cultist.BP_Cultist_C.ReceiveTick", "File": "x.h"}]
+        events = [{"TimerId": "5", "StartTime": "10.0"}, {"TimerId": "1", "StartTime": "10.2"},
+                  {"TimerId": "3", "StartTime": "10.2"}, {"TimerId": "6", "StartTime": "10.3"},
+                  {"TimerId": "6", "StartTime": "10.4"}, {"TimerId": "4", "StartTime": "10.4"},
+                  {"TimerId": "2", "StartTime": "11.5"}]
+        calls = [(round(t, 2), bp, fn, n) for t, bp, fn, n in ue.bp_calls(timers, events)]
+        self.assertEqual(calls, [(0.2, "BP_Door", "ReceiveBeginPlay", 1), (0.3, "BP_Cultist", "ReceiveTick", 2),
+                                 (1.5, "BP_Door", "OnInteract", 1)])
+
+
 class JsonEnvelope(unittest.TestCase):
     def run_json(self, project, *argv):
         out = io.StringIO()

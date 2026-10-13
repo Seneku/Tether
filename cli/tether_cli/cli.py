@@ -16,11 +16,11 @@ from .calls import (
 )
 from .images import cmd_look, cmd_shot
 from .testing import cmd_test
-from .assets import cmd_bp, cmd_diff, cmd_overview, cmd_size, cmd_table, cmd_usages, cmd_validate
+from .assets import cmd_diff, cmd_overview, cmd_size, cmd_table, cmd_usages, cmd_validate
 from .content import cmd_import, cmd_lint, cmd_unused
 from .jobs import cmd_job, cmd_package
 from .play import cmd_audio, cmd_mem, cmd_soak, cmd_ui, cmd_world
-from .playtest import cmd_input, perf_command, pie_command
+from .playtest import bp_command, cmd_input, perf_command, pie_command
 from .hooks import cmd_hook
 from .setup import cmd_doctor, cmd_init, cmd_reload
 from .selftest import cmd_ci, cmd_selftest
@@ -208,8 +208,9 @@ def build_parser():
     s.add_argument("--keep", action="store_true", help="with run/do: leave PIE running afterwards")
     s.add_argument("--simulate", action="store_true", help="Simulate-In-Editor (no player pawn)")
     s.add_argument("--warmup", type=float, default=0.5, help="seconds to let BeginPlay settle (0.5)")
-    s = add("bp", cmd_bp, "Blueprint graphs as text: read, --diff against the last read, --apply edited text")
-    s.add_argument("blueprint", nargs="?", help="/Game/Path/BP_Name, or `check [/Game/path]` to compile all and list the broken")
+    s = add("bp", bp_command, "Blueprint graphs as text: read, --diff, --apply; check; edit; trace (what ran in PIE)")
+    s.add_argument("blueprint", nargs="?", help="/Game/Path/BP_Name, `check [/Game/path]` to compile all and list the broken, "
+                                                "`edit <BP> ...`, or `trace` (Blueprint calls during PIE)")
     s.add_argument("graph", nargs="?", help="graph name (default: all); with edit: the Blueprint")
     s.add_argument("rest", nargs="*", help="with edit: add-var Name Type [default] | set-default Name=v ... | "
                                            "add-component Name Class [prop=v ...] | add-function Name | add-dispatcher Name | remove-var Name")
@@ -222,6 +223,10 @@ def build_parser():
     s.add_argument("--save", action="store_true", help="save the Blueprint afterwards")
     s.add_argument("--docs", action="store_true", help="print Epic's graph DSL syntax reference")
     s.add_argument("--warnings", action="store_true", help="with check: also list Blueprints with warnings")
+    s.add_argument("--seconds", type=float, help="with trace: how long to record (5, or 0 after --do)")
+    s.add_argument("--do", metavar="FILE", help="with trace: play this `ue pie do` step file while recording")
+    s.add_argument("--match", help="with trace: regex on Blueprint.Function")
+    s.add_argument("--keep", action="store_true", help="with trace: leave PIE running afterwards")
     s = add("table", cmd_table, "DataTable round-trips: show, --export JSON/CSV, --import with a row diff")
     s.add_argument("table", help="/Game/Path/DT_Name")
     s.add_argument("--export", metavar="FILE", help="write all rows to FILE (.json or .csv)")
