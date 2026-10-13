@@ -1213,6 +1213,8 @@ class TetherCore(_Base):
         if _LEGACY:
             return _legacy_props(obj, match, limit)
         cls = obj if isinstance(obj, unreal.Struct) else obj.get_class()
+        if not unreal.ToolsetLibrary.list_struct_properties(cls):  # Epic's schema gave up on a property type
+            return _legacy_props(obj, match, limit)
         schema = _reflect(unreal.ToolsetLibrary.list_struct_properties(cls), obj)
         names = list(schema)
         if match:
@@ -1243,7 +1245,10 @@ class TetherCore(_Base):
             One 'name: old -> new' line per property.
         """
         _authorize(token)
-        if _LEGACY:
+        legacy_obj = _resolve(target, pie) if not _LEGACY else None
+        legacy_cls = legacy_obj and (legacy_obj if isinstance(legacy_obj, unreal.Struct) else legacy_obj.get_class())
+        if _LEGACY or (legacy_cls and not unreal.ToolsetLibrary.list_struct_properties(legacy_cls)):
+            # Without Epic's ToolsetLibrary, or when its schema gives up on one of the class's property types
             obj = _resolve(target, pie)
             requested = json.loads(values)
             if not isinstance(requested, dict) or not requested:
@@ -3272,6 +3277,95 @@ class TetherCore(_Base):
                 rows.append(f"but its values were not set: {exc}")
             unreal.BlueprintEditorLibrary.compile_blueprint(bp)
         return "\n".join(rows)
+
+    @_tool
+    @staticmethod
+    def savegame(slot: str, user: int = 0, match: str = "", limit: int = 80) -> str:
+        """A save slot's SaveGame object, loaded in the editor, as 'name: Type = value' lines.
+
+        Args:
+            slot: Save slot name (Saved/SaveGames/<slot>.sav).
+            user: User index.
+            match: Case-insensitive regex on property names.
+            limit: Maximum number of lines.
+
+        Returns:
+            A header with the SaveGame class, then its properties.
+        """
+        if not unreal.GameplayStatics.does_save_game_exist(slot, user):
+            raise RuntimeError(f"no save slot '{slot}' (user {user})")
+        save = unreal.GameplayStatics.load_game_from_slot(slot, user)
+        if save is None:
+            raise RuntimeError(f"slot '{slot}' did not load (a SaveGame class that no longer exists?)")
+        # A text export lists every saved property, also plain UPROPERTY()s that neither Python nor Epic's
+        # reflection tools can read.
+        path = os.path.join(unreal.Paths.convert_relative_path_to_full(unreal.Paths.project_saved_dir()),
+                            "Tether", f"savegame-{slot}.t3d")
+        task = unreal.AssetExportTask()
+        for key, value in (("object", save), ("filename", path), ("automated", True), ("prompt", False),
+                           ("replace_identical", True)):
+            task.set_editor_property(key, value)
+        if not unreal.Exporter.run_asset_export_task(task):
+            raise RuntimeError("the editor could not export the SaveGame as text")
+        with open(path, encoding="utf-8-sig", errors="replace") as f:
+            lines = f.read().splitlines()
+        values, arrays = {}, {}
+        for line in lines[1:]:
+            m = re.match(r"^ {3}(\w+)(?:\((\d+)\))?=(.*)$", line)  # top-level properties only
+            if not m:
+                continue
+            if m.group(2) is not None:
+                arrays.setdefault(m.group(1), []).append(m.group(3))
+            else:
+                values[m.group(1)] = m.group(3)
+        rx = re.compile(match, re.I) if match else None
+        rows = [f"{k} = {_short(v, 100)}" for k, v in values.items() if not rx or rx.search(k)]
+        for k, items in arrays.items():
+            if not rx or rx.search(k):
+                rows.append(f"{k}: {len(items)} item(s)" + (f", first {_short(items[0], 80)}" if items else ""))
+        return _capped(f"slot {slot}: {save.get_class().get_name()} ({len(values) + len(arrays)} saved properties)",
+                       rows, limit)
+
+    @_tool
+    @staticmethod
+    def set_savegame(slot: str, values: str, user: int = 0, token: str = "") -> str:
+        """Change properties of a save slot's SaveGame and write it back (the old file is kept as a .bak).
+
+        Args:
+            slot: Save slot name.
+            values: JSON object of property name to value text, as for ue set.
+            user: User index.
+            token: Session token from Saved/Tether/session.json (the ue CLI sends it).
+
+        Returns:
+            One 'name: old -> new' line per property, and the backup's name.
+        """
+        _authorize(token)
+        if not unreal.GameplayStatics.does_save_game_exist(slot, user):
+            raise RuntimeError(f"no save slot '{slot}' (user {user})")
+        save = unreal.GameplayStatics.load_game_from_slot(slot, user)
+        if save is None:
+            raise RuntimeError(f"slot '{slot}' did not load")
+        try:
+            result = _RAW["set_props"](save.get_path_name(), values, True, token)  # pie=True: no editor transaction
+        except RuntimeError as exc:
+            if "has no property" in str(exc):
+                raise RuntimeError(f"{exc}. Only properties exposed to Blueprints or the editor can be set from Python; "
+                                   "a plain UPROPERTY() is read-only here (ue savegame shows it)") from None
+            raise
+        folder = os.path.join(unreal.Paths.convert_relative_path_to_full(unreal.Paths.project_saved_dir()), "SaveGames")
+        source = os.path.join(folder, f"{slot}.sav")
+        backup = None
+        if os.path.isfile(source):  # only now that the change is made in memory
+            import shutil
+            import time as _time
+            backup = os.path.join(folder, f"{slot}.sav.bak-{_time.strftime('%Y%m%d-%H%M%S')}")
+            shutil.copy2(source, backup)
+        if not unreal.GameplayStatics.save_game_to_slot(save, slot, user):
+            raise RuntimeError(f"could not write slot '{slot}'" + (f" (the old file is in {os.path.basename(backup)})" if backup else ""))
+        lines = result.splitlines()[1:]
+        return "\n".join([f"{slot} ({save.get_class().get_name()}) saved"] + lines
+                         + ([f"backup: Saved/SaveGames/{os.path.basename(backup)}"] if backup else []))
 
     @_tool
     @staticmethod

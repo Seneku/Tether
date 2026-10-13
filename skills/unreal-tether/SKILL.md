@@ -193,6 +193,8 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
 - Multiplayer: `ue pie start --clients 2` (listen server; `--net client` for a dedicated one), `ue pie status`
   for the worlds, `ue pie target 1` to make `--pie` reads, `pie do` and `ai` act on client 1 (0 = server).
   Compare a value on the server and a client to check replication.
+- Save games: `ue savegame` lists slots, `ue savegame <slot> [regex]` shows what is saved; `ue savegame <slot>
+  Name=value` edits it (a .bak is kept) to set up a play test. Ask before editing a user's real save.
 - `ue pie start` / `ue pie stop` / `ue pie status`. Status explains a session that died (fatal error
   plus your source line).
 - Drive the test from Python: in PIE, `w = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_game_world()`,

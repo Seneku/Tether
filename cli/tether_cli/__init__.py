@@ -31,7 +31,7 @@ socket, subprocess, zlib = _Lazy("socket"), _Lazy("subprocess"), _Lazy("zlib")
 CLI_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # cli/
 UE_SCRIPT = os.path.join(CLI_DIR, "ue.py")  # the entry point, for the CLI's own child processes
 TETHER = "tether.toolsets.TetherCore"
-GATED = {"py", "console", "set_props", "undo", "save", "spawn", "delete", "duplicate", "mv", "rm", "set_material", "pie_step", "set_config", "umg", "new_asset", "drop", "pie_net", "look_stage", "scatter", "bp_component"}  # tools that need the session token (see beacon.session_token)
+GATED = {"py", "console", "set_props", "undo", "save", "spawn", "delete", "duplicate", "mv", "rm", "set_material", "pie_step", "set_config", "umg", "new_asset", "drop", "pie_net", "look_stage", "scatter", "bp_component", "set_savegame"}  # tools that need the session token (see beacon.session_token)
 LEVELS = {"Fatal": 0, "Error": 1, "Warning": 2, "Display": 3, "Log": 4, "Verbose": 5, "VeryVerbose": 6}
 NOISE = {"LogModelContextProtocol", "LogToolsetRegistry"}  # our own transport chatter
 # Epic logs this whenever a schema is generated for a class with delegates (props, set, describe_toolset).
@@ -3669,6 +3669,28 @@ def doctor_print(results):
     return 1 if bad else 0
 
 
+def cmd_savegame(ctx, args):
+    """Save slots: list them (from disk), show one (loaded in the editor), or edit and save one."""
+    folder = os.path.join(os.path.dirname(ctx.project), "Saved", "SaveGames")
+    if not args.slot:
+        slots = sorted((f for f in os.listdir(folder) if f.endswith(".sav")), key=lambda f: -os.path.getmtime(
+            os.path.join(folder, f))) if os.path.isdir(folder) else []
+        print(f"{len(slots)} save slot(s) in Saved/SaveGames" + (":" if slots else ""))
+        for name in slots:
+            path = os.path.join(folder, name)
+            print(f"  {name[:-4]}  {human_bytes(os.path.getsize(path))}  "
+                  f"{time.strftime('%Y-%m-%d %H:%M', time.localtime(os.path.getmtime(path)))}")
+        return 0
+    assignments = [a for a in args.rest if "=" in a]
+    if assignments:
+        values = dict(a.partition("=")[::2] for a in assignments)
+        print(ctx.tether("set_savegame", slot=args.slot, values=json.dumps(values), user=args.user))
+        return 0
+    match = " ".join(args.rest)
+    print(ctx.tether("savegame", slot=args.slot, user=args.user, match=match, limit=args.limit if args.limit != 30 else 120))
+    return 0
+
+
 def cmd_find(ctx, args):
     print(ctx.tether("find", query=args.query or "", cls=args.cls or "", under=args.under, limit=args.limit))
     return 0
@@ -3985,6 +4007,26 @@ print('ok')
 """
 
 
+SAVE_PROBE = """
+import sys
+if not hasattr(sys, '_tether_save_cls'):  # a Python uclass can be defined once per editor session
+    @unreal.uclass()
+    class TetherSelftestSave(unreal.SaveGame):
+        score = unreal.uproperty(int)
+    sys._tether_save_cls = TetherSelftestSave
+if {make}:
+    s = unreal.GameplayStatics.create_save_game_object(sys._tether_save_cls)
+    s.set_editor_property('score', 7)
+    print(unreal.GameplayStatics.save_game_to_slot(s, 'TetherSelftest', 0))
+else:
+    import glob, os
+    unreal.GameplayStatics.delete_game_in_slot('TetherSelftest', 0)
+    for f in glob.glob(os.path.join(unreal.Paths.project_saved_dir(), 'SaveGames', 'TetherSelftest.sav.bak-*')):
+        os.remove(f)
+    print(True)
+"""
+
+
 def cmd_selftest(ctx, args):
     """Run every capability against the live editor, one CLI process per check, and report pass/fail/skip."""
     import tempfile
@@ -4038,6 +4080,12 @@ def cmd_selftest(ctx, args):
     check("config", ["config", "Project/Project/Maps", "DefaultMap"], skip="needs UE 5.8+" if remote else None,
           ok=lambda c, o: c == 0 and "gameDefaultMap" in o)
     check("usages", ["usages", "PrintString", "--budget", "5"], ok=lambda c, o: c == 0 and "line(s)" in o)
+    saved = check("savegame: make a slot", ["py", SAVE_PROBE.format(make=True)], ok=lambda c, o: c == 0 and o.endswith("True"))
+    check("savegame", ["savegame", "TetherSelftest"], skip=None if saved else "no slot",
+          ok=lambda c, o: c == 0 and "score = 7" in o)
+    check("savegame edit", ["savegame", "TetherSelftest", "score=42"], skip="needs UE 5.8+" if remote else None if saved else "no slot",
+          ok=lambda c, o: c == 0 and "7 -> 42" in o)
+    ue("py", SAVE_PROBE.format(make=False))
     check("nav", ["nav"], ok=lambda c, o: c == 0 and ("bounds" in o or "NavMeshBoundsVolume" in o))
     check("call tether.level_summary", ["call", "tether.level_summary", "limit=3"],
           ok=lambda c, o: c == 0 and "actors" in o)
@@ -5455,6 +5503,10 @@ def build_parser():
     s.add_argument("--sample", type=float, default=10, help="seconds between memory/fps samples (10)")
     s.add_argument("--max-growth", type=float, default=20, help="MB/min of memory growth that fails the run (20)")
     s.add_argument("--keep-going", action="store_true", help="keep looping after a failing iteration")
+    s = add("savegame", cmd_savegame, "save slots: list, show one (regex filter), or Name=value to edit and save (.bak kept)")
+    s.add_argument("slot", nargs="?", help="slot name (default: list the slots)")
+    s.add_argument("rest", nargs="*", metavar="regex|Name=value")
+    s.add_argument("--user", type=int, default=0, help="user index (0)")
     s = add("find", cmd_find, "search assets by name and/or class (asset registry)")
     s.add_argument("query", nargs="?", help="regex on the asset name")
     s.add_argument("--class", dest="cls", help="regex on the class name, e.g. StaticMesh or 'Material$'")
