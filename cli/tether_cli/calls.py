@@ -117,7 +117,7 @@ def same_value(a, b):
 
 
 def cmd_set(ctx, args):
-    if args.assets:
+    if getattr(args, "assets", None):
         return set_assets(ctx, args)
     if not args.target:
         raise CliError("ue set <target> Name=value ... (or --assets <folder> for many assets)")
