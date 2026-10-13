@@ -2474,6 +2474,104 @@ class TetherCore(_Base):
 
     @_tool
     @staticmethod
+    def new_asset(kind: str, path: str, parent: str = "", save: bool = False, token: str = "") -> str:
+        """Create an asset: blueprint (parent class), material, mi / material instance (parent material),
+        datatable (row struct), dataasset (data asset class), level, or folder. Refuses to overwrite.
+
+        Args:
+            kind: blueprint, material, mi, datatable, dataasset, level or folder.
+            path: New /Game/... path (folder/Name).
+            parent: Blueprint: parent class (Actor, /Script/Module.Class, or a Blueprint path); mi: parent material;
+                datatable: row struct (name, /Script/Module.Struct, or a struct asset); dataasset: its class.
+            save: Save the new asset.
+            token: Session token from Saved/Tether/session.json (the ue CLI sends it).
+
+        Returns:
+            What was created.
+        """
+        _authorize(token)
+        kind = kind.lower().replace("_", "").replace("-", "")
+        path = path.rstrip("/").split(".")[0]
+        library = unreal.EditorAssetLibrary
+        if not path.startswith("/") or path.count("/") < 2:
+            raise RuntimeError(f"expected a /Game/Folder/Name path, got '{path}'")
+        if kind == "folder":
+            if library.does_directory_exist(path):
+                raise RuntimeError(f"{path} already exists")
+            library.make_directory(path)
+            return f"created folder {path}"
+        if library.does_asset_exist(path):
+            raise RuntimeError(f"{path} already exists")
+        folder, name = path.rsplit("/", 1)
+
+        def find_class(ref, base=None):
+            if not ref:
+                return None
+            cls = None
+            if ref.startswith("/Script/"):
+                cls = unreal.load_class(None, ref)
+            elif ref.startswith("/"):
+                asset = unreal.load_asset(ref.split(".")[0])
+                cls = unreal.BlueprintEditorLibrary.generated_class(asset) if isinstance(asset, unreal.Blueprint) else asset
+            else:
+                wrapper = getattr(unreal, ref, None)
+                cls = wrapper.static_class() if isinstance(wrapper, type) and hasattr(wrapper, "static_class") else None
+            if not isinstance(cls, unreal.Class):
+                raise RuntimeError(f"no class '{ref}' (a class name like Actor, /Script/Module.Class, or a Blueprint path)")
+            return cls
+
+        tools = unreal.AssetToolsHelpers.get_asset_tools()
+        note = ""
+        if kind in ("blueprint", "bp"):
+            factory = unreal.BlueprintFactory()
+            factory.set_editor_property("parent_class", find_class(parent or "Actor"))
+            asset = tools.create_asset(name, folder, unreal.Blueprint, factory)
+            note = f"parent {parent or 'Actor'}"
+        elif kind == "material":
+            asset = tools.create_asset(name, folder, unreal.Material, unreal.MaterialFactoryNew())
+        elif kind in ("mi", "materialinstance"):
+            base = unreal.load_asset(parent.split(".")[0]) if parent else None
+            if parent and not isinstance(base, unreal.MaterialInterface):
+                raise RuntimeError(f"no material at {parent}")
+            asset = tools.create_asset(name, folder, unreal.MaterialInstanceConstant,
+                                       unreal.MaterialInstanceConstantFactoryNew())
+            if asset and base:
+                unreal.MaterialEditingLibrary.set_material_instance_parent(asset, base)
+                note = f"parent {_short_path(base.get_path_name())}"
+        elif kind == "datatable":
+            if not parent:
+                raise RuntimeError("a DataTable needs its row struct: --parent <StructName or /Script/Module.Struct>")
+            struct = unreal.load_object(None, parent) if parent.startswith("/Script/") else \
+                unreal.load_asset(parent.split(".")[0]) if parent.startswith("/") else None
+            if struct is None:
+                wrapper = getattr(unreal, parent, None)
+                struct = wrapper.static_struct() if wrapper is not None and hasattr(wrapper, "static_struct") else None
+            if not isinstance(struct, unreal.ScriptStruct):
+                raise RuntimeError(f"no row struct '{parent}'")
+            factory = unreal.DataTableFactory()
+            factory.set_editor_property("struct", struct)
+            asset = tools.create_asset(name, folder, unreal.DataTable, factory)
+            note = f"rows {struct.get_name()}"
+        elif kind == "dataasset":
+            if not parent:
+                raise RuntimeError("a DataAsset needs its class: --parent <DataAsset subclass>")
+            factory = unreal.DataAssetFactory()
+            factory.set_editor_property("data_asset_class", find_class(parent))
+            asset = tools.create_asset(name, folder, unreal.DataAsset, factory)
+            note = f"class {parent}"
+        elif kind in ("level", "map"):
+            asset = tools.create_asset(name, folder, unreal.World, unreal.WorldFactory())
+        else:
+            raise RuntimeError("kind must be blueprint, material, mi, datatable, dataasset, level or folder")
+        if asset is None:
+            raise RuntimeError(f"could not create {path} (see ue log)")
+        if save:
+            library.save_loaded_asset(asset, False)
+        return f"created {path} ({asset.get_class().get_name()}" + (f", {note}" if note else "") + ")" + \
+            ("" if save else " (unsaved: ue save, or pass --save)")
+
+    @_tool
+    @staticmethod
     def find(query: str = "", cls: str = "", under: str = "/Game", limit: int = 50) -> str:
         """Search the asset registry by name and/or class.
 

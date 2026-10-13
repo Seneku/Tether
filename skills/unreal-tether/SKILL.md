@@ -42,6 +42,9 @@ broken or unsupported.
 - In a Perforce (or other check-out) workspace, `ue save`/`mv`/`rm` check files out and mark new ones for add
   themselves; if one is checked out by someone else, or read-only without a connection, it says so and
   `ue save` exits 1: tell the user rather than making files writable yourself.
+- New assets: `ue new bp /Game/X/BP_Door --parent Actor` (or a C++ class, or another Blueprint), `ue new mi
+  /Game/X/MI_Rock --parent /Game/X/M_Rock`, `ue new datatable /Game/X/DT_Items --parent ItemRow`, `ue new level
+  /Game/Maps/L_Test`, `ue new folder /Game/X`. Then `ue save` (or pass --save).
 - Level edits: `ue spawn PointLight --at 0,0,300 --label Lamp` (or an asset path), `ue duplicate Lamp --count 3`,
   `ue delete Lamp`. Asset moves: `ue mv /Game/A/X /Game/B/` (then `ue save`), `ue rm /Game/A/X` (refuses while
   referenced; check `ue refs` first). Prefer these to raw `ue py`: they are undoable and checked.

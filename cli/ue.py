@@ -29,7 +29,7 @@ class _Lazy:
 socket, subprocess, zlib = _Lazy("socket"), _Lazy("subprocess"), _Lazy("zlib")
 
 TETHER = "tether.toolsets.TetherCore"
-GATED = {"py", "console", "set_props", "undo", "save", "spawn", "delete", "duplicate", "mv", "rm", "set_material", "pie_step", "set_config", "umg"}  # tools that need the session token (see beacon.session_token)
+GATED = {"py", "console", "set_props", "undo", "save", "spawn", "delete", "duplicate", "mv", "rm", "set_material", "pie_step", "set_config", "umg", "new_asset"}  # tools that need the session token (see beacon.session_token)
 LEVELS = {"Fatal": 0, "Error": 1, "Warning": 2, "Display": 3, "Log": 4, "Verbose": 5, "VeryVerbose": 6}
 NOISE = {"LogModelContextProtocol", "LogToolsetRegistry"}  # our own transport chatter
 # Epic logs this whenever a schema is generated for a class with delegates (props, set, describe_toolset).
@@ -2623,6 +2623,11 @@ def cmd_ai(ctx, args):
     return 0
 
 
+def cmd_new(ctx, args):
+    print(ctx.tether("new_asset", kind=args.kind, path=args.path, parent=args.parent or "", save=args.save))
+    return 0
+
+
 def cmd_find(ctx, args):
     print(ctx.tether("find", query=args.query or "", cls=args.cls or "", under=args.under, limit=args.limit))
     return 0
@@ -2920,6 +2925,11 @@ def cmd_selftest(ctx, args):
           ok=lambda c, o: c == 0 and "-> (1, 0, 0, 1)" in o)
     check("undo mat", ["undo"], skip="needs UE 5.8+" if remote else None if instance else "no transient instance",
           ok=lambda c, o: c == 0 and "undone: mat" in o)
+    created = check("new", ["new", "bp", "/Game/TetherSelftest/BP_SelftestNew", "--parent", "Actor"],
+                    ok=lambda c, o: c == 0 and "created /Game/TetherSelftest/BP_SelftestNew" in o)
+    check("rm (new asset)", ["rm", "/Game/TetherSelftest/BP_SelftestNew"], skip=None if created else "nothing created",
+          ok=lambda c, o: c == 0 and "deleted" in o)
+    ue("py", "unreal.EditorAssetLibrary.delete_directory('/Game/TetherSelftest')")
     check("destroy probe actor", ["py", "w = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_editor_world()\n"
           "found = [a for a in unreal.GameplayStatics.get_all_actors_of_class(w, unreal.Actor) "
           "if a.get_actor_label() == 'TetherSelftestProbe']\n"
@@ -4148,6 +4158,11 @@ def main(argv=None):
     s.add_argument("--submit", action="store_true", help="with type: press Enter afterwards")
     s = add("ai", cmd_ai, "AI in PIE: movement/path, focus, perception, brain, blackboard, project getters")
     s.add_argument("target", nargs="?", help="a pawn or controller (default: one line per AI)")
+    s = add("new", cmd_new, "create an asset: blueprint, material, mi, datatable, dataasset, level, folder")
+    s.add_argument("kind", choices=["blueprint", "bp", "material", "mi", "datatable", "dataasset", "level", "folder"])
+    s.add_argument("path", help="/Game/Folder/Name")
+    s.add_argument("--parent", help="blueprint: parent class; mi: parent material; datatable: row struct; dataasset: class")
+    s.add_argument("--save", action="store_true", help="save it right away")
     s = add("find", cmd_find, "search assets by name and/or class (asset registry)")
     s.add_argument("query", nargs="?", help="regex on the asset name")
     s.add_argument("--class", dest="cls", help="regex on the class name, e.g. StaticMesh or 'Material$'")
