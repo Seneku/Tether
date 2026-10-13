@@ -1375,6 +1375,16 @@ def cmd_shot(ctx, args):
     if launch.get("headless") and not launch.get("render"):
         raise CliError("this editor runs headless with -nullrhi and cannot render; "
                        "reopen it with `ue open --headless --render` (or windowed)")
+    baselines = os.path.join(state_dir(ctx.project), "shots", "baselines")
+    if args.compare:  # re-shoot the baseline's exact camera
+        meta = read_json(os.path.join(baselines, f"{args.compare}.json"))
+        if not meta:
+            names = sorted(f[:-5] for f in os.listdir(baselines) if f.endswith(".json")) if os.path.isdir(baselines) else []
+            raise CliError(f"no baseline '{args.compare}'" + (f" (have: {', '.join(names)})" if names else
+                                                             " (save one with ue shot ... --baseline NAME)"))
+        loc, rot = meta["pose"]["location"], meta["pose"]["rotation"]
+        args.actor, args.look_at = None, None
+        args.at, args.rot = f"{loc['x']},{loc['y']},{loc['z']}", f"{rot['pitch']},{rot['yaw']},{rot['roll']}"
     pose = ctx.tether("shot_pose", actor=args.actor or "", at=args.at or "", look_at=args.look_at or "",
                       rot=args.rot or "")
     pie, simulate = pose.pop("pie", False), pose.pop("simulate", False)
@@ -1410,7 +1420,125 @@ def cmd_shot(ctx, args):
     print(f"{path}  {width}x{height}  {len(raw) // 1024} KB" + ("  (Simulate)" if simulate else "  (PIE)" if pie else ""))
     print(f"camera at ({loc['x']:.0f}, {loc['y']:.0f}, {loc['z']:.0f}) "
           f"rot ({rot['pitch']:.0f}, {rot['yaw']:.0f}, {rot['roll']:.0f})")
+    if args.baseline:
+        os.makedirs(baselines, exist_ok=True)
+        with open(os.path.join(baselines, f"{args.baseline}.png"), "wb") as f:
+            f.write(raw)
+        write_json(os.path.join(baselines, f"{args.baseline}.json"), {"pose": pose, "time": time.time()})
+        print(f"baseline '{args.baseline}' saved (ue shot --compare {args.baseline})")
+    if args.compare:
+        with open(os.path.join(baselines, f"{args.compare}.png"), "rb") as f:
+            before = png_read(f.read())
+        share, regions, diff = image_diff(before, png_read(raw), args.threshold)
+        diff_path = os.path.splitext(path)[0] + f"-diff-{args.compare}.png"
+        png_write(diff_path, before[0], before[1], diff)
+        print(f"compare '{args.compare}': {share * 100:.2f}% of pixels changed"
+              + ("; areas " + ", ".join(f"x {b[0]}-{b[2]} y {b[1]}-{b[3]}" for b in regions[:3])
+                 + (f" (+{len(regions) - 3} more)" if len(regions) > 3 else "") if regions else "")
+              + f" (tolerance {args.tolerance:g}%)")
+        print(f"diff (changes in red): {diff_path}")
+        return 1 if share * 100 > args.tolerance else 0
     return 0
+
+
+def png_read(data):
+    """(width, height, channels, pixel bytes) from an 8-bit non-interlaced PNG (stdlib only)."""
+    import struct
+    if data[:8] != b"\x89PNG\r\n\x1a\n":
+        raise CliError("not a PNG")
+    pos, idat, width = 8, [], 0
+    while pos < len(data):
+        length, kind = struct.unpack(">I4s", data[pos:pos + 8])
+        body = data[pos + 8:pos + 8 + length]
+        if kind == b"IHDR":
+            width, height, depth, color, _, _, interlace = struct.unpack(">IIBBBBB", body)
+            channels = {0: 1, 2: 3, 4: 2, 6: 4}.get(color)
+            if depth != 8 or channels is None or interlace:
+                raise CliError(f"unsupported PNG (bit depth {depth}, color type {color}, interlace {interlace})")
+        elif kind == b"IDAT":
+            idat.append(body)
+        elif kind == b"IEND":
+            break
+        pos += 12 + length
+    raw = zlib.decompress(b"".join(idat))
+    stride = width * channels
+    out = bytearray(stride * height)
+    prev = bytearray(stride)
+    for y in range(height):
+        start = y * (stride + 1)
+        kind, line = raw[start], bytearray(raw[start + 1:start + 1 + stride])
+        if kind == 1:
+            for i in range(channels, stride):
+                line[i] = (line[i] + line[i - channels]) & 0xFF
+        elif kind == 2:
+            line = bytearray((a + b) & 0xFF for a, b in zip(line, prev))
+        elif kind == 3:
+            for i in range(stride):
+                left = line[i - channels] if i >= channels else 0
+                line[i] = (line[i] + ((left + prev[i]) >> 1)) & 0xFF
+        elif kind == 4:
+            for i in range(stride):
+                a = line[i - channels] if i >= channels else 0
+                b, c = prev[i], (prev[i - channels] if i >= channels else 0)
+                p = a + b - c
+                pa, pb, pc = abs(p - a), abs(p - b), abs(p - c)
+                line[i] = (line[i] + (a if pa <= pb and pa <= pc else b if pb <= pc else c)) & 0xFF
+        out[y * stride:(y + 1) * stride] = line
+        prev = line
+    return width, height, channels, bytes(out)
+
+
+def png_write(path, width, height, rgb):
+    """Write 8-bit RGB pixels as a PNG."""
+    import struct
+
+    def chunk(kind, body):
+        return struct.pack(">I", len(body)) + kind + body + struct.pack(">I", zlib.crc32(kind + body) & 0xFFFFFFFF)
+
+    stride = width * 3
+    raw = b"".join(b"\x00" + rgb[y * stride:(y + 1) * stride] for y in range(height))
+    with open(path, "wb") as f:
+        f.write(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+                + chunk(b"IDAT", zlib.compress(raw, 6)) + chunk(b"IEND", b""))
+
+
+def image_diff(before, after, threshold=32):
+    """Compare two decoded images: (share of changed pixels, bounding box (x0, y0, x1, y1) or None, diff RGB)."""
+    w, h, ca, a = before
+    w2, h2, cb, b = after
+    if (w, h) != (w2, h2):
+        raise CliError(f"sizes differ: baseline {w}x{h}, now {w2}x{h2} (same viewport size needed)")
+    changed, box, blocks = 0, None, {}
+    diff = bytearray(w * h * 3)
+    for y in range(h):
+        row_a, row_b = y * w * ca, y * w * cb
+        for x in range(w):
+            pa, pb = row_a + x * ca, row_b + x * cb
+            delta = max(abs(a[pa + k] - b[pb + k]) for k in range(min(ca, cb, 3)))
+            o = (y * w + x) * 3
+            if delta > threshold:
+                changed += 1
+                diff[o] = 255
+                blocks[(x >> 3, y >> 3)] = blocks.get((x >> 3, y >> 3), 0) + 1
+            else:
+                grey = (b[pb] + b[pb + (1 if cb > 2 else 0)] + b[pb + (2 if cb > 2 else 0)]) // 9
+                diff[o] = diff[o + 1] = diff[o + 2] = grey
+    # Changed areas: connected groups of 8x8 blocks at least a quarter changed, so lone noisy pixels (aliasing)
+    # do not count, and separate changes (an object moved, clouds drifting) stay apart. Largest first.
+    dense, regions = {k for k, n in blocks.items() if n >= 16}, []
+    while dense:
+        stack, group = [dense.pop()], []
+        while stack:
+            bx, by = stack.pop()
+            group.append((bx, by))
+            for n in ((bx + 1, by), (bx - 1, by), (bx, by + 1), (bx, by - 1)):
+                if n in dense:
+                    dense.remove(n)
+                    stack.append(n)
+        regions.append((sum(blocks[k] for k in group), (min(k[0] for k in group) * 8, min(k[1] for k in group) * 8,
+                        min(max(k[0] for k in group) * 8 + 7, w - 1), min(max(k[1] for k in group) * 8 + 7, h - 1))))
+    regions.sort(reverse=True)
+    return changed / float(w * h), [r[1] for r in regions], bytes(diff)
 
 
 TEST_LOCATION = re.compile(r"LogAutomationController: (?:Error|Warning): (.*) \[(.+)\((\d+)\)\]\s*$")
@@ -3048,6 +3176,15 @@ def cmd_selftest(ctx, args):
                      ok=lambda c, o: c == 0 and ".png" in o)
     if shot_out:
         notes["shot"] = shot_out.split()[1] if len(shot_out.split()) > 1 else ""
+        based = check("shot --baseline", ["shot", "--at", "0,-500,300", "--rot", "-20,90,0", "--baseline", "tether_selftest",
+                                          "-o", os.path.join(tempfile.gettempdir(), "tether-selftest-base.png")],
+                      ok=lambda c, o: c == 0 and "baseline 'tether_selftest' saved" in o)
+        check("shot --compare", ["shot", "--compare", "tether_selftest", "--tolerance", "5",
+                                 "-o", os.path.join(tempfile.gettempdir(), "tether-selftest-cmp.png")],
+              skip=None if based else "no baseline", ok=lambda c, o: c == 0 and "of pixels changed" in o)
+        for ext in (".png", ".json"):
+            with __import__("contextlib").suppress(OSError):
+                os.remove(os.path.join(state_dir(project), "shots", "baselines", "tether_selftest" + ext))
     tests_available = not remote and "AutomationTestToolset.AutomationTestToolset" in catalog(ctx)
     check("test", ["test", "StartsWith:System.Core.Math.Evaluate"], timeout=600,
           skip=None if tests_available else "needs Epic's AutomationTestToolset (UE 5.8+, `ue init` enables it)",
@@ -4181,6 +4318,10 @@ def main(argv=None):
     s.add_argument("--grid-z", type=float, default=0, help="with --annotate: grid height (0)")
     s.add_argument("--ui", action="store_true", help="include gizmos and selection outlines")
     s.add_argument("-o", "--output", help="PNG path (default Saved/Tether/shots/shot-<time>.png)")
+    s.add_argument("--baseline", metavar="NAME", help="also save this shot and its camera as a named baseline")
+    s.add_argument("--compare", metavar="NAME", help="re-shoot a baseline's camera and report what changed (exit 1)")
+    s.add_argument("--tolerance", type=float, default=0.5, help="with --compare: changed pixels allowed, %% (0.5)")
+    s.add_argument("--threshold", type=int, default=32, help="with --compare: per-channel difference that counts (32)")
     s = add("test", cmd_test, "run automation tests in the live editor; prints failures only (exit 1 on failure)")
     s.add_argument("filter", nargs="?", help="Epic filter: substring, ^Prefix, Suffix$, StartsWith:X, Group:Name; '+' joins")
     s.add_argument("--list", action="store_true", help="list matching tests instead of running them")

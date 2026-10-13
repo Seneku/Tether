@@ -133,6 +133,11 @@ broken or unsupported.
 - Cooks and other long commands: `ue job cook` or `ue job start -- <cmd>`, then `ue job wait` (errors only)
   or `ue job status`. Do not block a shell on them.
 
+## Visual checks
+- Before a change that should not alter a view (refactors, optimisations), `ue shot --at ... --look-at ... --baseline
+  NAME`; after it, `ue shot --compare NAME` reports what changed and where (diff image in red). Animated things
+  (clouds, water, particles) show up as separate areas; judge by the largest.
+
 ## Automated tests
 - `ue test <filter>` runs automation tests in the live editor and prints one summary line plus each
   failure with its source line; exit code 1 if any failed. Filter syntax is Epic's: a substring,

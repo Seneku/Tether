@@ -932,3 +932,46 @@ class Packaging(unittest.TestCase):
             self.assertIsNone(ue.packaged_executable(project.uproject, "Linux"))
         finally:
             project.close()
+
+
+class Pngs(unittest.TestCase):
+    def test_round_trip_and_diff(self):
+        w, h = 6, 4
+        pixels = bytes((x * 40) % 256 for x in range(w * h * 3))
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "a.png")
+            ue.png_write(path, w, h, pixels)
+            with open(path, "rb") as f:
+                decoded = ue.png_read(f.read())
+        self.assertEqual(decoded, (w, h, 3, pixels))
+        changed = bytearray(pixels)
+        changed[(2 * w + 3) * 3] = (changed[(2 * w + 3) * 3] + 128) % 256  # one pixel at (3, 2)
+        share, box, diff = ue.image_diff(decoded, (w, h, 3, bytes(changed)))
+        self.assertAlmostEqual(share, 1 / (w * h))
+        self.assertEqual(box, [])  # a lone changed pixel is noise, not an area
+        self.assertEqual(diff[(2 * w + 3) * 3:(2 * w + 3) * 3 + 3], b"\xff\x00\x00")
+
+    def test_changed_area_ignores_lone_pixels(self):
+        w, h = 32, 16
+        base = bytes(w * h * 3)
+        changed = bytearray(base)
+        for y in range(8, 16):  # a solid 8x8 block at (16, 8)
+            for x in range(16, 24):
+                changed[(y * w + x) * 3] = 200
+        changed[(1 * w + 1) * 3] = 200  # and one stray pixel
+        share, box, _ = ue.image_diff((w, h, 3, base), (w, h, 3, bytes(changed)))
+        self.assertEqual(box, [(16, 8, 23, 15)])
+        self.assertAlmostEqual(share, 65 / (w * h))
+
+    def test_png_filters(self):
+        import struct
+        # A 2x2 RGBA image with one row Sub-filtered and one Paeth-filtered, built by hand.
+        rows = [bytes([1, 10, 20, 30, 255, 5, 5, 5, 0]), bytes([4, 1, 1, 1, 0, 2, 2, 2, 0])]
+        def chunk(kind, body):
+            return struct.pack(">I", len(body)) + kind + body + struct.pack(">I", ue.zlib.crc32(kind + body) & 0xFFFFFFFF)
+        data = (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", 2, 2, 8, 6, 0, 0, 0))
+                + chunk(b"IDAT", ue.zlib.compress(b"".join(rows))) + chunk(b"IEND", b""))
+        w, h, c, px = ue.png_read(data)
+        self.assertEqual((w, h, c), (2, 2, 4))
+        self.assertEqual(px[:8], bytes([10, 20, 30, 255, 15, 25, 35, 255]))  # Sub adds the pixel to the left
+        self.assertEqual(px[8:], bytes([11, 21, 31, 255, 17, 27, 37, 255]))  # Paeth predicts from above/left
