@@ -1401,6 +1401,48 @@ class LevelCheck(unittest.TestCase):
         self.assertEqual(ue.level_lines({"actors": 3, "issues": []}), ["3 actors checked: nothing to report"])
 
 
+class WatchBaseline(unittest.TestCase):
+    BASE = {"targets": ["player.Health", "player", "Enemy.State", "Ghost"],
+            "samples": [[0.0, 0, 100, [0, 0, 0], "Idle", None], [1.0, 1, 80, [300, 0, 0], "Idle", None],
+                        [2.0, 2, 60, [600, 0, 0], "Chase", None], [3.0, 3, 60, [600, 0, 0], "Attack", None]]}
+
+    def test_identical_runs_match(self):
+        self.assertEqual(ue.compare_watch(self.BASE, self.BASE), [])
+
+    def test_small_jitter_is_tolerated(self):
+        run = {"targets": self.BASE["targets"],
+               "samples": [[0.0, 0, 100, [0, 0, 0], "Idle", None], [1.2, 1, 79, [290, 0, 0], "Idle", None],
+                           [2.4, 2, 59, [590, 10, 0], "Chase", None], [3.3, 3, 59, [595, 10, 0], "Attack", None]]}
+        self.assertEqual(ue.compare_watch(self.BASE, run), [])
+
+    def test_divergence_is_named(self):
+        run = {"targets": self.BASE["targets"],
+               "samples": [[0.0, 0, 100, [0, 0, 0], "Idle", None], [1.0, 1, 100, [0, 0, 0], "Idle", None],
+                           [5.0, 5, 100, [0, 0, 0], "Chase", None], [6.0, 6, 100, [0, 0, 0], "Attack", [1, 2, 3]]]}
+        found = {}
+        for spec, message in ue.compare_watch(self.BASE, run):
+            found.setdefault(spec, []).append(message)
+        self.assertEqual(found["player.Health"], ["ends at 100 (baseline 60)", "min 100 (baseline 60)"])
+        self.assertIn("ends 600 cm from where it did", found["player"][0])
+        self.assertEqual(found["Enemy.State"], ["reached Chase at 5.0s (baseline 2.0s)",
+                                                "reached Attack at 6.0s (baseline 3.0s)"])
+        self.assertEqual(found["Ghost"], ["now found, but not in the baseline"])
+
+    def test_different_state_sequence(self):
+        run = {"targets": ["Enemy.State"], "samples": [[0, 0, "Idle"], [1, 1, "Flee"]]}
+        base = {"targets": ["Enemy.State"], "samples": [[0, 0, "Idle"], [1, 1, "Chase"]]}
+        self.assertEqual(ue.compare_watch(base, run), [("Enemy.State", "went Idle -> Flee (baseline Idle -> Chase)")])
+
+    def test_watch_header(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "s.txt")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("# map: /Game/L\n# watch: player.Health Enemy.State\n# watch: player\nat 0,0,0\n")
+            self.assertEqual(ue.watch_header(path), ["player.Health", "Enemy.State", "player"])
+        self.assertTrue(ue.baseline_path("D:/P/Game.uproject", "door").replace("\\", "/").endswith(
+            "P/tests/play/baselines/door.json"))
+
+
 class JsonEnvelope(unittest.TestCase):
     def run_json(self, project, *argv):
         out = io.StringIO()

@@ -208,6 +208,10 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
   windowed editor and play (it stops when they stop PIE). The file replays with `ue pie do -f`: keys become
   `tap`/`hold`/`release` of their input actions, mouse look becomes `look` steps, ending with a `near` check.
   Add `expect` steps for what should have happened.
+- To lock in how play unfolds (not just that steps pass): add `# watch: BP_Enemy_C_1.State player.Health player`
+  to a step file in tests/play/. Its first `ue pie do -f` records tests/play/baselines/<file>.json (commit it);
+  later runs and `ue ci --play` fail on differences (states reached late, values ending elsewhere, paths drifting).
+  Re-record on purpose with `--baseline <file stem>`.
 - To see how values change during play (instead of adding print nodes): `ue pie watch player.Health
   BP_Enemy_C_1.State BP_Enemy_C_1 --seconds 10` (an actor alone = its location; `-f steps.txt` plays a step file
   while watching). Prints each value's range, path or changes with times; the full samples go to a CSV.

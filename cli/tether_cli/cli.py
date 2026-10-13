@@ -231,6 +231,11 @@ def build_parser():
                                                  "to sample (10, or until the -f steps finish); with record: stop "
                                                  "after this long (default: when PIE stops)")
     s.add_argument("--every", type=float, default=0.1, help="with watch: seconds between samples (0.1)")
+    s.add_argument("--watch", nargs="+", metavar="ACTOR.PROP", help="with do: watch these while the steps run "
+                                                                   "(or a `# watch:` line in the step file)")
+    s.add_argument("--baseline", metavar="NAME", help="with watch/do: record the watched values as a baseline "
+                                                      "(tests/play/baselines/NAME.json)")
+    s.add_argument("--compare", metavar="NAME", help="with watch/do: compare with that baseline; exit 1 on differences")
     s.add_argument("-o", "--output", help="with watch: CSV path (default Saved/Tether/watch/); with record: step file "
                                                "(default Saved/Tether/recordings/)")
     s.add_argument("--keep", action="store_true", help="with run/do: leave PIE running afterwards")

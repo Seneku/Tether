@@ -160,6 +160,59 @@ def write_watch_csv(path, result):
             out.writerow(cells)
 
 
+def compare_watch(baseline, result, time_tolerance=1.5, distance_tolerance=150.0, value_tolerance=0.05):
+    """How a watched run differs from its baseline: [(value, message)]. Numbers: final value and extremes beyond
+    5% of the baseline's range (or of the value); positions: where it ended and how far it went; anything else:
+    the sequence of values, and when each was first reached (beyond time_tolerance seconds)."""
+    def first_times(points):
+        seen = {}
+        for t, v in points:
+            key = json.dumps(v)
+            seen.setdefault(key, t)
+        return seen
+
+    def series(res, i):
+        return [(row[0], row[2 + i]) for row in res["samples"] if row[2 + i] is not None]
+    found = []
+    base_index = {spec: i for i, spec in enumerate(baseline["targets"])}
+    for i, spec in enumerate(result["targets"]):
+        if spec not in base_index:
+            continue
+        old, new = series(baseline, base_index[spec]), series(result, i)
+        if bool(old) != bool(new):
+            found.append((spec, "was found in the baseline but not now" if old else "now found, but not in the baseline"))
+            continue
+        if not old:
+            continue
+        old_values, new_values = [v for _, v in old], [v for _, v in new]
+        if all(_num(v) for v in old_values + new_values):
+            span = max(max(old_values) - min(old_values), abs(old_values[-1]), 1e-6)
+            for label, a, b in (("ends at", old_values[-1], new_values[-1]), ("min", min(old_values), min(new_values)),
+                                ("max", max(old_values), max(new_values))):
+                if abs(a - b) > value_tolerance * span:
+                    found.append((spec, f"{label} {_fmt(b)} (baseline {_fmt(a)})"))
+        elif all(isinstance(v, list) and len(v) == 3 for v in old_values + new_values):
+            end = sum((x - y) ** 2 for x, y in zip(old_values[-1], new_values[-1])) ** 0.5
+            if end > distance_tolerance:
+                found.append((spec, f"ends {end:.0f} cm from where it did: {_fmt(new_values[-1])} (baseline "
+                                    f"{_fmt(old_values[-1])})"))
+            travel = lambda vals: sum(sum((x - y) ** 2 for x, y in zip(a, b)) ** 0.5 for a, b in zip(vals, vals[1:]))  # noqa: E731
+            a, b = travel(old_values), travel(new_values)
+            if abs(a - b) > max(distance_tolerance, 0.25 * a):
+                found.append((spec, f"moved {b:.0f} cm (baseline {a:.0f} cm)"))
+        else:
+            runs = lambda vals: [v for k, v in enumerate(vals) if k == 0 or v != vals[k - 1]]  # noqa: E731
+            if runs(old_values) != runs(new_values):
+                found.append((spec, f"went {' -> '.join(_fmt(v) for v in runs(new_values)[:8])} (baseline "
+                                    f"{' -> '.join(_fmt(v) for v in runs(old_values)[:8])})"))
+            else:
+                old_t, new_t = first_times(old), first_times(new)
+                for key, t in new_t.items():
+                    if key in old_t and abs(t - old_t[key]) > time_tolerance:
+                        found.append((spec, f"reached {_fmt(json.loads(key))} at {t:.1f}s (baseline {old_t[key]:.1f}s)"))
+    return found
+
+
 def pie_watch(ctx, args):
     """Sample properties while PIE runs (for --seconds, or while a step file plays), then summarise them."""
     specs = list(args.script or [])
@@ -197,7 +250,45 @@ def pie_watch(ctx, args):
     for line in lines:
         print("  " + line)
     ctx.data = {"csv": path, "samples": len(samples), "seconds": span, "values": summary}
+    if getattr(args, "baseline", None):
+        target = baseline_path(ctx.project, args.baseline)
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        with open(target, "w", encoding="utf-8") as f:
+            json.dump({"targets": result["targets"], "samples": result["samples"], "steps": args.file,
+                       "recorded": time.strftime("%Y-%m-%d %H:%M")}, f)
+        print(f"baseline recorded: {target} (commit it; --compare {args.baseline} checks later runs against it)")
+    if getattr(args, "compare", None):
+        target = baseline_path(ctx.project, args.compare)
+        if not os.path.isfile(target):
+            raise CliError(f"no baseline {target} (record one with --baseline {args.compare})")
+        with open(target, encoding="utf-8") as f:
+            base = json.load(f)
+        diffs = compare_watch(base, result)
+        for spec, message in diffs:
+            print(f"DIFF {spec}: {message}")
+        print(("matches" if not diffs else f"{len(diffs)} difference(s) from") + f" baseline {args.compare}"
+              + f" (recorded {base.get('recorded', '?')})")
+        ctx.data["differences"] = [{"value": s, "message": m} for s, m in diffs]
+        code = code or (1 if diffs else 0)
     return code
+
+
+def baseline_path(project, name):
+    """A baseline file: a path as given, or tests/play/baselines/<name>.json next to the play tests."""
+    if name.endswith(".json") or os.sep in name or "/" in name:
+        return os.path.abspath(name)
+    return os.path.join(os.path.dirname(project), "tests", "play", "baselines", name + ".json")
+
+
+def watch_header(path):
+    """The values a step file asks to watch (`# watch: player.Health BP_Enemy.State`), or []."""
+    specs = []
+    with open(path, encoding="utf-8-sig") as f:
+        for line in f:
+            m = re.match(r"\s*#\s*watch:\s*(.+)$", line)
+            if m:
+                specs += m.group(1).split()
+    return specs
 
 
 def _apply_modifiers(value, modifiers):
@@ -599,6 +690,16 @@ def pie_command(ctx, args):
     """`ue pie`: watch and record live here; everything else is play.cmd_pie."""
     if args.action == "watch":
         return pie_watch(ctx, args)
+    if args.action == "do" and args.file and (args.watch or watch_header(args.file)):
+        # A step file that watches values is a regression test: compare with its baseline, or record it first.
+        name = args.compare or args.baseline or os.path.splitext(os.path.basename(args.file))[0]
+        recorded = os.path.isfile(baseline_path(ctx.project, name))
+        watch_args = argparse.Namespace(**vars(args))
+        watch_args.script = args.watch or watch_header(args.file)
+        watch_args.seconds = None
+        watch_args.baseline = None if recorded and not args.baseline else name
+        watch_args.compare = name if recorded and not args.baseline else None
+        return pie_watch(ctx, watch_args)
     if args.action == "record":
         return pie_record(ctx, args)
     return cmd_pie(ctx, args)
