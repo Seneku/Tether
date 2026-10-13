@@ -13,7 +13,7 @@ from .core import (
 from .transport import catalog, py_json, resolve_toolset
 from .build import csharp_changes, csharp_layout, csharp_reload_build
 from .calls import flush_editor_log
-from .images import cmd_shot
+from .images import cmd_shot, image_diff, png_read, png_write
 from .assets import mcp_tool
 from .jobs import cmd_job, jobs_dir
 
@@ -970,6 +970,8 @@ def pie_do(ctx, args):
             node = find_ui(nodes, parts[0], {"textbox", "spinbox"})
             mcp_tool(ctx, "SlateInspectorToolset", "Type", {"ref": node["ref"], "text": " ".join(parts[1:]), "submit": False})
             return True, f'typed into "{node["label"]}"'
+        if verb == "shot-check":
+            return shot_check(ctx, rest)
         if verb == "shot":
             shot_args = argparse.Namespace(actor=None, at=None, look_at=None, rot=None, annotate=False, grid_z=0,
                                            ui=False, output=rest or None)
@@ -1009,6 +1011,36 @@ def pie_do(ctx, args):
         print(("PASS" if not failures else "FAIL") + f" in {time.time() - started:.1f}s"
               + ("" if not failures else ": " + "; ".join(failures)))
     return 1 if failures else 0
+
+
+def shot_check(ctx, rest):
+    """`shot-check NAME [tolerance%]` in a step file: compare the view with tests/play/shots/NAME.png, recording it
+    the first time. (ok, detail)."""
+    import io
+    import shutil
+    from contextlib import redirect_stdout
+    name, _, tolerance = rest.partition(" ")
+    if not name:
+        raise CliError("shot-check NAME [tolerance %]")
+    tolerance = float(tolerance or 2.0)
+    baseline = os.path.join(os.path.dirname(ctx.project), "tests", "play", "shots", name + ".png")
+    path = os.path.join(state_dir(ctx.project), "shots", time.strftime(f"check-{name}-%H%M%S.png"))
+    with redirect_stdout(io.StringIO()):
+        cmd_shot(ctx, argparse.Namespace(actor=None, at=None, look_at=None, rot=None, annotate=False, grid_z=0, ui=False,
+                                         output=path, baseline=None, compare=None, tolerance=tolerance, threshold=32))
+    if not os.path.isfile(baseline):
+        os.makedirs(os.path.dirname(baseline), exist_ok=True)
+        shutil.copyfile(path, baseline)
+        return True, f"recorded {os.path.relpath(baseline, os.path.dirname(ctx.project))} (commit it)"
+    with open(baseline, "rb") as f:
+        before = png_read(f.read())
+    with open(path, "rb") as f:
+        after = png_read(f.read())
+    share, regions, diff = image_diff(before, after, 32)
+    diff_path = os.path.splitext(path)[0] + "-diff.png"
+    png_write(diff_path, before[0], before[1], diff)
+    ok = share * 100 <= tolerance
+    return ok, f"{share * 100:.2f}% changed (tolerance {tolerance:g}%)" + ("" if ok else f"; diff in red: {diff_path}")
 
 
 def cmd_pie(ctx, args):

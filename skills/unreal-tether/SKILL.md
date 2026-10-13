@@ -222,6 +222,8 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
   windowed editor and play (it stops when they stop PIE). The file replays with `ue pie do -f`: keys become
   `tap`/`hold`/`release` of their input actions, mouse look becomes `look` steps, ending with a `near` check.
   Add `expect` steps for what should have happened.
+- Visual checkpoints in a step file: `shot-check gate_view` records tests/play/shots/gate_view.png the first time
+  and fails later runs that look different (diff image in the output); put a `look` step before it.
 - To lock in how play unfolds (not just that steps pass): add `# watch: BP_Enemy_C_1.State player.Health player`
   to a step file in tests/play/. Its first `ue pie do -f` records tests/play/baselines/<file>.json (commit it);
   later runs and `ue ci --play` fail on differences (states reached late, values ending elsewhere, paths drifting).
