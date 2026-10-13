@@ -1490,6 +1490,15 @@ class LintFix(unittest.TestCase):
                          ["rename:SM_Rock", "rename:SK_Hero", "rename:My_Rock"])
 
 
+class AssetPattern(unittest.TestCase):
+    def test_folder_and_name_glob(self):
+        self.assertEqual(ue.asset_pattern("/Game/Props"), ("/Game/Props", ""))
+        self.assertEqual(ue.asset_pattern("/Game/Props/"), ("/Game/Props", ""))
+        self.assertEqual(ue.asset_pattern("/Game/Props/**"), ("/Game/Props", ""))
+        self.assertEqual(ue.asset_pattern("/Game/Tex/*_N"), ("/Game/Tex", "*_N"))
+        self.assertEqual(ue.asset_pattern("/Game/**/T_*"), ("/Game", "T_*"))
+
+
 class JsonEnvelope(unittest.TestCase):
     def run_json(self, project, *argv):
         out = io.StringIO()

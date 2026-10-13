@@ -4987,6 +4987,61 @@ class TetherCore(_Base):
 
     @_tool
     @staticmethod
+    def set_assets(folder: str, values: str, cls: str = "", match: str = "", dry_run: bool = False, save: bool = False,
+                   limit: int = 500, token: str = "") -> str:
+        """Set the same properties on many assets: every asset under a folder whose class and name match. Each
+        asset is changed like `ue set` does (one undoable step each); a dry run shows the current values instead.
+
+        Args:
+            folder: Content folder, searched recursively.
+            values: JSON object of property name to value text, as for set_props.
+            cls: Regex on the asset class (e.g. 'Texture2D$').
+            match: fnmatch pattern on the asset name (e.g. '*_N').
+            dry_run: Show what would change, change nothing.
+            save: Save each changed asset.
+            limit: At most this many assets.
+            token: Session token from Saved/Tether/editors/<pid>.token (the ue CLI sends it).
+
+        Returns:
+            JSON {matched, rows: [{asset, ok, detail}]}.
+        """
+        import fnmatch
+        _authorize(token)
+        registry = unreal.AssetRegistryHelpers.get_asset_registry()
+        cls_rx = re.compile(cls, re.I) if cls else None
+        found = []
+        for data in registry.get_assets_by_path(folder.rstrip("/"), recursive=True):
+            name, kind = str(data.asset_name), str(data.asset_class_path.asset_name)
+            if (cls_rx and not cls_rx.search(kind)) or (match and not fnmatch.fnmatch(name, match)):
+                continue
+            found.append(str(data.package_name))
+        found = sorted(set(found))
+        requested = json.loads(values)
+        rows = []
+        for package in found[:limit]:
+            try:
+                if dry_run:
+                    obj = unreal.load_asset(package)
+                    schema = _reflect(unreal.ToolsetLibrary.list_struct_properties(obj.get_class()), obj)
+                    by_lower = {n.lower(): n for n in schema}
+                    wanted = [by_lower.get(k.rstrip("+").lower()) for k in requested]
+                    missing = [k for k, w in zip(requested, wanted) if w is None]
+                    if missing:
+                        raise RuntimeError(f"no property {', '.join(missing)}")
+                    current = _reflect(unreal.ToolsetLibrary.get_object_properties(obj, wanted), obj)
+                    rows.append({"asset": package, "ok": True, "detail": ", ".join(
+                        f"{k} is {_short(_compact(v), 40)}" for k, v in current.items())})
+                else:
+                    out = _RAW["set_props"](package, values, False, token)
+                    if save:
+                        unreal.EditorAssetLibrary.save_asset(package, only_if_is_dirty=True)
+                    rows.append({"asset": package, "ok": True, "detail": "; ".join(out.splitlines()[1:])})
+            except Exception as exc:  # one asset without the property must not stop the rest
+                rows.append({"asset": package, "ok": False, "detail": str(exc)})
+        return json.dumps({"matched": len(found), "rows": rows})
+
+    @_tool
+    @staticmethod
     def lint_fix(plan: str, save: bool = False, token: str = "") -> str:
         """Apply `ue lint --fix` fixes: rename (references fixed up, through revision control), normal-map
         compression, sRGB off for masks, a box collision for meshes without simple collision.

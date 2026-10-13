@@ -117,6 +117,10 @@ def same_value(a, b):
 
 
 def cmd_set(ctx, args):
+    if args.assets:
+        return set_assets(ctx, args)
+    if not args.target:
+        raise CliError("ue set <target> Name=value ... (or --assets <folder> for many assets)")
     values = {}
     if args.from_file:  # apply only what differs from the object now (e.g. an exported DataAsset, edited)
         with open(args.from_file, encoding="utf-8-sig") as f:
@@ -496,4 +500,44 @@ def cmd_collision(ctx, args):
 def cmd_class(ctx, args):
     print(ctx.tether("class_info", name=args.name, limit=args.limit))
     return 0
+
+
+def asset_pattern(pattern):
+    """(folder, name glob) from '/Game/Props', '/Game/Props/**' or '/Game/Props/*Rock*'."""
+    parts = pattern.rstrip("/").split("/")
+    glob = ""
+    if parts and any(ch in parts[-1] for ch in "*?["):
+        glob = "" if parts[-1] == "**" else parts[-1]
+        parts = parts[:-1]
+    while parts and parts[-1] == "**":
+        parts = parts[:-1]
+    return "/".join(parts) or "/Game", glob
+
+
+def set_assets(ctx, args):
+    """`ue set --assets`: the same properties on every matching asset."""
+    assignments = ([args.target] if args.target else []) + list(args.assignments)
+    values = {}
+    for item in assignments:
+        name, eq, value = item.partition("=")
+        if not eq or not name:
+            raise CliError(f"expected Name=value, got '{item}'")
+        values[name.strip()] = value
+    if not values:
+        raise CliError("ue set --assets <folder> [--class C] [--match GLOB] Name=value ...")
+    folder, glob = asset_pattern(args.assets)
+    data = ctx.tether("set_assets", folder=folder, values=json.dumps(values), cls=args.cls or "",
+                      match=args.match or glob, dry_run=args.dry_run, save=args.save, limit=500)
+    data = json.loads(data) if isinstance(data, str) else data
+    rows, failed = data["rows"], [r for r in data["rows"] if not r["ok"]]
+    for row in rows[: args.limit]:
+        print(f"{'' if row['ok'] else 'SKIP '}{row['asset']}: {row['detail'] or 'already set'}")
+    if len(rows) > args.limit:
+        print(f"... +{len(rows) - args.limit} more (--limit N)")
+    verb = "would change" if args.dry_run else "changed"
+    print(f"{data['matched']} asset(s) matched; {verb} {len(rows) - len(failed)}, skipped {len(failed)}"
+          + (" (500 at a time)" if data["matched"] > 500 else "")
+          + ("" if args.dry_run or args.save else "; not saved (ue save, or --save)"))
+    ctx.data = data
+    return 1 if failed and len(failed) == len(rows) else 0
 
