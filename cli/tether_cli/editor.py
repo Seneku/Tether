@@ -4,9 +4,9 @@ import os
 import time
 
 from .core import (
-    CliError, blocking_dialogs, crash_reports, crash_summary, describe_crash, editor_executable, engine_root,
-    filter_log, live_coding_available, logged_dialogs, modal_dialogs, pick_port, pid_alive, port_open, read_json,
-    read_new_log, recent_crash, state_dir, subprocess, write_json,
+    CliError, blocking_dialogs, crash_reports, crash_summary, describe_crash, editor_beacons, editor_executable,
+    editor_label, engine_root, filter_log, live_coding_available, live_editors, logged_dialogs, modal_dialogs,
+    pick_port, pid_alive, port_open, read_json, read_new_log, recent_crash, state_dir, subprocess, write_json,
 )
 from .build import (
     classify_changes, csharp_changes, csharp_layout, csharp_reload_build, editor_env, live_coding_build,
@@ -20,7 +20,8 @@ def cmd_status(ctx, args):
     beacon = ctx.beacon
     name = os.path.splitext(os.path.basename(ctx.project))[0]
     if not beacon:
-        print(f"{name}: no beacon (editor never started with Tether, or not yet ready)")
+        print(f"{name}: editor not running (ue open starts one; an editor you open yourself works too, once it "
+              "has loaded)")
         return 2
     alive = pid_alive(beacon.get("pid"))
     age = time.time() - beacon.get("heartbeat", 0)
@@ -40,11 +41,21 @@ def cmd_status(ctx, args):
     else:
         link = f"mcp :{port} " + ("up" if alive and port and port_open(port) else "down")
     dirty = beacon.get("dirty") if alive else None
-    ctx.data = dict(beacon, state=state, alive=bool(alive), heartbeat_age=round(age, 1))
-    print(f"{name} | {state} | UE {beacon.get('engine', '?').split('+')[0]} | pid {beacon.get('pid')} | "
+    others = [b for b in live_editors(ctx.project) if b.get("pid") != beacon.get("pid")] if alive else []
+    ctx.data = dict(beacon, state=state, alive=bool(alive), heartbeat_age=round(age, 1),
+                    others=[{"pid": b.get("pid"), "headless": b.get("headless"),
+                             "launched_by_tether": b.get("launched_by_tether")} for b in others])
+    print(f"{name} | {state} | UE {beacon.get('engine', '?').split('+')[0]} | {editor_label(beacon)} | "
           f"map {beacon.get('map')} | {link} | heartbeat {age:.1f}s ago"
           + (f" | {dirty} unsaved (ue changes)" if dirty else "")
           + (f" | revision control {beacon['vcs']}" if alive and beacon.get("vcs") else ""))
+    if alive and not port and ctx.transport != "remote":
+        print("  no MCP server in this editor: run `ue reload` (Tether starts one), or in the editor's console: "
+              "ModelContextProtocol.StartServer")
+    for other in others:
+        print(f"  also open on this project: {editor_label(other)}, map {other.get('map')}. Saving the same assets "
+              f"from two editors loses work; `ue --pid {other.get('pid')} ...` talks to that one"
+              + (f", `ue close --pid {other.get('pid')}` closes it" if other.get("launched_by_tether") else ""))
     return 0 if alive and age <= 10 else 2
 
 
@@ -98,8 +109,8 @@ def cmd_build(ctx, args):
 
 def cmd_open(ctx, args):
     beacon = ctx.beacon
-    if beacon and pid_alive(beacon.get("pid")):
-        print("already running")
+    if beacon and pid_alive(beacon.get("pid")):  # attach to the open editor, the user's own included
+        print(f"already open ({editor_label(beacon)}); using it")
         return cmd_status(ctx, args)
     has_csharp = csharp_layout(ctx.project) is not None
     last = (beacon or {}).get("heartbeat", 0)
@@ -117,7 +128,8 @@ def cmd_open(ctx, args):
     exe = editor_executable(engine_root(ctx.project))
     port = pick_port(ctx.project)
     cmd = [exe, ctx.project] + ([args.map] if args.map else []) + [
-        "-nosplash", "-ModelContextProtocolStartServer", f"-ModelContextProtocolPort={port}"]
+        "-nosplash", "-ModelContextProtocolStartServer", f"-ModelContextProtocolPort={port}",
+        "-TetherLaunched"]  # marks the editors the CLI started, so it never closes one the user opened
     # UnrealSharp disables C# hot reload under -unattended, so headless UnrealSharp editors stay
     # attended; the bridge suppresses dialogs per operation instead.
     unattended = args.unattended if args.unattended is not None else bool(args.headless and not has_csharp)
@@ -154,7 +166,7 @@ def cmd_open(ctx, args):
     if args.no_wait:
         return 0
     while time.time() - started < args.wait:
-        beacon = ctx.beacon
+        beacon = next((b for b in editor_beacons(ctx.project) if b.get("pid") == proc.pid), None)
         if beacon and beacon.get("pid") == proc.pid and beacon.get("heartbeat", 0) > started and (
                 remote or port_open(port)):
             boot = read_new_log(ctx.project, from_start=True)
@@ -183,11 +195,26 @@ def cmd_open(ctx, args):
 
 
 def cmd_close(ctx, args):
+    explicit = os.environ.get("UE_EDITOR_PID")
+    launched = [b for b in live_editors(ctx.project) if b.get("launched_by_tether")]
+    if explicit or not launched:
+        return close_editor(ctx, args, explicit)
+    os.environ["UE_EDITOR_PID"] = str(launched[0]["pid"])  # with the user's editor open too: the one ue open started
+    try:
+        return close_editor(ctx, args, explicit)
+    finally:
+        os.environ.pop("UE_EDITOR_PID", None)
+
+
+def close_editor(ctx, args, explicit):
     beacon = ctx.beacon
     pid = (beacon or {}).get("pid")
     if not pid_alive(pid):
         print("not running")
         return 0
+    if beacon.get("launched_by_tether") is False and not explicit:
+        raise CliError(f"pid {pid} is an editor you opened yourself, not one `ue open` started; close it in the "
+                       f"editor, or pass --pid {pid} to close it from here")
     if not args.force:
         dirty = ctx.tether("py", code=(
             "U = unreal.EditorLoadingAndSavingUtils\n"

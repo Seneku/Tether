@@ -4,7 +4,7 @@ import os
 import re
 import time
 
-from .core import CliError, compact_error, log_end, log_path, read_json, state_dir, unwrap, write_json, zlib
+from .core import CliError, compact_error, editor_mode, log_end, log_path, read_json, state_dir, unwrap, write_json, zlib
 from .calls import flush_editor_log
 
 
@@ -88,7 +88,7 @@ LOOK_VIEWS = (("front", 180, -10), ("right", 270, -10), ("back", 0, -10), ("left
 def cmd_look(ctx, args):
     """Render an asset from six angles into one contact sheet (front, right, back / left, top, three-quarter)."""
     import math
-    launch = read_json(os.path.join(state_dir(ctx.project), "launch.json")) or {}
+    launch = editor_mode(ctx.project, ctx.beacon)
     if launch.get("headless") and not launch.get("render"):
         raise CliError("this editor runs headless with -nullrhi and cannot render; reopen it with "
                        "`ue open --headless --render`")
@@ -127,7 +127,7 @@ def cmd_look(ctx, args):
 
 def cmd_shot(ctx, args):
     """Capture the viewport (or the player's view during PIE) to a PNG and print its path."""
-    launch = read_json(os.path.join(state_dir(ctx.project), "launch.json")) or {}
+    launch = editor_mode(ctx.project, ctx.beacon)
     if launch.get("headless") and not launch.get("render"):
         raise CliError("this editor runs headless with -nullrhi and cannot render; "
                        "reopen it with `ue open --headless --render` (or windowed)")

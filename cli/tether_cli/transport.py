@@ -6,8 +6,8 @@ import sys
 import time
 
 from .core import (
-    CliError, GATED, TETHER, compact_error, engine_root, find_project, pid_alive, port_from_log, read_json, socket,
-    stall_report, state_dir, unwrap, write_json,
+    CliError, GATED, TETHER, chosen_editor, compact_error, editor_label, editor_token, engine_root, find_project,
+    live_editors, pid_alive, port_from_log, read_json, socket, stall_report, state_dir, unwrap, write_json,
 )
 
 
@@ -147,7 +147,7 @@ def transport(project):
     forced = os.environ.get("UE_TRANSPORT", "").lower()
     if forced in ("mcp", "remote"):
         return forced
-    beacon = read_json(os.path.join(state_dir(project), "editor.json")) or {}
+    beacon = chosen_editor(project) or {}
     version = beacon.get("engine", "")
     if not version:
         try:
@@ -165,6 +165,7 @@ class Ctx:
     def __init__(self, args):
         self.args = args
         self._project = self._mcp = self._rex = self._transport = None
+        self._warned = False
         self.data = None  # structured result a command offers for --json
 
     @property
@@ -175,7 +176,7 @@ class Ctx:
 
     @property
     def beacon(self):
-        return read_json(os.path.join(state_dir(self.project), "editor.json"))
+        return chosen_editor(self.project)
 
     @property
     def port(self):
@@ -214,7 +215,13 @@ class Ctx:
 
     def tether(self, tool, **kwargs):
         if tool in GATED:  # the editor writes a per-session token next to the beacon
-            kwargs["token"] = (read_json(os.path.join(state_dir(self.project), "session.json")) or {}).get("token", "")
+            beacon = self.beacon
+            kwargs["token"] = editor_token(self.project, beacon)
+            others = [b for b in live_editors(self.project) if b.get("pid") != (beacon or {}).get("pid")]
+            if others and not self._warned:
+                self._warned = True
+                print(f"note: {len(others) + 1} editors are open on this project; this goes to {editor_label(beacon)} "
+                      f"(--pid to choose). Saving the same assets from both loses work.", file=sys.stderr)
         if self.transport == "remote":
             if self._rex is None:
                 self._check_modal()

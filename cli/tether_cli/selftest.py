@@ -4,7 +4,9 @@ import os
 import sys
 import time
 
-from .core import CliError, UE_SCRIPT, editor_live, host_platform, read_json, state_dir, subprocess, write_json
+from .core import (
+    CliError, UE_SCRIPT, editor_live, editor_mode, host_platform, read_json, state_dir, subprocess, write_json,
+)
 from .transport import catalog
 from .images import png_write
 from .assets import package_file
@@ -105,7 +107,7 @@ def cmd_selftest(ctx, args):
             print(f"{status} {name}: {detail}")
         raise CliError("the editor is not running or not answering; start it with `ue open --headless --render`", 2)
     remote = ctx.transport == "remote"
-    launch = read_json(os.path.join(state_dir(project), "launch.json")) or {}
+    launch = editor_mode(project, editor_live(project))
     check("doctor", ["doctor"], ok=lambda c, o: "checks:" in o)
     check("py", ["py", "6*7"], ok=lambda c, o: c == 0 and o.endswith("42"))
     check("exec", ["exec", "stat fps"], ok=lambda c, o: c == 0 and "Cmd: stat fps" in o)

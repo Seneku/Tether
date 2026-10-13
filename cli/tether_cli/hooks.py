@@ -6,7 +6,8 @@ import sys
 import time
 
 from .core import (
-    CliError, editor_live, find_project, pid_alive, project_of, read_json, stall_report, state_dir, write_json,
+    CliError, chosen_editor, editor_label, editor_live, live_editors, find_project, pid_alive, project_of, read_json, stall_report, state_dir,
+    write_json,
 )
 from .build import classify_changes, csharp_changes, csharp_layout
 from .assets import project_overview
@@ -71,7 +72,7 @@ def hook_session_start(payload):
         brief = "\n".join(project_overview(project, full=False)[1:])
     except Exception:  # a hook must never fail
         brief = ""
-    beacon = read_json(os.path.join(state_dir(project), "editor.json")) or {}
+    beacon = chosen_editor(project) or {}
     if not pid_alive(beacon.get("pid")):
         head = (f"Unreal project {name}: editor not running. Use the `ue` CLI (unreal-tether skill); "
                 "start it with `ue open --headless` (`--render` if you need `ue shot`).")
@@ -79,8 +80,15 @@ def hook_session_start(payload):
         report = stall_report(project)
         state = report or ("PIE running" if beacon.get("pie") else "ready")
         head = (f"Unreal project {name}: editor {state} | map {beacon.get('map')} | UE "
-                f"{beacon.get('engine', '?').split('+')[0]} | mcp :{beacon.get('mcp_port')}\n"
+                f"{beacon.get('engine', '?').split('+')[0]} | mcp :{beacon.get('mcp_port')} | {editor_label(beacon)}\n"
                 "Use the `ue` CLI (unreal-tether skill); `ue status` refreshes this.")
+        if beacon.get("launched_by_tether") is False:
+            head += ("\nThis is the user's own editor: they may be working in it. Don't close or restart it "
+                     "(ue build --restart included) without asking.")
+        others = [b for b in live_editors(project) if b.get("pid") != beacon.get("pid")]
+        if others:
+            head += ("\nAlso open on this project: " + "; ".join(editor_label(b) for b in others)
+                     + ". Saving from two editors loses work; see `ue status`.")
     return head + (f"\nProject (ue overview for more):\n{brief}" if brief else "")
 
 

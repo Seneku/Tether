@@ -6,7 +6,8 @@ import sys
 import time
 
 from .core import (
-    CliError, GATED, TETHER, compact_error, emit, filter_log, human_bytes, log_end, log_path, pid_alive, port_open,
+    CliError, GATED, TETHER, compact_error, editor_token, emit, filter_log, human_bytes, log_end, log_path, pid_alive,
+    port_open,
     read_json, read_new_log, short, state_dir, unwrap,
 )
 from .transport import catalog, fill_args, resolve_toolset, schema, signature
@@ -66,7 +67,7 @@ def cmd_call(ctx, args):
     call_args = json.loads(args.args) if args.args else fill_args(tool, given)
     name = tool["name"].rsplit(".", 1)[-1]
     if toolset == TETHER and name in GATED and not call_args.get("token"):  # fill_args blanks it to ""
-        call_args["token"] = (read_json(os.path.join(state_dir(ctx.project), "session.json")) or {}).get("token", "")
+        call_args["token"] = editor_token(ctx.project, ctx.beacon)
     text, is_error = ctx.mcp.call(toolset, name, call_args)
     if is_error:
         raise CliError(compact_error(text))

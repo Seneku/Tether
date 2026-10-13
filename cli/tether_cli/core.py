@@ -215,7 +215,7 @@ def engine_root(project):
 
 def pick_port(project):
     """Stable per-project port (so two editors never fight over 8000), skipping busy ones."""
-    base = 18000 + zlib.crc32(project.lower().encode()) % 1000
+    base = 18000 + zlib.crc32(os.path.normcase(os.path.abspath(project)).encode()) % 1000  # = the plugin's
     for port in range(base, base + 50):
         if not port_open(port):
             return port
@@ -302,6 +302,13 @@ def emit(args, value):
 # ---------------------------------------------------------------- logs (byte-offset cursor; no editor needed)
 
 def log_path(project):
+    """The chosen editor's log: <Project>.log, or <Project>_2.log for a second editor on the project."""
+    try:
+        logged = (chosen_editor(project) or {}).get("log")
+    except CliError:  # --pid names no running editor; the error surfaces where the editor is needed
+        logged = None
+    if logged and os.path.isfile(logged):
+        return logged
     return os.path.join(os.path.dirname(project), "Saved", "Logs",
                         os.path.splitext(os.path.basename(project))[0] + ".log")
 
@@ -468,7 +475,7 @@ def blocking_dialogs(pid):
 
 def stall_report(project):
     """Why a running editor is not answering, or None if it looks healthy (or is not running)."""
-    beacon = read_json(os.path.join(state_dir(project), "editor.json")) or {}
+    beacon = chosen_editor(project) or {}
     pid = beacon.get("pid")
     if not pid_alive(pid):
         return None
@@ -586,9 +593,80 @@ def running_editors():
     return rows
 
 
+def editor_beacons(project):
+    """Every editor beacon this project has, newest heartbeat first: one file per editor process
+    (Saved/Tether/editors/<pid>.json), plus the single editor.json that Tether before 0.11 wrote."""
+    folder = os.path.join(state_dir(project), "editors")
+    found = {}
+    for name in os.listdir(folder) if os.path.isdir(folder) else []:
+        if name.endswith(".json"):
+            beacon = read_json(os.path.join(folder, name))
+            if beacon and beacon.get("pid"):
+                found[beacon["pid"]] = beacon
+    legacy = read_json(os.path.join(state_dir(project), "editor.json"))
+    if legacy and legacy.get("pid") and legacy["pid"] not in found:
+        found[legacy["pid"]] = dict(legacy, legacy=True)
+    return sorted(found.values(), key=lambda b: -b.get("heartbeat", 0))
+
+
+def live_editors(project):
+    """Beacons of the project's editors whose process is still running (ticking or hung)."""
+    return [b for b in editor_beacons(project) if pid_alive(b.get("pid"))]
+
+
+def chosen_editor(project):
+    """The editor the CLI talks to, or the last one seen when none is running (for status and crash
+    reports). With several open: --pid / UE_EDITOR_PID if given, else the one the user opened rather
+    than one `ue open` launched, else the most recently started."""
+    wanted = os.environ.get("UE_EDITOR_PID")
+    beacons = editor_beacons(project)
+    live = [b for b in beacons if pid_alive(b.get("pid"))]
+    if wanted:
+        match = next((b for b in beacons if str(b.get("pid")) == wanted), None)
+        if match is None or match not in live:
+            running = ", ".join(str(b["pid"]) for b in live) or "none"
+            raise CliError(f"no editor with pid {wanted} is open on this project (running: {running})", 2)
+        return match
+    if live:
+        return sorted(live, key=lambda b: (bool(b.get("launched_by_tether")), -b.get("started", 0)))[0]
+    return beacons[0] if beacons else None
+
+
+def editor_token(project, beacon):
+    """The session token of the editor this beacon belongs to."""
+    pid = (beacon or {}).get("pid")
+    token = read_json(os.path.join(state_dir(project), "editors", f"{pid}.token")) or {}
+    if not token:  # Tether before 0.11: one session.json per project
+        token = read_json(os.path.join(state_dir(project), "session.json")) or {}
+        if token.get("pid") not in (None, pid):
+            token = {}
+    return token.get("token", "")
+
+
+def editor_label(beacon):
+    """'pid 123, yours' / 'pid 456, headless, started by ue open'."""
+    if not beacon:
+        return "none"
+    parts = [f"pid {beacon.get('pid')}"]
+    if beacon.get("headless"):
+        parts.append("headless")
+    parts.append("started by ue open" if beacon.get("launched_by_tether") else
+                 "opened by hand" if "launched_by_tether" in beacon else "")
+    return ", ".join(p for p in parts if p)
+
+
+def editor_mode(project, beacon):
+    """How the editor was started: {headless, render, sound}. Its beacon says (Tether 0.11+); older plugins
+    leave it to launch.json, which only `ue open` writes."""
+    if beacon and "nullrhi" in beacon:
+        return {"headless": bool(beacon.get("headless")), "render": not beacon["nullrhi"],
+                "sound": bool(beacon.get("sound", True))}
+    return read_json(os.path.join(state_dir(project), "launch.json")) or {}
+
+
 def editor_live(project):
-    """The project's beacon if its editor is running and ticking, else None."""
-    beacon = read_json(os.path.join(state_dir(project), "editor.json")) or {}
+    """The chosen editor's beacon if it is running and ticking, else None."""
+    beacon = chosen_editor(project) or {}
     alive = pid_alive(beacon.get("pid")) and time.time() - beacon.get("heartbeat", 0) < 15
     return beacon if alive else None
 

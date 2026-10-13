@@ -9,7 +9,7 @@ import re
 import shutil
 import time
 
-from .core import CliError, log_end, log_path, read_json, state_dir
+from .core import CliError, editor_mode, log_end, log_path, read_json, state_dir
 from .calls import flush_editor_log
 from .assets import cmd_bp, code_usages
 from .play import cmd_perf, cmd_pie, insights_exe, insights_export, pie_do, unthrottled
@@ -322,8 +322,7 @@ def record_steps(result, wanted_map=None, tap_seconds=0.25, look_degrees=10.0):
 
 def pie_record(ctx, args):
     """Record a human playing in PIE until PIE stops (or --seconds), then write it as a `pie do` step file."""
-    launch = read_json(os.path.join(state_dir(ctx.project), "launch.json")) or {}
-    if launch.get("headless") and launch.get("port") == (ctx.beacon or {}).get("port"):
+    if editor_mode(ctx.project, ctx.beacon).get("headless"):
         print("note: this editor is headless, so nobody can play in it; open one with `ue open` (no --headless)")
     was_running = ctx.tether("pie", action="status") == "running"
     if not was_running:

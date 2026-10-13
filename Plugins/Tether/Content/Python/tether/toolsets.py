@@ -224,7 +224,7 @@ def _authorize(token):
     import hmac
     from tether import beacon
     if not hmac.compare_digest(str(token), beacon.session_token()):
-        raise RuntimeError("unauthorized: pass the session token from Saved/Tether/session.json "
+        raise RuntimeError("unauthorized: pass the session token from Saved/Tether/editors/<pid>.token "
                            "(the ue CLI does this automatically)")
 
 
@@ -1464,7 +1464,7 @@ class TetherCore(_Base):
 
         Args:
             code: Python source to execute.
-            token: Session token from Saved/Tether/session.json (the ue CLI sends it).
+            token: Session token from Saved/Tether/editors/<pid>.token (the ue CLI sends it).
 
         Returns:
             Captured output and the trailing expression value.
@@ -1482,7 +1482,7 @@ class TetherCore(_Base):
         Args:
             command: The console command line.
             pie: Require a PIE world (error if PIE is not running).
-            token: Session token from Saved/Tether/session.json (the ue CLI sends it).
+            token: Session token from Saved/Tether/editors/<pid>.token (the ue CLI sends it).
 
         Returns:
             Which world the command ran in.
@@ -1542,7 +1542,7 @@ class TetherCore(_Base):
             target: Object or asset path, actor label or name, or 'ActorLabel.ComponentName'.
             values: JSON object of property name to value text, e.g. {"Intensity": "10", "location+": "0,0,200"}.
             pie: Change the PIE world instead of the editor level (not undoable, not saved).
-            token: Session token from Saved/Tether/session.json (the ue CLI sends it).
+            token: Session token from Saved/Tether/editors/<pid>.token (the ue CLI sends it).
 
         Returns:
             One 'name: old -> new' line per property.
@@ -1829,7 +1829,7 @@ class TetherCore(_Base):
             label: Actor label to give it.
             ground: Drop it onto the first surface below `at` (its bounds' bottom on the ground).
             align: With ground: tilt it to the surface normal.
-            token: Session token from Saved/Tether/session.json (the ue CLI sends it).
+            token: Session token from Saved/Tether/editors/<pid>.token (the ue CLI sends it).
 
         Returns:
             The new actor's label, class and location.
@@ -1879,7 +1879,7 @@ class TetherCore(_Base):
         Args:
             targets: Comma-separated actor labels or names.
             align: Also tilt each to the surface normal.
-            token: Session token from Saved/Tether/session.json (the ue CLI sends it).
+            token: Session token from Saved/Tether/editors/<pid>.token (the ue CLI sends it).
 
         Returns:
             One line per actor: old -> new height and what it landed on.
@@ -1925,7 +1925,7 @@ class TetherCore(_Base):
             seed: Random seed (same seed, same layout).
             align: Tilt each to the surface.
             label: Label prefix (default: the asset's name).
-            token: Session token from Saved/Tether/session.json (the ue CLI sends it).
+            token: Session token from Saved/Tether/editors/<pid>.token (the ue CLI sends it).
 
         Returns:
             How many were placed, and why any were not.
@@ -2007,7 +2007,7 @@ class TetherCore(_Base):
 
         Args:
             targets: Comma-separated actor labels or names.
-            token: Session token from Saved/Tether/session.json (the ue CLI sends it).
+            token: Session token from Saved/Tether/editors/<pid>.token (the ue CLI sends it).
 
         Returns:
             What was deleted.
@@ -2037,7 +2037,7 @@ class TetherCore(_Base):
             target: Actor label or name.
             offset: Shift per copy 'x,y,z'.
             count: Number of copies.
-            token: Session token from Saved/Tether/session.json (the ue CLI sends it).
+            token: Session token from Saved/Tether/editors/<pid>.token (the ue CLI sends it).
 
         Returns:
             The copies' labels and locations.
@@ -2072,7 +2072,7 @@ class TetherCore(_Base):
         Args:
             asset: /Game/... asset path.
             dest: New /Game/... path (folder/Name), or a folder ending in '/' to keep the name.
-            token: Session token from Saved/Tether/session.json (the ue CLI sends it).
+            token: Session token from Saved/Tether/editors/<pid>.token (the ue CLI sends it).
 
         Returns:
             Old and new paths, and how many referencers were fixed up.
@@ -2113,7 +2113,7 @@ class TetherCore(_Base):
         Args:
             asset: /Game/... asset path.
             force: Delete even if referenced (the references break).
-            token: Session token from Saved/Tether/session.json (the ue CLI sends it).
+            token: Session token from Saved/Tether/editors/<pid>.token (the ue CLI sends it).
 
         Returns:
             What was deleted.
@@ -2198,7 +2198,7 @@ class TetherCore(_Base):
 
         Args:
             paths: Comma-separated package paths ('' saves every unsaved package).
-            token: Session token from Saved/Tether/session.json (the ue CLI sends it).
+            token: Session token from Saved/Tether/editors/<pid>.token (the ue CLI sends it).
 
         Returns:
             What was saved and what was skipped.
@@ -2244,7 +2244,7 @@ class TetherCore(_Base):
         since; it never undoes someone else's edit.
 
         Args:
-            token: Session token from Saved/Tether/session.json (the ue CLI sends it).
+            token: Session token from Saved/Tether/editors/<pid>.token (the ue CLI sends it).
 
         Returns:
             What was undone.
@@ -2628,7 +2628,7 @@ class TetherCore(_Base):
             target: Material instance (or material) path.
             values: JSON object of parameter name to value text: numbers, 'r,g,b[,a]', true/false, texture paths.
             reset: Comma-separated parameter names to stop overriding (instances only).
-            token: Session token from Saved/Tether/session.json (the ue CLI sends it).
+            token: Session token from Saved/Tether/editors/<pid>.token (the ue CLI sends it).
 
         Returns:
             One 'name: old -> new' line per parameter.
@@ -2701,7 +2701,7 @@ class TetherCore(_Base):
 
         Args:
             step: The step text.
-            token: Session token from Saved/Tether/session.json (the ue CLI sends it).
+            token: Session token from Saved/Tether/editors/<pid>.token (the ue CLI sends it).
 
         Returns:
             JSON {"ok": bool, "detail": str}.
@@ -2960,7 +2960,7 @@ class TetherCore(_Base):
         Args:
             section: Section name or Container/Category/Section (see `config`).
             values: JSON object of setting name to value text (numbers, true/false, enum names, paths, JSON).
-            token: Session token from Saved/Tether/session.json (the ue CLI sends it).
+            token: Session token from Saved/Tether/editors/<pid>.token (the ue CLI sends it).
 
         Returns:
             One 'name: old -> new' line per setting.
@@ -3004,7 +3004,7 @@ class TetherCore(_Base):
 
         Args:
             click: Button label or widget name to click ('' lists).
-            token: Session token from Saved/Tether/session.json (needed only with click).
+            token: Session token from Saved/Tether/editors/<pid>.token (needed only with click).
 
         Returns:
             One line per widget, indented by nesting.
@@ -3201,7 +3201,7 @@ class TetherCore(_Base):
             parent: Blueprint: parent class (Actor, /Script/Module.Class, or a Blueprint path); mi: parent material;
                 datatable: row struct (name, /Script/Module.Struct, or a struct asset); dataasset: its class.
             save: Save the new asset.
-            token: Session token from Saved/Tether/session.json (the ue CLI sends it).
+            token: Session token from Saved/Tether/editors/<pid>.token (the ue CLI sends it).
 
         Returns:
             What was created.
@@ -3539,7 +3539,7 @@ class TetherCore(_Base):
 
         Args:
             paths: JSON list of redirector packages.
-            token: Session token from Saved/Tether/session.json (the ue CLI sends it).
+            token: Session token from Saved/Tether/editors/<pid>.token (the ue CLI sends it).
 
         Returns:
             One line per redirector.
@@ -3562,7 +3562,7 @@ class TetherCore(_Base):
             dest: Content folder, e.g. /Game/Props/Crates.
             options: JSON {name: str (single file), collision: none|box|sphere|capsule|convex|complex,
                 lods: int, nanite: bool, texture_group: e.g. World|UI|Character, replace: bool, save: bool}.
-            token: Session token from Saved/Tether/session.json (the ue CLI sends it).
+            token: Session token from Saved/Tether/editors/<pid>.token (the ue CLI sends it).
 
         Returns:
             JSON list of {file, assets: [{path, class, detail}], error}.
@@ -3610,7 +3610,7 @@ class TetherCore(_Base):
             paths: JSON list of asset paths or content folders (searched recursively).
             force: Reimport even when the source file is not newer than the saved asset.
             save: Save the reimported assets.
-            token: Session token from Saved/Tether/session.json (the ue CLI sends it).
+            token: Session token from Saved/Tether/editors/<pid>.token (the ue CLI sends it).
 
         Returns:
             JSON list of {path, source, state: reimported|unchanged|source missing|no source|failed, detail}.
@@ -3842,7 +3842,7 @@ class TetherCore(_Base):
             clients: With configure: number of clients.
             net: With configure: standalone, listen (listen server + clients) or client (dedicated server + clients).
             target: With target: the PIE instance index to act on (0 = the first world), or -1 for the default.
-            token: Session token from Saved/Tether/session.json (the ue CLI sends it).
+            token: Session token from Saved/Tether/editors/<pid>.token (the ue CLI sends it).
 
         Returns:
             What was done, or one line per PIE world.
@@ -3907,7 +3907,7 @@ class TetherCore(_Base):
         Args:
             asset: /Game/... (or /Engine/...) asset path.
             action: place or remove.
-            token: Session token from Saved/Tether/session.json (the ue CLI sends it).
+            token: Session token from Saved/Tether/editors/<pid>.token (the ue CLI sends it).
 
         Returns:
             JSON {"center": [x, y, z], "radius": r} after place.
@@ -3963,7 +3963,7 @@ class TetherCore(_Base):
             cls: Component class: a name (StaticMeshComponent, PointLightComponent) or /Script/Module.Class.
             parent: Name of the component to attach under ('' = the root component).
             values: JSON object of property name to value text, as for ue set (e.g. {"StaticMesh": "/Game/X"}).
-            token: Session token from Saved/Tether/session.json (the ue CLI sends it).
+            token: Session token from Saved/Tether/editors/<pid>.token (the ue CLI sends it).
 
         Returns:
             What was added, and the values set.
@@ -4073,7 +4073,7 @@ class TetherCore(_Base):
             slot: Save slot name.
             values: JSON object of property name to value text, as for ue set.
             user: User index.
-            token: Session token from Saved/Tether/session.json (the ue CLI sends it).
+            token: Session token from Saved/Tether/editors/<pid>.token (the ue CLI sends it).
 
         Returns:
             One 'name: old -> new' line per property, and the backup's name.

@@ -54,7 +54,7 @@ and a private mid-size C++/Blueprint game. Methodology is in [docs/DESIGN.md](do
  agent ──shell──▶ ue (cli/ue.py) ──HTTP──▶ Epic MCP server ──▶ ToolsetRegistry
                     │                         (in editor)       ├─ Epic's ~830 tools
                     │                                           └─ tether toolset (Plugins/Tether)
-                    └── reads Saved/Tether/editor.json (beacon) and Saved/Logs directly
+                    └── reads Saved/Tether/editors/<pid>.json (beacons) and Saved/Logs directly
 ```
 
 - **`cli/ue.py`** is the out-of-editor half: a launcher for the stdlib-only `cli/tether_cli` package. It launches and closes
@@ -63,11 +63,25 @@ and a private mid-size C++/Blueprint game. Methodology is in [docs/DESIGN.md](do
   editor is hung or gone.
 - **`Plugins/Tether`** is a content-only (pure Python) editor plugin. It registers a `tether` toolset into
   Epic's registry: unrestricted Python, console commands, compact level, actor and property reads, and
-  C# reload state. It also writes a heartbeat beacon. It hot-reloads with `ue reload`.
+  C# reload state. It also writes a heartbeat beacon, and starts Epic's MCP server when the editor was opened
+  without it. It hot-reloads with `ue reload`.
 - **`Plugins/TetherUnrealSharp`** is optional. It's a small C++ editor plugin that makes UnrealSharp's C#
   hot reload callable from Python with modal dialogs suppressed.
 - **The Claude Code plugin** (`.claude-plugin/`, `skills/`, `hooks/`, `bin/`) puts `ue` on the agent's
   PATH, adds the `unreal-tether` skill that teaches the workflow, and installs hooks (see below).
+
+### Your own editor, and more than one
+
+Open the project in the editor as you normally do and the agent works with that editor: Tether starts Epic's MCP
+server in it (on the project's own port, unless something already started one), and `ue open` sees it is open
+and uses it instead of starting another. `ue close` and `ue build --restart` will not close an editor you opened
+yourself; they say so, and `--pid <pid>` overrides that. The session-start hook tells the agent whose editor it is.
+
+Two editors on the same project (yours, and a headless one an agent started earlier) each have their own beacon,
+token and log (`Saved/Logs/<Project>_2.log` for the second), so neither breaks the other. `ue` talks to yours, says
+which one it is using whenever it changes anything, and `ue status` lists the other with how to reach it
+(`ue --pid <pid> ...`) or close it (`ue close` closes the one `ue open` started). Still, saving the same assets
+from both loses work: close one. `TETHER_NO_MCP=1` in the editor's environment stops Tether starting the server.
 
 ## Requirements
 

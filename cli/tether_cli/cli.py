@@ -49,6 +49,8 @@ def build_parser():
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--project", default=argparse.SUPPRESS,
                         help=".uproject path (default: search upward from cwd, or UE_PROJECT)")
+    common.add_argument("--pid", type=int, default=argparse.SUPPRESS,
+                        help="with several editors open on the project: the one to use (default: the one you opened)")
     common.add_argument("--port", type=int, default=argparse.SUPPRESS,
                         help="MCP port (default: beacon, UE_MCP_PORT, then 8000)")
     common.add_argument("--timeout", type=float, default=argparse.SUPPRESS, help="seconds to wait (120)")
@@ -408,10 +410,12 @@ def parse_command(parser, raw):
     args = parser.parse_args(raw)
     args.job_command = command
     args.timeout_given = hasattr(args, "timeout")
-    for key, default in (("project", None), ("port", None), ("timeout", 120.0), ("json", False),
+    for key, default in (("project", None), ("pid", None), ("port", None), ("timeout", 120.0), ("json", False),
                          ("limit", 30), ("time", False)):
         if not hasattr(args, key):
             setattr(args, key, default)
+    if args.pid:  # every lookup of "the editor" reads this, the beacon helpers in core included
+        os.environ["UE_EDITOR_PID"] = str(args.pid)
     return args
 
 
@@ -430,6 +434,7 @@ def cmd_batch(ctx, args):
         if argv and argv[0] == "ue":
             argv = argv[1:]
         print(f"$ ue {line[3:] if line.startswith('ue ') else line}", flush=True)
+        chosen = os.environ.get("UE_EDITOR_PID")  # a line's --pid applies to that line only
         try:
             sub = parse_command(parser, undo_msys_paths(argv))
             if sub.fn in (cmd_batch, cmd_hook):
@@ -440,6 +445,11 @@ def cmd_batch(ctx, args):
             code = exc.code
         except SystemExit as exc:  # argparse rejected the line (its message is already printed)
             code = exc.code if isinstance(exc.code, int) else 2
+        finally:
+            if chosen is None:
+                os.environ.pop("UE_EDITOR_PID", None)
+            else:
+                os.environ["UE_EDITOR_PID"] = chosen
         worst = max(worst, code)
         if code and args.stop_on_error:
             print(f"(stopped at the first failure; {len(lines) - lines.index(line) - 1} line(s) not run)")

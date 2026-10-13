@@ -9,6 +9,11 @@ Run `ue` from the project folder (or set `UE_PROJECT`). The Tether Claude Code p
 if `ue` is not found, use `python "${CLAUDE_PLUGIN_ROOT}/cli/ue.py"` instead. If `ue status` exits 2,
 start the editor with `ue open --headless` (`--render` if you need `ue shot`).
 
+If the user has the project open in their own editor, `ue` works with that one (`ue status` says "opened by hand"):
+do not start a second editor, and do not close or restart theirs (`ue build --restart` included) without asking;
+the user may be working in it, so say before you save. With two editors open (`ue status` lists both), commands
+go to the user's; `ue --pid <pid> ...` picks the other, and saving the same assets from both loses work.
+
 Several reads or edits in a row? Put them in one `ue batch` (one command per line, from stdin or a file):
 one process and one editor session for all of them.
 

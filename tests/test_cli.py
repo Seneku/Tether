@@ -573,10 +573,58 @@ class Transport(unittest.TestCase):
             with open(project.uproject, "w") as f:
                 f.write('{"EngineAssociation": "5.6"}')
             self.assertEqual(ue.transport(project.uproject), "remote")
-            ue.write_json(os.path.join(ue.state_dir(project.uproject), "editor.json"), {"engine": "5.8.3-1+++UE5"})
+            ue.write_json(os.path.join(ue.state_dir(project.uproject), "editors", f"{os.getpid()}.json"),
+                          {"pid": os.getpid(), "engine": "5.8.3-1+++UE5"})
             self.assertEqual(ue.transport(project.uproject), "mcp")  # the running editor wins
             with unittest.mock.patch.dict(os.environ, {"UE_TRANSPORT": "remote"}):
                 self.assertEqual(ue.transport(project.uproject), "remote")
+        finally:
+            project.close()
+
+
+class Editors(unittest.TestCase):
+    """Several editors on one project: the user's and one `ue open` started (two live pids: ours and our parent's)."""
+
+    def beacon(self, project, pid, **fields):
+        ue.write_json(os.path.join(ue.state_dir(project.uproject), "editors", f"{pid}.json"),
+                      dict({"pid": pid, "heartbeat": time.time(), "started": 0}, **fields))
+
+    def test_prefers_the_users_editor_then_honours_an_explicit_pid(self):
+        project = Project()
+        try:
+            self.beacon(project, os.getpid(), launched_by_tether=True, headless=True, started=200)
+            self.beacon(project, os.getppid(), launched_by_tether=False, started=100)
+            self.beacon(project, 999999, launched_by_tether=False, started=300)  # gone
+            self.assertEqual(len(ue.live_editors(project.uproject)), 2)
+            self.assertEqual(ue.chosen_editor(project.uproject)["pid"], os.getppid())
+            with unittest.mock.patch.dict(os.environ, {"UE_EDITOR_PID": str(os.getpid())}):
+                self.assertEqual(ue.chosen_editor(project.uproject)["pid"], os.getpid())
+            with unittest.mock.patch.dict(os.environ, {"UE_EDITOR_PID": "999999"}):
+                with self.assertRaises(ue.CliError):
+                    ue.chosen_editor(project.uproject)
+            self.assertEqual(ue.editor_label(ue.chosen_editor(project.uproject)), f"pid {os.getppid()}, opened by hand")
+        finally:
+            project.close()
+
+    def test_tokens_are_per_editor_with_the_old_file_as_fallback(self):
+        project = Project()
+        try:
+            folder = ue.state_dir(project.uproject)
+            ue.write_json(os.path.join(folder, "editors", "11.token"), {"pid": 11, "token": "a"})
+            ue.write_json(os.path.join(folder, "session.json"), {"pid": 22, "token": "b"})
+            self.assertEqual(ue.editor_token(project.uproject, {"pid": 11}), "a")
+            self.assertEqual(ue.editor_token(project.uproject, {"pid": 22}), "b")
+            self.assertEqual(ue.editor_token(project.uproject, {"pid": 33}), "")  # another editor's token: no
+        finally:
+            project.close()
+
+    def test_old_single_beacon_still_counts(self):
+        project = Project()
+        try:
+            ue.write_json(os.path.join(ue.state_dir(project.uproject), "editor.json"),
+                          {"pid": os.getpid(), "heartbeat": time.time()})
+            self.assertEqual(ue.chosen_editor(project.uproject)["pid"], os.getpid())
+            self.assertTrue(ue.editor_live(project.uproject))
         finally:
             project.close()
 
