@@ -1092,7 +1092,7 @@ def cmd_build(ctx, args):
         print("  editor left closed because the build failed")
         return code
     code = cmd_open(ctx, argparse.Namespace(map=reopen_map, headless=launch.get("headless", False),
-                                            render=launch.get("render", False),
+                                            render=launch.get("render", False), sound=launch.get("sound", False),
                                             unattended=launch.get("unattended"), no_build=True,
                                             limit=args.limit, wait=600, no_wait=False))
     print(f"restart cycle: {time.time() - started:.1f}s total")
@@ -1128,7 +1128,12 @@ def cmd_open(ctx, args):
         # Agent-only session: never block on the "restore unsaved packages?" prompt.
         # --render keeps a GPU renderer with no window (-RenderOffscreen), for `ue shot`; plain headless
         # skips rendering entirely (-nullrhi), which boots faster and leaves the viewport zero-sized.
-        cmd += ["-RenderOffscreen" if args.render else "-nullrhi", "-nosound", "-AutoDeclinePackageRecovery"]
+        cmd += ["-RenderOffscreen" if args.render else "-nullrhi", "-AutoDeclinePackageRecovery"]
+        if getattr(args, "sound", False):  # a real audio device (for ue audio) that stays silent: PIE at volume 0, editor at 0
+            cmd += ["-ini:EditorPerProjectUserSettings:[/Script/UnrealEd.LevelEditorPlaySettings]:EnableGameSound=False",
+                    "-ini:EditorPerProjectUserSettings:[/Script/UnrealEd.LevelEditorMiscSettings]:EditorVolumeLevel=0"]
+        else:
+            cmd += ["-nosound"]
         if not unattended:
             # Attended for UnrealSharp, but nobody can see a dialog: log each one and take its default.
             cmd += ["-RUNNINGUNATTENDEDSCRIPT"]
@@ -1139,7 +1144,7 @@ def cmd_open(ctx, args):
         cmd += ["-ini:Engine:[/Script/PythonScriptPlugin.PythonScriptPluginSettings]:bRemoteExecution=True"]
     write_json(os.path.join(state_dir(ctx.project), "launch.json"),
                {"headless": bool(args.headless), "render": bool(args.render or not args.headless),
-                "unattended": unattended, "port": port})
+                "sound": bool(getattr(args, "sound", False) or not args.headless), "unattended": unattended, "port": port})
     started = time.time()
     detach = ({"creationflags": subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt"
               else {"start_new_session": True})  # outlive this CLI process either way
@@ -3127,6 +3132,70 @@ def cmd_world(ctx, args):
                                            limit=args.limit, project=args.project))
 
 
+ACTIVE_SOUND = re.compile(r"LogAudio: Display: (\S.*?) \(([\d.e+-]+)\) - (.*)$")
+WAVE_INSTANCE = re.compile(r"LogAudio: Display: {3,}(\S.*?) \(([\d.e+-]+)\) \((\d+)\) - ([\d.e+-]+)")
+
+
+def parse_active_sounds(lines):
+    """The sounds listed by au.DumpActiveSounds (the last dump in lines), each with its wave instances."""
+    start = max((i for i, l in enumerate(lines) if "Active Sound Count:" in l), default=None)
+    if start is None:
+        return None
+    sounds = []
+    for line in lines[start + 1:]:
+        wave = WAVE_INSTANCE.search(line)
+        if wave and sounds:
+            sounds[-1]["waves"].append({"wave": wave.group(1), "volume": float(wave.group(4))})
+            continue
+        sound = ACTIVE_SOUND.search(line)
+        if sound and not line.split("Display: ", 1)[-1].startswith(" "):
+            sounds.append({"sound": sound.group(1), "duration": float(sound.group(2)),
+                           "component": sound.group(3).strip(), "waves": []})
+    return sounds
+
+
+def active_sounds(ctx):
+    """Every sound the audio device is playing for PIE, fire-and-forget ones included (au.DumpActiveSounds)."""
+    start = log_end(ctx.project)
+    ctx.tether("console", command="au.DumpActiveSounds", pie=True)
+    deadline = time.time() + 5
+    while time.time() < deadline:  # the dump is written from the audio thread
+        sounds = parse_active_sounds(new_log_lines(ctx, start))
+        if sounds is not None:
+            time.sleep(0.3)
+            return parse_active_sounds(new_log_lines(ctx, start)) or []
+        time.sleep(0.3)
+    raise CliError("au.DumpActiveSounds wrote nothing: this editor has no audio device "
+                   "(reopen with `ue open --headless --sound`, which keeps it silent)")
+
+
+def cmd_audio(ctx, args):
+    """Sounds playing in PIE: what, from where, how loud."""
+    if not (ctx.beacon or {}).get("pie"):
+        raise CliError("PIE is not running (ue pie start)")
+    sounds = active_sounds(ctx)
+    comps = ctx.tether("audio_components", limit=200)
+    comps = json.loads(comps) if isinstance(comps, str) else comps
+    by_name = {c["component"]: c for c in comps}
+    rx = re.compile(args.match, re.I) if args.match else None
+    rows = []
+    for s in sounds:
+        comp = next((c for n, c in by_name.items() if n and n in s["component"]), None)
+        length = "loop" if s["duration"] >= 10000 else f"{s['duration']:.1f} s"
+        volume = max((w["volume"] for w in s["waves"]), default=None)
+        row = (f"{s['sound']} ({length})" + (f" on {comp['owner']}" if comp and comp.get("owner") else
+                                              f" via {s['component']}" if s["component"] not in ("", "None") else "")
+               + (f", {comp['distance']} cm away" if comp and comp.get("distance") is not None else "")
+               + (f", volume {volume:.2f}" if volume is not None else "")
+               + (f", attenuation {comp['attenuation']}" if comp and comp.get("attenuation") else ""))
+        if not rx or rx.search(row):
+            rows.append(row)
+    print(f"{len(rows)} sound(s) playing" + (f" matching /{args.match}/" if args.match else "") + (":" if rows else ""))
+    for row in rows[: args.limit]:
+        print("  " + row)
+    return 0
+
+
 def cmd_find(ctx, args):
     print(ctx.tether("find", query=args.query or "", cls=args.cls or "", under=args.under, limit=args.limit))
     return 0
@@ -3588,6 +3657,8 @@ def cmd_selftest(ctx, args):
           ok=lambda c, o: c == 0 and "PASS" in o)
     check("ui", ["ui"], ok=lambda c, o: c == 0)
     check("ai", ["ai"], ok=lambda c, o: c == 0 and ("AI" in o))
+    check("audio", ["audio"], skip=None if launch.get("sound", not launch.get("headless")) else "no audio device (ue open --headless --sound)",
+          ok=lambda c, o: c == 0 and "sound(s) playing" in o)
     check("anim", ["anim", "player"], ok=lambda c, o: c == 0 and ("skeletal mesh" in o or "anim instance" in o
                                                                    or "mesh " in o))
     fixture = (ue("py", "hasattr(unreal, 'TetherProbeUILibrary')")[1].splitlines() or [""])[-1] == "True"
@@ -4096,6 +4167,12 @@ def pie_do(ctx, args):
             held.add(rest.split()[0])
         elif verb == "release":
             held.discard(rest.split()[0])
+        if verb == "expect-sound":
+            rx = re.compile(rest, re.I)
+            def heard():
+                ok = any(rx.search(s["sound"]) for s in active_sounds(ctx))
+                return ok, "" if ok else "no such sound playing"
+            return poll(heard, seconds or 3)
         if verb == "click":
             return True, ui_click(ctx, rest)
         if verb in ("expect-ui", "ui-gone"):
@@ -4632,6 +4709,7 @@ def main(argv=None):
     s.add_argument("--map", help="map to open, e.g. /Game/Maps/Lvl_Test")
     s.add_argument("--headless", action="store_true", help="no window: -nullrhi -nosound (+ -unattended, see below)")
     s.add_argument("--render", action="store_true", help="with --headless: render offscreen instead of -nullrhi (for ue shot)")
+    s.add_argument("--sound", action="store_true", help="with --headless: keep a (silent) audio device, for ue audio")
     s.add_argument("--unattended", dest="unattended", action="store_true", default=None,
                    help="force -unattended (default for headless, except UnrealSharp projects)")
     s.add_argument("--attended", dest="unattended", action="store_false", help="never pass -unattended")
@@ -4828,6 +4906,8 @@ def main(argv=None):
     s.add_argument("--force", action="store_true", help="run a builder even though the map is open in the editor")
     s.add_argument("--no-wait", action="store_true", help="with builders: start the job and return")
     s.add_argument("--wait", type=float, default=1800, help="seconds to wait for nav or lighting (1800)")
+    s = add("audio", cmd_audio, "sounds playing in PIE: sound, owner, distance, volume, attenuation")
+    s.add_argument("match", nargs="?", help="regex filter")
     s = add("find", cmd_find, "search assets by name and/or class (asset registry)")
     s.add_argument("query", nargs="?", help="regex on the asset name")
     s.add_argument("--class", dest="cls", help="regex on the class name, e.g. StaticMesh or 'Material$'")

@@ -1044,3 +1044,19 @@ class WorldBuilds(unittest.TestCase):
         self.assertIn("Skipping Lighting Build", ue.LIGHTING_DONE.search(line).group(1))
         line = "[x][ 1]LogStaticLightingSystem: Illumination: 12.3 s (1 s encoding lightmaps, 0 s encoding shadowmaps)"
         self.assertTrue(ue.LIGHTING_DONE.search(line).group(1).startswith("Illumination"))
+
+
+class Audio(unittest.TestCase):
+    def test_parse_active_sounds(self):
+        lines = [
+            "[x][1]LogAudio: Display: Active Sound Count: 2",
+            "[x][1]LogAudio: Display: ------------------------",
+            "[x][1]LogAudio: Display: Wind_Loop (10000) - AudioComponent_3",
+            "[x][1]LogAudio: Display:    Wind_Wave (12.5) (204800) - 0.8",
+            "[x][1]LogAudio: Display: Pickup_Cue (0.42) - None",
+        ]
+        sounds = ue.parse_active_sounds(lines)
+        self.assertEqual([s["sound"] for s in sounds], ["Wind_Loop", "Pickup_Cue"])
+        self.assertEqual(sounds[0]["waves"], [{"wave": "Wind_Wave", "volume": 0.8}])
+        self.assertEqual(sounds[1]["component"], "None")
+        self.assertIsNone(ue.parse_active_sounds(["nothing"]))

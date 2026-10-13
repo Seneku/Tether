@@ -2948,6 +2948,40 @@ class TetherCore(_Base):
 
     @_tool
     @staticmethod
+    def audio_components(limit: int = 60) -> str:
+        """Playing audio components in PIE: sound, owner, distance to the player's camera, volume multiplier and
+        attenuation. (Fire-and-forget sounds have no component; `ue audio` adds those from the audio device.)
+
+        Args:
+            limit: Maximum number of entries.
+
+        Returns:
+            JSON list of {component, sound, owner, distance, volume, attenuation}.
+        """
+        game = _game_world()
+        if game is None:
+            raise RuntimeError("PIE is not running (ue pie start)")
+        camera = unreal.GameplayStatics.get_player_camera_manager(game, 0)
+        listener = camera.get_camera_location() if camera else None
+        rows = []
+        for comp in unreal.ObjectIterator(unreal.AudioComponent):
+            if _try(lambda: comp.get_world()) != game or not _try(lambda: comp.is_playing(), False):
+                continue
+            sound = _try(lambda: comp.get_editor_property("sound"))
+            owner = comp.get_owner()
+            where = comp.get_world_location()
+            attenuation = _try(lambda: comp.get_editor_property("attenuation_settings"))
+            rows.append({"component": comp.get_name(), "sound": sound.get_name() if sound else None,
+                         "owner": _label(owner) if owner else None,
+                         "distance": round(where.distance(listener)) if listener else None,
+                         "volume": round(_try(lambda: comp.get_editor_property("volume_multiplier"), 1.0), 3),
+                         "attenuation": attenuation.get_name() if attenuation else None})
+            if len(rows) >= limit:
+                break
+        return json.dumps(rows)
+
+    @_tool
+    @staticmethod
     def find(query: str = "", cls: str = "", under: str = "/Game", limit: int = 50) -> str:
         """Search the asset registry by name and/or class.
 
