@@ -859,3 +859,36 @@ class Watchdog(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SlateSnapshots(unittest.TestCase):
+    SNAPSHOT = "\n".join([
+        'window "Game - Unreal Editor" [pos=0,0 size=1280,720] [src=SWindow.cpp:1] [ref=w1]',
+        '  splitter [pos=4,102 size=799,582] [src=SDockingSplitter.cpp:15] [ref=sp4]',
+        '    tab "Viewport 1" [pos=4,102 size=160,25] [src=SLevelEditor.cpp:1346] [ref=t3]',
+        '      text "Viewport 1" [pos=31,106 size=61,15] [src=SDockTab.cpp:723] [ref=x6]',
+        '    combobox [pos=571,131 size=56,24] [src=SToolBarComboButtonBlock.cpp:359] [ref=co10]',
+        '      text "Lit" [pos=597,135 size=14,15] [src=SToolBarComboButtonBlock.cpp:209] [ref=x8]',
+        '    text "INVENTORY" [pos=700,150 size=100,20] [src=SInventoryScreen.cpp:40] [ref=x12]',
+        '    button "USE" [pos=700,200 size=60,20] [src=SInventoryScreen.cpp:80] [ref=b22]',
+        '    button "DROP" [disabled] [pos=760,200 size=60,20] [src=SInventoryScreen.cpp:81] [ref=b23]',
+        '    image [pos=0,0 size=0,0] [src=SImage.cpp:1] [ref=i9]',
+        '  splitter [pos=808,102 size=468,582] [src=SDockingSplitter.cpp:15] [ref=sp5]',
+        '    tab "Outliner" [pos=808,102 size=160,25] [src=SLevelEditor.cpp:1113] [ref=t4]'])
+
+    def test_game_ui_drops_the_editor_viewport_chrome(self):
+        nodes = ue.game_ui(ue.parse_snapshot(self.SNAPSHOT))
+        self.assertEqual(ue.ui_lines(nodes), ['text "INVENTORY"', 'button "USE"  (b22)', 'button "DROP" [disabled]  (b23)'])
+
+    def test_find_ui_by_label_or_ref_and_refuses_disabled(self):
+        nodes = ue.game_ui(ue.parse_snapshot(self.SNAPSHOT))
+        self.assertEqual(ue.find_ui(nodes, "use")["ref"], "b22")
+        self.assertEqual(ue.find_ui(nodes, "b22")["label"], "USE")
+        with self.assertRaises(ue.CliError):
+            ue.find_ui(nodes, "DROP")
+        with self.assertRaises(ue.CliError):
+            ue.find_ui(nodes, "Lit")  # the editor's own control is not game UI
+
+    def test_a_pie_window_is_all_game(self):
+        text = 'window "Game Preview [NetMode: Standalone 0]" [ref=w2]\n  button "Play" [size=10,10] [src=SMenu.cpp:1] [ref=b1]'
+        self.assertEqual(ue.ui_lines(ue.game_ui(ue.parse_snapshot(text))), ['button "Play"  (b1)'])

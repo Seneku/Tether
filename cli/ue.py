@@ -29,7 +29,7 @@ class _Lazy:
 socket, subprocess, zlib = _Lazy("socket"), _Lazy("subprocess"), _Lazy("zlib")
 
 TETHER = "tether.toolsets.TetherCore"
-GATED = {"py", "console", "set_props", "undo", "save", "spawn", "delete", "duplicate", "mv", "rm", "set_material", "pie_step", "set_config"}  # tools that need the session token (see beacon.session_token)
+GATED = {"py", "console", "set_props", "undo", "save", "spawn", "delete", "duplicate", "mv", "rm", "set_material", "pie_step", "set_config", "umg"}  # tools that need the session token (see beacon.session_token)
 LEVELS = {"Fatal": 0, "Error": 1, "Warning": 2, "Display": 3, "Log": 4, "Verbose": 5, "VeryVerbose": 6}
 NOISE = {"LogModelContextProtocol", "LogToolsetRegistry"}  # our own transport chatter
 # Epic logs this whenever a schema is generated for a class with delegates (props, set, describe_toolset).
@@ -2473,6 +2473,151 @@ def cmd_config(ctx, args):
     return 0
 
 
+SNAPSHOT_LINE = re.compile(r'^(?P<indent> *)(?P<role>[\w-]+)(?: "(?P<label>(?:[^"\\]|\\.)*)")?(?P<attrs>(?: \[[^\]]*\])*)\s*$')
+# Source files of the editor's own viewport controls (toolbars, tabs, menus) in a Slate snapshot.
+EDITOR_CHROME = ("SDock", "SToolBar", "SClippingHorizontalBox", "SComboButton", "SEditorViewport", "SLevelViewport",
+                 "SViewportToolBar", "SViewportToolbar", "SCommonEditorViewport", "STransformViewport", "SActorPilot",
+                 "SToolMenu", "SMenuEntryBlock", "SLevelEditor", "SPIEToolbar", "SGameLayerManager", "SNotification")
+INTERACTIVE = {"button", "checkbox", "combobox", "textbox", "slider", "hyperlink", "menuitem", "radiobutton", "spinbox"}
+UI_TOOLSET = "SlateInspectorToolset.SlateInspectorToolset"
+
+
+def parse_snapshot(text):
+    nodes = []
+    for line in text.splitlines():
+        m = SNAPSHOT_LINE.match(line)
+        if not m:
+            continue
+        attrs = re.findall(r"\[([^\]]*)\]", m.group("attrs") or "")
+        fields = dict(a.split("=", 1) for a in attrs if "=" in a)
+        nodes.append({"indent": len(m.group("indent")), "role": m.group("role"),
+                      "label": (m.group("label") or "").replace('\\"', '"'), "ref": fields.get("ref", ""),
+                      "src": fields.get("src", ""), "size": fields.get("size", ""),
+                      "flags": [a for a in attrs if "=" not in a]})
+    return nodes
+
+
+def subtree(nodes, i):
+    end = i + 1
+    while end < len(nodes) and nodes[end]["indent"] > nodes[i]["indent"]:
+        end += 1
+    return nodes[i + 1:end]
+
+
+def game_ui(nodes):
+    """The game's widgets in a whole-editor Slate snapshot: a PIE window's content, or the level viewport's panel
+    minus the editor's own controls (told apart by the source file that created each widget)."""
+    for i, node in enumerate(nodes):
+        if node["role"] == "window" and re.search(r"Preview \[NetMode|\(PIE\)", node["label"]):
+            return subtree(nodes, i)
+    for i, node in enumerate(nodes):
+        if node["role"] != "tab" or not node["label"].startswith("Viewport") or not node["src"].startswith("SLevelEditor"):
+            continue
+        parent = next((j for j in range(i - 1, -1, -1) if nodes[j]["indent"] < node["indent"]), None)
+        if parent is None:
+            continue
+        game, keep = [], False
+        for n in subtree(nodes, parent):
+            if n["indent"] == node["indent"]:
+                keep = not n["src"].startswith(EDITOR_CHROME) and n is not node
+            if keep:
+                game.append(n)
+        if game:
+            return game
+    return []
+
+
+def ui_nodes(ctx):
+    """(game widget nodes, True) via Epic's Slate inspector, or (None, False) when it is not enabled."""
+    if ctx.transport == "remote" or UI_TOOLSET not in catalog(ctx):
+        return None, False
+    text = mcp_tool(ctx, "SlateInspectorToolset", "Snapshot", {"ref": "", "maxDepth": 120, "bIncludeSourceLocations": True})
+    return game_ui(parse_snapshot(text if isinstance(text, str) else json.dumps(text))), True
+
+
+def ui_lines(nodes, show_all=False, match=None):
+    base = min((n["indent"] for n in nodes), default=0)
+    rx = re.compile(match, re.I) if match else None
+    out = []
+    for n in nodes:
+        if not show_all and (n["size"].startswith("0,") or n["size"].endswith(",0")
+                             or (n["role"] == "image" and not n["label"])):
+            continue
+        line = "  " * ((n["indent"] - base) // 2) + n["role"] + (f' "{n["label"]}"' if n["label"] else "") + \
+            "".join(f" [{f}]" for f in n["flags"]) + (f"  ({n['ref']})" if n["role"] in INTERACTIVE else "")
+        if not rx or rx.search(line):
+            out.append(line)
+    return out
+
+
+def find_ui(nodes, target, roles=INTERACTIVE):
+    """A game widget by ref or by label (exact, then contained; case-insensitive)."""
+    if re.fullmatch(r"[a-z]+\d+", target):
+        hit = [n for n in nodes if n["ref"] == target]
+    else:
+        key = target.lower()
+        pool = [n for n in nodes if n["role"] in roles]
+        hit = [n for n in pool if n["label"].lower() == key] or [n for n in pool if key in n["label"].lower()]
+    if not hit:
+        names = ", ".join(f'{n["role"]} "{n["label"]}"' for n in nodes if n["role"] in roles and n["label"])[:300]
+        raise CliError(f"no {'/'.join(sorted(roles)) if len(roles) < 4 else 'interactive'} widget '{target}' on screen"
+                       + (f" (have: {names})" if names else ""))
+    if "disabled" in hit[0]["flags"]:
+        raise CliError(f'{hit[0]["role"]} "{hit[0]["label"]}" is disabled')
+    return hit[0]
+
+
+def ui_click(ctx, target):
+    nodes, slate = ui_nodes(ctx)
+    if not slate:
+        return ctx.tether("umg", click=target)
+    node = find_ui(nodes, target)
+    mcp_tool(ctx, "SlateInspectorToolset", "Click", {"ref": node["ref"]})
+    return f'clicked {node["role"]} "{node["label"]}"'
+
+
+def ui_has_text(ctx, text):
+    nodes, slate = ui_nodes(ctx)
+    lines = ui_lines(nodes, show_all=True) if slate else ctx.tether("umg").splitlines()
+    return any(text.lower() in line.lower() for line in lines)
+
+
+def cmd_ui(ctx, args):
+    """The game's on-screen UI in PIE (Slate and UMG), and clicking, typing and keys."""
+    if ctx.transport != "remote" and not (ctx.beacon or {}).get("pie"):
+        raise CliError("PIE is not running (ue pie start)")
+    action = args.action or "show"
+    if action == "click":
+        print(ui_click(ctx, " ".join(args.rest)))
+        return 0
+    if action in ("type", "key"):
+        nodes, slate = ui_nodes(ctx)
+        if not slate:
+            raise CliError(f"ue ui {action} needs Epic's SlateInspectorToolset (ue init enables it)")
+        if action == "key":
+            mcp_tool(ctx, "SlateInspectorToolset", "PressKey", {"key": " ".join(args.rest)})
+            print(f"pressed {' '.join(args.rest)}")
+            return 0
+        if len(args.rest) < 2:
+            raise CliError("ue ui type <textbox label|ref> <text> [--submit]")
+        node = find_ui(nodes, args.rest[0], {"textbox", "spinbox"})
+        mcp_tool(ctx, "SlateInspectorToolset", "Type", {"ref": node["ref"], "text": " ".join(args.rest[1:]),
+                                                        "submit": args.submit})
+        print(f'typed into textbox "{node["label"]}"')
+        return 0
+    match = " ".join(([action] if action != "show" else []) + args.rest)
+    nodes, slate = ui_nodes(ctx)
+    if not slate:
+        print("(UMG only: enable Epic's SlateInspectorToolset, e.g. with ue init, to also see Slate widgets)")
+        print(ctx.tether("umg"))
+        return 0
+    lines = ui_lines(nodes, args.all, match or None)
+    print(f"{len(lines)} widget(s) on screen" + (f" matching /{match}/" if match else "") + (":" if lines else ""))
+    for line in lines[: args.limit if args.limit != 30 else 200]:
+        print(line)
+    return 0
+
+
 def cmd_find(ctx, args):
     print(ctx.tether("find", query=args.query or "", cls=args.cls or "", under=args.under, limit=args.limit))
     return 0
@@ -2816,6 +2961,11 @@ def cmd_selftest(ctx, args):
     check("actors --pie", ["actors", "--pie", "--limit", "1"])
     check("pie do", ["pie", "do", "at 100,200,300", "near 100,200,300 50", "expect player.location ~ ."],
           ok=lambda c, o: c == 0 and "PASS" in o)
+    check("ui", ["ui"], ok=lambda c, o: c == 0)
+    fixture = (ue("py", "hasattr(unreal, 'TetherProbeUILibrary')")[1].splitlines() or [""])[-1] == "True"
+    check("ui click (Sandbox fixture)", ["pie", "do", "call /Script/Sandbox.Default__TetherProbeUILibrary ShowProbeUI",
+                                         "expect-ui Tether probe panel", "click UMG Probe Button", "expect-ui UMG clicks: "],
+          skip=None if fixture else "no UI fixture (Sandbox's TetherProbeUILibrary)", ok=lambda c, o: c == 0 and "PASS" in o)
     check("pie stop", ["pie", "stop"], ok=lambda c, o: c == 0 and "OK" in o)
     if args.reload:
         check("reload", ["reload"])
@@ -3174,6 +3324,26 @@ def pie_do(ctx, args):
             held.add(rest.split()[0])
         elif verb == "release":
             held.discard(rest.split()[0])
+        if verb == "click":
+            return True, ui_click(ctx, rest)
+        if verb in ("expect-ui", "ui-gone"):
+            want = verb == "expect-ui"
+            def check():
+                ok = ui_has_text(ctx, rest) == want
+                return ok, "" if ok else ("still on screen" if not want else "not on screen")
+            return poll(check, seconds or 3)
+        if verb in ("type", "key"):
+            import shlex
+            parts = shlex.split(rest)
+            if verb == "key":
+                mcp_tool(ctx, "SlateInspectorToolset", "PressKey", {"key": rest})
+                return True, f"pressed {rest}"
+            nodes, slate = ui_nodes(ctx)
+            if not slate or len(parts) < 2:
+                raise CliError('type needs SlateInspectorToolset and: type "<textbox label>" <text>')
+            node = find_ui(nodes, parts[0], {"textbox", "spinbox"})
+            mcp_tool(ctx, "SlateInspectorToolset", "Type", {"ref": node["ref"], "text": " ".join(parts[1:]), "submit": False})
+            return True, f'typed into "{node["label"]}"'
         if verb == "shot":
             shot_args = argparse.Namespace(actor=None, at=None, look_at=None, rot=None, annotate=False, grid_z=0,
                                            ui=False, output=rest or None)
@@ -3510,7 +3680,8 @@ def cmd_hook(ctx, args):
     return 0
 
 
-REQUIRED_PLUGINS = ["PythonScriptPlugin", "ModelContextProtocol", "EditorToolset", "AutomationTestToolset", "Tether"]
+REQUIRED_PLUGINS = ["PythonScriptPlugin", "ModelContextProtocol", "EditorToolset", "AutomationTestToolset", "SlateInspectorToolset",
+                    "Tether"]
 
 
 def tether_plugins_dir():
@@ -3837,6 +4008,11 @@ def main(argv=None):
     s = add("config", cmd_config, "project/editor settings: list sections, read one, or Name=value to set (saved)")
     s.add_argument("section", nargs="?", help="Maps, Rendering, Engine/General, or Container/Category/Section")
     s.add_argument("rest", nargs="*", metavar="regex|Name=value", help="a regex to filter settings, or values to set")
+    s = add("ui", cmd_ui, "the game's on-screen UI in PIE (Slate + UMG); click | type | key to interact")
+    s.add_argument("action", nargs="?", help="click <label|ref>, type <textbox> <text>, key <Key>, or a regex filter")
+    s.add_argument("rest", nargs="*")
+    s.add_argument("--all", action="store_true", help="also images and zero-size widgets")
+    s.add_argument("--submit", action="store_true", help="with type: press Enter afterwards")
     s = add("find", cmd_find, "search assets by name and/or class (asset registry)")
     s.add_argument("query", nargs="?", help="regex on the asset name")
     s.add_argument("--class", dest="cls", help="regex on the class name, e.g. StaticMesh or 'Material$'")

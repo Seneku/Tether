@@ -2041,7 +2041,13 @@ class TetherCore(_Base):
                 raise RuntimeError("call <target> <Function> [json args]")
             obj = _pie_object(parts[0], pawn, controller)
             args = json.loads(parts[2]) if len(parts) > 2 else []
-            result = obj.call_method(parts[1], tuple(args) if isinstance(args, list) else (args,))
+            args = tuple(args) if isinstance(args, list) else (args,)
+            try:
+                result = obj.call_method(parts[1], args)
+            except TypeError as exc:  # a library function's WorldContext parameter: pass the PIE world
+                if "world_context" not in str(exc).lower():
+                    raise
+                result = obj.call_method(parts[1], (game,) + args)
             if isinstance(result, unreal.StructBase):
                 result = _compact(_try(lambda: result.to_dict(), str(result)))
             elif isinstance(result, unreal.Object):
@@ -2270,6 +2276,85 @@ class TetherCore(_Base):
             raise RuntimeError("did not take: " + ", ".join(f"{p} stayed {_compact(after.get(p))}" for p in ignored))
         rows = [f"{p}: {_compact(old.get(p))} -> {_compact(after.get(p))}" for p in plan]
         return "\n".join([f"{container}/{category}/{name} (saved)"] + rows)
+
+    @_tool
+    @staticmethod
+    def umg(click: str = "", token: str = "") -> str:
+        """UMG widgets on the PIE viewport as a compact tree: texts, buttons (by their label), text boxes and
+        check boxes. The fallback for `ue ui` when Epic's SlateInspectorToolset is not enabled: raw Slate
+        widgets are invisible from Python. With click, fire the OnClicked of the button whose label or name
+        matches (case-insensitive).
+
+        Args:
+            click: Button label or widget name to click ('' lists).
+            token: Session token from Saved/Tether/session.json (needed only with click).
+
+        Returns:
+            One line per widget, indented by nesting.
+        """
+        game = _game_world()
+        if game is None:
+            raise RuntimeError("PIE is not running")
+        tops = [u for u in unreal.WidgetLibrary.get_all_widgets_of_class(game, unreal.UserWidget, True)
+                if u.is_in_viewport() and u.is_visible()]
+        lib = unreal.UserWidgetFunctionLibrary
+        children, owners = {}, {}
+        for widget in unreal.ObjectIterator(unreal.Widget):
+            owner = _try(lambda: lib.get_outer_user_widget(widget))
+            if owner in tops:
+                children.setdefault(widget.get_parent(), []).append(widget)
+                owners[widget] = owner
+
+        def label(widget):
+            if isinstance(widget, unreal.TextBlock):
+                return str(widget.get_text())
+            texts = [label(c) for c in children.get(widget, []) if isinstance(c, (unreal.TextBlock, unreal.PanelWidget))]
+            return " ".join(t for t in texts if t)
+
+        for parent, kids in children.items():  # layout order, not object creation order
+            if parent is not None:
+                kids.sort(key=lambda w: _try(lambda: parent.get_child_index(w), 0))
+        rows, buttons = [], []
+
+        def walk(widget, depth):
+            if not widget.is_visible():
+                return
+            kind = None
+            if isinstance(widget, unreal.Button):
+                kind, text = "button", label(widget)
+                buttons.append((text, widget))
+            elif isinstance(widget, unreal.TextBlock):
+                kind, text = "text", str(widget.get_text())
+            elif isinstance(widget, (unreal.EditableTextBox, unreal.EditableText)):
+                kind, text = "textbox", str(widget.get_text()) or str(_try(lambda: widget.get_editor_property("hint_text"), ""))
+            elif isinstance(widget, unreal.CheckBox):
+                kind, text = "checkbox", ""
+            if kind:
+                flags = "" if widget.get_is_enabled() else " [disabled]"
+                if kind == "checkbox":
+                    flags += " [checked]" if widget.is_checked() else " [unchecked]"
+                rows.append("  " * depth + f'{kind} "{text}"{flags}  ({widget.get_name()})')
+            if kind == "button":
+                return  # its label is already on the button line
+            for child in children.get(widget, []):
+                walk(child, depth + (1 if kind else 0))
+
+        for top in tops:
+            rows.append(f"{top.get_class().get_name()}")
+            for root in [w for w in children.get(None, []) if owners[w] == top]:
+                walk(root, 1)
+        if click:
+            _authorize(token)
+            key = click.lower()
+            match = [b for t, b in buttons if t.lower() == key or b.get_name().lower() == key] or \
+                [b for t, b in buttons if key in t.lower()]
+            if not match:
+                raise RuntimeError(f"no visible button '{click}' (buttons: {', '.join(t or b.get_name() for t, b in buttons[:10])})")
+            if not match[0].get_is_enabled():
+                raise RuntimeError(f"'{click}' is disabled")
+            match[0].on_clicked.broadcast()
+            return f"clicked {match[0].get_name()}"
+        return "\n".join(rows) if rows else "no UMG widgets on the viewport"
 
     @_tool
     @staticmethod

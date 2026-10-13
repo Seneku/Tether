@@ -142,6 +142,10 @@ broken or unsupported.
   Steps: at, look, move, press/tap/hold/release (Enhanced Input actions: asset names, or actions the
   character creates in C++), call, expect/until (`= != < > <= >= ~`), log, exists/gone, wait, exec, shot.
   Each step prints ok/FAIL; it stops at the first failure. Write the step file once and rerun it after changes.
+- Game UI in PIE: `ue ui` lists what is on screen (Slate and UMG texts, buttons, text boxes); `ue ui click
+  "Close"`, `ue ui type "Name" hello`, `ue ui key Escape`. In `ue pie do`: `click <label>`, `expect-ui <text>`,
+  `ui-gone <text>`. Clicks are real mouse clicks at the widget, so whatever is on top receives them; labels are
+  stable, refs (b12) change between reads. Canvas-drawn HUD text is not a widget: check it with `ue shot`.
 - Prefer `ue pie run check.py --expect '<log regex>' --reject 'Error|no subsystem'` for verifying gameplay:
   it starts PIE, runs the script in the PIE world, waits for the log lines, stops PIE and exits 0/1.
   Write the script once and rerun it after every change.
