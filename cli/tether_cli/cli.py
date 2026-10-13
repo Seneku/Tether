@@ -19,8 +19,8 @@ from .testing import cmd_test
 from .assets import cmd_bp, cmd_diff, cmd_overview, cmd_size, cmd_table, cmd_usages, cmd_validate
 from .content import cmd_import, cmd_lint, cmd_unused
 from .jobs import cmd_job, cmd_package
-from .play import cmd_audio, cmd_mem, cmd_perf, cmd_soak, cmd_ui, cmd_world
-from .playtest import cmd_input, pie_command
+from .play import cmd_audio, cmd_mem, cmd_soak, cmd_ui, cmd_world
+from .playtest import cmd_input, perf_command, pie_command
 from .hooks import cmd_hook
 from .setup import cmd_doctor, cmd_init, cmd_reload
 from .selftest import cmd_ci, cmd_selftest
@@ -229,8 +229,13 @@ def build_parser():
     s.add_argument("--prune", action="store_true", help="with --import: remove rows missing from FILE")
     s.add_argument("--dry-run", action="store_true", help="with --import: show the diff only")
     s.add_argument("--save", action="store_true", help="save the DataTable afterwards")
-    s = add("perf", cmd_perf, "frame-time capture in PIE: frame/game/render/GPU ms, hitches, change vs last capture")
-    s.add_argument("--seconds", type=float, default=10, help="capture length (10)")
+    s = add("perf", perf_command, "frame-time capture in PIE: frame/game/render/GPU ms, hitches, change vs last "
+                                   "capture; `perf load [map]`: PIE start, streaming, hitches and the loads in them")
+    s.add_argument("action", nargs="?", choices=["load"], help="load: map load and streaming hitches")
+    s.add_argument("map", nargs="?", help="with load: the map to open first (default: the open one)")
+    s.add_argument("--seconds", type=float, help="capture length (10); with load: how long to play (10, or 0 after -f)")
+    s.add_argument("-f", "--file", help="with load: a `ue pie do` route to play while measuring")
+    s.add_argument("--hitch", type=float, default=50, help="with load: frames longer than this many ms are hitches (50)")
     s.add_argument("--editor", action="store_true", help="measure the editor as is, without starting PIE")
     s.add_argument("--no-record", action="store_true", help="do not make this capture the comparison baseline")
     s.add_argument("--trace", action="store_true", help="also an Unreal Insights trace: top CPU scopes per thread")

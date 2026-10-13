@@ -1276,6 +1276,39 @@ class Lint(unittest.TestCase):
         self.assertNotIn(("texture-size", "/Game/Tex/T_Rock_ORM"), found)
 
 
+class PerfLoad(unittest.TestCase):
+    LOG = [
+        "[2026.10.13-14.09.59:000][920]LogPython: TetherFrameLog mark 1000.000",
+        "[2026.10.13-14.10.00:500][123]LogStreaming: Verbose: CreateAsyncPackages: AddPackage: /Game/A (0x1) /Game/A (0x1) - Start loading package.",
+        "[2026.10.13-14.10.00:900][123]LogStreaming: Display: FlushAsyncLoading(12): 1 QueuedPackages, 0 AsyncPackages",
+        "[2026.10.13-14.10.00:950][124]LogStreaming: Verbose: GameThread: LoadCompleted: /Game/A (0x1) /Game/A (0x1) - All loading of package is done",
+        "[2026.10.13-14.10.01:000][124]LogStreaming: Verbose: CreateAsyncPackages: AddPackage: /Game/B (0x2) /Game/B (0x2) - Start loading package.",
+        "[2026.10.13-14.10.01:010][125]LogStreaming: Verbose: GameThread: LoadCompleted: /Game/B (0x2) /Game/B (0x2) - All loading of package is done",
+    ]
+
+    def test_log_is_put_on_the_marker_clock(self):
+        events, marked = ue.parse_load_log(self.LOG)
+        self.assertTrue(marked)
+        self.assertEqual([(round(t, 3), k, w) for t, k, w in events],
+                         [(1001.5, "start", "/Game/A"), (1001.9, "flush", "1"), (1001.95, "done", "/Game/A"),
+                          (1002.0, "start", "/Game/B"), (1002.01, "done", "/Game/B")])
+        self.assertEqual(ue.parse_load_log(self.LOG[1:]), ([], False))
+
+    def test_hitches_name_the_loads_inside_them(self):
+        events, _ = ue.parse_load_log(self.LOG)
+        frames = [[1000.5 + i * 0.01, 0.01, True] for i in range(100)]  # 10 ms frames until 1001.49
+        frames += [[1001.96, 0.2, True], [1001.97, 0.01, True], [1002.5, 0.06, True], [999.0, 0.5, True],
+                   [1001.98, 0.3, False]]  # before the start and outside PIE: ignored
+        lines, data = ue.load_report(frames, events, started=1000.0)
+        self.assertEqual(lines[0], "103 frames, median 10.0 ms; 2 hitch(es) over 50 ms:")
+        self.assertEqual(lines[1], "  +  1.96s     200 ms  game thread waited for loading (1 flush); "
+                                   "1 package(s) finished: A")
+        self.assertEqual(lines[2], "  +  2.50s      60 ms  no loading in it")
+        self.assertEqual(lines[3:], ["2 package(s) loaded; slowest (request to done):",
+                                     "      450 ms  /Game/A", "       10 ms  /Game/B"])
+        self.assertEqual(data["hitches"][0]["loaded"], ["/Game/A"])
+
+
 class JsonEnvelope(unittest.TestCase):
     def run_json(self, project, *argv):
         out = io.StringIO()

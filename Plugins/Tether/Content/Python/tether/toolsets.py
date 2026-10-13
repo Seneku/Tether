@@ -1017,6 +1017,30 @@ def _after_import(asset, opts):
     return ""
 
 
+# `ue perf load`: each frame's wall-clock time and length, and whether World Partition streaming is done.
+_FRAMES = getattr(sys, "_tether_frames", None) or {"handle": None}
+sys._tether_frames = _FRAMES
+
+
+def _frame_tick(_delta):
+    state = _FRAMES
+    now = time.time()
+    game = _game_world()
+    # The time since this callback last ran, not the engine's delta: that is measured as a frame starts, so a
+    # stall would show up one frame late, after the loads that caused it.
+    last, state["last"] = state.get("last") or now, now
+    if len(state["frames"]) < 200000:
+        state["frames"].append([round(now, 4), round(now - last, 5), game is not None])
+    if game is not None and now - state["last_stream"] >= 0.25:  # cheap, but no need to ask every frame
+        state["last_stream"] = now
+        subsystem = state.get("subsystem")
+        if subsystem is None or _try(lambda: subsystem.get_world()) != game:
+            subsystem = state["subsystem"] = next((s for s in unreal.ObjectIterator(unreal.WorldPartitionSubsystem)
+                                                   if _try(lambda: s.get_world()) == game), None)
+        done = _try(lambda: subsystem.is_all_streaming_completed()) if subsystem else None
+        state["streaming"].append([round(now, 3), done])
+
+
 _COMPARE = re.compile(r"^(?P<lhs>\S+)\s*(?P<op>==|!=|<=|>=|=|<|>|~)\s*(?P<rhs>.*)$")
 
 
@@ -3646,6 +3670,39 @@ class TetherCore(_Base):
                     if save:
                         unreal.EditorAssetLibrary.save_loaded_asset(fresh, False)
         return json.dumps(rows)
+
+    @_tool
+    @staticmethod
+    def frame_log(action: str = "status") -> str:
+        """Record every editor frame's wall-clock time and length, with package loading logged verbosely, so the
+        ue CLI's `perf load` can tell which loads landed in which hitch.
+
+        Args:
+            action: 'start' (logs a marker line tying the log's clock to the wall clock), 'stop' or 'status'.
+
+        Returns:
+            start/status: a line of text. stop: JSON {frames: [[wall time, seconds, in PIE]], mark: wall time, streaming:
+            [[wall time, all streaming completed]]}.
+        """
+        state = _FRAMES
+        if action == "start":
+            if state.get("handle") is not None:
+                unreal.unregister_slate_post_tick_callback(state["handle"])
+            state.update(frames=[], streaming=[], last_stream=0.0, mark=time.time(), subsystem=None, last=None)
+            unreal.SystemLibrary.execute_console_command(None, "log LogStreaming Verbose")
+            unreal.log(f"TetherFrameLog mark {state['mark']:.3f}")
+            state["handle"] = unreal.register_slate_post_tick_callback(_frame_tick)
+            return "recording frames"
+        if action == "stop":
+            if state.get("handle") is not None:
+                unreal.unregister_slate_post_tick_callback(state["handle"])
+                state["handle"] = None
+            unreal.SystemLibrary.execute_console_command(None, "log LogStreaming Log")
+            if "frames" not in state:
+                raise RuntimeError("no frame log was started")
+            return json.dumps({"frames": state["frames"], "mark": state["mark"], "streaming": state["streaming"]})
+        return (f"recording, {len(state.get('frames', []))} frame(s)" if state.get("handle") is not None
+                else "not recording")
 
     @_tool
     @staticmethod

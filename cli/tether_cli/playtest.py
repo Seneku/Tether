@@ -1,15 +1,17 @@
-"""Play testing: input maps, recording a play session, watching properties over time."""
+"""Play testing: input maps, recording a play session, watching properties over time, load hitches."""
 import argparse
 import csv
+import datetime
 import json
 import math
 import os
 import re
 import time
 
-from .core import CliError, read_json, state_dir
+from .core import CliError, log_end, log_path, read_json, state_dir
+from .calls import flush_editor_log
 from .assets import code_usages
-from .play import cmd_pie, pie_do, unthrottled
+from .play import cmd_perf, cmd_pie, pie_do, unthrottled
 
 
 def input_lines(data, match=None, code_refs=None):
@@ -352,6 +354,141 @@ def pie_record(ctx, args):
                                              "  (move it to tests/play/ to make it part of ue ci --play)"))
     ctx.data = {"file": path, "steps": [l for l in lines if not l.startswith("#")]}
     return 0
+
+
+LOG_STAMP = re.compile(r"^\[(\d{4}\.\d\d\.\d\d-\d\d\.\d\d\.\d\d:\d{3})\]\[\s*\d+\]")
+LOAD_START = re.compile(r"LogStreaming: Verbose: CreateAsyncPackages: AddPackage: (\S+)")
+LOAD_DONE = re.compile(r"LogStreaming: Verbose: GameThread: LoadCompleted: (\S+)")
+LOAD_FLUSH = re.compile(r"LogStreaming: \w+: FlushAsyncLoading\(\d+\): (\d+) QueuedPackages, (\d+) AsyncPackages")
+FRAME_MARK = re.compile(r"TetherFrameLog mark ([\d.]+)")
+
+
+def _log_seconds(stamp):
+    when = datetime.datetime.strptime(stamp, "%Y.%m.%d-%H.%M.%S:%f")
+    return (when - datetime.datetime(1970, 1, 1)).total_seconds()
+
+
+def parse_load_log(lines):
+    """Package loads from a verbose LogStreaming log, on the wall clock of the TetherFrameLog marker:
+    ([(wall time, 'start'|'done'|'flush', package or queued count)], marker found)."""
+    offset, events = None, []
+    for line in lines:
+        stamp = LOG_STAMP.match(line)
+        if not stamp:
+            continue
+        mark = FRAME_MARK.search(line)
+        if mark:
+            offset = float(mark.group(1)) - _log_seconds(stamp.group(1))
+            continue
+        for kind, rx in (("start", LOAD_START), ("done", LOAD_DONE), ("flush", LOAD_FLUSH)):
+            m = rx.search(line)
+            if m:
+                events.append((_log_seconds(stamp.group(1)), kind, m.group(1)))
+                break
+    if offset is None:
+        return [], False
+    return [(t + offset, kind, what) for t, kind, what in events], True
+
+
+def load_report(frames, events, started, hitch_ms=50.0, top=8):
+    """Lines and data for `ue perf load`: hitches with the loads that finished in them, the slowest loads."""
+    frames = [f for f in frames if f[0] >= started and (len(f) < 3 or f[2])]  # PIE frames only
+    lines, data = [], {"frames": len(frames)}
+    if frames:
+        deltas = sorted(f[1] for f in frames)
+        median = deltas[len(deltas) // 2]
+        limit = max(hitch_ms / 1000.0, median * 3)
+        hitches = sorted((f for f in frames if f[1] > limit), key=lambda f: -f[1])
+        data.update(median_ms=round(median * 1000, 1), hitches=[])
+        lines.append(f"{len(frames)} frames, median {median * 1000:.1f} ms; {len(hitches)} hitch(es) over "
+                     f"{limit * 1000:.0f} ms" + (":" if hitches else ""))
+        for end, length, *_ in hitches[:top]:
+            begin = end - length - 0.01
+            loaded = [what for t, kind, what in events if kind == "done" and begin <= t <= end + 0.01]
+            flushes = [what for t, kind, what in events if kind == "flush" and begin <= t <= end + 0.01]
+            note = []
+            if flushes:
+                note.append(f"game thread waited for loading ({len(flushes)} flush)")
+            if loaded:
+                shown = ", ".join(p.rsplit("/", 1)[-1] for p in loaded[:4])
+                note.append(f"{len(loaded)} package(s) finished: {shown}" + (" ..." if len(loaded) > 4 else ""))
+            lines.append(f"  +{end - started:6.2f}s  {length * 1000:6.0f} ms  " + ("; ".join(note) or "no loading in it"))
+            data["hitches"].append({"at": round(end - started, 3), "ms": round(length * 1000, 1), "loaded": loaded,
+                                    "flushes": len(flushes)})
+    begun, durations = {}, []
+    for t, kind, what in events:
+        if t < started:
+            continue
+        if kind == "start":
+            begun.setdefault(what, t)
+        elif kind == "done" and what in begun:
+            durations.append((t - begun.pop(what), what))
+    durations.sort(reverse=True)
+    data["loads"] = [{"package": p, "ms": round(d * 1000, 1)} for d, p in durations]
+    if durations:
+        lines.append(f"{len(durations)} package(s) loaded; slowest (request to done):")
+        for seconds, package in durations[:top]:
+            lines.append(f"  {seconds * 1000:7.0f} ms  {package}")
+    else:
+        lines.append("no packages loaded during the run (all already in memory: the editor keeps what it loaded)")
+    return lines, data
+
+
+def perf_load(ctx, args):
+    """Map load and streaming: PIE start time, World Partition streaming completion, hitches and the loads in them."""
+    if ctx.tether("pie", action="status") == "running":
+        raise CliError("PIE is running; perf load starts it itself to time the start (ue pie stop)")
+    if args.map and (ctx.beacon or {}).get("map") != args.map.split(".")[0]:
+        dirty = ctx.tether("py", code="len([p for p in unreal.EditorLoadingAndSavingUtils.get_dirty_map_packages() "
+                                      "if not p.get_name().startswith('/Temp/')])")
+        if str(dirty).strip() not in ("0", ""):
+            raise CliError(f"the open map has unsaved changes; save or discard them before loading {args.map}")
+        began = time.time()
+        ctx.tether("py", code=f"unreal.EditorLoadingAndSavingUtils.load_map({args.map.split('.')[0]!r})")
+        print(f"editor: opened {args.map} in {time.time() - began:.1f}s")
+    start = log_end(ctx.project)
+    with unthrottled(ctx):
+        print(ctx.tether("frame_log", action="start"))
+        began = time.time()
+        code = cmd_pie(ctx, argparse.Namespace(action="start", simulate=False, warmup=0, limit=0, script=None))
+        if code:
+            ctx.tether("frame_log", action="stop")
+            return code
+        try:
+            if args.file:
+                code = pie_do(ctx, argparse.Namespace(script=[], file=args.file, reject=None, keep=True,
+                                                      keep_going=False, warmup=0, quiet=True))
+            time.sleep(args.seconds if args.seconds is not None else (0 if args.file else 10))
+        finally:
+            result = ctx.tether("frame_log", action="stop")
+            cmd_pie(ctx, argparse.Namespace(action="stop", simulate=False, warmup=0, limit=0, script=None))
+    result = json.loads(result) if isinstance(result, str) else result
+    flush_editor_log(ctx)
+    with open(log_path(ctx.project), "rb") as f:
+        f.seek(start)
+        events, marked = parse_load_log(f.read().decode("utf-8", "replace").splitlines())
+    first = next((f[0] for f in result["frames"] if f[0] >= began and f[2]), None)
+    streaming = [(t, done) for t, done in result["streaming"] if done is not None]
+    done_at = next((t for t, done in streaming if done), None)
+    print(f"PIE start: {(first or began) - began:.2f}s to the first frame" +
+          (f"; World Partition streaming complete at +{done_at - began:.2f}s" if done_at else
+           "; World Partition streaming never completed" if streaming else "; no World Partition"))
+    if not marked:
+        print("note: the log marker was not found, so loads are not matched to frames")
+    lines, data = load_report(result["frames"], events, began, args.hitch, args.top)
+    for line in lines:
+        print(line)
+    data.update(pie_start_s=round((first or began) - began, 3),
+                streaming_done_s=round(done_at - began, 3) if done_at else None)
+    ctx.data = data
+    return code
+
+
+def perf_command(ctx, args):
+    """`ue perf`: load lives here; the frame-time capture is play.cmd_perf."""
+    if getattr(args, "action", None) == "load":
+        return perf_load(ctx, args)
+    return cmd_perf(ctx, args)
 
 
 def pie_command(ctx, args):

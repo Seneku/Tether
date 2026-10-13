@@ -577,6 +577,7 @@ def frame_stats(values):
 
 def cmd_perf(ctx, args):
     """Frame-time capture through the CSV profiler: frame/game/render/GPU, hitches, change vs last capture."""
+    args.seconds = args.seconds or 10
     if ctx.transport == "remote":
         raise CliError("ue perf needs UE 5.8+ in this version")
     toolset = resolve_toolset(ctx, "editorapp")

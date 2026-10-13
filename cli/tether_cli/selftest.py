@@ -240,6 +240,8 @@ def cmd_selftest(ctx, args):
     check("perf --trace", ["perf", "--seconds", "2", "--no-record", "--trace"], timeout=600,
           skip="needs 5.8" if remote else None if rendering else "headless with -nullrhi (no render timings)",
           ok=lambda c, o: c == 0 and "top scopes" in o)
+    check("perf load", ["perf", "load", "--seconds", "1"], timeout=300, skip="needs 5.8" if remote else None,
+          ok=lambda c, o: c == 0 and "PIE start:" in o and "frames, median" in o)
     check("pie start", ["pie", "start"], ok=lambda c, o: c == 0 and "OK" in o, timeout=300)
     check("pie status", ["pie", "status"], ok=lambda c, o: c == 0 and "running" in o)
     check("actors --pie", ["actors", "--pie", "--limit", "1"])

@@ -174,6 +174,9 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
 ## Play testing
 - Performance: `ue perf` before and after a change; each run prints the difference from the previous one.
   `ue perf --trace` adds which scopes (functions, Blueprint events, render passes) take the time per thread.
+  Stutter while moving through a level: `ue perf load [/Game/Maps/L] -f tests/play/route.txt` lists hitches
+  with the packages that finished loading in each (and sync-load flushes), plus World Partition streaming time.
+  Run it on a freshly opened editor: packages already in memory do not load again.
   When it says the frame rate is capped, compare the per-frame game/render/GPU work, not the fps.
 - To play the game like a player would: `ue pie do "at ItemPickup_Key -150,0,100" "look ItemPickup_Key"
   "tap InteractAction" "until player.Inventory.Items ~ Key within 2" "gone ItemPickup_Key"` (or `-f steps.txt`).
