@@ -1071,7 +1071,7 @@ class Soak(unittest.TestCase):
     def test_navigation_ensure_from_python_calls_is_left_out(self):
         lines = ["[x][103]LogOutputDevice: Error: === Handled ensure: ===",
                  "[x][103]LogOutputDevice: Error: Ensure condition failed: false || !HasAnyFlags(RF_ClassDefaultObject)"
-                 "  [File:D:\build\Engine\Source\Runtime\NavigationSystem\Public\NavigationSystem.h] [Line: 293]",
+                 "  [File:D:/build/Engine/Source/Runtime/NavigationSystem/Public/NavigationSystem.h] [Line: 293]",
                  "[x][103]LogOutputDevice: Error: [Callstack] 0x1 UnrealEditor-NavigationSystem.dll!UnknownFunction []",
                  "[x][104]LogTemp: Error: a real one"]
         self.assertEqual(ue.filter_log(lines, level="Error"), ["E LogTemp: a real one"])
