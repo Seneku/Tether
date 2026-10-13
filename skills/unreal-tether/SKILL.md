@@ -57,7 +57,8 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
 - Content conventions: `ue lint [/Game/Folder]` checks naming prefixes (SM_, T_, BP_, ...), textures (power of
   two, size, normal maps compressed as such, masks without sRGB) and meshes (simple collision, LODs or Nanite)
   in under a second, from registry data. Project rules go in Config/Tether/lint.json (prefixes, ignore globs,
-  disable, max_texture_size, lod_triangles). Run it on folders you added to.
+  disable, max_texture_size, lod_triangles). Run it on folders you added to; `ue lint <folder> --fix --dry-run`
+  then `--fix --save` corrects texture settings and missing collision (renames: `--rule naming --fix`).
 - Cleaning up content: `ue unused [/Game/Folder]` lists assets nothing reaches from the maps, the config, the
   code and the cook settings, biggest first. Confirm with `ue usages <asset>` before `ue rm` (paths built at
   runtime are invisible to it). `ue unused --redirectors --fix` repoints references and deletes redirectors.

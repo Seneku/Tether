@@ -1471,6 +1471,25 @@ class TraceOutput(unittest.TestCase):
                          "sphere 20 cm trace on Interact from (0, 0, 150) to (1000, 0, 150): nothing hit")
 
 
+class LintFix(unittest.TestCase):
+    FOUND = [("naming", "/Game/P/Rock", "StaticMesh: expected SM_"),
+             ("naming", "/Game/P/Hero", "SkeletalMesh: expected SK_ or SKM_"),
+             ("characters", "/Game/P/My Rock", "spaces or non-ASCII characters"),
+             ("texture-normal", "/Game/T/T_Rock_N", "named as a normal map"),
+             ("texture-mask-srgb", "/Game/T/T_Rock_ORM", "a mask"),
+             ("mesh-collision", "/Game/P/SM_Fence", "no simple collision"),
+             ("texture-pow2", "/Game/T/T_Odd", "not a power of two")]
+
+    def test_safe_fixes_only_unless_renames_are_asked_for(self):
+        self.assertEqual([(p["package"], p["fix"]) for p in ue.lint_plan(self.FOUND)],
+                         [("/Game/T/T_Rock_N", "normalmap"), ("/Game/T/T_Rock_ORM", "linear"), ("/Game/P/SM_Fence", "box")])
+
+    def test_renames_with_their_rule(self):
+        plan = ue.lint_plan(self.FOUND, {"naming", "characters"})
+        self.assertEqual([p["fix"] for p in plan if p["rule"] in ("naming", "characters")],
+                         ["rename:SM_Rock", "rename:SK_Hero", "rename:My_Rock"])
+
+
 class JsonEnvelope(unittest.TestCase):
     def run_json(self, project, *argv):
         out = io.StringIO()

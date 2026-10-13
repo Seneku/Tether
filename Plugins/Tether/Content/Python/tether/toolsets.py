@@ -4987,6 +4987,57 @@ class TetherCore(_Base):
 
     @_tool
     @staticmethod
+    def lint_fix(plan: str, save: bool = False, token: str = "") -> str:
+        """Apply `ue lint --fix` fixes: rename (references fixed up, through revision control), normal-map
+        compression, sRGB off for masks, a box collision for meshes without simple collision.
+
+        Args:
+            plan: JSON list of {rule, package, fix}: fix is 'rename:<NewName>', 'normalmap', 'linear' or 'box'.
+            save: Save each changed asset (renames save their referencers as ue mv does).
+            token: Session token from Saved/Tether/editors/<pid>.token (the ue CLI sends it).
+
+        Returns:
+            JSON list of {package, fix, ok, detail}.
+        """
+        _authorize(token)
+        results = []
+        for item in json.loads(plan):
+            package, fix = item["package"], item["fix"]
+            try:
+                if fix.startswith("rename:"):
+                    folder = package.rsplit("/", 1)[0]
+                    target = f"{folder}/{fix.split(':', 1)[1]}"
+                    if unreal.EditorAssetLibrary.does_asset_exist(target):
+                        raise RuntimeError(f"{target} already exists")
+                    detail = _RAW["mv"](package, target, token)
+                else:
+                    asset = unreal.load_asset(package)
+                    if asset is None:
+                        raise RuntimeError("not found")
+                    if fix == "normalmap":
+                        asset.set_editor_property("compression_settings", unreal.TextureCompressionSettings.TC_NORMALMAP)
+                        asset.set_editor_property("srgb", False)
+                        detail = "normal-map compression, sRGB off"
+                    elif fix == "linear":
+                        asset.set_editor_property("srgb", False)
+                        if asset.get_editor_property("compression_settings") == unreal.TextureCompressionSettings.TC_DEFAULT:
+                            asset.set_editor_property("compression_settings", unreal.TextureCompressionSettings.TC_MASKS)
+                        detail = "sRGB off" + (", mask compression" if asset.get_editor_property(
+                            "compression_settings") == unreal.TextureCompressionSettings.TC_MASKS else "")
+                    elif fix == "box":
+                        unreal.EditorStaticMeshLibrary.add_simple_collisions(asset, unreal.ScriptCollisionShapeType.BOX)
+                        detail = "added a box collision"
+                    else:
+                        raise RuntimeError(f"unknown fix '{fix}'")
+                    if save:
+                        unreal.EditorAssetLibrary.save_loaded_asset(asset, False)
+                results.append({"package": package, "fix": fix, "ok": True, "detail": detail})
+            except Exception as exc:  # one bad asset must not stop the rest
+                results.append({"package": package, "fix": fix, "ok": False, "detail": str(exc)})
+        return json.dumps(results)
+
+    @_tool
+    @staticmethod
     def fix_redirectors(paths: str, token: str = "") -> str:
         """Fix up redirectors: resave what references each one (now pointing at the real asset), then delete it.
 

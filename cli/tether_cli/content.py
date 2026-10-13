@@ -248,6 +248,28 @@ def lint_rules(rows, config=None):
     return found
 
 
+LINT_FIXES = {"texture-normal": "normalmap", "texture-mask-srgb": "linear", "mesh-collision": "box"}
+
+
+def lint_plan(found, rules=None):
+    """[{rule, package, fix}] for the findings that have a safe fix. Renames (naming, characters) only when their
+    rule is asked for by name: they touch every asset that references the one renamed."""
+    plan = []
+    for rule, package, message in found:
+        name = package.rsplit("/", 1)[-1]
+        if rule == "naming" and rules and "naming" in rules:
+            prefix = re.search(r"expected (\w+?)(?: or|$)", message)
+            if prefix:
+                plan.append({"rule": rule, "package": package, "fix": f"rename:{prefix.group(1)}{name}"})
+        elif rule == "characters" and rules and "characters" in rules:
+            clean = re.sub(r"[^A-Za-z0-9_]+", "_", name).strip("_")
+            if clean and clean != name:
+                plan.append({"rule": rule, "package": package, "fix": f"rename:{clean}"})
+        elif rule in LINT_FIXES:
+            plan.append({"rule": rule, "package": package, "fix": LINT_FIXES[rule]})
+    return plan
+
+
 def cmd_lint(ctx, args):
     """Content rules beyond Epic's validators, from asset registry tags (nothing is loaded)."""
     config_path = os.path.join(os.path.dirname(ctx.project), "Config", "Tether", "lint.json")
@@ -265,6 +287,27 @@ def cmd_lint(ctx, args):
     found = lint_rules(rows, config)
     if args.rule:
         found = [f for f in found if re.search(args.rule, f[0])]
+    if args.fix:
+        rules = {f[0] for f in found} if args.rule else None
+        plan = lint_plan(found, rules)
+        if not plan:
+            print("nothing to fix" + ("" if args.rule else " (renames need --rule naming or --rule characters)"))
+            return 0
+        if args.dry_run:
+            for item in plan[: args.limit]:
+                print(f"would fix {item['package']}: {item['fix'].replace('rename:', 'rename to ')}")
+            print(f"{len(plan)} fix(es) planned" + (f", first {args.limit} shown" if len(plan) > args.limit else ""))
+            ctx.data = plan
+            return 0
+        results = ctx.tether("lint_fix", plan=json.dumps(plan), save=args.save)
+        results = json.loads(results) if isinstance(results, str) else results
+        failed = [r for r in results if not r["ok"]]
+        for r in results[: args.limit]:
+            print(f"{'fixed ' if r['ok'] else 'FAILED'} {r['package']}: {r['detail']}")
+        print(f"{len(results) - len(failed)} fixed, {len(failed)} failed" + ("" if args.save else
+                                                                           "; not saved (ue save, or --save)"))
+        ctx.data = results
+        return 1 if failed else 0
     by_rule = {}
     for rule, package, message in found:
         by_rule.setdefault(rule, []).append((package, message))
