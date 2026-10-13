@@ -716,6 +716,23 @@ class Sizes(unittest.TestCase):
         self.assertEqual(lines[3], "textures: 1 loaded, 1 MB in memory; biggest T_Bark 1.3 MB (World)")
 
 
+class EngineDiscovery(unittest.TestCase):
+    def test_falls_back_to_the_default_install_folder(self):
+        project = Project()
+        try:
+            with open(project.uproject, "w") as f:
+                f.write('{"EngineAssociation": "5.7"}')
+            engine = os.path.join(project.root, "Epic Games", "UE_5.7")
+            os.makedirs(os.path.join(engine, "Engine", "Binaries"))
+            with unittest.mock.patch.dict(os.environ, {"UE_ROOT": ""}), \
+                    unittest.mock.patch.object(ue, "launcher_manifest", return_value={}), \
+                    unittest.mock.patch.object(ue, "registered_builds", return_value={}), \
+                    unittest.mock.patch.object(ue, "installed_engine_dirs", return_value=["/nowhere", engine]):
+                self.assertEqual(ue.engine_root(project.uproject), engine)
+        finally:
+            project.close()
+
+
 class Validate(unittest.TestCase):
     def setUp(self):
         self.project = Project()

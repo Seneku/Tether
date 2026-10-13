@@ -260,15 +260,14 @@ switches it on for the session anyway).
 
 | Works | Needs 5.8 |
 |---|---|
-| `status`, `open`, `close`, `build` (UBT and Live Coding), `log`, `py`, `exec`, `actors`, `props` (from the Python wrappers' property lists), `call tether.*`, `pie start/stop/status`, `reload`, `init`, hooks | `set`, `shot`, `test`, `tools`, and `call` for Epic's toolsets |
+| `status`, `open`, `close`, `build` (UBT and Live Coding), `log`, `py`, `exec`, `actors`, `props` (from the Python wrappers' property lists), `asset`, `find`, `refs`, `validate`, `size`, `mem`, `nav`, `mat` (reading), `changes`, `save`, `spawn`/`delete`/`duplicate`/`mv`/`rm`, `call tether.*`, `pie start/stop/status/do`, `reload`, `init`, `selftest`, hooks | `set`, `undo`, `mat` (writing), `diff`, `config`, `shot`, `test`, `bp`, `table`, `perf`, `tools`, and `call` for Epic's toolsets |
 
 Each call costs about 0.5 s more (UDP discovery), and the token gate adds nothing here: remote execution
 itself runs any Python sent to it, so keep its bind address at the default `127.0.0.1`.
 
-If you have a 5.4–5.7 project, `ue selftest` there tells us whether it works; please paste its output into
-an issue. **Tested** so far only by forcing this route on a 5.8 editor (`UE_TRANSPORT=remote`, plus `TETHER_LEGACY=1` in the
-editor's environment to use the pre-5.8 code paths). It has not run on an actual 5.4–5.7 install yet;
-reports welcome.
+**Tested** on UE 5.7.4 (a Blueprint-only project set up with `ue init`): `ue selftest` passes 26 checks,
+fails none and skips the 11 that need 5.8. 5.4–5.6 have not been run yet; if you have such a project,
+please paste its `ue selftest` output into an issue.
 
 ## Repository layout
 

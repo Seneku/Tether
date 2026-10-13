@@ -1,7 +1,7 @@
 {
 	"FileVersion": 3,
-	"Version": 8,
-	"VersionName": "0.6.1",
+	"Version": 9,
+	"VersionName": "0.6.2",
 	"FriendlyName": "Tether",
 	"Description": "Agent-native editor tools for coding agents: unrestricted editor Python, console commands, compact reads and an editor beacon. Registers into Epic's ToolsetRegistry / ModelContextProtocol.",
 	"Category": "Editor",
@@ -17,11 +17,13 @@
 		},
 		{
 			"Name": "ToolsetRegistry",
-			"Enabled": true
+			"Enabled": true,
+			"Optional": true
 		},
 		{
 			"Name": "ModelContextProtocol",
-			"Enabled": true
+			"Enabled": true,
+			"Optional": true
 		}
 	]
 }

@@ -1675,7 +1675,12 @@ class TetherCore(_Base):
         elif isinstance(asset, unreal.Blueprint):
             parent = _try(lambda: unreal.BlueprintEditorLibrary.get_blueprint_parent_class(asset))
             generated = _try(lambda: unreal.BlueprintEditorLibrary.generated_class(asset))
-            out.append(f"  parent {parent.get_name() if parent else '?'}, class {generated.get_name() if generated else '?'}")
+            parent_name = parent.get_name() if parent else None
+            if not parent_name:  # no get_blueprint_parent_class before 5.8: the registry's ParentClass tag
+                data = unreal.AssetRegistryHelpers.get_asset_registry().get_assets_by_package_name(package)
+                tag = str(_try(lambda: data[0].get_tag_value("ParentClass"), "") or "")
+                parent_name = tag.rstrip("'").rsplit(".", 1)[-1] or "?"
+            out.append(f"  parent {parent_name}, class {generated.get_name() if generated else '?'}")
             if generated and parent and not _LEGACY:
                 mine = set(_reflect(unreal.ToolsetLibrary.list_struct_properties(generated), asset)) - \
                     set(_reflect(unreal.ToolsetLibrary.list_struct_properties(parent), asset))

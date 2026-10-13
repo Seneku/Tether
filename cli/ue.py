@@ -175,6 +175,22 @@ def live_coding_available():
     return os.name == "nt"  # Live Coding is Windows-only in UE 5
 
 
+def installed_engine_dirs(version):
+    """Where a launcher-installed engine may live when the launcher manifest does not name it."""
+    found = []
+    if os.name == "nt":
+        import winreg
+        try:
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, rf"SOFTWARE\EpicGames\Unreal Engine\{version}") as key:
+                found.append(winreg.QueryValueEx(key, "InstalledDirectory")[0])
+        except OSError:
+            pass
+        found.append(os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "Epic Games", f"UE_{version}"))
+    elif sys.platform == "darwin":
+        found.append(f"/Users/Shared/Epic Games/UE_{version}")
+    return found
+
+
 def engine_root(project):
     """Engine dir from UE_ROOT, the launcher manifest, or registered source builds."""
     if os.environ.get("UE_ROOT"):
@@ -188,6 +204,10 @@ def engine_root(project):
     builds = registered_builds()
     if assoc in builds:
         return builds[assoc]
+    if assoc:  # a launcher install the manifest does not list (yet): the engine's own key, then default folders
+        for root in installed_engine_dirs(assoc):
+            if os.path.isdir(os.path.join(root, "Engine", "Binaries")):
+                return root
     if not assoc:  # a project inside an engine tree (e.g. a source build checkout)
         here = os.path.dirname(os.path.abspath(project))
         while os.path.dirname(here) != here:
