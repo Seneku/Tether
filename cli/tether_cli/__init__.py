@@ -31,7 +31,7 @@ socket, subprocess, zlib = _Lazy("socket"), _Lazy("subprocess"), _Lazy("zlib")
 CLI_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # cli/
 UE_SCRIPT = os.path.join(CLI_DIR, "ue.py")  # the entry point, for the CLI's own child processes
 TETHER = "tether.toolsets.TetherCore"
-GATED = {"py", "console", "set_props", "undo", "save", "spawn", "delete", "duplicate", "mv", "rm", "set_material", "pie_step", "set_config", "umg", "new_asset", "drop", "pie_net", "look_stage"}  # tools that need the session token (see beacon.session_token)
+GATED = {"py", "console", "set_props", "undo", "save", "spawn", "delete", "duplicate", "mv", "rm", "set_material", "pie_step", "set_config", "umg", "new_asset", "drop", "pie_net", "look_stage", "scatter"}  # tools that need the session token (see beacon.session_token)
 LEVELS = {"Fatal": 0, "Error": 1, "Warning": 2, "Display": 3, "Log": 4, "Verbose": 5, "VeryVerbose": 6}
 NOISE = {"LogModelContextProtocol", "LogToolsetRegistry"}  # our own transport chatter
 # Epic logs this whenever a schema is generated for a class with delegates (props, set, describe_toolset).
@@ -2090,6 +2090,15 @@ def cmd_spawn(ctx, args):
     return 0
 
 
+def cmd_scatter(ctx, args):
+    if not args.area and not args.line:
+        raise CliError("give --area x,y,radius or --line x,y,z x,y,z")
+    print(ctx.tether("scatter", what=args.what, count=args.count, area=args.area or "",
+                     line=" ".join(args.line) if args.line else "", yaw=args.yaw, scale=args.scale,
+                     spacing=args.spacing, seed=args.seed, align=args.align, label=args.label or ""))
+    return 0
+
+
 def cmd_drop(ctx, args):
     print(ctx.tether("drop", targets=",".join(args.actors), align=args.align))
     return 0
@@ -3965,6 +3974,11 @@ def cmd_selftest(ctx, args):
     check("rm (new asset)", ["rm", "/Game/TetherSelftest/BP_SelftestNew"], skip=None if created else "nothing created",
           ok=lambda c, o: c == 0 and "deleted" in o)
     ue("py", "unreal.EditorAssetLibrary.delete_directory('/Game/TetherSelftest')")
+    scattered = check("scatter", ["scatter", "/Engine/BasicShapes/Cube", "--count", "3", "--area", "0,0,400",
+                                  "--label", "TetherSelftestScatter"],
+                      ok=lambda c, o: c == 0 and ("placed 3 of 3" in o or "had no ground" in o))
+    check("undo scatter", ["undo"], skip=None if scattered and "placed 3" in scattered else "nothing was placed",
+          ok=lambda c, o: c == 0 and "undone: scatter" in o)
     check("destroy probe actor", ["py", "w = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_editor_world()\n"
           "found = [a for a in unreal.GameplayStatics.get_all_actors_of_class(w, unreal.Actor) "
           "if a.get_actor_label() == 'TetherSelftestProbe']\n"
@@ -5155,6 +5169,17 @@ def build_parser():
     s.add_argument("--label", help="actor label")
     s.add_argument("--ground", action="store_true", help="drop it onto the surface below --at")
     s.add_argument("--align", action="store_true", help="with --ground: tilt it to the surface")
+    s = add("scatter", cmd_scatter, "place many copies on the ground in an area or along a line (one undo step)")
+    s.add_argument("what", help="asset (/Game/...) or class")
+    s.add_argument("--count", type=int, default=10)
+    s.add_argument("--area", help="x,y,radius")
+    s.add_argument("--line", nargs=2, metavar=("X,Y,Z", "X,Y,Z"), help="place evenly along this segment")
+    s.add_argument("--yaw", default="0,360", help="random yaw range min,max (0,360)")
+    s.add_argument("--scale", default="1,1", help="random uniform scale range min,max (1,1)")
+    s.add_argument("--spacing", type=float, default=0, help="minimum distance between copies, cm")
+    s.add_argument("--seed", type=int, default=0, help="same seed, same layout")
+    s.add_argument("--align", action="store_true", help="tilt each to the surface")
+    s.add_argument("--label", help="label prefix (default: the asset name)")
     s = add("drop", cmd_drop, "put actors on the ground below them (undoable)")
     s.add_argument("actors", nargs="+", help="actor labels or names")
     s.add_argument("--align", action="store_true", help="also tilt each to the surface normal")

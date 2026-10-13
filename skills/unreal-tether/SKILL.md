@@ -51,6 +51,8 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
   /Game/Maps/L_Test`, `ue new folder /Game/X`. Then `ue save` (or pass --save).
 - On terrain, never guess heights: `ue spawn /Game/X/SM_Rock --at 1200,-300,0 --ground` (or `ue drop Rock1 Rock2`,
   `--align` to follow the slope) puts things on the surface below.
+- Many props at once: `ue scatter /Game/X/SM_Rock --count 30 --area 1200,-300,2000 --spacing 250 --scale 0.7,1.4
+  --align` (one undo step; same `--seed`, same layout).
 - Level edits: `ue spawn PointLight --at 0,0,300 --label Lamp` (or an asset path), `ue duplicate Lamp --count 3`,
   `ue delete Lamp`. Asset moves: `ue mv /Game/A/X /Game/B/` (then `ue save`), `ue rm /Game/A/X` (refuses while
   referenced; check `ue refs` first). Prefer these to raw `ue py`: they are undoable and checked.

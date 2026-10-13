@@ -912,7 +912,7 @@ def _ground_actor(actor, align=False):
 
     def trace(start_z):
         hit = unreal.SystemLibrary.line_trace_single(
-            world, unreal.Vector(origin.x, origin.y, start_z), unreal.Vector(origin.x, origin.y, origin.z - 200000),
+            world, unreal.Vector(origin.x, origin.y, start_z), unreal.Vector(origin.x, origin.y, origin.z - 1000000),
             unreal.TraceTypeQuery.TRACE_TYPE_QUERY1, True, [actor], unreal.DrawDebugTrace.NONE, True)
         if not hit:
             return None
@@ -1595,6 +1595,100 @@ class TetherCore(_Base):
                     rows.append(f"{actor.get_actor_label()}: {exc}")
         _record_undo(before, "drop " + ", ".join(a.get_actor_label() for a in actors))
         return "\n".join(rows)
+
+    @_tool
+    @staticmethod
+    def scatter(what: str, count: int, area: str = "", line: str = "", yaw: str = "0,360", scale: str = "1,1",
+                spacing: float = 0.0, seed: int = 0, align: bool = False, label: str = "", token: str = "") -> str:
+        """Place many copies of an asset or class on the ground: random points in a circle (area 'x,y,radius') or
+        evenly along a line (line 'x,y,z x,y,z'), each dropped onto the first surface below it, with random yaw
+        and uniform scale ranges and a minimum spacing. One undoable step.
+
+        Args:
+            what: Asset path (mesh, Blueprint, ...) or class name, as for spawn.
+            count: How many to place.
+            area: 'x,y,radius' circle to scatter in.
+            line: 'x,y,z x,y,z' segment to place along (evenly spaced).
+            yaw: 'min,max' degrees.
+            scale: 'min,max' uniform scale.
+            spacing: Minimum distance between copies (cm).
+            seed: Random seed (same seed, same layout).
+            align: Tilt each to the surface.
+            label: Label prefix (default: the asset's name).
+            token: Session token from Saved/Tether/session.json (the ue CLI sends it).
+
+        Returns:
+            How many were placed, and why any were not.
+        """
+        _authorize(token)
+        import math
+        import random
+        rng = random.Random(seed)
+        subsystem = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
+        if what.startswith(("/Game/", "/Engine/")):
+            asset = unreal.load_asset(what.split(".")[0])
+            if asset is None:
+                raise RuntimeError(f"no asset at {what} (ue find)")
+            cls = unreal.BlueprintEditorLibrary.generated_class(asset) if isinstance(asset, unreal.Blueprint) else None
+        else:
+            asset = None
+            cls = unreal.load_class(None, what) if what.startswith("/Script/") else getattr(unreal, what, None)
+            if cls is None:
+                raise RuntimeError(f"no class '{what}'")
+        yaw_lo, yaw_hi = (_numbers(yaw) or [0, 360])[:2]
+        scale_lo, scale_hi = ((_numbers(scale) or [1, 1]) * 2)[:2]
+        points = []
+        if line:
+            ends = [(_numbers(p) or []) for p in line.split()]
+            if len(ends) != 2 or any(len(e) != 3 for e in ends):
+                raise RuntimeError("line: expected 'x,y,z x,y,z'")
+            (ax, ay, _), (bx, by, _) = ends
+            points = [(ax + (bx - ax) * i / max(count - 1, 1), ay + (by - ay) * i / max(count - 1, 1))
+                      for i in range(count)]
+        else:
+            nums = _numbers(area) or []
+            if len(nums) != 3:
+                raise RuntimeError("area: expected 'x,y,radius' (or use line)")
+            cx, cy, radius = nums
+            tries = 0
+            while len(points) < count and tries < count * 50:
+                tries += 1
+                r, a = radius * math.sqrt(rng.random()), rng.random() * 2 * math.pi
+                p = (cx + r * math.cos(a), cy + r * math.sin(a))
+                if spacing and any((p[0] - q[0]) ** 2 + (p[1] - q[1]) ** 2 < spacing ** 2 for q in points):
+                    continue
+                points.append(p)
+        prefix = label or (asset.get_name() if asset else what.rsplit(".", 1)[-1])
+        placed, no_ground = [], 0
+        before = unreal.ToolsetLibrary.get_active_undo_count() if not _LEGACY else 0
+        with unreal.ScopedEditorTransaction(f"ue scatter {prefix} x{len(points)}"):
+            for i, (x, y) in enumerate(points):
+                rotation = unreal.Rotator(roll=0, pitch=0, yaw=rng.uniform(yaw_lo, yaw_hi))
+                spot = unreal.Vector(x, y, 200000)  # dropped from high above onto the first surface below
+                actor = (subsystem.spawn_actor_from_class(cls, spot, rotation) if cls is not None
+                         else subsystem.spawn_actor_from_object(asset, spot, rotation))
+                if actor is None:
+                    continue
+                s = rng.uniform(scale_lo, scale_hi)
+                actor.set_actor_scale3d(unreal.Vector(s, s, s))
+                try:
+                    _ground_actor(actor, align)
+                except RuntimeError:
+                    subsystem.destroy_actor(actor)
+                    no_ground += 1
+                    continue
+                actor.set_actor_label(f"{prefix}_{i + 1:02d}")
+                placed.append(actor)
+        if placed:
+            _record_undo(before, f"scatter {prefix} x{len(placed)}")
+        notes = []
+        if len(points) < count:
+            notes.append(f"{count - len(points)} did not fit with spacing {spacing:g}")
+        if no_ground:
+            notes.append(f"{no_ground} had no ground below")
+        zs = [a.get_actor_location().z for a in placed]
+        return (f"placed {len(placed)} of {count} {prefix}" + (f" (z {min(zs):.0f} to {max(zs):.0f})" if zs else "")
+                + (": " + "; ".join(notes) if notes else "") + (f"; labels {prefix}_01.." if placed else ""))
 
     @_tool
     @staticmethod
