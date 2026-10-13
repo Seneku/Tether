@@ -155,7 +155,7 @@ def cmd_selftest(ctx, args):
     check("drop", ["drop", "TetherSelftestProbe"], skip=probe_skip,
           ok=lambda c, o: c == 0 and ("-> " in o or "no ground below" in o))
     check("collision", ["collision", "TetherSelftestProbe"], skip=probe_skip,
-          ok=lambda c, o: c == 0 and "profile" in o and "Block:" in o)
+          ok=lambda c, o: c == 0 and "primitive component(s)" in o and "profile" in o)
     check("trace --editor", ["trace", "--editor", "--from", "0,0,5000", "--to", "0,0,-5000"],
           ok=lambda c, o: c == 0 and "line trace on Visibility" in o)
     check("undo --editor", ["undo", "--editor"], skip=probe_skip, ok=lambda c, o: c == 0 and "undone:" in o)

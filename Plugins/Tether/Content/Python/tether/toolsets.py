@@ -2728,16 +2728,11 @@ class TetherCore(_Base):
             comps = [k.split(" ", 1)[1] + f" ({v.get_class().get_name()})" for k, v in parts.items() if k.startswith("component ")]
             if comps:
                 lines.append(f"components ({len(comps)}): " + ", ".join(comps[:limit]))
-            variables = []
-            for var in _try(lambda: list(unreal.BlueprintEditorLibrary.get_blueprint_variables(bp)), None) or []:
-                variables.append(str(var))
-            if not variables:  # read the new variables from the class itself: props not on the parent
-                parent_props = set(_try(lambda: _reflect(unreal.ToolsetLibrary.list_struct_properties(
-                    unreal.BlueprintEditorLibrary.get_blueprint_parent_class(bp)), None), {}) or {})
-                mine = _try(lambda: _reflect(unreal.ToolsetLibrary.list_struct_properties(cls), None), {}) or {}
-                comp_names = {k.split(" ", 1)[1].lower() for k in parts if k.startswith("component ")}
-                variables = [f"{k} ({_type_name(v)})" for k, v in mine.items() if k not in parent_props
-                             and not k.lower().startswith("ubergraph") and k.lower() not in comp_names]
+            mine = _try(lambda: _reflect(unreal.ToolsetLibrary.list_struct_properties(cls), None), {}) or {}
+            types = {k.lower(): _type_name(v) for k, v in mine.items()}
+            comp_names = {k.split(" ", 1)[1].lower() for k in parts if k.startswith("component ")}
+            names = _try(lambda: list(unreal.BlueprintEditorLibrary.list_member_variable_names(bp, False)), []) or []
+            variables = [f"{n} ({types.get(str(n).lower(), '?')})" for n in map(str, names) if n.lower() not in comp_names]
             if variables:
                 lines.append(f"variables ({len(variables)}): " + ", ".join(variables[:limit]))
             graphs = list(unreal.BlueprintEditorLibrary.list_graphs(bp))
