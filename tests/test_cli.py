@@ -975,3 +975,21 @@ class Pngs(unittest.TestCase):
         self.assertEqual((w, h, c), (2, 2, 4))
         self.assertEqual(px[:8], bytes([10, 20, 30, 255, 15, 25, 35, 255]))  # Sub adds the pixel to the left
         self.assertEqual(px[8:], bytes([11, 21, 31, 255, 17, 27, 37, 255]))  # Paeth predicts from above/left
+
+
+class Usages(unittest.TestCase):
+    def test_code_and_asset_usages(self):
+        project = Project()
+        try:
+            project.write("Source/Game/Door.h", "UFUNCTION(BlueprintCallable)\nvoid OpenDoor();\nvoid OpenDoorFast();\n")
+            project.write("Source/Game/Door.cpp", "void ADoor::OpenDoor_Implementation() {}\nIDoor::Execute_OpenDoor(this);\n")
+            project.write("Source/Game/Intermediate/Gen.cpp", "OpenDoor();")  # generated code is skipped
+            project.write("Content/BP_Door.uasset", "\x00\x01OpenDoor\x00")
+            project.write("Content/BP_Wall.uasset", "nothing here")
+            hits = ue.code_usages(project.uproject, "OpenDoor")
+            self.assertEqual([(os.path.basename(p), n) for p, n, _ in hits],
+                             [("Door.cpp", 1), ("Door.cpp", 2), ("Door.h", 2)])
+            found, skipped = ue.asset_files_mentioning(project.uproject, "OpenDoor")
+            self.assertEqual((sorted(found), skipped), (["/Game/BP_Door"], 0))
+        finally:
+            project.close()

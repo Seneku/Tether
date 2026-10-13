@@ -2762,6 +2762,168 @@ def cmd_new(ctx, args):
     return 0
 
 
+SOURCE_EXTS = (".h", ".hpp", ".cpp", ".inl", ".cs", ".ini", ".py")
+SKIP_DIRS = {"Binaries", "Intermediate", "Saved", "DerivedDataCache", ".git", "ThirdParty", "__pycache__", "obj", "bin"}
+
+
+def project_code_roots(project):
+    """The project's own code and config folders: Source, Config, Script (C#), and each project plugin's Source."""
+    root = os.path.dirname(project)
+    roots = [os.path.join(root, d) for d in ("Source", "Config", "Script") if os.path.isdir(os.path.join(root, d))]
+    plugins = os.path.join(root, "Plugins")
+    for dirpath, dirs, files in os.walk(plugins) if os.path.isdir(plugins) else []:
+        if any(f.endswith(".uplugin") for f in files):
+            roots += [os.path.join(dirpath, d) for d in ("Source", "Config") if os.path.isdir(os.path.join(dirpath, d))]
+            dirs[:] = []
+        else:
+            dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+    return roots
+
+
+def code_usages(project, symbol, limit=200):
+    """(path, line number, text) for whole-word matches of symbol in the project's code and config."""
+    # Interface and RPC functions are called and implemented under decorated names.
+    rx = re.compile(r"(?<![\w])(?:Execute_|K2_)?" + re.escape(symbol) + r"(?:_Implementation|_Validate)?(?![\w])")
+    hits = []
+    for root in project_code_roots(project):
+        for dirpath, dirs, files in os.walk(root):
+            dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+            for name in files:
+                if not name.endswith(SOURCE_EXTS):
+                    continue
+                path = os.path.join(dirpath, name)
+                try:
+                    with open(path, encoding="utf-8", errors="replace") as f:
+                        for number, line in enumerate(f, 1):
+                            if rx.search(line):
+                                hits.append((path, number, line.strip()))
+                                if len(hits) >= limit:
+                                    return hits
+                except OSError:
+                    continue
+    return hits
+
+
+def asset_files_mentioning(project, needle, max_mb=32):
+    """Packages whose bytes contain needle (a name in their name table: a function, property or class they use).
+    Files over max_mb (meshes, textures) are skipped. Returns ({package: path}, skipped count)."""
+    import mmap
+    root = os.path.dirname(project)
+    found, skipped = {}, 0
+    targets = [needle.encode("utf-8")]
+    content_dirs = [os.path.join(root, "Content")]
+    for dirpath, dirs, files in os.walk(os.path.join(root, "Plugins")) if os.path.isdir(os.path.join(root, "Plugins")) else []:
+        if "Content" in dirs and any(f.endswith(".uplugin") for f in files):
+            content_dirs.append(os.path.join(dirpath, "Content"))
+        dirs[:] = [d for d in dirs if d not in SKIP_DIRS and d != "Content"]
+    for content in content_dirs:
+        for dirpath, dirs, files in os.walk(content):
+            for name in files:
+                if not name.endswith((".uasset", ".umap")):
+                    continue
+                path = os.path.join(dirpath, name)
+                try:
+                    size = os.path.getsize(path)
+                    if size > max_mb * 1024 * 1024:
+                        skipped += 1
+                        continue
+                    if size == 0:
+                        continue
+                    with open(path, "rb") as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as data:
+                        if any(data.find(t) != -1 for t in targets):
+                            package = content_package(project, path)
+                            if package:
+                                found[package] = path
+                except (OSError, ValueError):
+                    continue
+    return found, skipped
+
+
+def cmd_usages(ctx, args):
+    """Where a C++ symbol (function, property, class) or an asset is used: code, Blueprint graphs, other assets."""
+    project, symbol = ctx.project, args.symbol
+    if symbol.startswith("/"):  # an asset: the registry knows its referencers; code and config may name its path
+        print(ctx.tether("refs", asset=symbol, deps=False, limit=args.limit))
+        package = symbol.split(".")[0]
+        hits = [h for h in code_usages(project, package.rsplit("/", 1)[-1]) if package in h[2]]
+        if hits:
+            print(f"{len(hits)} mention(s) in code and config:")
+            for path, number, text in hits[: args.limit]:
+                print(f"  {os.path.relpath(path, os.path.dirname(project))}:{number}: {short(text, 140)}")
+        return 0
+    bare = symbol.split("::")[-1].split(".")[-1]
+    stem = re.sub(r"^[AUFESIT](?=[A-Z])", "", bare)  # AMyActor -> MyActor: reflected names drop the prefix
+    started = time.time()
+    hits = code_usages(project, bare, limit=500)
+    print(f"{len(hits)} line(s) in the project's code and config" + (":" if hits else ""))
+    for path, number, text in hits[: args.limit]:
+        print(f"  {os.path.relpath(path, os.path.dirname(project))}:{number}: {short(text, 140)}")
+    if len(hits) > args.limit:
+        print(f"  ... +{len(hits) - args.limit} more (--limit)")
+    assets, skipped = asset_files_mentioning(project, stem, args.max_mb)
+    names = sorted(assets)
+    levels = {}
+    plain = []
+    for package in names:
+        match = re.match(r"^(/[^/]+)/__ExternalActors__/(.+)/[^/]+/[^/]+/[^/]+$", package)
+        if match:
+            level = f"{match.group(1)}/{match.group(2)}"
+            levels[level] = levels.get(level, 0) + 1
+        else:
+            plain.append(package)
+    print(f"{len(names)} asset(s) name '{stem}'" + (f" ({skipped} files over {args.max_mb} MB not searched)" if skipped else "")
+          + (":" if names else ""))
+    graphs, confirming = {}, False
+    if plain and editor_live(project) and ctx.transport != "remote":
+        confirming = True
+        try:  # confirm in the Blueprints' graphs and show the nodes
+            graph = ctx.tether("package_graph", packages=",".join(plain[:200]))
+            classes = (json.loads(graph) if isinstance(graph, str) else graph)["classes"]
+            rx = re.compile(r"(?<![\w])" + re.escape(stem) + r"(?![\w])")
+            deadline = time.time() + args.budget  # big Blueprints take seconds per graph
+            for package in [p for p in plain if classes.get(p, "").endswith("Blueprint")][:args.limit]:
+                if time.time() > deadline:
+                    break
+                if os.path.getsize(assets[package]) > 4 * 1024 * 1024:
+                    continue  # loading and reading a huge Blueprint's graphs can take minutes
+                bp = asset_ref(package)
+                outline = bp_outline(ctx, bp)
+                if not outline:
+                    continue
+                source = graph_source(ctx, bp)
+                lines, complete = [], True
+                for name in outline["graphs"]:
+                    if time.time() > deadline:
+                        complete = False
+                        break
+                    for line in read_graph(ctx, source, bp, name).splitlines():
+                        if rx.search(line):
+                            lines.append(f"{name}: {line.strip()}")
+                if complete or lines:
+                    graphs[package] = lines
+        except CliError:
+            graphs = {}
+    for package in plain[: args.limit]:
+        lines = graphs.get(package)
+        if lines:
+            print(f"  {package}")
+            for line in lines[:5]:
+                print(f"    {short(line, 150)}")
+            if len(lines) > 5:
+                print(f"    ... +{len(lines) - 5} more")
+        else:
+            print(f"  {package}" + ("  (not in its graphs: class defaults, a pin default or a property name)"
+                                    if package in graphs else ""))
+    unread = [p for p in plain[: args.limit] if p not in graphs]
+    if confirming and unread:
+        print(f"  ({len(unread)} not checked in their graphs: over 4 MB, or past --budget {args.budget:g}s)")
+    for level, count in sorted(levels.items()):
+        print(f"  {level}: {count} placed actor{'' if count == 1 else 's'}")
+    if args.time:
+        print(f"({time.time() - started:.1f}s)", file=sys.stderr)
+    return 0
+
+
 def cmd_find(ctx, args):
     print(ctx.tether("find", query=args.query or "", cls=args.cls or "", under=args.under, limit=args.limit))
     return 0
@@ -3125,6 +3287,7 @@ def cmd_selftest(ctx, args):
     check("mem", ["mem", "--top", "3"], timeout=300, ok=lambda c, o: c == 0 and "process:" in o)
     check("config", ["config", "Project/Project/Maps", "DefaultMap"], skip="needs UE 5.8+" if remote else None,
           ok=lambda c, o: c == 0 and "gameDefaultMap" in o)
+    check("usages", ["usages", "PrintString", "--budget", "5"], ok=lambda c, o: c == 0 and "line(s)" in o)
     check("nav", ["nav"], ok=lambda c, o: c == 0 and ("bounds" in o or "NavMeshBoundsVolume" in o))
     check("call tether.level_summary", ["call", "tether.level_summary", "limit=3"],
           ok=lambda c, o: c == 0 and "actors" in o)
@@ -4409,6 +4572,10 @@ def main(argv=None):
     s.add_argument("path", help="/Game/Folder/Name")
     s.add_argument("--parent", help="blueprint: parent class; mi: parent material; datatable: row struct; dataasset: class")
     s.add_argument("--save", action="store_true", help="save it right away")
+    s = add("usages", cmd_usages, "where a C++ function/property/class or an asset is used: code, Blueprints, assets")
+    s.add_argument("symbol", help="e.g. TryAttack, AEnemyCharacter, Health, or /Game/Path/Asset")
+    s.add_argument("--max-mb", type=float, default=32, help="skip asset files bigger than this (32)")
+    s.add_argument("--budget", type=float, default=20, help="seconds to spend reading Blueprint graphs (20)")
     s = add("find", cmd_find, "search assets by name and/or class (asset registry)")
     s.add_argument("query", nargs="?", help="regex on the asset name")
     s.add_argument("--class", dest="cls", help="regex on the class name, e.g. StaticMesh or 'Material$'")
