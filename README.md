@@ -303,7 +303,7 @@ please paste its `ue selftest` output into an issue.
 
 | Path | Contents |
 |---|---|
-| `cli/` | `ue.py` (the entry point) and `tether_cli/`, the stdlib-only CLI package |
+| `cli/` | `ue.py` (the entry point) and `tether_cli/`, the stdlib-only CLI package (one module per area: transport, build, editor, assets, play, hooks, ...) |
 | `bin/` | `ue` and `ue.cmd` launchers; the Claude Code plugin puts this folder on the agent's PATH |
 | `.claude-plugin/`, `skills/`, `hooks/` | Claude Code plugin manifest (the repo is also its own marketplace), the `unreal-tether` skill, and the hooks |
 | `tests/` | Unit tests for the editor-free parts (`python -m unittest discover -s tests`) |

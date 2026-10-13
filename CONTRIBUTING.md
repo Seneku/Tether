@@ -56,6 +56,15 @@ The iteration loop for each part:
 
 Close the editor with `ue close` when you're done.
 
+### Where CLI code goes
+
+`cli/tether_cli/` is split by layer; each module imports only from the ones listed before it in
+`__init__.py` (core, transport, build, editor, calls, images, testing, assets, jobs, play, hooks, setup,
+selftest, cli). A new command is a `cmd_<name>(ctx, args)` function in the module that fits, plus its
+subparser in `cli.py`'s `build_parser()`. Set `ctx.data` to something structured if a script would want it
+from `--json`. Helpers two modules need go in the lower of the two, so imports never go back up. In tests,
+patch a name in the module that defines it (`ue.core.editor_live`), not on the package.
+
 ## Testing
 
 Unit tests cover the parts that need no editor: log filtering, diagnostics, change classification,

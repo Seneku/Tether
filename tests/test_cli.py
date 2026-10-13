@@ -500,7 +500,7 @@ class Ci(unittest.TestCase):
         try:
             args = argparse.Namespace(tests=None, bp=None, validate=validate, play=None, cook=False, cook_timeout=60, report=report, verbose=False)
             ctx = argparse.Namespace(project=project.uproject)
-            with unittest.mock.patch.object(ue, "editor_live", return_value={"pid": 1}), \
+            with unittest.mock.patch.object(ue.selftest, "editor_live", return_value={"pid": 1}), \
                     unittest.mock.patch.object(ue.subprocess, "run", side_effect=fake_run), \
                     unittest.mock.patch("builtins.print"):
                 return ue.cmd_ci(ctx, args)
@@ -740,9 +740,9 @@ class EngineDiscovery(unittest.TestCase):
             engine = os.path.join(project.root, "Epic Games", "UE_5.7")
             os.makedirs(os.path.join(engine, "Engine", "Binaries"))
             with unittest.mock.patch.dict(os.environ, {"UE_ROOT": ""}), \
-                    unittest.mock.patch.object(ue, "launcher_manifest", return_value={}), \
-                    unittest.mock.patch.object(ue, "registered_builds", return_value={}), \
-                    unittest.mock.patch.object(ue, "installed_engine_dirs", return_value=["/nowhere", engine]):
+                    unittest.mock.patch.object(ue.core, "launcher_manifest", return_value={}), \
+                    unittest.mock.patch.object(ue.core, "registered_builds", return_value={}), \
+                    unittest.mock.patch.object(ue.core, "installed_engine_dirs", return_value=["/nowhere", engine]):
                 self.assertEqual(ue.engine_root(project.uproject), engine)
         finally:
             project.close()
@@ -1147,7 +1147,7 @@ class Batch(unittest.TestCase):
             path = os.path.join(tmp, "cmds.txt")
             with open(path, "w") as f:
                 f.write(text)
-            with unittest.mock.patch.object(ue, "build_parser", return_value=parser), \
+            with unittest.mock.patch.object(ue.cli, "build_parser", return_value=parser), \
                     unittest.mock.patch("builtins.print"):
                 code = ue.cmd_batch(None, argparse.Namespace(file=path, stop_on_error=stop))
         return code, ran

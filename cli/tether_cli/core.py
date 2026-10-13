@@ -1,0 +1,606 @@
+"""Shared plumbing: project and beacon files, engine discovery, ports, dialogs, crash reports, git, rendering, logs."""
+import importlib
+import json
+import os
+import re
+import sys
+import time
+
+
+class _Lazy:
+    """A module imported on first use. Hooks start a fresh Python on every edit, so keep startup lean."""
+
+    def __init__(self, name):
+        self._name = name
+
+    def __getattr__(self, attr):
+        return getattr(importlib.import_module(self._name), attr)
+
+
+socket, subprocess, zlib = _Lazy("socket"), _Lazy("subprocess"), _Lazy("zlib")
+
+CLI_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # cli/
+UE_SCRIPT = os.path.join(CLI_DIR, "ue.py")  # the entry point, for the CLI's own child processes
+TETHER = "tether.toolsets.TetherCore"
+GATED = {"py", "console", "set_props", "undo", "save", "spawn", "delete", "duplicate", "mv", "rm", "set_material", "pie_step", "set_config", "umg", "new_asset", "drop", "pie_net", "look_stage", "scatter", "bp_component", "set_savegame"}  # tools that need the session token (see beacon.session_token)
+LEVELS = {"Fatal": 0, "Error": 1, "Warning": 2, "Display": 3, "Log": 4, "Verbose": 5, "VeryVerbose": 6}
+NOISE = {"LogModelContextProtocol", "LogToolsetRegistry"}  # our own transport chatter
+# Epic logs this whenever a schema is generated for a class with delegates (props, set, describe_toolset).
+NOISE_MESSAGE = re.compile(r"^Property \"\w+\" type \w+ unhandled during Json schema generation")
+LOG_FRAME = re.compile(r"^\[[^\]]*\]\[\s*(\d+)\]")
+TETHER_COPY = re.compile(r"[/\\]Tether[/\\]diff[/\\]")  # Saved/Tether/diff, mounted as /Temp/Tether/diff
+TOOL_ENSURE = re.compile(r"Ensure condition failed: false \|\| !HasAnyFlags\(RF_ClassDefaultObject\).*NavigationSystem\.h")
+LOG_LINE = re.compile(r"^(?:\[[^\]]*\]\[[^\]]*\])?([A-Za-z0-9_]+): (?:(Fatal|Error|Warning|Display|Verbose|VeryVerbose): )?(.*)$")
+
+
+class CliError(Exception):
+    def __init__(self, message, code=1):
+        super().__init__(message)
+        self.code = code
+
+
+# ---------------------------------------------------------------- project / beacon
+
+def find_project(explicit):
+    if explicit or os.environ.get("UE_PROJECT"):
+        return os.path.abspath(explicit or os.environ["UE_PROJECT"])
+    here = os.getcwd()
+    while True:
+        hits = [f for f in os.listdir(here) if f.endswith(".uproject")]
+        if hits:
+            return os.path.join(here, hits[0])
+        parent = os.path.dirname(here)
+        if parent == here:
+            break
+        here = parent
+    below = [os.path.join(os.getcwd(), d, f) for d in os.listdir(os.getcwd())
+             if os.path.isdir(d) for f in os.listdir(d) if f.endswith(".uproject")]
+    if len(below) == 1:
+        return below[0]
+    raise CliError("no .uproject found; pass --project or set UE_PROJECT", 2)
+
+
+def state_dir(project):
+    return os.path.join(os.path.dirname(project), "Saved", "Tether")
+
+
+def read_json(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def write_json(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f)
+
+
+def pid_alive(pid):
+    if not pid:
+        return False
+    if os.name == "nt":  # never os.kill on Windows: it terminates the process
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        kernel32.OpenProcess.restype = ctypes.c_void_p
+        kernel32.GetExitCodeProcess.argtypes = (ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong))
+        kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
+        handle = kernel32.OpenProcess(0x1000, False, int(pid))  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            return False
+        code = ctypes.c_ulong()
+        ok = kernel32.GetExitCodeProcess(handle, ctypes.byref(code))
+        kernel32.CloseHandle(handle)
+        return bool(ok) and code.value == 259  # STILL_ACTIVE
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except OSError:
+        return False
+
+
+# ---------------------------------------------------------------- platform (Windows is the tested one)
+
+def host_platform():
+    """UE's name for this host: Win64, Mac or Linux."""
+    return {"win32": "Win64", "darwin": "Mac"}.get(sys.platform, "Linux")
+
+
+def epic_settings_dir():
+    """Where the launcher and UnrealBuildTool keep per-user state on this host."""
+    if os.name == "nt":
+        return os.environ.get("LOCALAPPDATA", "")
+    if sys.platform == "darwin":
+        return os.path.expanduser("~/Library/Application Support/Epic")
+    return os.path.expanduser("~/.config/Epic")
+
+
+def launcher_manifest():
+    if os.name == "nt":
+        path = os.path.join(os.environ.get("PROGRAMDATA", r"C:\ProgramData"), "Epic", "UnrealEngineLauncher",
+                            "LauncherInstalled.dat")
+    else:  # the Mac launcher keeps it per user; Linux has no launcher
+        path = os.path.join(epic_settings_dir(), "UnrealEngineLauncher", "LauncherInstalled.dat")
+    return read_json(path) or {}
+
+
+def registered_builds():
+    """Source builds registered with the engine's own registration tool: {association: path}."""
+    if os.name == "nt":
+        import winreg
+        builds = {}
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Epic Games\Unreal Engine\Builds") as key:
+                for i in range(winreg.QueryInfoKey(key)[1]):
+                    name, value, _ = winreg.EnumValue(key, i)
+                    builds[name] = value
+        except OSError:
+            pass
+        return builds
+    import configparser
+    ini = configparser.ConfigParser(strict=False)
+    ini.optionxform = str
+    ini.read(os.path.join(epic_settings_dir(), "UnrealEngine", "Install.ini"))
+    return dict(ini["Installations"]) if ini.has_section("Installations") else {}
+
+
+def editor_executable(root):
+    binaries = os.path.join(root, "Engine", "Binaries", host_platform())
+    if os.name == "nt":
+        return os.path.join(binaries, "UnrealEditor.exe")
+    if sys.platform == "darwin":
+        return os.path.join(binaries, "UnrealEditor.app", "Contents", "MacOS", "UnrealEditor")
+    return os.path.join(binaries, "UnrealEditor")
+
+
+def ubt_command(root):
+    """The command that runs UnrealBuildTool on this host (arguments follow: target platform config ...)."""
+    if os.name == "nt":
+        return [os.path.join(root, "Engine", "Binaries", "DotNET", "UnrealBuildTool", "UnrealBuildTool.exe")]
+    return ["sh", os.path.join(root, "Engine", "Build", "BatchFiles", host_platform(), "Build.sh")]
+
+
+def uat_command(root):
+    batch = os.path.join(root, "Engine", "Build", "BatchFiles")
+    return [os.path.join(batch, "RunUAT.bat")] if os.name == "nt" else ["sh", os.path.join(batch, "RunUAT.sh")]
+
+
+def live_coding_available():
+    return os.name == "nt"  # Live Coding is Windows-only in UE 5
+
+
+def installed_engine_dirs(version):
+    """Where a launcher-installed engine may live when the launcher manifest does not name it."""
+    found = []
+    if os.name == "nt":
+        import winreg
+        try:
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, rf"SOFTWARE\EpicGames\Unreal Engine\{version}") as key:
+                found.append(winreg.QueryValueEx(key, "InstalledDirectory")[0])
+        except OSError:
+            pass
+        found.append(os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "Epic Games", f"UE_{version}"))
+    elif sys.platform == "darwin":
+        found.append(f"/Users/Shared/Epic Games/UE_{version}")
+    return found
+
+
+def engine_root(project):
+    """Engine dir from UE_ROOT, the launcher manifest, or registered source builds."""
+    if os.environ.get("UE_ROOT"):
+        return os.environ["UE_ROOT"]
+    with open(project, encoding="utf-8") as f:
+        match = re.search(r'"EngineAssociation"\s*:\s*"([^"]*)"', f.read())
+    assoc = match.group(1) if match else ""
+    for item in launcher_manifest().get("InstallationList", []):
+        if item.get("AppName") == f"UE_{assoc}":
+            return item["InstallLocation"]
+    builds = registered_builds()
+    if assoc in builds:
+        return builds[assoc]
+    if assoc:  # a launcher install the manifest does not list (yet): the engine's own key, then default folders
+        for root in installed_engine_dirs(assoc):
+            if os.path.isdir(os.path.join(root, "Engine", "Binaries")):
+                return root
+    if not assoc:  # a project inside an engine tree (e.g. a source build checkout)
+        here = os.path.dirname(os.path.abspath(project))
+        while os.path.dirname(here) != here:
+            if os.path.isdir(os.path.join(here, "Engine", "Binaries")):
+                return here
+            here = os.path.dirname(here)
+    raise CliError(f"cannot find engine '{assoc}'; set UE_ROOT", 2)
+
+
+def pick_port(project):
+    """Stable per-project port (so two editors never fight over 8000), skipping busy ones."""
+    base = 18000 + zlib.crc32(project.lower().encode()) % 1000
+    for port in range(base, base + 50):
+        if not port_open(port):
+            return port
+    raise CliError("no free port near %d" % base)
+
+
+def port_from_log(project):
+    """Fallback when there is no beacon: Epic's server logs 'Starting MCP server on port N'."""
+    path = log_path(project)
+    try:
+        with open(path, "rb") as f:
+            hits = re.findall(rb"Starting MCP server on port (\d+)", f.read())
+        return int(hits[-1]) if hits else None
+    except OSError:
+        return None
+
+
+def port_open(port):
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=0.3):
+            return True
+    except OSError:
+        return False
+
+
+# ---------------------------------------------------------------- rendering
+
+def unwrap(text):
+    try:
+        value = json.loads(text)
+    except ValueError:
+        return text
+    if isinstance(value, dict) and set(value) == {"returnValue"}:
+        value = value["returnValue"]
+        if isinstance(value, str) and value[:1] in "[{":
+            try:
+                value = json.loads(value)
+            except ValueError:
+                pass
+    return value
+
+
+def compact_error(text):
+    text = text.split("\nFunction schema Json", 1)[0]
+    return re.sub(r"\s+", " ", text).strip()[:600]
+
+
+def strip_common(paths):
+    if len(paths) < 2:
+        return "", paths
+    prefix = os.path.commonprefix(paths)
+    cut = max(prefix.rfind(c) for c in ".:/") + 1
+    return prefix[:cut], [p[cut:] for p in paths]
+
+
+def short(value, width=100):
+    text = value if isinstance(value, str) else json.dumps(value, separators=(",", ":"))
+    return text if len(text) <= width else text[: width - 3] + "..."
+
+
+def render(value, limit):
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        items = value
+        if items and all(isinstance(v, dict) and set(v) == {"refPath"} for v in items):
+            items = [v["refPath"] for v in items]
+        head = f"{len(items)} items"
+        if items and all(isinstance(v, str) for v in items):
+            prefix, items = strip_common(items)
+            head += f" under {prefix}" if prefix else ""
+        rows = [v if isinstance(v, str) else short(v) for v in items]
+        return "\n".join([head] + rows[:limit] + ([f"... +{len(rows) - limit} more (--limit)"] if len(rows) > limit else []))
+    if isinstance(value, dict):
+        rows = [f"{k}: {short(v)}" for k, v in value.items()]
+        return "\n".join(rows[:limit] + ([f"... +{len(rows) - limit} more (--limit)"] if len(rows) > limit else []))
+    return json.dumps(value)
+
+
+def emit(args, value):
+    print(json.dumps(value) if args.json else render(value, args.limit))
+
+
+# ---------------------------------------------------------------- logs (byte-offset cursor; no editor needed)
+
+def log_path(project):
+    return os.path.join(os.path.dirname(project), "Saved", "Logs",
+                        os.path.splitext(os.path.basename(project))[0] + ".log")
+
+
+def log_identity(stat):
+    """Changes when UE rotates the log (renames it, starts a new file). st_ctime is the creation time on
+    Windows but the last metadata change on POSIX, where it moves on every write; use the inode there."""
+    return stat.st_ctime if os.name == "nt" else stat.st_ino
+
+
+def read_new_log(project, from_start=False, advance=True):
+    path = log_path(project)
+    cursor_file = os.path.join(state_dir(project), "log-cursor.json")
+    if not os.path.exists(path):
+        raise CliError(f"no log at {path}", 2)
+    stat = os.stat(path)
+    cursor = read_json(cursor_file) or {}
+    offset = cursor.get("offset", 0)
+    if from_start or cursor.get("id") != log_identity(stat) or offset > stat.st_size:
+        offset = 0
+    with open(path, "rb") as f:
+        f.seek(offset)
+        data = f.read()
+    end = data.rfind(b"\n") + 1  # keep a partial trailing line for next time
+    if advance:
+        write_json(cursor_file, {"id": log_identity(stat), "offset": offset + end})
+    return data[:end].decode("utf-8", "replace").lstrip("﻿").splitlines()
+
+
+def log_end(project):
+    path = log_path(project)
+    return os.path.getsize(path) if os.path.exists(path) else 0
+
+
+# FMessageDialog under -RUNNINGUNATTENDEDSCRIPT logs instead of blocking; the text runs to the next stamped line.
+DIALOG = re.compile(r"Message dialog closed, result: \w+, title: (?P<title>[^\r\n]*?), text: (?P<text>.*?)"
+                    r"(?=^\[\d{4}\.\d\d\.\d\d-|\Z)", re.S | re.M)
+
+
+def logged_dialogs(lines):
+    """(title, text) of every dialog the editor answered by itself in these log lines."""
+    return [(m.group("title"), m.group("text").strip()) for m in DIALOG.finditer("\n".join(lines))]
+
+
+FRAME = re.compile(r"^\s+at (?P<where>[\w.<>`+]+)\(.*\) in (?P<file>.+):line (?P<line>\d+)")
+
+
+def user_frame(lines, start):
+    """First C# stack frame with a source location below an error line, as ' @ File.cs:N (Type.Method)'."""
+    for line in lines[start + 1: start + 12]:
+        if LOG_LINE.match(line):
+            break
+        m = FRAME.match(line)
+        if m and "/plugins/unrealsharp/" not in m.group("file").replace("\\", "/").lower():  # skip glue
+            method = ".".join(m.group("where").split(".")[-2:])
+            name = re.split(r"[/\\]", m.group("file"))[-1]  # Windows paths in the log, on any host
+            return f" @ {name}:{m.group('line')} ({method})"
+    return ""
+
+
+def filter_log(lines, level="Warning", category=None, pattern=None):
+    max_level = LEVELS.get(level.capitalize() if level.lower() != "veryverbose" else "VeryVerbose", 2)
+    rx = re.compile(pattern, re.I) if pattern else None
+    order, counts = [], {}
+    # Tether's own /Temp copies of assets (ue diff, ue bp, ue usages) compile on load, and a copy can fail where
+    # the real asset does not; leave out compiler output from the frames that loaded one.
+    frame = lambda line: (LOG_FRAME.match(line) or [None, None])[1]  # the editor's frame counter, [342]
+    copy_frames = {frame(l) for l in lines if TETHER_COPY.search(l)} - {None}
+    # Python calls UNavigationSystemV1's static functions through its default object, which is Within=World: the
+    # engine raises a handled ensure about it once per session. Leave out that ensure's report (same frame).
+    ensure_frames = {frame(l) for l in lines if TOOL_ENSURE.search(l)} - {None}
+    for index, line in enumerate(lines):
+        m = LOG_LINE.match(line)
+        if not m:
+            continue
+        cat, lvl, msg = m.group(1), m.group(2) or "Log", m.group(3)
+        if cat in NOISE or (cat == "Cmd" and msg.strip() == "FLUSHLOG") or (cat == "LogJson" and NOISE_MESSAGE.match(msg)):
+            continue
+        if copy_frames and (TETHER_COPY.search(line) or (cat in ("BlueprintLog", "LogBlueprint", "LogK2Compiler")
+                                                          and frame(line) in copy_frames)):
+            continue
+        if ensure_frames and cat in ("LogOutputDevice", "EnsureFailed", "LogStats") and frame(line) in ensure_frames:
+            continue
+        if lvl in ("Error", "Fatal"):
+            msg += user_frame(lines, index)
+        if LEVELS[lvl] > max_level or (category and cat.lower() != category.lower()):
+            continue
+        if rx and not rx.search(line):
+            continue
+        key = (lvl[0], cat, msg.strip())
+        if key not in counts:
+            order.append(key)
+        counts[key] = counts.get(key, 0) + 1
+    return [f"{l} {c}: {m}" + (f"  x{counts[(l, c, m)]}" if counts[(l, c, m)] > 1 else "") for l, c, m in order]
+
+
+def modal_dialogs(pid):
+    """Text of the native modal dialogs (#32770 windows) a process is showing; Windows only."""
+    if os.name != "nt":
+        return []
+    import ctypes
+    from ctypes import wintypes
+    user32 = ctypes.windll.user32
+    callback = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+    def text(hwnd, getter=user32.GetWindowTextW, size=1024):
+        buf = ctypes.create_unicode_buffer(size)
+        getter(hwnd, buf, size)
+        return buf.value
+
+    found = []
+
+    def visit(hwnd, _):
+        owner = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner))
+        if owner.value == pid and user32.IsWindowVisible(hwnd) and text(hwnd, user32.GetClassNameW, 64) == "#32770":
+            parts = []
+            user32.EnumChildWindows(hwnd, callback(lambda child, _: parts.append(text(child)) or True), 0)
+            found.append(" ".join(p for p in parts if p and p not in ("OK", "Cancel", "&Yes", "&No")) or text(hwnd))
+        return True
+
+    user32.EnumWindows(callback(visit), 0)
+    return found
+
+
+def editor_windows(pid):
+    """(class, title, enabled) for each visible top-level window of a process; Windows only."""
+    if os.name != "nt" or not pid:
+        return []
+    import ctypes
+    from ctypes import wintypes
+    user32 = ctypes.windll.user32
+    callback = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    found = []
+
+    def visit(hwnd, _):
+        owner = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner))
+        if owner.value == pid and user32.IsWindowVisible(hwnd):
+            cls, title = ctypes.create_unicode_buffer(64), ctypes.create_unicode_buffer(512)
+            user32.GetClassNameW(hwnd, cls, 64)
+            user32.GetWindowTextW(hwnd, title, 512)
+            found.append((cls.value, title.value, bool(user32.IsWindowEnabled(hwnd))))
+        return True
+
+    user32.EnumWindows(callback(visit), 0)
+    return found
+
+
+def blocking_dialogs(pid):
+    """Titles of the dialogs a (windowed) editor is blocked on: native message boxes, plus Slate modals.
+
+    A Slate modal (e.g. "Save Content") is an ordinary UnrealWindow, but while it is open Slate disables
+    every other editor window, so an enabled titled window beside a disabled main frame is the modal."""
+    found = modal_dialogs(pid)
+    windows = editor_windows(pid)
+    main_disabled = any(c == "UnrealWindow" and t.endswith(" - Unreal Editor") and not e for c, t, e in windows)
+    if main_disabled:
+        found += [t for c, t, e in windows if c == "UnrealWindow" and e and t and not t.endswith(" - Unreal Editor")]
+    return found
+
+
+def stall_report(project):
+    """Why a running editor is not answering, or None if it looks healthy (or is not running)."""
+    beacon = read_json(os.path.join(state_dir(project), "editor.json")) or {}
+    pid = beacon.get("pid")
+    if not pid_alive(pid):
+        return None
+    dialogs = blocking_dialogs(pid)
+    if dialogs:
+        return "blocked by modal: " + ", ".join(f'"{d[:80]}"' for d in dialogs[:3])
+    age = time.time() - beacon.get("heartbeat", 0)
+    return f"no heartbeat for {age:.0f}s (game thread busy or hung)" if age > 10 else None
+
+
+CRASH_NOISE = re.compile(r"^\[[^\]]*\]\[[^\]]*\](LogModuleManager|LogPython: Display: Running start-up|LogUObjectHash|"
+                         r"LogStreaming|LogCsvProfiler|LogEOSSDK|LogInit: Display: Engine is initialized)")
+
+
+def crash_reports(project):
+    """Crash folders under Saved/Crashes, newest first, as dicts parsed from CrashContext.runtime-xml."""
+    root = os.path.join(os.path.dirname(project), "Saved", "Crashes")
+    reports = []
+    for name in os.listdir(root) if os.path.isdir(root) else []:
+        folder = os.path.join(root, name)
+        context = os.path.join(folder, "CrashContext.runtime-xml")
+        if not os.path.isfile(context):
+            continue
+        with open(context, encoding="utf-8", errors="replace") as f:
+            xml = f.read()
+        tag = lambda t: (re.search(rf"<{t}>(.*?)</{t}>", xml, re.S) or [None, ""])[1].strip()
+        ticks = tag("TimeOfCrash")  # .NET ticks (100 ns since 0001-01-01, UTC)
+        when = (int(ticks) - 621355968000000000) / 1e7 if ticks.isdigit() else os.path.getmtime(context)
+        reports.append({"folder": folder, "time": when, "type": tag("CrashType"),
+                        "error": re.sub(r"\s+", " ", tag("ErrorMessage")), "stack": tag("CallStack").splitlines()})
+    return sorted(reports, key=lambda r: -r["time"])
+
+
+def describe_crash(project, report, lines=8):
+    """A short account: when, what, the module chain, project modules involved, and what the log said last."""
+    when = time.strftime("%Y-%m-%d %H:%M", time.localtime(report["time"]))
+    out = [f"crash {when} ({report['type'] or 'unknown'}): {report['error'][:300]}"]
+    chain = []  # each module once, in the order it first appears from the innermost frame
+    for frame in report["stack"]:
+        module = frame.strip().replace("UnrealEditor_", "").replace("UnrealEditor-", "")
+        if module and module not in chain:
+            chain.append(module)
+    if chain:
+        out.append("  modules (innermost first): " + " <- ".join(chain[:10]) + (" ..." if len(chain) > 10 else ""))
+    source = os.path.join(os.path.dirname(project), "Source")
+    mine = sorted({d for d in (os.listdir(source) if os.path.isdir(source) else [])
+                   if os.path.isdir(os.path.join(source, d))} & set(chain))
+    if mine:
+        out.append("  your modules on the stack: " + ", ".join(mine))
+    logs = [f for f in os.listdir(report["folder"]) if f.endswith(".log")]
+    if logs:
+        with open(os.path.join(report["folder"], logs[0]), encoding="utf-8", errors="replace") as f:
+            tail = [l.split("]", 2)[-1].strip() for l in f.read().splitlines()
+                    if l.strip() and not CRASH_NOISE.match(l) and "GetLastError" not in l]
+        tail = [l for i, l in enumerate(tail) if l and (i == 0 or l != tail[i - 1])]  # Python logs some lines twice
+        out.append(f"  last log lines ({logs[0]}):")
+        out += ["    " + l[:180] for l in tail[-lines:]]
+    out.append(f"  folder: {report['folder']}")
+    return "\n".join(out)
+
+
+def crash_summary(report, width=120):
+    """One line: the error without the engine-source '[File:...] [Line: N]' noise."""
+    text = re.sub(r"\s*\[File:[^\]]*\]\s*\[Line:\s*\d+\]\s*", " ", report["error"]).strip()
+    return text[:width]
+
+
+def recent_crash(project, since):
+    """The newest crash after `since` (epoch seconds), or None. Ensure reports (the editor carried on) are not
+    crashes."""
+    reports = [r for r in crash_reports(project) if r["type"].lower() != "ensure"]
+    return reports[0] if reports and reports[0]["time"] >= since else None
+
+
+def run_git(project, *argv, binary=False, check=True):
+    """git in the project folder: stdout (bytes with binary), or None on failure when check is False."""
+    try:
+        proc = subprocess.run(["git", "-C", os.path.dirname(project), *argv], capture_output=True)
+    except OSError:
+        raise CliError("git is not installed") from None
+    if proc.returncode:
+        if not check:
+            return None
+        err = proc.stderr.decode("utf-8", "replace").strip()
+        raise CliError(f"git {argv[0]}: {err.splitlines()[-1] if err else 'failed'}")
+    return proc.stdout if binary else proc.stdout.decode("utf-8", "replace")
+
+
+def human_bytes(n):
+    for unit, size in (("GB", 1024 ** 3), ("MB", 1024 ** 2), ("KB", 1024)):
+        if n >= size:
+            return f"{n / size:.1f} {unit}" if n < 100 * size else f"{n / size:.0f} {unit}"
+    return f"{n} B"
+
+
+def running_editors():
+    """[(pid, command line)] of every running Unreal Editor process on this machine."""
+    try:
+        if os.name == "nt":
+            out = subprocess.run(["powershell", "-NoProfile", "-Command",
+                                  "Get-CimInstance Win32_Process -Filter \"Name like 'UnrealEditor%'\" | "
+                                  "ForEach-Object { \"$($_.ProcessId)`t$($_.CommandLine)\" }"],
+                                 capture_output=True, text=True, timeout=30).stdout
+        else:
+            out = "\n".join(l.strip().replace(" ", "\t", 1) for l in subprocess.run(
+                ["ps", "-eo", "pid,args"], capture_output=True, text=True, timeout=30).stdout.splitlines()
+                if "UnrealEditor" in l)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    rows = []
+    for line in out.splitlines():
+        pid, _, command = line.partition("\t")
+        if pid.strip().isdigit():
+            rows.append((int(pid), command.strip()))
+    return rows
+
+
+def editor_live(project):
+    """The project's beacon if its editor is running and ticking, else None."""
+    beacon = read_json(os.path.join(state_dir(project), "editor.json")) or {}
+    alive = pid_alive(beacon.get("pid")) and time.time() - beacon.get("heartbeat", 0) < 15
+    return beacon if alive else None
+
+
+def project_of(path):
+    """The nearest .uproject above a file (which may not exist yet), or None."""
+    here = os.path.dirname(os.path.abspath(path))
+    for _ in range(12):
+        if os.path.isdir(here):
+            hits = [f for f in os.listdir(here) if f.endswith(".uproject")]
+            if hits:
+                return os.path.join(here, hits[0])
+        parent = os.path.dirname(here)
+        if parent == here:
+            return None
+        here = parent
+    return None
