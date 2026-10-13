@@ -1019,3 +1019,16 @@ class Usages(unittest.TestCase):
             self.assertEqual((sorted(found), skipped), (["/Game/BP_Door"], 0))
         finally:
             project.close()
+
+
+class TetherCopyNoise(unittest.TestCase):
+    def test_compiler_output_of_tether_copies_is_left_out(self):
+        lines = [
+            stamped("LogBlueprint: Compiling Blueprint '/Temp/Tether/diff/34ed/UDW.UDW'").replace("[398]", "[342]"),
+            "[2026.10.13-10.06.44:369][342]LogBlueprint: Error: [AssetLog] D:\\P\\Saved\\Tether\\diff\\34ed\\UDW.uasset: bad",
+            "[2026.10.13-10.06.45:254][342]BlueprintLog: Warning: Blueprint failed to compile:  UDW",
+            "[2026.10.13-10.06.45:254][343]BlueprintLog: Warning: Blueprint failed to compile:  BP_Real",
+            "[2026.10.13-10.06.45:254][342]LogTemp: Warning: unrelated",
+        ]
+        self.assertEqual(ue.filter_log(lines), ["W BlueprintLog: Blueprint failed to compile:  BP_Real",
+                                                "W LogTemp: unrelated"])

@@ -167,6 +167,8 @@ broken or unsupported.
 - Prefer `ue pie run check.py --expect '<log regex>' --reject 'Error|no subsystem'` for verifying gameplay:
   it starts PIE, runs the script in the PIE world, waits for the log lines, stops PIE and exits 0/1.
   Write the script once and rerun it after every change.
+- Animation in PIE: `ue anim <actor|player>` (anim BP and its variables, montage, curves, movement mode and
+  speed). Python cannot read state machine states; the variables the transitions use usually tell you.
 - AI in PIE: `ue ai` (one line per AI), `ue ai <pawn>` (movement, focus, perception, brain, blackboard, and the
   project's getters). State a C++ class keeps in plain members is invisible: suggest exposing it as a
   `UFUNCTION(BlueprintPure)` getter.

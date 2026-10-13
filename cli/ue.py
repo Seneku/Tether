@@ -34,6 +34,8 @@ LEVELS = {"Fatal": 0, "Error": 1, "Warning": 2, "Display": 3, "Log": 4, "Verbose
 NOISE = {"LogModelContextProtocol", "LogToolsetRegistry"}  # our own transport chatter
 # Epic logs this whenever a schema is generated for a class with delegates (props, set, describe_toolset).
 NOISE_MESSAGE = re.compile(r"^Property \"\w+\" type \w+ unhandled during Json schema generation")
+LOG_FRAME = re.compile(r"^\[[^\]]*\]\[\s*(\d+)\]")
+TETHER_COPY = re.compile(r"[/\\]Tether[/\\]diff[/\\]")  # Saved/Tether/diff, mounted as /Temp/Tether/diff
 LOG_LINE = re.compile(r"^(?:\[[^\]]*\]\[[^\]]*\])?([A-Za-z0-9_]+): (?:(Fatal|Error|Warning|Display|Verbose|VeryVerbose): )?(.*)$")
 
 
@@ -646,12 +648,19 @@ def filter_log(lines, level="Warning", category=None, pattern=None):
     max_level = LEVELS.get(level.capitalize() if level.lower() != "veryverbose" else "VeryVerbose", 2)
     rx = re.compile(pattern, re.I) if pattern else None
     order, counts = [], {}
+    # Tether's own /Temp copies of assets (ue diff, ue bp, ue usages) compile on load, and a copy can fail where
+    # the real asset does not; leave out compiler output from the frames that loaded one.
+    frame = lambda line: (LOG_FRAME.match(line) or [None, None])[1]  # the editor's frame counter, [342]
+    copy_frames = {frame(l) for l in lines if TETHER_COPY.search(l)} - {None}
     for index, line in enumerate(lines):
         m = LOG_LINE.match(line)
         if not m:
             continue
         cat, lvl, msg = m.group(1), m.group(2) or "Log", m.group(3)
         if cat in NOISE or (cat == "Cmd" and msg.strip() == "FLUSHLOG") or (cat == "LogJson" and NOISE_MESSAGE.match(msg)):
+            continue
+        if copy_frames and (TETHER_COPY.search(line) or (cat in ("BlueprintLog", "LogBlueprint", "LogK2Compiler")
+                                                          and frame(line) in copy_frames)):
             continue
         if lvl in ("Error", "Fatal"):
             msg += user_frame(lines, index)
@@ -2752,6 +2761,11 @@ def cmd_ui(ctx, args):
     return 0
 
 
+def cmd_anim(ctx, args):
+    print(ctx.tether("anim", target=args.target, pie=not args.editor, limit=args.limit))
+    return 0
+
+
 def cmd_ai(ctx, args):
     print(ctx.tether("ai", target=args.target or "", limit=args.limit))
     return 0
@@ -3479,6 +3493,8 @@ def cmd_selftest(ctx, args):
           ok=lambda c, o: c == 0 and "PASS" in o)
     check("ui", ["ui"], ok=lambda c, o: c == 0)
     check("ai", ["ai"], ok=lambda c, o: c == 0 and ("AI" in o))
+    check("anim", ["anim", "player"], ok=lambda c, o: c == 0 and ("skeletal mesh" in o or "anim instance" in o
+                                                                   or "mesh " in o))
     fixture = (ue("py", "hasattr(unreal, 'TetherProbeUILibrary')")[1].splitlines() or [""])[-1] == "True"
     check("ui click (Sandbox fixture)", ["pie", "do", "call /Script/Sandbox.Default__TetherProbeUILibrary ShowProbeUI",
                                          "expect-ui Tether probe panel", "click UMG Probe Button", "expect-ui UMG clicks: "],
@@ -4692,6 +4708,9 @@ def main(argv=None):
     s.add_argument("rest", nargs="*")
     s.add_argument("--all", action="store_true", help="also images and zero-size widgets")
     s.add_argument("--submit", action="store_true", help="with type: press Enter afterwards")
+    s = add("anim", cmd_anim, "animation state in PIE: anim BP, montage, curves, its variables, movement")
+    s.add_argument("target", help="actor, 'player', or Actor.Component")
+    s.add_argument("--editor", action="store_true", help="read the editor level instead of PIE")
     s = add("ai", cmd_ai, "AI in PIE: movement/path, focus, perception, brain, blackboard, project getters")
     s.add_argument("target", nargs="?", help="a pawn or controller (default: one line per AI)")
     s = add("new", cmd_new, "create an asset: blueprint, material, mi, datatable, dataasset, level, folder")

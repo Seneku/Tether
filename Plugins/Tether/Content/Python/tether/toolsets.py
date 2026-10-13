@@ -2865,6 +2865,89 @@ class TetherCore(_Base):
 
     @_tool
     @staticmethod
+    def anim(target: str, pie: bool = True, limit: int = 30) -> str:
+        """Animation state of an actor: per skeletal mesh component, its mode, Anim Blueprint or single animation,
+        the playing montage (section, position, rate), root motion mode, active curves, and the Anim Blueprint's
+        own variables (the values its state machine transitions test); plus the character's movement mode and
+        speed, to tell animation from movement problems.
+
+        Args:
+            target: Actor label/name, 'player', or 'Actor.Component'.
+            pie: Read the PIE world (default) instead of the editor level.
+            limit: Maximum number of lines per component.
+
+        Returns:
+            A block per skeletal mesh component.
+        """
+        game = _game_world() if pie else None
+        if pie and game is None:
+            raise RuntimeError("PIE is not running (ue pie start; or --editor for the editor level)")
+        if target.lower() in ("player", "pawn") and game is not None:
+            obj = unreal.GameplayStatics.get_player_pawn(game, 0)
+        else:
+            obj = _resolve(target, pie)
+        actor = obj if isinstance(obj, unreal.Actor) else obj.get_owner()
+        comps = [obj] if isinstance(obj, unreal.SkeletalMeshComponent) else \
+            list(actor.get_components_by_class(unreal.SkeletalMeshComponent))
+        enum = lambda v: str(v).split(".")[-1].split(":")[0].lower()
+        out = [f"{_label(actor)} ({actor.get_class().get_name()})"]
+        movement = _try(lambda: actor.get_editor_property("character_movement")) if isinstance(actor, unreal.Character) else None
+        if movement:
+            velocity = actor.get_velocity()
+            out.append(f"  movement: {enum(movement.get_editor_property('movement_mode'))}, speed "
+                       f"{velocity.length():.0f} cm/s (max walk {movement.get_editor_property('max_walk_speed'):.0f})"
+                       + (", falling" if _try(lambda: movement.is_falling(), False) else ""))
+        for comp in comps:
+            mesh = _try(lambda: comp.get_skeletal_mesh_asset()) or _try(lambda: comp.get_editor_property("skeletal_mesh"))
+            mode = enum(_try(lambda: comp.get_editor_property("animation_mode"), "?"))
+            lines = [f"  {comp.get_name()}: mesh {_short_path(mesh.get_path_name()) if mesh else 'None'}, {mode}"
+                     + ("" if comp.is_visible() else ", hidden")]
+            instance = _try(lambda: comp.get_anim_instance())
+            if mode.endswith("asset") or "single" in mode:
+                anim = _try(lambda: comp.get_editor_property("animation_data").get_editor_property("anim_to_play"))
+                lines.append(f"    single animation {_short_path(anim.get_path_name()) if anim else 'None'}")
+            if instance is not None:
+                lines.append(f"    anim instance {instance.get_class().get_name()}, root motion "
+                             f"{enum(_try(lambda: instance.get_editor_property('root_motion_mode'), '?'))}")
+                montage = _try(lambda: instance.get_current_active_montage())
+                if montage:
+                    section = str(_try(lambda: instance.montage_get_current_section(montage), "?"))
+                    position = _try(lambda: instance.montage_get_position(montage), 0.0)
+                    length = _try(lambda: montage.get_play_length(), 0.0)
+                    lines.append(f"    montage {_short_path(montage.get_path_name())}: section {section}, "
+                                 f"{position:.2f}/{length:.2f} s, rate {_try(lambda: instance.montage_get_play_rate(montage), 1.0):g}"
+                                 + ("" if _try(lambda: instance.montage_is_playing(montage), True) else ", paused"))
+                elif not _try(lambda: instance.is_any_montage_playing(), False):
+                    lines.append("    no montage playing")
+                curves = []
+                for name in (_try(lambda: instance.get_all_curve_names(), []) or [])[:200]:
+                    value = _try(lambda: instance.get_curve_value(name), 0.0)
+                    if abs(value) > 1e-3:
+                        curves.append(f"{name}={value:.2f}")
+                if curves:
+                    lines.append(f"    curves: {', '.join(curves[:12])}" + (f" +{len(curves) - 12}" if len(curves) > 12 else ""))
+                if not _LEGACY:  # the Anim Blueprint's own variables: what its transitions read
+                    cls = instance.get_class()
+                    own = set(_reflect(unreal.ToolsetLibrary.list_struct_properties(cls), instance)) - \
+                        set(_reflect(unreal.ToolsetLibrary.list_struct_properties(unreal.AnimInstance.static_class()), instance))
+                    names = sorted(own)
+                    values = _reflect(unreal.ToolsetLibrary.get_object_properties(instance, names), instance) if names else {}
+                    shown = [f"{n}={_short(_round(values.get(n)), 40)}" for n in names
+                             if not isinstance(values.get(n), (dict, list)) or set(values.get(n) or {}) <= {"x", "y", "z"}]
+                    if shown:
+                        lines.append("    variables: " + ", ".join(shown[:limit]) + (f" +{len(shown) - limit}" if len(shown) > limit else ""))
+            elif _try(lambda: comp.get_editor_property("leader_pose_component")):
+                leader = comp.get_editor_property("leader_pose_component")
+                lines.append(f"    follows {leader.get_name()}'s pose (leader pose component)")
+            elif mode.endswith("blueprint"):
+                lines.append("    no anim instance (not initialised: is the component ticking and visible?)")
+            out.extend(lines)
+        if not comps:
+            out.append("  no skeletal mesh components")
+        return "\n".join(out)
+
+    @_tool
+    @staticmethod
     def find(query: str = "", cls: str = "", under: str = "/Game", limit: int = 50) -> str:
         """Search the asset registry by name and/or class.
 
