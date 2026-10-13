@@ -1988,8 +1988,9 @@ def crash_summary(report, width=120):
 
 
 def recent_crash(project, since):
-    """The newest crash after `since` (epoch seconds), or None."""
-    reports = crash_reports(project)
+    """The newest crash after `since` (epoch seconds), or None. Ensure reports (the editor carried on) are not
+    crashes."""
+    reports = [r for r in crash_reports(project) if r["type"].lower() != "ensure"]
     return reports[0] if reports and reports[0]["time"] >= since else None
 
 
@@ -3353,6 +3354,139 @@ def cmd_soak(ctx, args):
     return 1 if failed else 0
 
 
+def running_editors():
+    """[(pid, command line)] of every running Unreal Editor process on this machine."""
+    try:
+        if os.name == "nt":
+            out = subprocess.run(["powershell", "-NoProfile", "-Command",
+                                  "Get-CimInstance Win32_Process -Filter \"Name like 'UnrealEditor%'\" | "
+                                  "ForEach-Object { \"$($_.ProcessId)`t$($_.CommandLine)\" }"],
+                                 capture_output=True, text=True, timeout=30).stdout
+        else:
+            out = "\n".join(l.strip().replace(" ", "\t", 1) for l in subprocess.run(
+                ["ps", "-eo", "pid,args"], capture_output=True, text=True, timeout=30).stdout.splitlines()
+                if "UnrealEditor" in l)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    rows = []
+    for line in out.splitlines():
+        pid, _, command = line.partition("\t")
+        if pid.strip().isdigit():
+            rows.append((int(pid), command.strip()))
+    return rows
+
+
+def cmd_doctor(ctx, args):
+    """Check the setup Tether depends on and say how to fix what is wrong."""
+    import io
+    import contextlib
+    import shutil
+    results = []
+
+    def report(status, what, fix=""):
+        results.append((status, what, fix))
+
+    report("ok" if sys.version_info >= (3, 9) else "FAIL", f"Python {sys.version.split()[0]}",
+           "" if sys.version_info >= (3, 9) else "install Python 3.9 or newer")
+    try:
+        project = ctx.project
+    except CliError as exc:
+        report("FAIL", f"no project: {exc}", "run ue from the project folder, or pass --project / set UE_PROJECT")
+        return doctor_print(results)
+    data = read_json(project) or {}
+    assoc = data.get("EngineAssociation", "?")
+    try:
+        engine = engine_root(project)
+        version = read_json(os.path.join(engine, "Engine", "Build", "Build.version")) or {}
+        exe = editor_executable(engine)
+        if os.path.isfile(exe):
+            report("ok", f"engine {assoc}: {engine} ({version.get('MajorVersion')}.{version.get('MinorVersion')}."
+                   f"{version.get('PatchVersion')})")
+        else:
+            report("FAIL", f"engine {assoc} at {engine} has no editor binary ({exe})",
+                   "finish or repair the install in the Epic launcher")
+    except CliError as exc:
+        engine = None
+        report("FAIL", f"engine {assoc}: {exc}", "install it, or set UE_ROOT to its folder")
+    out = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(out):
+            cmd_init(ctx, argparse.Namespace(dry_run=True, unrealsharp=False))
+        text = out.getvalue().strip()
+        if text.startswith("already set up"):
+            report("ok", "plugins enabled and the Tether plugin current")
+        else:
+            report("WARN", "project setup incomplete: " + "; ".join(l.replace("would ", "") for l in text.splitlines()),
+                   "ue init")
+    except (CliError, OSError, ValueError) as exc:
+        report("WARN", f"could not check the project setup: {exc}", "")
+    beacon = ctx.beacon or {}
+    pid = beacon.get("pid")
+    if pid and pid_alive(pid):
+        age = time.time() - beacon.get("heartbeat", 0)
+        stall = stall_report(project)
+        if stall:
+            report("FAIL", f"editor pid {pid}: {stall}", "answer the dialog in the editor, or ue close --force")
+        elif age > 15:
+            report("FAIL", f"editor pid {pid}: no heartbeat for {age:.0f}s (busy or hung)",
+                   "wait for long work to finish; ue status; ue close --force if it never recovers")
+        else:
+            port = beacon.get("mcp_port")
+            reach = "python remote execution" if ctx.transport == "remote" else (
+                f"MCP :{port} " + ("answering" if port and port_open(port) else "NOT answering"))
+            report("ok" if "NOT" not in reach else "FAIL", f"editor pid {pid} ready on {beacon.get('map')}, {reach}",
+                   "" if "NOT" not in reach else "check the ModelContextProtocol plugin is enabled (ue init), then ue close; ue open")
+    else:
+        # A crash only explains the editor's absence if it came after the editor last ran fine.
+        crash = recent_crash(project, max(time.time() - 24 * 3600, beacon.get("heartbeat", 0)))
+        report("ok" if not crash else "WARN", "editor not running" + (f"; it crashed: {crash_summary(crash, 90)}" if crash else ""),
+               "ue crash for details" if crash else "ue open --headless when you need it")
+        port = pick_port(project)
+        if port_open(port):
+            report("WARN", f"port {port} (this project's MCP port) is in use by another program",
+                   "ue open picks the next free port; close the other program to keep this one")
+    others = [(p, c) for p, c in running_editors() if p != pid]
+    if engine and others:
+        same = [(p, c) for p, c in others if os.path.normcase(engine) in os.path.normcase(c)]
+        for p, c in same[:3]:
+            name = next((os.path.basename(t.strip('"')) for t in c.split() if t.strip('"').endswith(".uproject")), "?")
+            report("WARN", f"another editor on this engine: pid {p} ({name})",
+                   "C++ builds (UBT) fail while an editor on the same engine holds Live Coding; close it, or build there")
+    if ctx.transport == "remote":
+        ini = os.path.join(os.path.dirname(project), "Config", "DefaultEngine.ini")
+        enabled = os.path.isfile(ini) and re.search(r"^bRemoteExecution\s*=\s*True", open(ini, encoding="utf-8-sig",
+                                                                                            errors="replace").read(), re.M | re.I)
+        report("ok" if enabled else "WARN", "Python remote execution " + ("enabled" if enabled else "not enabled in DefaultEngine.ini"),
+               "" if enabled else "ue init (ue open also enables it for its session)")
+    if csharp_layout(project):
+        dotnet = shutil.which("dotnet")
+        version = subprocess.run([dotnet, "--version"], capture_output=True, text=True).stdout.strip() if dotnet else ""
+        report("ok" if dotnet else "FAIL", f".NET SDK {version or 'not found'} (UnrealSharp project)",
+               "" if dotnet else "install the .NET SDK 10.0.5 or later")
+    git = shutil.which("git")
+    if git:
+        lfs_needed = os.path.isfile(os.path.join(os.path.dirname(project), ".gitattributes")) and "filter=lfs" in \
+            open(os.path.join(os.path.dirname(project), ".gitattributes"), encoding="utf-8", errors="replace").read()
+        lfs = run_git(project, "lfs", "version", check=False) if lfs_needed else "n/a"
+        report("ok" if lfs else "WARN", "git" + (f", LFS {'installed' if lfs else 'NOT installed'}" if lfs_needed else ""),
+               "" if lfs else "install Git LFS (git lfs install): assets are LFS pointers without it")
+    else:
+        report("WARN", "git not found", "ue diff and ue validate --changed need git")
+    free = shutil.disk_usage(os.path.dirname(project)).free / 1024 ** 3
+    report("ok" if free >= 20 else "WARN", f"{free:.0f} GB free on the project's drive",
+           "" if free >= 20 else "builds, cooks and the DDC need room: free some space")
+    return doctor_print(results)
+
+
+def doctor_print(results):
+    for status, what, fix in results:
+        print(f"{status:<4} {what}" + (f"\n       fix: {fix}" if fix and status != "ok" else ""))
+    bad = sum(1 for s, _, _ in results if s == "FAIL")
+    warn = sum(1 for s, _, _ in results if s == "WARN")
+    print(f"{len(results)} checks: {bad} problem(s), {warn} warning(s)")
+    return 1 if bad else 0
+
+
 def cmd_find(ctx, args):
     print(ctx.tether("find", query=args.query or "", cls=args.cls or "", under=args.under, limit=args.limit))
     return 0
@@ -3705,6 +3839,7 @@ def cmd_selftest(ctx, args):
         raise CliError("the editor is not running or not answering; start it with `ue open --headless --render`", 2)
     remote = ctx.transport == "remote"
     launch = read_json(os.path.join(state_dir(project), "launch.json")) or {}
+    check("doctor", ["doctor"], ok=lambda c, o: "checks:" in o)
     check("py", ["py", "6*7"], ok=lambda c, o: c == 0 and o.endswith("42"))
     check("exec", ["exec", "stat fps"], ok=lambda c, o: c == 0 and "Cmd: stat fps" in o)
     check("actors", ["actors", "--limit", "3"], ok=lambda c, o: c == 0 and "actors" in o.splitlines()[0])
@@ -4888,6 +5023,7 @@ def build_parser():
         return s
 
     add("status", cmd_status, "editor state from the beacon (no HTTP needed)")
+    add("doctor", cmd_doctor, "check the setup (engine, plugins, editor, ports, Live Coding lock, .NET, git/LFS, disk)")
     s = add("open", cmd_open, "launch the editor with the MCP server on a per-project port and wait until ready")
     s.add_argument("--map", help="map to open, e.g. /Game/Maps/Lvl_Test")
     s.add_argument("--headless", action="store_true", help="no window: -nullrhi -nosound (+ -unattended, see below)")

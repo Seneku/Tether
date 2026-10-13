@@ -15,8 +15,8 @@ one process and one editor session for all of them.
 Once the editor is running, talk to it; do not boot it again. Each `ue` call takes tens of
 milliseconds. A `-run=pythonscript` commandlet takes ~25 s and floods the log.
 
-If something behaves unexpectedly, `ue selftest` checks every capability in ~35 s and names what is
-broken or unsupported.
+If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins, editor, Live Coding lock,
+.NET, LFS) in a second, and `ue selftest` checks every capability against the editor and names what is broken.
 
 ## First moves
 - New to the project? `ue overview` (key classes, maps, input, content) before exploring files by hand.

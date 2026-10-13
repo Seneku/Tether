@@ -518,6 +518,19 @@ class Ci(unittest.TestCase):
 
 
 class Crashes(unittest.TestCase):
+    def test_ensure_reports_are_not_crashes(self):
+        project = Project()
+        try:
+            for name, kind in (("UECC-A_0000", "Crash"), ("UECC-B_0000", "Ensure")):
+                folder = os.path.join(project.root, "Saved", "Crashes", name)
+                os.makedirs(folder)
+                ticks = int((time.time() + (10 if kind == "Ensure" else 0)) * 1e7) + 621355968000000000
+                with open(os.path.join(folder, "CrashContext.runtime-xml"), "w") as f:
+                    f.write(f"<CrashType>{kind}</CrashType><TimeOfCrash>{ticks}</TimeOfCrash><ErrorMessage>{kind} x</ErrorMessage>")
+            self.assertEqual(ue.recent_crash(project.uproject, time.time() - 60)["type"], "Crash")
+        finally:
+            project.close()
+
     def test_parse_describe_and_recent(self):
         project = Project()
         try:
