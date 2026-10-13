@@ -12,7 +12,7 @@ from .editor import cmd_build, cmd_close, cmd_crash, cmd_open, cmd_status
 from .calls import (
     cmd_actors, cmd_ai, cmd_anim, cmd_api, cmd_asset, cmd_call, cmd_changes, cmd_config, cmd_delete, cmd_drop,
     cmd_duplicate, cmd_exec, cmd_find, cmd_log, cmd_mat, cmd_mv, cmd_nav, cmd_new, cmd_props, cmd_py, cmd_refs,
-    cmd_foliage, cmd_level, cmd_rm, cmd_save, cmd_savegame, cmd_scatter, cmd_set, cmd_spawn, cmd_tools, cmd_undo, cmd_watch,
+    cmd_foliage, cmd_level, cmd_rm, cmd_statetree, cmd_save, cmd_savegame, cmd_scatter, cmd_set, cmd_spawn, cmd_tools, cmd_undo, cmd_watch,
 )
 from .images import cmd_look, cmd_shot
 from .testing import cmd_test
@@ -315,6 +315,9 @@ def build_parser():
     s = add("anim", cmd_anim, "animation state in PIE: anim BP, montage, curves, its variables, movement")
     s.add_argument("target", help="actor, 'player', or Actor.Component")
     s.add_argument("--editor", action="store_true", help="read the editor level instead of PIE")
+    s = add("statetree", cmd_statetree, "a StateTree as text (states, conditions, tasks, transitions); no asset: list them")
+    s.add_argument("asset", nargs="?", help="/Game/.../ST_Name (default: list the project's StateTrees)")
+    s.add_argument("--pie", action="store_true", help="the PIE world's StateTree components, with tree and run status")
     s = add("ai", cmd_ai, "AI in PIE: movement/path, focus, perception, brain, blackboard, project getters")
     s.add_argument("target", nargs="?", help="a pawn or controller (default: one line per AI)")
     s = add("new", cmd_new, "create an asset: blueprint, material, mi, datatable, dataasset, level, folder")

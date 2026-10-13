@@ -175,6 +175,7 @@ def cmd_selftest(ctx, args):
           skip=edit_skip, ok=lambda c, o: c == 0 and "added Body" in o and "BasicShapes/Cube" in o)
     check("rm (new asset)", ["rm", "/Game/TetherSelftest/BP_SelftestNew"], skip=None if created else "nothing created",
           ok=lambda c, o: c == 0 and "deleted" in o)
+    check("statetree", ["statetree"], ok=lambda c, o: (c == 0 and "StateTree asset(s)" in o) or "needs the StateTree" in o)
     check("level check", ["level", "check"], ok=lambda c, o: c == 0 and "actors checked" in o)
     check("landscape", ["landscape"], ok=lambda c, o: (c == 0 and "paint layers" in o) or "no landscape" in o)
     check("foliage", ["foliage"], ok=lambda c, o: c == 0 and "foliage instance(s)" in o)

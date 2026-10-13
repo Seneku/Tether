@@ -433,3 +433,8 @@ def cmd_level(ctx, args):
     ctx.data = data
     return 1 if data["issues"] and args.strict else 0
 
+
+def cmd_statetree(ctx, args):
+    print(ctx.tether("statetree", target=args.asset or "-", pie=args.pie))
+    return 0
+

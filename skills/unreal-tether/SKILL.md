@@ -225,6 +225,8 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
   speed). Python cannot read state machine states; the variables the transitions use usually tell you.
 - Audio in PIE: `ue audio` lists what is playing (needs `ue open --headless --sound`, which stays silent);
   `expect-sound <regex>` as a `ue pie do` step checks a sound fires.
+- AI built on StateTree: `ue statetree /Game/AI/ST_Enemy` prints the whole tree as text (states, enter conditions,
+  tasks, transitions); read it before changing AI behaviour. `ue statetree --pie` shows each component's run status.
 - AI in PIE: `ue ai` (one line per AI), `ue ai <pawn>` (movement, focus, perception, brain, blackboard, and the
   project's getters). State a C++ class keeps in plain members is invisible: suggest exposing it as a
   `UFUNCTION(BlueprintPure)` getter.

@@ -1359,6 +1359,93 @@ def _mat_set_default(expr, text):
 _MISSING = object()
 
 
+def _enum_name(value):
+    """An enum value's name in one spelling: 'GOTO_STATE', 'GotoState' and 'EStateTreeTransitionType::GotoState'
+    all become 'gotostate'."""
+    name = getattr(value, "name", None)
+    if not isinstance(name, str):
+        text = str(value).strip("<> ").split(":")[0] if str(value).startswith("<") else str(value)
+        name = text.split("::")[-1].split(".")[-1]
+    return name.replace("_", "").lower()
+
+
+def _statetree_lines(tree):
+    """A StateTree as indented text: evaluators, global tasks, then each state with its enter conditions,
+    tasks and transitions (Epic's StateTreeEditorData, described the way the editor describes nodes)."""
+    ed = unreal.StateTreeEditorData.get_editor_data(tree)
+    if ed is None:
+        raise RuntimeError(f"{tree.get_name()} has no editor data")
+
+    def describe(node):
+        text = _try(lambda: str(ed.get_node_description(node)), "") or ""
+        text = re.sub(r"<[^>]+>", "", text).strip()  # the editor's rich-text markup
+        if not text:
+            inner = _try(lambda: node.get_editor_property("node"))
+            text = _try(lambda: inner.get_editor_property("name"), "") or _try(lambda: str(inner.get_script_struct().get_name()), "?")
+        return text
+
+    def target(link):
+        kind = _enum_name(_try(lambda: link.get_editor_property("link_type"), ""))
+        name = str(_try(lambda: link.get_editor_property("name"), "") or "")
+        return {"gotostate": name or "?", "nextstate": "the next state", "nextselectablestate": "the next selectable state",
+                "succeeded": "succeed", "failed": "fail", "none": "nothing"}.get(kind, f"{kind} {name}".strip())
+
+    def tag_name(tag):
+        name = str(_try(lambda: tag.get_editor_property("tag_name"), "") or "")
+        return "" if name in ("None", "") else name
+
+    lines = [f"{tree.get_name()} (schema {_try(lambda: ed.get_editor_property('schema').get_class().get_name(), '?')})"]
+    for label, nodes in (("evaluators", _try(lambda: list(ed.get_editor_property("evaluators")), [])),
+                         ("global tasks", _try(lambda: list(ed.get_editor_property("global_tasks")), []))):
+        if nodes:
+            lines.append(f"{label}: " + "; ".join(describe(n) for n in nodes))
+    count = [0]
+
+    def walk(state, depth):
+        count[0] += 1
+        pad = "  " * depth
+        kind = _enum_name(_try(lambda: state.get_editor_property("type"), ""))
+        select = _enum_name(_try(lambda: state.get_editor_property("selection_behavior"), ""))
+        enabled = _try(lambda: state.get_editor_property("enabled"), True)
+        head = f"{pad}{state.get_editor_property('name')}" + ("" if kind in ("", "state") else f" ({kind})")
+        if select and select not in ("tryenterstate", "tryselectchildreninorder"):
+            head += f" [select: {select}]"
+        lines.append(head + ("" if enabled else "  (disabled)"))
+        conditions = _try(lambda: list(state.get_editor_property("enter_conditions")), [])
+        if conditions:
+            lines.append(f"{pad}  enter if: " + " and ".join(describe(c) for c in conditions))
+        tasks = _try(lambda: list(state.get_editor_property("tasks")), [])
+        if tasks:
+            lines.append(f"{pad}  tasks: " + "; ".join(describe(t) for t in tasks))
+        linked = _try(lambda: state.get_editor_property("linked_subtree"))
+        linked_name = str(_try(lambda: linked.get_editor_property("name"), "") or "") if linked else ""
+        if linked_name and linked_name != "None":
+            lines.append(f"{pad}  runs subtree: {linked_name}")
+        asset = _try(lambda: state.get_editor_property("linked_asset"))
+        if asset:
+            lines.append(f"{pad}  runs: {asset.get_name()}")
+        for tr in _try(lambda: list(state.get_editor_property("transitions")), []):
+            trigger = {"onstatecompleted": "when done", "onstatesucceeded": "on success", "onstatefailed": "on failure",
+                       "ontick": "every tick", "onevent": "on event", "ondelegate": "on delegate"}.get(
+                _enum_name(_try(lambda: tr.get_editor_property("trigger"), "")), "")
+            event = tag_name(_try(lambda: tr.get_editor_property("required_event").get_editor_property("tag"))) or tag_name(
+                _try(lambda: tr.get_editor_property("event_tag")))
+            if event:
+                trigger += f" {event}"
+            conds = _try(lambda: list(tr.get_editor_property("conditions")), [])
+            delay = _try(lambda: tr.get_editor_property("delay_duration"), 0.0) if _try(lambda: tr.get_editor_property("delay_transition"), False) else 0
+            on = _try(lambda: tr.get_editor_property("enabled"), True)
+            lines.append(f"{pad}  -> {target(tr.get_editor_property('state'))} {trigger.strip()}"
+                         + (f" if {' and '.join(describe(c) for c in conds)}" if conds else "")
+                         + (f" after {delay:g}s" if delay else "") + ("" if on else " (disabled)"))
+        for child in _try(lambda: list(state.get_editor_property("children")), []):
+            walk(child, depth + 1)
+    for root in list(ed.get_editor_property("sub_trees")):
+        walk(root, 0)
+    lines[0] += f", {count[0]} state(s)"
+    return lines
+
+
 def _rot_tuple(rot):
     return rot.pitch, rot.yaw, rot.roll
 
@@ -2129,6 +2216,50 @@ class TetherCore(_Base):
         zs = [a.get_actor_location().z for a in placed]
         return (f"placed {len(placed)} of {count} {prefix}" + (f" (z {min(zs):.0f} to {max(zs):.0f})" if zs else "")
                 + (": " + "; ".join(notes) if notes else "") + (f"; labels {prefix}_01.." if placed else ""))
+
+    @_tool
+    @staticmethod
+    def statetree(target: str = "-", pie: bool = False) -> str:
+        """A StateTree asset as text (states, enter conditions, tasks, transitions, evaluators, global tasks), the
+        project's StateTree assets, or in PIE each StateTree component with its tree and run status.
+
+        Args:
+            target: A StateTree asset path; '-' lists the assets (or, with pie, the components).
+            pie: List the PIE world's StateTree components instead.
+
+        Returns:
+            Text.
+        """
+        if getattr(unreal, "StateTreeEditorData", None) is None:
+            raise RuntimeError("needs the StateTree plugin (enable StateTree / GameplayStateTree)")
+        if pie:
+            game = _game_world()
+            if game is None:
+                raise RuntimeError("PIE is not running (ue pie start)")
+            component_class = getattr(unreal, "StateTreeComponent", None)
+            if component_class is None:
+                raise RuntimeError("no StateTree components: GameplayStateTree is not enabled")
+            rows = []
+            for actor in unreal.GameplayStatics.get_all_actors_of_class(game, unreal.Actor):
+                for comp in actor.get_components_by_class(component_class):
+                    ref = _try(lambda: comp.get_editor_property("state_tree_ref"))
+                    tree = _try(lambda: ref.get_editor_property("state_tree")) if ref else None
+                    tree = tree or _try(lambda: comp.get_editor_property("state_tree"))
+                    status = _enum_name(_try(lambda: comp.get_state_tree_run_status(), "?"))
+                    rows.append(f"{_label(actor)}: {tree.get_name() if tree else 'no tree'}, {status}"
+                                + ("" if _try(lambda: comp.is_active(), True) else ", inactive"))
+            return _capped(f"{len(rows)} StateTree component(s) in PIE (Python cannot read the active state; "
+                           "`ue statetree <asset>` shows the states)", rows, 60)
+        if target in ("", "-"):
+            registry = unreal.AssetRegistryHelpers.get_asset_registry()
+            found = registry.get_assets(unreal.ARFilter(
+                class_paths=[unreal.TopLevelAssetPath("/Script/StateTreeModule", "StateTree")], recursive_classes=True))
+            names = sorted(str(d.package_name) for d in found if str(d.package_name).startswith("/Game"))
+            return _capped(f"{len(names)} StateTree asset(s)", names, 60)
+        tree = unreal.load_asset(target.split(".")[0])
+        if not isinstance(tree, unreal.StateTree):
+            raise RuntimeError(f"{target} is not a StateTree (ue statetree lists them)")
+        return "\n".join(_statetree_lines(tree))
 
     @_tool
     @staticmethod
