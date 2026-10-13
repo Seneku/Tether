@@ -2416,6 +2416,111 @@ class TetherCore(_Base):
 
     @_tool
     @staticmethod
+    def wp(action: str = "info", match: str = "", area: str = "-", limit: int = 60, token: str = "") -> str:
+        """World Partition in the editor: a summary (actors in total and loaded, data layers, runtime grids), every
+        actor including unloaded ones (from actor descriptors), or loading/unloading actors by area or name so
+        other commands can see them.
+
+        Args:
+            action: info, actors, load or unload.
+            match: Regex on actor label, name or class (actors, load, unload).
+            area: 'x,y,radius' for load/unload (and to narrow actors).
+            limit: Maximum rows.
+            token: Session token from Saved/Tether/editors/<pid>.token (the ue CLI sends it; load/unload).
+
+        Returns:
+            Text.
+        """
+        lib = unreal.WorldPartitionBlueprintLibrary
+        descs = _try(lambda: list(lib.get_actor_descs() or []), None)
+        if not descs:
+            raise RuntimeError("the edited level is not a World Partition level (or has no actors)")
+        world = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_editor_world()
+        key = lambda guid: _try(lambda: guid.export_text(), "") if guid is not None else ""  # noqa: E731
+        loaded = {key(_try(lambda: a.get_editor_property("actor_guid"))) for a in
+                  unreal.get_editor_subsystem(unreal.EditorActorSubsystem).get_all_level_actors()}
+        rx = re.compile(match, re.I) if match else None
+        circle = _numbers(area) if area not in ("", "-") else None
+
+        def info(d):
+            return {k: _try(lambda: d.get_editor_property(k)) for k in
+                    ("label", "name", "class_", "native_class", "guid", "bounds", "is_spatially_loaded", "runtime_grid",
+                     "data_layer_assets", "actor_is_editor_only")}
+
+        def centre(i):
+            b = i["bounds"]
+            return ((b.min.x + b.max.x) / 2, (b.min.y + b.max.y) / 2, (b.min.z + b.max.z) / 2) if b else (0, 0, 0)
+
+        def class_name(i):
+            for c in (i["class_"], i["native_class"]):
+                text = _try(lambda: c.export_text(), "") if c is not None else ""
+                if text and text != "None":
+                    return text.strip("'\"").rsplit(".", 1)[-1]
+            return "?"
+        rows = [info(d) for d in descs]
+
+        def selected(i):
+            if not rx and (class_name(i).startswith("WorldPartitionHLOD") or str(i["label"] or "").startswith("HLOD")):
+                return False  # generated HLOD proxies: only when asked for by name
+            if rx and not (rx.search(str(i["label"] or "")) or rx.search(str(i["name"] or "")) or rx.search(class_name(i))):
+                return False
+            if circle:
+                x, y, _ = centre(i)
+                return (x - circle[0]) ** 2 + (y - circle[1]) ** 2 <= circle[2] ** 2
+            return True
+        if action == "info":
+            in_memory = sum(1 for i in rows if key(i["guid"]) in loaded)
+            always = sum(1 for i in rows if not i["is_spatially_loaded"])
+            layers, grids = {}, {}
+            for i in rows:
+                for layer in i["data_layer_assets"] or []:
+                    layers[_try(lambda: layer.get_name(), str(layer))] = layers.get(_try(lambda: layer.get_name(), str(layer)), 0) + 1
+                grid = str(i["runtime_grid"] or "")
+                if grid and grid != "None":
+                    grids[grid] = grids.get(grid, 0) + 1
+            bounds = _try(lambda: lib.get_editor_world_bounds())
+            size = f", {(bounds.max.x - bounds.min.x) / 100:.0f} x {(bounds.max.y - bounds.min.y) / 100:.0f} m" if bounds else ""
+            lines = [f"{world.get_outermost().get_name()}: {len(rows)} actors{size}, {in_memory} loaded in the editor, "
+                     f"{always} always loaded (not spatially loaded)"]
+            if layers:
+                lines.append("data layers: " + ", ".join(f"{n} ({c})" for n, c in sorted(layers.items())))
+            if grids:
+                lines.append("runtime grids: " + ", ".join(f"{n} ({c})" for n, c in sorted(grids.items())))
+            unloaded = len(rows) - in_memory
+            if unloaded:
+                lines.append(f"{unloaded} actor(s) are not loaded: other ue commands do not see them until "
+                             "`ue wp load x,y,r` or `ue wp load <regex>`")
+            return "\n".join(lines)
+        if action == "actors":
+            picked = [i for i in rows if selected(i)]
+            out = []
+            for i in sorted(picked, key=lambda i: str(i["label"] or i["name"]))[:limit]:
+                x, y, z = centre(i)
+                out.append(f"{'*' if key(i['guid']) in loaded else ' '} {i['label'] or i['name']}  {class_name(i)}  "
+                           f"({x:.0f}, {y:.0f}, {z:.0f})" + ("" if i["is_spatially_loaded"] else "  always loaded"))
+            return _capped(f"{len(picked)} actor(s) (* = loaded in the editor)", out, limit) if len(out) == len(picked) \
+                else "\n".join([f"{len(picked)} actor(s) (* = loaded in the editor)"] + out + [f"... +{len(picked) - limit} more"])
+        if action in ("load", "unload"):
+            _authorize(token)
+            if not (rx or circle):
+                raise RuntimeError(f"{action} what? an area 'x,y,radius' or a name regex")
+            picked = [i for i in rows if selected(i)]
+            guids = [i["guid"] for i in picked if (key(i["guid"]) in loaded) == (action == "unload")]
+            if guids:
+                (lib.load_actors if action == "load" else lib.unload_actors)(guids)
+            now = {key(_try(lambda: a.get_editor_property("actor_guid"))) for a in
+                   unreal.get_editor_subsystem(unreal.EditorActorSubsystem).get_all_level_actors()}
+            changed = sum(1 for g in guids if (key(g) in now) == (action == "load"))
+            text = f"{action}ed {changed} actor(s)" + (f" ({len(picked) - len(guids)} already {action}ed)"
+                                                      if len(picked) > len(guids) else "")
+            if action == "unload" and changed < len(guids):
+                text += (f"; {len(guids) - changed} stay loaded: the editor's own loaded regions hold them "
+                         "(unload releases what `ue wp load` loaded)")
+            return text
+        raise RuntimeError("action: info, actors, load or unload")
+
+    @_tool
+    @staticmethod
     def lights(limit: int = 60) -> str:
         """The edited level's lighting in one view: every light (type, mobility, intensity, colour, radius,
         shadows, IES, light function), sky light, height fog, post-process exposure, and notes on what commonly

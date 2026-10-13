@@ -73,6 +73,8 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
   `... set #3 value=0.5`, `... delete #7`; each recompiles. Instances: `ue mat MI Name=value`.
 - Lighting and mood: `ue lights` lists lights, sky, fog and exposure with notes (e.g. auto exposure undoing a dark
   scene); check it before and after lighting changes, together with `ue shot`.
+- World Partition levels: other commands only see loaded actors. `ue wp` says how many are loaded; `ue wp actors
+  Door` finds unloaded ones; `ue wp load x,y,r` (or `ue wp load <regex>`) loads them before you work on them.
 - After placing or scattering things: `ue level check` finds floating or buried props, stacked duplicates,
   invisible walls and overlapping stationary lights; `ue drop <actor>` fixes a floating one.
 - Terrain: `ue landscape` (size, layers), `ue landscape at x,y` (height, slope, layer weights: use it before placing

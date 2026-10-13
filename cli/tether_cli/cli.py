@@ -12,7 +12,7 @@ from .editor import cmd_build, cmd_close, cmd_crash, cmd_open, cmd_status
 from .calls import (
     cmd_actors, cmd_ai, cmd_anim, cmd_api, cmd_asset, cmd_call, cmd_changes, cmd_config, cmd_delete, cmd_drop,
     cmd_duplicate, cmd_exec, cmd_find, cmd_log, cmd_mat, cmd_mv, cmd_nav, cmd_new, cmd_props, cmd_py, cmd_refs,
-    cmd_class, cmd_collision, cmd_foliage, cmd_lights, cmd_level, cmd_rm, cmd_statetree, cmd_trace, cmd_save, cmd_savegame, cmd_scatter, cmd_set, cmd_spawn, cmd_tools, cmd_undo, cmd_watch,
+    cmd_class, cmd_collision, cmd_foliage, cmd_lights, cmd_wp, cmd_level, cmd_rm, cmd_statetree, cmd_trace, cmd_save, cmd_savegame, cmd_scatter, cmd_set, cmd_spawn, cmd_tools, cmd_undo, cmd_watch,
 )
 from .images import cmd_look, cmd_shot
 from .testing import cmd_test
@@ -147,6 +147,9 @@ def build_parser():
     s.add_argument("--px", type=int, default=128, help="map: pixels per side (128, max 256)")
     s.add_argument("-o", "--output", help="map: PNG path (default Saved/Tether/shots/)")
     s.add_argument("--backup", help="restore: the backup file an edit printed")
+    s = add("wp", cmd_wp, "World Partition: info, actors [regex|x,y,r] (unloaded too), load|unload <x,y,r|regex>")
+    s.add_argument("action", nargs="?", default="info", choices=["info", "actors", "load", "unload"])
+    s.add_argument("where", nargs="?", help="a name/class regex, or an area x,y,radius")
     add("lights", cmd_lights, "lighting overview: lights, sky, fog, exposure, and what commonly goes wrong")
     s = add("trace", cmd_trace, "what a trace hits (PIE by default): from the player's view, or between points/actors")
     s.add_argument("--from", dest="start", default="player", help="player (PIE camera), camera (editor view), an actor, or x,y,z")

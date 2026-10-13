@@ -546,3 +546,12 @@ def cmd_lights(ctx, args):
     print(ctx.tether("lights", limit=args.limit))
     return 0
 
+
+def cmd_wp(ctx, args):
+    """World Partition: summary, all actors (loaded or not), load/unload by area or name."""
+    where = args.where or ""
+    area = where if re.fullmatch(r"\s*-?[\d.]+\s*,\s*-?[\d.]+\s*,\s*[\d.]+\s*", where) else "-"
+    match = "" if area != "-" else where
+    print(ctx.tether("wp", action=args.action, match=match, area=area, limit=args.limit))
+    return 0
+
