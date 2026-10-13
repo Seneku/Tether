@@ -170,6 +170,10 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
   character creates in C++), call, expect/until (`= != < > <= >= ~`), log, exists/gone, wait, exec, shot.
   Each step prints ok/FAIL; it stops at the first failure. Write the step file once and rerun it after changes.
   Keep step files in `tests/play/` with a `# map: /Game/...` line: `ue ci --play` runs them all as regression tests.
+- To turn the user's own play-through into a test: ask them to run `ue pie record -o tests/play/<name>.txt` in a
+  windowed editor and play (it stops when they stop PIE). The file replays with `ue pie do -f`: keys become
+  `tap`/`hold`/`release` of their input actions, mouse look becomes `look` steps, ending with a `near` check.
+  Add `expect` steps for what should have happened.
 - To see how values change during play (instead of adding print nodes): `ue pie watch player.Health
   BP_Enemy_C_1.State BP_Enemy_C_1 --seconds 10` (an actor alone = its location; `-f steps.txt` plays a step file
   while watching). Prints each value's range, path or changes with times; the full samples go to a CSV.

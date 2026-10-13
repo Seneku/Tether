@@ -380,6 +380,8 @@ def filter_log(lines, level="Warning", category=None, pattern=None):
         cat, lvl, msg = m.group(1), m.group(2) or "Log", m.group(3)
         if cat in NOISE or (cat == "Cmd" and msg.strip() == "FLUSHLOG") or (cat == "LogJson" and NOISE_MESSAGE.match(msg)):
             continue
+        if cat == "LogConsoleManager" and "FindConsoleObject() for 'FLUSHLOG'" in msg:  # our own log flushes
+            continue
         if copy_frames and (TETHER_COPY.search(line) or (cat in ("BlueprintLog", "LogBlueprint", "LogK2Compiler")
                                                           and frame(line) in copy_frames)):
             continue

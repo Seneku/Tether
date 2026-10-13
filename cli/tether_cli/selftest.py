@@ -237,6 +237,8 @@ def cmd_selftest(ctx, args):
           ok=lambda c, o: c == 0 and "PASS" in o)
     check("pie watch", ["pie", "watch", "player", "--seconds", "1"],
           ok=lambda c, o: c == 0 and "sample(s)" in o and "player  " in o)
+    check("pie record", ["pie", "record", "--seconds", "1", "-o", os.path.join(tempfile.gettempdir(), "tether-selftest-rec.txt")],
+          ok=lambda c, o: (c == 0 and "recorded" in o) or "no keys to record" in o)
     check("ui", ["ui"], ok=lambda c, o: c == 0)
     check("ai", ["ai"], ok=lambda c, o: c == 0 and ("AI" in o))
     check("audio", ["audio"], skip=None if launch.get("sound", not launch.get("headless")) else "no audio device (ue open --headless --sound)",

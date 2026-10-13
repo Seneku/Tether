@@ -1160,6 +1160,46 @@ class PieWatch(unittest.TestCase):
         self.assertEqual(rows[3], "1.0,1.0,60,300,400,0,Chase,")
 
 
+class PieRecord(unittest.TestCase):
+    MAPPINGS = [{"context": "IMC", "action": "IA_Jump", "type": "boolean", "key": "SpaceBar", "modifiers": []},
+                {"context": "IMC", "action": "IA_Use", "type": "boolean", "key": "E", "modifiers": []},
+                {"context": "IMC_UI", "action": "IA_Confirm", "type": "boolean", "key": "E", "modifiers": []},
+                {"context": "IMC", "action": "IA_Move", "type": "axis2d", "key": "W", "modifiers": ["swizzle:YXZ"]},
+                {"context": "IMC", "action": "IA_Move", "type": "axis2d", "key": "A", "modifiers": ["negate:xyz"]}]
+
+    def steps(self, events, **kw):
+        lines = ue.record_steps({"mappings": self.MAPPINGS, "active": ["IMC"], "events": events, "seconds": 4}, **kw)
+        return [l for l in lines if not l.startswith("#")]
+
+    def test_keys_become_action_steps_with_modifiers(self):
+        steps = self.steps([[0.0, "pose", [0, 0, 90], [0.0, 0.0], [0, 0, 150]],
+                            [0.5, "down", "W"], [1.0, "down", "A"], [1.5, "up", "W"], [2.0, "up", "A"],
+                            [2.2, "down", "SpaceBar"], [2.3, "up", "SpaceBar"], [2.6, "down", "E"], [3.4, "up", "E"],
+                            [3.5, "pose", [300, -100, 90], [0.0, 0.0], [300, -100, 150]]])
+        self.assertEqual(steps, ["at 0,0,90", "look 1000,0,150", "wait 0.5", "hold IA_Move 0,1", "wait 0.5",
+                                 "hold IA_Move -1,1", "wait 0.5", "hold IA_Move -1,0", "wait 0.5", "release IA_Move",
+                                 "wait 0.2", "tap IA_Jump", "wait 0.4", "hold IA_Use", "wait 0.8", "release IA_Use",
+                                 "wait 0.1", "near 300,-100,90 500"])
+
+    def test_turning_adds_look_steps_and_aims_before_a_press(self):
+        steps = self.steps([[0.0, "pose", [0, 0, 90], [0.0, 0.0], [0, 0, 100]],
+                            [1.0, "pose", [0, 0, 90], [0.0, 90.0], [0, 0, 100]],
+                            [1.5, "pose", [0, 0, 90], [0.0, 95.0], [0, 0, 100]],
+                            [1.6, "down", "SpaceBar"], [1.65, "up", "SpaceBar"]])
+        self.assertEqual(steps[2:], ["wait 1", "look 0,1000,100", "wait 0.6", "look -87,996,100", "tap IA_Jump",
+                                     "near 0,0,90 500"])
+
+    def test_map_header_and_unreleased_holds(self):
+        lines = ue.record_steps({"mappings": self.MAPPINGS, "active": ["IMC"], "seconds": 2,
+                                 "events": [[0.5, "down", "W"], [1.0, "down", "SpaceBar"]]}, "/Game/Maps/L")
+        self.assertEqual(lines[0], "# map: /Game/Maps/L")
+        self.assertEqual(lines[-2:], ["release IA_Jump", "release IA_Move"])
+
+    def test_modifiers(self):
+        self.assertEqual(ue.playtest._apply_modifiers((1, 0, 0), ["swizzle:YXZ", "negate:y"]), [0, -1, 0])
+        self.assertEqual(ue.playtest._apply_modifiers((1, 0, 0), ["scalar:0.5,1,1"]), [0.5, 0, 0])
+
+
 class JsonEnvelope(unittest.TestCase):
     def run_json(self, project, *argv):
         out = io.StringIO()

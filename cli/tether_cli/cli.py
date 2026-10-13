@@ -199,9 +199,11 @@ def build_parser():
     s.add_argument("--expect", action="append", help="with run: log regex that must appear (repeatable)")
     s.add_argument("--reject", action="append", help="with run/do: log regex that must not appear (repeatable)")
     s.add_argument("--seconds", type=float, help="with run: how long to wait for expectations (5); with watch: how long "
-                                                 "to sample (10, or until the -f steps finish)")
+                                                 "to sample (10, or until the -f steps finish); with record: stop "
+                                                 "after this long (default: when PIE stops)")
     s.add_argument("--every", type=float, default=0.1, help="with watch: seconds between samples (0.1)")
-    s.add_argument("-o", "--output", help="with watch: CSV path (default Saved/Tether/watch/watch-<time>.csv)")
+    s.add_argument("-o", "--output", help="with watch: CSV path (default Saved/Tether/watch/); with record: step file "
+                                               "(default Saved/Tether/recordings/)")
     s.add_argument("--keep", action="store_true", help="with run/do: leave PIE running afterwards")
     s.add_argument("--simulate", action="store_true", help="Simulate-In-Editor (no player pawn)")
     s.add_argument("--warmup", type=float, default=0.5, help="seconds to let BeginPlay settle (0.5)")
