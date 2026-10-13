@@ -541,3 +541,8 @@ def set_assets(ctx, args):
     ctx.data = data
     return 1 if failed and len(failed) == len(rows) else 0
 
+
+def cmd_lights(ctx, args):
+    print(ctx.tether("lights", limit=args.limit))
+    return 0
+

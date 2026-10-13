@@ -187,6 +187,7 @@ def cmd_selftest(ctx, args):
     check("anim graph", ["anim", "graph", "/Engine/Tutorial/SubEditors/TutorialAssets/Character/TutorialTPP_AnimBlueprint"],
           ok=lambda c, o: (c == 0 and "Output Pose <-" in o) or "is not an Animation Blueprint" in o)
     check("statetree", ["statetree"], ok=lambda c, o: (c == 0 and "StateTree asset(s)" in o) or "needs the StateTree" in o)
+    check("lights", ["lights"], ok=lambda c, o: c == 0 and "light(s)" in o and "project default" in o)
     check("level check", ["level", "check"], ok=lambda c, o: c == 0 and "actors checked" in o)
     check("landscape", ["landscape"], ok=lambda c, o: (c == 0 and "paint layers" in o) or "no landscape" in o)
     check("foliage", ["foliage"], ok=lambda c, o: c == 0 and "foliage instance(s)" in o)

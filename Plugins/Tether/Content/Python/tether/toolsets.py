@@ -2416,6 +2416,130 @@ class TetherCore(_Base):
 
     @_tool
     @staticmethod
+    def lights(limit: int = 60) -> str:
+        """The edited level's lighting in one view: every light (type, mobility, intensity, colour, radius,
+        shadows, IES, light function), sky light, height fog, post-process exposure, and notes on what commonly
+        goes wrong (auto exposure lifting intended darkness, huge radii, costly shadowing lights).
+
+        Args:
+            limit: Maximum light rows.
+
+        Returns:
+            Text.
+        """
+        world = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_editor_world()
+        actors = unreal.get_editor_subsystem(unreal.EditorActorSubsystem).get_all_level_actors()
+        get = lambda obj, prop, default=None: _try(lambda: obj.get_editor_property(prop), default)  # noqa: E731
+
+        def colour(c):
+            if not c:
+                return "?"
+            if isinstance(c, unreal.Color):  # 0-255 bytes
+                return f"rgb({c.r}, {c.g}, {c.b})"
+            return f"({c.r:.2f}, {c.g:.2f}, {c.b:.2f})"
+        rows, notes, counts = [], [], {}
+        movable_shadows = 0
+        for actor in actors:
+            comp = None
+            if isinstance(actor, unreal.Light):
+                comp = get(actor, "light_component")
+            elif isinstance(actor, unreal.SkyLight):
+                comp = get(actor, "light_component")
+            if comp is None:
+                continue
+            kind = comp.get_class().get_name().replace("Component", "").replace("Light", " light").strip().lower()
+            mobility = _enum_name(get(comp, "mobility", "?"))
+            counts[mobility] = counts.get(mobility, 0) + 1
+            visible = get(comp, "visible", True) and not get(actor, "hidden", False)
+            shadows = get(comp, "cast_shadows", False)
+            if shadows and mobility == "movable" and not isinstance(actor, unreal.SkyLight):
+                movable_shadows += 1
+            parts = [f"{kind:<15} {_label(actor):<24} {mobility}"]
+            intensity = get(comp, "intensity")
+            units = _enum_name(get(comp, "intensity_units", "")) if not isinstance(comp, (unreal.DirectionalLightComponent,
+                                                                                          unreal.SkyLightComponent)) else ""
+            unit_text = {"candelas": "cd", "lumens": "lm", "unitless": "", "ev": "EV"}.get(units, units)
+            if isinstance(comp, unreal.DirectionalLightComponent):
+                unit_text = "lux"
+            if intensity is not None:
+                parts.append(f"intensity {intensity:g}" if isinstance(comp, unreal.SkyLightComponent)
+                             else f"{intensity:g} {unit_text}".strip())
+            if not isinstance(comp, unreal.SkyLightComponent):
+                parts.append(colour(get(comp, "light_color")))
+                if get(comp, "use_temperature", False):
+                    parts.append(f"{get(comp, 'temperature', 6500):.0f} K")
+            radius = get(comp, "attenuation_radius")
+            if radius is not None:
+                parts.append(f"radius {radius / 100:g} m")
+                if radius > 5000:
+                    notes.append(f"{_label(actor)}: {radius / 100:g} m radius (cost grows with what it reaches)")
+            if isinstance(comp, unreal.SpotLightComponent):
+                parts.append(f"cone {get(comp, 'outer_cone_angle', 0):g} deg")
+            parts.append("shadows" if shadows else "no shadows")
+            if get(comp, "ies_texture"):
+                parts.append(f"IES {get(comp, 'ies_texture').get_name()}")
+            if get(comp, "light_function_material"):
+                parts.append(f"light function {get(comp, 'light_function_material').get_name()}")
+            if isinstance(comp, unreal.SkyLightComponent):
+                parts.append("real-time capture" if get(comp, "real_time_capture", False) else
+                             _enum_name(get(comp, "source_type", "")).replace("sls", "source: "))
+            if isinstance(comp, unreal.DirectionalLightComponent) and get(comp, "atmosphere_sun_light", False):
+                parts.append("atmosphere sun")
+            volumetric = get(comp, "volumetric_scattering_intensity", 1.0)
+            if volumetric not in (None, 1.0):
+                parts.append(f"volumetric x{volumetric:g}")
+            rows.append("  ".join(parts) + ("" if visible else "  (hidden)"))
+        lines = [f"{len(rows)} light(s): " + ", ".join(f"{n} {m}" for m, n in sorted(counts.items()))
+                 + (f"; {movable_shadows} movable shadow-casting" if movable_shadows else "")]
+        lines += rows[:limit] + ([f"... +{len(rows) - limit} more"] if len(rows) > limit else [])
+        for fog in [a for a in actors if isinstance(a, unreal.ExponentialHeightFog)]:
+            comp = get(fog, "component")
+            if comp:
+                lines.append(f"fog {_label(fog)}: density {get(comp, 'fog_density', 0):g}, height falloff "
+                             f"{get(comp, 'fog_height_falloff', 0):g}, inscattering {colour(get(comp, 'fog_inscattering_luminance') or get(comp, 'fog_inscattering_color'))}"
+                             + (", volumetric fog" if get(comp, "volumetric_fog", False) else ""))
+        auto_exposure = None
+        for volume in [a for a in actors if isinstance(a, unreal.PostProcessVolume)]:
+            settings = get(volume, "settings")
+            if settings is None:
+                continue
+            bits = []
+            if get(settings, "override_auto_exposure_method", False):
+                method = _enum_name(get(settings, "auto_exposure_method", "")).replace("aem", "")
+                bits.append(f"exposure {method}")
+                auto_exposure = method != "manual"
+            if get(settings, "override_auto_exposure_min_brightness", False) or get(settings, "override_auto_exposure_max_brightness", False):
+                bits.append(f"EV100 {get(settings, 'auto_exposure_min_brightness', 0):g}..{get(settings, 'auto_exposure_max_brightness', 0):g}")
+            if get(settings, "override_auto_exposure_bias", False):
+                bits.append(f"compensation {get(settings, 'auto_exposure_bias', 0):g}")
+            if get(settings, "override_bloom_intensity", False):
+                bits.append(f"bloom {get(settings, 'bloom_intensity', 0):g}")
+            scope = "unbound" if get(volume, "unbound", False) else "bounded"
+            lines.append(f"post process {_label(volume)} ({scope}, priority {get(volume, 'priority', 0):g}): "
+                         + (", ".join(bits) if bits else "no exposure overrides"))
+        project_auto = True
+        config = os.path.join(unreal.Paths.convert_relative_path_to_full(unreal.Paths.project_config_dir()), "DefaultEngine.ini")
+        try:
+            with open(config, encoding="utf-8-sig", errors="replace") as f:
+                m = re.search(r"^r\.DefaultFeature\.AutoExposure\s*=\s*(\w+)", f.read(), re.M | re.I)
+                if m:
+                    project_auto = m.group(1).lower() in ("1", "true")
+        except OSError:
+            pass
+        lines.append(f"project default: auto exposure {'on' if project_auto else 'off'} (r.DefaultFeature.AutoExposure)")
+        if auto_exposure or (auto_exposure is None and project_auto):
+            notes.append("auto exposure is on: the camera brightens dark areas toward middle grey, so intended darkness "
+                         "fades in; for a dark game use Manual exposure or raise the minimum EV100 in an unbound post "
+                         "process volume")
+        if movable_shadows > 6:
+            notes.append(f"{movable_shadows} movable lights cast shadows (each costs shadow depth passes every frame)")
+        if notes:
+            lines.append("notes:")
+            lines += [f"  - {n}" for n in notes[:12]]
+        return "\n".join(lines)
+
+    @_tool
+    @staticmethod
     def class_info(name: str, limit: int = 40) -> str:
         """A class at a glance, C++ or Blueprint: parent chain, its own properties (with Blueprint access) and
         functions, a Blueprint's variables, components, functions and events, the classes and Blueprints that

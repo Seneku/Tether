@@ -71,6 +71,8 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
 - Materials as text: `ue mat graph /Game/X/M_Rock` (outputs, nodes, wiring). Edit in small steps:
   `ue mat graph M add ScalarParameter Wetness 0.2`, `... connect Wetness Lerp.Alpha`, `... connect Lerp BaseColor`,
   `... set #3 value=0.5`, `... delete #7`; each recompiles. Instances: `ue mat MI Name=value`.
+- Lighting and mood: `ue lights` lists lights, sky, fog and exposure with notes (e.g. auto exposure undoing a dark
+  scene); check it before and after lighting changes, together with `ue shot`.
 - After placing or scattering things: `ue level check` finds floating or buried props, stacked duplicates,
   invisible walls and overlapping stationary lights; `ue drop <actor>` fixes a floating one.
 - Terrain: `ue landscape` (size, layers), `ue landscape at x,y` (height, slope, layer weights: use it before placing
