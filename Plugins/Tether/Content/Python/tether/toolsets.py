@@ -1242,6 +1242,42 @@ def _ground_actor(actor, align=False):
     return old_z, loc.z, (landed.get_actor_label() if landed else "?")
 
 
+def _trace_down(world, x, y, ignore=(), top=200000.0):
+    """The first blocking surface below (x, y) from high above, as a hit dict, or None."""
+    hit = unreal.SystemLibrary.line_trace_single(
+        world, unreal.Vector(x, y, top), unreal.Vector(x, y, -1000000), unreal.TraceTypeQuery.TRACE_TYPE_QUERY1, True,
+        list(ignore), unreal.DrawDebugTrace.NONE, True)
+    if not hit:
+        return None
+    fields = _try(lambda: hit.to_dict()) or dict(zip(_HIT_FIELDS, hit.to_tuple()))
+    return fields if fields.get("blocking_hit") else None
+
+
+def _circle_points(rng, cx, cy, radius, count, spacing=0.0):
+    """Up to count random points in a circle, at least spacing apart."""
+    import math
+    points, tries = [], 0
+    cell = {}  # spacing grid, so dense fills stay fast
+    size = spacing or 1.0
+    while len(points) < count and tries < count * 30:
+        tries += 1
+        r, a = radius * math.sqrt(rng.random()), rng.random() * 2 * math.pi
+        p = (cx + r * math.cos(a), cy + r * math.sin(a))
+        if spacing:
+            gx, gy = int(p[0] // size), int(p[1] // size)
+            near = [q for dx in (-1, 0, 1) for dy in (-1, 0, 1) for q in cell.get((gx + dx, gy + dy), ())]
+            if any((p[0] - q[0]) ** 2 + (p[1] - q[1]) ** 2 < spacing ** 2 for q in near):
+                continue
+            cell.setdefault((gx, gy), []).append(p)
+        points.append(p)
+    return points
+
+
+def _slope_degrees(normal):
+    import math
+    return math.degrees(math.acos(max(-1.0, min(1.0, normal.z))))
+
+
 def _legacy_key(name):
     """Match 'bCastShadows', 'CastShadows' and 'cast_shadows' to the Python wrapper's 'cast_shadows'."""
     key = name.replace("_", "").lower()
@@ -1999,6 +2035,195 @@ class TetherCore(_Base):
         zs = [a.get_actor_location().z for a in placed]
         return (f"placed {len(placed)} of {count} {prefix}" + (f" (z {min(zs):.0f} to {max(zs):.0f})" if zs else "")
                 + (": " + "; ".join(notes) if notes else "") + (f"; labels {prefix}_01.." if placed else ""))
+
+    @_tool
+    @staticmethod
+    def foliage(action: str = "list", what: str = "-", area: str = "-", density: float = -1.0, count: int = -1,
+                spacing: float = -1.0, slope: str = "-", height: str = "-", scale: str = "-", align: bool = False,
+                seed: int = 0, folder: str = "/Game/Foliage", token: str = "") -> str:
+        """Foliage instances in the edited level: list them by type, add instances over an area (real instanced
+        foliage, snapped to the ground), or remove them from an area. Unset options use the foliage type's own
+        settings (density, radius, ground slope, height range, scale, random yaw, align to normal).
+
+        Args:
+            action: list, add or remove.
+            what: A FoliageType asset, or a static mesh (its foliage type is found, or created in folder for add).
+                '-' for every type (list, remove).
+            area: 'x,y,radius'; required for add and remove, optional for list.
+            density: Instances per 10 m x 10 m (the foliage tool's unit).
+            count: Exact number to add instead of density.
+            spacing: Minimum distance between new instances, cm.
+            slope: 'min,max' ground slope in degrees.
+            height: 'min,max' world z.
+            scale: 'min,max' uniform scale.
+            align: Tilt each instance to the ground normal.
+            seed: Random seed (same seed, same layout).
+            folder: Where a foliage type made for a mesh goes.
+            token: Session token from Saved/Tether/editors/<pid>.token (the ue CLI sends it; add and remove).
+
+        Returns:
+            What was found, added or removed.
+        """
+        import math
+        import random
+        world = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_editor_world()
+        circle = _numbers(area) if area not in ("", "-") else None
+        if circle is not None and len(circle) != 3:
+            raise RuntimeError("area: expected 'x,y,radius'")
+        registry = unreal.AssetRegistryHelpers.get_asset_registry()
+        types = []
+        for data in registry.get_assets_by_class(unreal.TopLevelAssetPath("/Script/Foliage", "FoliageType_InstancedStaticMesh"),
+                                                 True):
+            ft = _try(lambda: unreal.load_asset(str(data.package_name)))
+            if ft is not None:
+                types.append(ft)
+        by_mesh = {}
+        for ft in types:
+            mesh = _try(lambda: ft.get_editor_property("mesh"))
+            if mesh:
+                by_mesh.setdefault(mesh.get_path_name(), []).append(ft)
+
+        def resolve(ref, create):
+            asset = unreal.load_asset(ref.split(".")[0])
+            if asset is None:
+                raise RuntimeError(f"no asset at {ref} (a FoliageType or a StaticMesh)")
+            if isinstance(asset, unreal.FoliageType):
+                return asset, None
+            if not isinstance(asset, unreal.StaticMesh):
+                raise RuntimeError(f"{ref} is a {asset.get_class().get_name()}, not a FoliageType or StaticMesh")
+            known = by_mesh.get(asset.get_path_name(), [])
+            if len(known) > 1 and not create:
+                raise RuntimeError(f"{len(known)} foliage types use {asset.get_name()}: name one "
+                                   f"({', '.join(_short_path(k.get_path_name()) for k in known)})")
+            if known:
+                return known[0], None
+            if not create:
+                raise RuntimeError(f"no foliage type uses {asset.get_name()}")
+            name = "FT_" + re.sub(r"^SM_", "", asset.get_name())
+            ft = unreal.AssetToolsHelpers.get_asset_tools().create_asset(
+                name, folder.rstrip("/"), unreal.FoliageType_InstancedStaticMesh,
+                unreal.FoliageType_InstancedStaticMeshFactory())
+            if ft is None:
+                raise RuntimeError(f"could not create {folder}/{name}")
+            ft.set_editor_property("mesh", asset)
+            unreal.EditorAssetLibrary.save_loaded_asset(ft, False)
+            return ft, f"created {_short_path(ft.get_path_name())} for {asset.get_name()}"
+
+        components = []
+        for ifa in unreal.GameplayStatics.get_all_actors_of_class(world, unreal.InstancedFoliageActor):
+            components += ifa.get_components_by_class(unreal.FoliageInstancedStaticMeshComponent)
+
+        def in_circle(comp):
+            """Indices of a component's instances inside the area (all of them without one)."""
+            total = comp.get_instance_count()
+            if circle is None:
+                return list(range(total))
+            cx, cy, r = circle
+            box = unreal.Box(unreal.Vector(cx - r, cy - r, -1e7), unreal.Vector(cx + r, cy + r, 1e7))
+            hits = comp.get_instances_overlapping_box(box, True)
+            keep = []
+            for i in hits:
+                loc = comp.get_instance_transform(i, True).translation
+                if (loc.x - cx) ** 2 + (loc.y - cy) ** 2 <= r * r:
+                    keep.append(i)
+            return keep
+
+        if action == "list":
+            rows = {}
+            for comp in components:
+                mesh = comp.get_editor_property("static_mesh")
+                key = mesh.get_path_name() if mesh else "?"
+                total, inside = rows.get(key, (0, 0))
+                rows[key] = (total + comp.get_instance_count(), inside + (len(in_circle(comp)) if circle else 0))
+            out = []
+            for key, (total, inside) in sorted(rows.items(), key=lambda kv: -kv[1][0]):
+                names = ", ".join(ft.get_name() for ft in by_mesh.get(key, [])) or "no foliage type asset"
+                out.append(f"{names} ({key.rsplit('.', 1)[-1]}): {total} instance(s)"
+                           + (f", {inside} in the area" if circle else ""))
+            unused = [ft.get_name() for ft in types if _try(lambda: ft.get_editor_property("mesh")) and
+                      ft.get_editor_property("mesh").get_path_name() not in rows]
+            head = f"{sum(t for t, _ in rows.values())} foliage instance(s) of {len(rows)} mesh(es) in {len(components)} component(s)"
+            if unused:
+                out.append(f"foliage types with no instances here: {', '.join(sorted(unused)[:12])}"
+                           + (f" +{len(unused) - 12}" if len(unused) > 12 else ""))
+            return _capped(head, out, 60)
+        _authorize(token)
+        if circle is None:
+            raise RuntimeError(f"{action} needs an area: 'x,y,radius'")
+        cx, cy, radius = circle
+        if action == "add":
+            if what in ("", "-"):
+                raise RuntimeError("add what? a FoliageType asset or a static mesh")
+            ft, note = resolve(what, create=True)
+            rng = random.Random(seed)
+            per_100m2 = density if density >= 0 else float(_try(lambda: ft.get_editor_property("density"), 100.0))
+            wanted = count if count >= 0 else int(round(per_100m2 * math.pi * radius * radius / 1e6))
+            gap = spacing if spacing >= 0 else float(_try(lambda: ft.get_editor_property("radius"), 0.0))
+            slope_range = _numbers(slope) if slope not in ("", "-") else None
+            if slope_range is None:
+                interval = _try(lambda: ft.get_editor_property("ground_slope_angle"))
+                slope_range = [interval.min, interval.max] if interval else [0, 90]
+            height_range = _numbers(height) if height not in ("", "-") else None
+            if height_range is None:
+                interval = _try(lambda: ft.get_editor_property("height"))
+                height_range = [interval.min, interval.max] if interval else [-1e9, 1e9]
+            scale_range = _numbers(scale) if scale not in ("", "-") else None
+            if scale_range is None:
+                interval = _try(lambda: ft.get_editor_property("scale_x"))
+                scale_range = [interval.min, interval.max] if interval else [1, 1]
+            scale_range = (scale_range * 2)[:2]
+            random_yaw = bool(_try(lambda: ft.get_editor_property("random_yaw"), True))
+            tilt = align or bool(_try(lambda: ft.get_editor_property("align_to_normal"), False))
+            transforms, skipped = [], {"no ground": 0, "slope": 0, "height": 0}
+            for x, y in _circle_points(rng, cx, cy, radius, wanted, gap):
+                hit = _trace_down(world, x, y)
+                if hit is None:
+                    skipped["no ground"] += 1
+                    continue
+                normal, point = hit["impact_normal"], hit["impact_point"]
+                if not slope_range[0] <= _slope_degrees(normal) <= slope_range[1]:
+                    skipped["slope"] += 1
+                    continue
+                if not height_range[0] <= point.z <= height_range[1]:
+                    skipped["height"] += 1
+                    continue
+                yaw = rng.uniform(0, 360) if random_yaw else 0.0
+                rotation = unreal.Rotator(roll=0, pitch=0, yaw=yaw)
+                if tilt:
+                    rotation = unreal.MathLibrary.make_rot_from_zx(normal, unreal.MathLibrary.get_forward_vector(rotation))
+                s = rng.uniform(*scale_range)
+                transforms.append(unreal.Transform(point, rotation, unreal.Vector(s, s, s)))
+            if transforms:
+                with unreal.ScopedEditorTransaction(f"ue foliage add {ft.get_name()} x{len(transforms)}"):
+                    unreal.InstancedFoliageActor.add_instances(world, ft, transforms)
+            notes = [f"{n} {why}" for why, n in skipped.items() if n]
+            if len(transforms) + sum(skipped.values()) < wanted:
+                notes.append(f"{wanted - len(transforms) - sum(skipped.values())} did not fit with spacing {gap:g}")
+            return (f"added {len(transforms)} of {wanted} {ft.get_name()}" + (f" ({note})" if note else "")
+                    + (": skipped " + ", ".join(notes) if notes else ""))
+        if action == "remove":
+            targets = [resolve(what, create=False)[0]] if what not in ("", "-") else types
+            removed, kept_total = [], 0
+            with unreal.ScopedEditorTransaction("ue foliage remove"):
+                for ft in targets:
+                    mesh = _try(lambda: ft.get_editor_property("mesh"))
+                    comps = [c for c in components if mesh and c.get_editor_property("static_mesh") == mesh]
+                    inside = {id(c): set(in_circle(c)) for c in comps}
+                    if not any(inside.values()):
+                        continue
+                    if len(by_mesh.get(mesh.get_path_name(), [])) > 1 and what in ("", "-"):
+                        continue  # can't tell which type an instance came from; name the type to remove it
+                    # Python can only remove all of a type's instances: keep the rest by adding them back.
+                    keep = [c.get_instance_transform(i, True) for c in comps for i in range(c.get_instance_count())
+                            if i not in inside[id(c)]]
+                    unreal.InstancedFoliageActor.remove_all_instances(world, ft)
+                    if keep:
+                        unreal.InstancedFoliageActor.add_instances(world, ft, keep)
+                    removed.append(f"{sum(len(v) for v in inside.values())} {ft.get_name()}")
+                    kept_total += len(keep)
+            return ("removed " + ", ".join(removed) + f" ({kept_total} outside the area kept)") if removed else \
+                "no foliage instances of those types in the area"
+        raise RuntimeError("action: list, add or remove")
 
     @_tool
     @staticmethod

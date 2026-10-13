@@ -380,3 +380,15 @@ def cmd_log(ctx, args):
     if len(shown) > args.limit:
         print(f"... +{len(shown) - args.limit} more (--limit)")
     return 0
+
+
+def cmd_foliage(ctx, args):
+    """Foliage instances: list by type, add over an area, remove from an area."""
+    def opt(value):
+        return "-" if value is None else value
+    print(ctx.tether("foliage", action=args.action, what=opt(args.what), area=opt(args.area),
+                     density=-1.0 if args.density is None else args.density, count=-1 if args.count is None else args.count,
+                     spacing=-1.0 if args.spacing is None else args.spacing, slope=opt(args.slope),
+                     height=opt(args.height), scale=opt(args.scale), align=args.align, seed=args.seed,
+                     folder=args.folder))
+    return 0

@@ -67,6 +67,9 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
   change: `ue import --reimport /Game/Props` reimports the changed ones and re-applies those options.
 - On terrain, never guess heights: `ue spawn /Game/X/SM_Rock --at 1200,-300,0 --ground` (or `ue drop Rock1 Rock2`,
   `--align` to follow the slope) puts things on the surface below.
+- Grass, bushes, trees: `ue foliage add /Game/Foliage/FT_Fern --area 1200,-300,2000 --density 40` (real foliage
+  instances on the ground; a mesh path works too and gets a foliage type). `ue foliage` counts by type
+  (`--area` for one spot); `ue foliage remove FT_Fern --area x,y,r` clears an area.
 - Many props at once: `ue scatter /Game/X/SM_Rock --count 30 --area 1200,-300,2000 --spacing 250 --scale 0.7,1.4
   --align` (one undo step; same `--seed`, same layout).
 - Level edits: `ue spawn PointLight --at 0,0,300 --label Lamp` (or an asset path), `ue duplicate Lamp --count 3`,

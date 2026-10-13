@@ -173,6 +173,12 @@ def cmd_selftest(ctx, args):
           skip=edit_skip, ok=lambda c, o: c == 0 and "added Body" in o and "BasicShapes/Cube" in o)
     check("rm (new asset)", ["rm", "/Game/TetherSelftest/BP_SelftestNew"], skip=None if created else "nothing created",
           ok=lambda c, o: c == 0 and "deleted" in o)
+    check("foliage", ["foliage"], ok=lambda c, o: c == 0 and "foliage instance(s)" in o)
+    planted = check("foliage add", ["foliage", "add", "/Engine/BasicShapes/Cube", "--area", "0,0,800", "--count", "12",
+                                    "--scale", "0.2,0.3", "--folder", "/Game/TetherSelftest"],
+                    ok=lambda c, o: c == 0 and "added" in o)
+    check("foliage remove", ["foliage", "remove", "/Game/TetherSelftest/FT_Cube", "--area", "0,0,100000"],
+          skip=None if planted else "nothing added", ok=lambda c, o: c == 0 and "removed" in o)
     png = os.path.join(tempfile.gettempdir(), "T_TetherSelftestImport.png")
     png_write(png, 8, 8, bytes(range(192)))
     imported = check("import", ["import", png, "/Game/TetherSelftest"],

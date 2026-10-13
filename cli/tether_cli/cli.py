@@ -12,7 +12,7 @@ from .editor import cmd_build, cmd_close, cmd_crash, cmd_open, cmd_status
 from .calls import (
     cmd_actors, cmd_ai, cmd_anim, cmd_api, cmd_asset, cmd_call, cmd_changes, cmd_config, cmd_delete, cmd_drop,
     cmd_duplicate, cmd_exec, cmd_find, cmd_log, cmd_mat, cmd_mv, cmd_nav, cmd_new, cmd_props, cmd_py, cmd_refs,
-    cmd_rm, cmd_save, cmd_savegame, cmd_scatter, cmd_set, cmd_spawn, cmd_tools, cmd_undo, cmd_watch,
+    cmd_foliage, cmd_rm, cmd_save, cmd_savegame, cmd_scatter, cmd_set, cmd_spawn, cmd_tools, cmd_undo, cmd_watch,
 )
 from .images import cmd_look, cmd_shot
 from .testing import cmd_test
@@ -130,6 +130,19 @@ def build_parser():
     s.add_argument("--seed", type=int, default=0, help="same seed, same layout")
     s.add_argument("--align", action="store_true", help="tilt each to the surface")
     s.add_argument("--label", help="label prefix (default: the asset name)")
+    s = add("foliage", cmd_foliage, "foliage instances: list by type, add over an area (snapped to the ground), remove")
+    s.add_argument("action", nargs="?", default="list", choices=["list", "add", "remove"])
+    s.add_argument("what", nargs="?", help="a FoliageType asset or a static mesh (add: required; remove: default all)")
+    s.add_argument("--area", help="x,y,radius (required for add and remove)")
+    s.add_argument("--density", type=float, help="add: instances per 10 x 10 m (default: the foliage type's)")
+    s.add_argument("--count", type=int, help="add: exactly this many instead")
+    s.add_argument("--spacing", type=float, help="add: minimum distance, cm (default: the type's radius)")
+    s.add_argument("--slope", help="add: allowed ground slope min,max degrees (default: the type's)")
+    s.add_argument("--height", help="add: allowed world z min,max (default: the type's)")
+    s.add_argument("--scale", help="add: uniform scale min,max (default: the type's)")
+    s.add_argument("--align", action="store_true", help="add: tilt to the ground")
+    s.add_argument("--seed", type=int, default=0)
+    s.add_argument("--folder", default="/Game/Foliage", help="add with a mesh: where its new foliage type goes")
     s = add("drop", cmd_drop, "put actors on the ground below them (undoable)")
     s.add_argument("actors", nargs="+", help="actor labels or names")
     s.add_argument("--align", action="store_true", help="also tilt each to the surface normal")
