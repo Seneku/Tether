@@ -3485,6 +3485,31 @@ class TetherCore(_Base):
 
     @_tool
     @staticmethod
+    def lint_data(path: str = "/Game") -> str:
+        """Every asset under a folder with its class and the asset registry tags `ue lint` checks (no loading).
+
+        Args:
+            path: Content folder.
+
+        Returns:
+            JSON list of [package, class, {tag: value}] (tags for textures and static meshes only).
+        """
+        registry = unreal.AssetRegistryHelpers.get_asset_registry()
+        wanted = {"Texture2D": ("Dimensions", "CompressionSettings", "SRGB", "LODGroup"),
+                  "StaticMesh": ("Triangles", "LODs", "CollisionPrims", "CollisionComplexity", "NaniteEnabled",
+                                 "DefaultCollision")}
+        rows, seen = [], set()
+        for data in registry.get_assets_by_path(path.rstrip("/") or "/Game", recursive=True):
+            package, cls = str(data.package_name), str(data.asset_class_path.asset_name)
+            if package in seen or "/__External" in package:
+                continue
+            seen.add(package)
+            tags = {t: data.get_tag_value(t) for t in wanted.get(cls, ())}
+            rows.append([package, cls, {k: v for k, v in tags.items() if v is not None}])
+        return json.dumps(rows)
+
+    @_tool
+    @staticmethod
     def fix_redirectors(paths: str, token: str = "") -> str:
         """Fix up redirectors: resave what references each one (now pointing at the real asset), then delete it.
 

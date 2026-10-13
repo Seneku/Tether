@@ -17,7 +17,7 @@ from .calls import (
 from .images import cmd_look, cmd_shot
 from .testing import cmd_test
 from .assets import cmd_bp, cmd_diff, cmd_overview, cmd_size, cmd_table, cmd_usages, cmd_validate
-from .content import cmd_import, cmd_unused
+from .content import cmd_import, cmd_lint, cmd_unused
 from .jobs import cmd_job, cmd_package
 from .play import cmd_audio, cmd_mem, cmd_perf, cmd_soak, cmd_ui, cmd_world
 from .playtest import cmd_input, pie_command
@@ -331,6 +331,11 @@ def build_parser():
     s.add_argument("--top", type=int, default=20, help="rows in the biggest list (20)")
     s.add_argument("--redirectors", action="store_true", help="list redirectors instead")
     s.add_argument("--fix", action="store_true", help="with --redirectors: resave their referencers and delete them")
+    s = add("lint", cmd_lint, "content rules beyond Epic's validators: naming, texture size/format, mesh collision/LODs")
+    s.add_argument("path", nargs="?", default="/Game", help="content folder (default /Game)")
+    s.add_argument("--rule", help="regex: only these rules (naming, characters, texture-*, mesh-*)")
+    s.add_argument("--ignore", action="append", metavar="GLOB", help="skip packages matching, e.g. '/Game/Fab/*' (repeatable)")
+    s.add_argument("--strict", action="store_true", help="exit 1 when anything is reported")
     s = add("find", cmd_find, "search assets by name and/or class (asset registry)")
     s.add_argument("query", nargs="?", help="regex on the asset name")
     s.add_argument("--class", dest="cls", help="regex on the class name, e.g. StaticMesh or 'Material$'")

@@ -1,4 +1,5 @@
-"""Content hygiene and intake: ue import, ue unused."""
+"""Content hygiene and intake: ue import, ue unused, ue lint."""
+import fnmatch
 import json
 import os
 import re
@@ -179,3 +180,102 @@ def cmd_unused(ctx, args):
     ctx.data = {"unused": [{"package": p, "class": c, "bytes": b} for p, c, b in rows],
                 "redirectors": data["redirectors"], "roots": data["roots"]}
     return 0
+
+
+# Prefixes by asset class (Epic's and the community style guide's); a project can change them in
+# Config/Tether/lint.json: {"prefixes": {"World": ["L_", "Lvl_"]}, "ignore": ["/Game/Fab/*"], "disable": ["naming"],
+# "max_texture_size": 4096, "lod_triangles": 10000}.
+LINT_PREFIXES = {
+    "StaticMesh": ["SM_"], "SkeletalMesh": ["SK_", "SKM_"], "Skeleton": ["SKEL_"], "PhysicsAsset": ["PHYS_", "PA_"],
+    "Texture2D": ["T_"], "TextureCube": ["T_", "HDR_"], "TextureRenderTarget2D": ["RT_"],
+    "Material": ["M_"], "MaterialInstanceConstant": ["MI_"], "MaterialFunction": ["MF_"],
+    "MaterialParameterCollection": ["MPC_"], "Blueprint": ["BP_"], "WidgetBlueprint": ["WBP_", "W_"],
+    "AnimBlueprint": ["ABP_"], "AnimSequence": ["A_", "AS_"], "AnimMontage": ["AM_"], "BlendSpace": ["BS_"],
+    "BlendSpace1D": ["BS_"], "SoundWave": ["S_", "SW_"], "SoundCue": ["SC_"], "MetaSoundSource": ["MS_", "MSS_"],
+    "SoundAttenuation": ["ATT_", "SA_"], "NiagaraSystem": ["NS_"], "NiagaraEmitter": ["NE_"], "DataTable": ["DT_"],
+    "CurveTable": ["CT_"], "CurveFloat": ["Curve_", "C_"], "UserDefinedEnum": ["E_", "Enum_"],
+    "UserDefinedStruct": ["F_", "S_", "ST_"], "InputAction": ["IA_"], "InputMappingContext": ["IMC_"],
+    "BehaviorTree": ["BT_"], "BlackboardData": ["BB_"], "StateTree": ["ST_"], "World": ["L_", "Lvl_", "Map_"],
+    "LevelSequence": ["LS_", "SEQ_"], "PhysicalMaterial": ["PM_", "PhysMat_"], "Font": ["Font_", "F_"],
+}
+NORMAL_NAME = re.compile(r"_(N|Normal|Nrm)$", re.I)
+MASK_NAME = re.compile(r"_(ORM|ARM|MRA|RMA|ORD|Masks?|AO|Rough(ness)?|Metal(lic)?|Height)$", re.I)
+
+
+def lint_rules(rows, config=None):
+    """[(rule, package, message)] for `ue lint`, from lint_data rows and the project's lint.json."""
+    config = config or {}
+    prefixes = dict(LINT_PREFIXES, **config.get("prefixes", {}))
+    disabled, ignore = set(config.get("disable", [])), config.get("ignore", [])
+    max_size, lod_tris = config.get("max_texture_size", 4096), config.get("lod_triangles", 10000)
+    found = []
+
+    def add(rule, package, message):
+        if rule not in disabled:
+            found.append((rule, package, message))
+    for package, cls, tags in rows:
+        if package.startswith(("/Game/Developers/", "/Game/Collections/")) or \
+                any(fnmatch.fnmatch(package, pattern) for pattern in ignore):
+            continue
+        name = package.rsplit("/", 1)[-1]
+        wanted = prefixes.get(cls)
+        if wanted and not name.startswith(tuple(wanted)):
+            add("naming", package, f"{cls}: expected {' or '.join(wanted)}")
+        if " " in name or not name.isascii():
+            add("characters", package, "spaces or non-ASCII characters in the name break some platforms and tools")
+        if cls == "Texture2D" and tags.get("Dimensions"):
+            w, _, h = tags["Dimensions"].partition("x")
+            w, h = int(w or 0), int(h or 0)
+            ui = "UI" in (tags.get("LODGroup") or "")
+            if not ui and w and h and (w & (w - 1) or h & (h - 1)):
+                add("texture-pow2", package, f"{w}x{h} is not a power of two: no mips, no streaming")
+            if max(w, h) > max_size:
+                add("texture-size", package, f"{w}x{h} is over {max_size}")
+            if NORMAL_NAME.search(name) and tags.get("CompressionSettings") not in (None, "TC_Normalmap"):
+                add("texture-normal", package, f"named as a normal map but compressed as {tags['CompressionSettings']}")
+            if MASK_NAME.search(name) and tags.get("SRGB") == "True":
+                add("texture-mask-srgb", package, "a mask/packed texture with sRGB on (its values get gamma-curved)")
+        if cls == "StaticMesh" and tags.get("Triangles"):
+            tris = int(tags["Triangles"])
+            if tags.get("CollisionPrims") == "0" and tags.get("CollisionComplexity") != "CTF_UseComplexAsSimple" \
+                    and tags.get("DefaultCollision") != "NoCollision":
+                add("mesh-collision", package, f"no simple collision ({tags.get('DefaultCollision') or 'default'} "
+                                               "profile): characters and physics pass through it")
+            if tags.get("NaniteEnabled") != "True" and tags.get("LODs") == "1" and tris > lod_tris:
+                add("mesh-lods", package, f"{tris} triangles, one LOD and no Nanite")
+    return found
+
+
+def cmd_lint(ctx, args):
+    """Content rules beyond Epic's validators, from asset registry tags (nothing is loaded)."""
+    config_path = os.path.join(os.path.dirname(ctx.project), "Config", "Tether", "lint.json")
+    config = {}
+    if os.path.isfile(config_path):
+        try:
+            with open(config_path, encoding="utf-8") as f:
+                config = json.load(f)
+        except ValueError as exc:
+            raise CliError(f"{config_path}: {exc}")
+    if args.ignore:
+        config["ignore"] = config.get("ignore", []) + args.ignore
+    rows = ctx.tether("lint_data", path=args.path)
+    rows = json.loads(rows) if isinstance(rows, str) else rows
+    found = lint_rules(rows, config)
+    if args.rule:
+        found = [f for f in found if re.search(args.rule, f[0])]
+    by_rule = {}
+    for rule, package, message in found:
+        by_rule.setdefault(rule, []).append((package, message))
+    ranked = sorted(by_rule.items(), key=lambda kv: -len(kv[1]))
+    print(f"{len(rows)} asset(s) under {args.path}: "
+          + (", ".join(f"{len(items)} {rule}" for rule, items in ranked) if ranked else "nothing to report")
+          + (f" (rules from {os.path.relpath(config_path, os.path.dirname(ctx.project))})" if config else ""))
+    per_rule = args.limit if args.rule else min(args.limit, 8)
+    for rule, items in ranked:
+        print(f"{rule}:")
+        for package, message in items[:per_rule]:
+            print(f"  {package}  {message}")
+        if len(items) > per_rule:
+            print(f"  ... +{len(items) - per_rule} more (ue lint --rule {rule} --limit N)")
+    ctx.data = [{"rule": r, "package": p, "message": m} for r, p, m in found]
+    return 1 if found and args.strict else 0

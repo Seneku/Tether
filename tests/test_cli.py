@@ -1241,6 +1241,41 @@ GlobalDefaultGameMode=/Game/Core/BP_GameMode.BP_GameMode_C
             project.close()
 
 
+class Lint(unittest.TestCase):
+    ROWS = [["/Game/Props/Rock", "StaticMesh", {"Triangles": "20000", "LODs": "1", "CollisionPrims": "0",
+                                                 "CollisionComplexity": "CTF_UseSimpleAndComplex", "NaniteEnabled": "False",
+                                                 "DefaultCollision": "BlockAll"}],
+            ["/Game/Props/SM_Grass", "StaticMesh", {"Triangles": "20000", "LODs": "1", "CollisionPrims": "0",
+                                                    "CollisionComplexity": "CTF_UseSimpleAndComplex", "NaniteEnabled": "True",
+                                                    "DefaultCollision": "NoCollision"}],
+            ["/Game/Tex/T_Rock_N", "Texture2D", {"Dimensions": "1000x1024", "CompressionSettings": "TC_Default",
+                                                  "SRGB": "True", "LODGroup": "TEXTUREGROUP_World"}],
+            ["/Game/Tex/T_Rock_ORM", "Texture2D", {"Dimensions": "8192x8192", "CompressionSettings": "TC_Masks",
+                                                    "SRGB": "True", "LODGroup": "TEXTUREGROUP_World"}],
+            ["/Game/UI/T_Icon", "Texture2D", {"Dimensions": "100x60", "LODGroup": "TEXTUREGROUP_UI"}],
+            ["/Game/Maps/Lvl_Island", "World", {}],
+            ["/Game/Fab/Thing", "StaticMesh", {}],
+            ["/Game/Developers/me/junk", "Blueprint", {}],
+            ["/Game/BP_Door Old", "Blueprint", {}]]
+
+    def test_rules(self):
+        found = {(rule, package) for rule, package, _ in ue.lint_rules(self.ROWS)}
+        self.assertEqual(found, {("naming", "/Game/Props/Rock"), ("mesh-collision", "/Game/Props/Rock"),
+                                 ("mesh-lods", "/Game/Props/Rock"), ("texture-pow2", "/Game/Tex/T_Rock_N"),
+                                 ("texture-normal", "/Game/Tex/T_Rock_N"), ("texture-size", "/Game/Tex/T_Rock_ORM"),
+                                 ("texture-mask-srgb", "/Game/Tex/T_Rock_ORM"), ("naming", "/Game/Fab/Thing"),
+                                 ("characters", "/Game/BP_Door Old")})
+
+    def test_config_overrides(self):
+        config = {"prefixes": {"World": ["Map_"]}, "ignore": ["/Game/Fab/*"], "disable": ["mesh-lods"],
+                  "max_texture_size": 8192}
+        found = {(rule, package) for rule, package, _ in ue.lint_rules(self.ROWS, config)}
+        self.assertIn(("naming", "/Game/Maps/Lvl_Island"), found)
+        self.assertNotIn(("naming", "/Game/Fab/Thing"), found)
+        self.assertNotIn(("mesh-lods", "/Game/Props/Rock"), found)
+        self.assertNotIn(("texture-size", "/Game/Tex/T_Rock_ORM"), found)
+
+
 class JsonEnvelope(unittest.TestCase):
     def run_json(self, project, *argv):
         out = io.StringIO()

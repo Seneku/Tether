@@ -119,6 +119,7 @@ def cmd_selftest(ctx, args):
     check("log", ["log", "--level", "Error"])
     check("changes", ["changes"], ok=lambda c, o: c == 0 and "unsaved package" in o)
     check("size", ["size", "--top", "3"], ok=lambda c, o: c == 0 and "packages" in o)
+    check("lint", ["lint", "/Engine/BasicShapes"], ok=lambda c, o: c == 0 and "naming" in o)
     check("unused", ["unused", "--top", "3"], ok=lambda c, o: c == 0 and "are unused" in o)
     check("unused --redirectors", ["unused", "--redirectors"], ok=lambda c, o: c == 0 and "redirector" in o)
     check("mem", ["mem", "--top", "3"], timeout=300, ok=lambda c, o: c == 0 and "process:" in o)

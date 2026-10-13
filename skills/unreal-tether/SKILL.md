@@ -49,6 +49,10 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
 - New assets: `ue new bp /Game/X/BP_Door --parent Actor` (or a C++ class, or another Blueprint), `ue new mi
   /Game/X/MI_Rock --parent /Game/X/M_Rock`, `ue new datatable /Game/X/DT_Items --parent ItemRow`, `ue new level
   /Game/Maps/L_Test`, `ue new folder /Game/X`. Then `ue save` (or pass --save).
+- Content conventions: `ue lint [/Game/Folder]` checks naming prefixes (SM_, T_, BP_, ...), textures (power of
+  two, size, normal maps compressed as such, masks without sRGB) and meshes (simple collision, LODs or Nanite)
+  in under a second, from registry data. Project rules go in Config/Tether/lint.json (prefixes, ignore globs,
+  disable, max_texture_size, lod_triangles). Run it on folders you added to.
 - Cleaning up content: `ue unused [/Game/Folder]` lists assets nothing reaches from the maps, the config, the
   code and the cook settings, biggest first. Confirm with `ue usages <asset>` before `ue rm` (paths built at
   runtime are invisible to it). `ue unused --redirectors --fix` repoints references and deletes redirectors.
