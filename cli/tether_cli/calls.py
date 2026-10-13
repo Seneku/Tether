@@ -84,8 +84,8 @@ def cmd_py(ctx, args):
     else:
         code = " ".join(args.code)
     out = ctx.tether("py", code=code.lstrip("﻿"))  # PowerShell pipes a BOM
-    if out:
-        print(out.rstrip("\n"))
+    if out not in ("", None):  # output that is itself JSON comes back decoded
+        print(out.rstrip("\n") if isinstance(out, str) else json.dumps(out))
     return 0
 
 
@@ -392,3 +392,4 @@ def cmd_foliage(ctx, args):
                      height=opt(args.height), scale=opt(args.scale), align=args.align, seed=args.seed,
                      folder=args.folder))
     return 0
+

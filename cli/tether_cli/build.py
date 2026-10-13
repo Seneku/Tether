@@ -4,7 +4,7 @@ import re
 import time
 
 from .core import (
-    CliError, engine_root, epic_settings_dir, host_platform, log_end, log_path, logged_dialogs, read_json,
+    CliError, engine_root, epic_settings_dir, host_platform, live_editors, log_end, log_path, logged_dialogs, read_json,
     read_new_log, state_dir, subprocess, uat_command, ubt_command, write_json,
 )
 
@@ -214,8 +214,14 @@ def ubt_build(ctx, args):
     name = os.path.splitext(os.path.basename(ctx.project))[0]
     target = args.target or f"{name}Editor"
     started = time.time()
-    proc = subprocess.run(ubt_command(root) + [target, host_platform(), args.config, f"-Project={ctx.project}", "-WaitMutex"],
-                          capture_output=True, text=True, errors="replace")
+    extra = []
+    if not live_editors(ctx.project):
+        # UBT refuses to build while any editor on this engine has Live Coding on: its mutex is named after the
+        # shared UnrealEditor.exe, so another project's editor blocks this one. The check protects a running
+        # editor of this target from having its object files rewritten, and none is running.
+        extra.append("-NoHotReloadFromIDE")
+    proc = subprocess.run(ubt_command(root) + [target, host_platform(), args.config, f"-Project={ctx.project}", "-WaitMutex"]
+                          + extra, capture_output=True, text=True, errors="replace")
     lines = (proc.stdout + proc.stderr).splitlines()
     errors, warnings, hidden = compact_diagnostics(lines, os.path.dirname(ctx.project))
     result = next((l.strip() for l in reversed(lines) if l.strip().startswith("Result:")), f"exit {proc.returncode}")

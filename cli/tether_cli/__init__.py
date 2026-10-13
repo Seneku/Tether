@@ -15,7 +15,7 @@ Modules, lowest layer first (each imports only from those above it):
   images     screenshots, ue look, PNG read/write/diff
   testing    ue test
   assets     Blueprints, data tables, diff, validate, size, usages, overview
-  content    ue import, unused, lint
+  content    ue import, unused, lint, landscape
   jobs       ue job, ue package
   play       pie, ui, perf, mem, world, audio, soak
   playtest   ue input, pie record, pie watch

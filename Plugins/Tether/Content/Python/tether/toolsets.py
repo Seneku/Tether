@@ -1273,6 +1273,37 @@ def _circle_points(rng, cx, cy, radius, count, spacing=0.0):
     return points
 
 
+def _read_square(world, rt, width, height, x0, y0, x1, y1):
+    """Pixels of a square of a render target, row by row. In 5.8 read_render_target_raw_pixel_area takes its
+    'max' arguments as the width and height (clamped to the target), not as the far corner; try that, then the
+    documented corner form, and trust only a read of exactly the right size."""
+    cols, rows = x1 - x0 + 1, y1 - y0 + 1
+    for args in ((x0, y0, cols, rows), (x0, y0, x1 + 1, y1 + 1), (x0, y0, x1, y1)):
+        pixels = unreal.RenderingLibrary.read_render_target_raw_pixel_area(world, rt, *args, True)
+        if len(pixels) == cols * rows:
+            return list(pixels)
+    raise RuntimeError(f"could not read a {cols} x {rows} square of the render target exactly")
+
+
+def _rg16(pixels):
+    """16-bit heights from an RGBA8 render target's R (high byte) and G (low byte). The raw read returns bytes as
+    0-255 or 0-1 depending on the format and engine version, so look at the values."""
+    scale = 1.0 if any(p.r > 1.0 or p.g > 1.0 for p in pixels) else 255.0
+    return [int(round(p.r * scale)) * 256 + int(round(p.g * scale)) for p in pixels]
+
+
+def _png_rgba8(width, height, rgba):
+    """An 8-bit RGBA PNG in memory (for import_buffer_as_texture2d)."""
+    import struct
+    import zlib
+    rows = b"".join(b"\x00" + bytes(rgba[y * width * 4:(y + 1) * width * 4]) for y in range(height))
+
+    def chunk(kind, data):
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(rows)) + chunk(b"IEND", b""))
+
+
 def _slope_degrees(normal):
     import math
     return math.degrees(math.acos(max(-1.0, min(1.0, normal.z))))
@@ -2035,6 +2066,260 @@ class TetherCore(_Base):
         zs = [a.get_actor_location().z for a in placed]
         return (f"placed {len(placed)} of {count} {prefix}" + (f" (z {min(zs):.0f} to {max(zs):.0f})" if zs else "")
                 + (": " + "; ".join(notes) if notes else "") + (f"; labels {prefix}_01.." if placed else ""))
+
+    @_tool
+    @staticmethod
+    def landscape(action: str = "info", x: float = 0.0, y: float = 0.0, size: float = 0.0, px: int = 64) -> str:
+        """Landscapes in the edited level: a summary, the surface at a point, or a height/layer grid of an area.
+
+        Args:
+            action: info; at (height, slope and paint-layer weights at x,y); grid (px x px samples of a size x size
+                cm square centred on x,y: heights and the dominant paint layer, for a picture).
+            x: World x.
+            y: World y.
+            size: With grid: side of the square, cm (default: the whole landscape).
+            px: With grid: samples per side (max 256).
+
+        Returns:
+            info: text. at / grid: JSON.
+        """
+        world = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_editor_world()
+        proxies = list(unreal.GameplayStatics.get_all_actors_of_class(world, unreal.LandscapeProxy))
+        if not proxies:
+            raise RuntimeError("no landscape in the edited level")
+        landscapes = [p for p in proxies if isinstance(p, unreal.Landscape)] or proxies
+        components = [c for p in proxies for c in p.get_components_by_class(unreal.LandscapeComponent)]
+        layers = []
+        for land in landscapes:
+            for name in _try(lambda: list(land.get_target_layer_names()), []) or []:
+                if str(name) not in layers:
+                    layers.append(str(name))
+
+        def component_at(px_, py_):
+            """The landscape component covering a point (weights are read per component)."""
+            for comp in components:
+                origin, extent, _ = unreal.SystemLibrary.get_component_bounds(comp)
+                if abs(px_ - origin.x) <= extent.x and abs(py_ - origin.y) <= extent.y:
+                    return comp
+            return None
+
+        def surface(px_, py_):
+            hits = unreal.SystemLibrary.line_trace_multi(
+                world, unreal.Vector(px_, py_, 1e6), unreal.Vector(px_, py_, -1e6), unreal.TraceTypeQuery.TRACE_TYPE_QUERY1,
+                True, [], unreal.DrawDebugTrace.NONE, True) or []
+            for hit in hits:
+                fields = _try(lambda: hit.to_dict()) or dict(zip(_HIT_FIELDS, hit.to_tuple()))
+                if isinstance(fields.get("hit_actor"), unreal.LandscapeProxy):
+                    return fields
+            return None
+
+        def weights(comp, point):
+            out = {}
+            for name in layers:
+                w = _try(lambda: comp.editor_get_paint_layer_weight_by_name_at_location(point, name))
+                if w is not None:
+                    out[name] = round(w, 3)
+            return out
+
+        if action == "info":
+            lines = []
+            for land in landscapes:
+                origin, extent = land.get_actor_bounds(False)
+                scale = land.get_actor_scale3d()
+                mine = [c for c in components if c.get_owner() == land or
+                        _try(lambda: c.get_owner().get_landscape_actor()) == land]
+                quads = round(unreal.SystemLibrary.get_component_bounds(mine[0])[1].x * 2 / scale.x) if mine else 0
+                material = _try(lambda: land.get_editor_property("landscape_material"))
+                lines.append(f"{_label(land)}: {extent.x * 2 / 100:.0f} x {extent.y * 2 / 100:.0f} m, z {origin.z - extent.z:.0f} "
+                             f"to {origin.z + extent.z:.0f}, {len(mine)} component(s) of {quads} quads, "
+                             f"{scale.x / 100:g} m per quad, material {material.get_name() if material else 'none'}")
+            proxies_only = len(proxies) - len(landscapes)
+            if proxies_only > 0:
+                lines.append(f"{proxies_only} streaming proxies (World Partition)")
+            lines.append("paint layers: " + (", ".join(layers) if layers else "none"))
+            return "\n".join(lines)
+        if action == "at":
+            hit = surface(x, y)
+            if hit is None:
+                raise RuntimeError(f"no landscape below {x:.0f}, {y:.0f}")
+            point, normal = hit["impact_point"], hit["impact_normal"]
+            comp = component_at(x, y)
+            return json.dumps({"x": round(x), "y": round(y), "z": round(point.z, 1),
+                               "slope": round(_slope_degrees(normal), 1),
+                               "normal": [round(normal.x, 3), round(normal.y, 3), round(normal.z, 3)],
+                               "landscape": _label(hit["hit_actor"]), "weights": weights(comp, point) if comp else {}})
+        if action == "grid":
+            px = max(2, min(256, int(px)))
+            if size <= 0:  # the whole (first) landscape
+                origin, extent = landscapes[0].get_actor_bounds(False)
+                x, y, size = origin.x, origin.y, 2 * max(extent.x, extent.y)
+            step = size / (px - 1)
+            heights, dominant = [], []
+            for row in range(px):
+                hrow, drow = [], []
+                for col in range(px):
+                    sx, sy = x - size / 2 + col * step, y - size / 2 + row * step
+                    hit = surface(sx, sy)
+                    if hit is None:
+                        hrow.append(None)
+                        drow.append(None)
+                        continue
+                    hrow.append(round(hit["impact_point"].z, 1))
+                    comp = component_at(sx, sy) if layers else None
+                    w = weights(comp, hit["impact_point"]) if comp else {}
+                    drow.append(max(w, key=w.get) if w and max(w.values()) > 0 else None)
+                heights.append(hrow)
+                dominant.append(drow)
+            return json.dumps({"x": x, "y": y, "size": size, "px": px, "heights": heights, "layers": layers,
+                               "dominant": dominant})
+        raise RuntimeError("action: info, at or grid")
+
+    @_tool
+    @staticmethod
+    def landscape_edit(step: str, action: str = "-", x: float = 0.0, y: float = 0.0, radius: float = 0.0,
+                       value: float = 0.0, strength: float = 1.0, backup: str = "-", token: str = "") -> str:
+        """Sculpt the landscape under a circle: flatten (to value, or the height at the centre), raise (by value cm,
+        negative lowers), smooth, or restore a backup. Python cannot sculpt, so this goes through the heightmap:
+        export it to a render target, rewrite just the circle's square, check it reads back exactly, then import.
+        GPU work lands a frame later, so the ue CLI calls the steps in turn: begin, apply, commit.
+
+        Args:
+            step: begin (export), apply (edit the square; writes a backup), commit (verify and import), or cancel.
+            action: With begin: flatten, raise, smooth or restore.
+            x: Circle centre x.
+            y: Circle centre y.
+            radius: Circle radius, cm (the outer quarter fades out).
+            value: flatten: target height (below -1e29: the centre's); raise: cm.
+            strength: 0..1, how far toward the result (smooth: passes).
+            backup: With restore: the backup file a previous edit wrote.
+            token: Session token from Saved/Tether/editors/<pid>.token (the ue CLI sends it).
+
+        Returns:
+            JSON {step, ...}.
+        """
+        _authorize(token)
+        import math
+        state = getattr(sys, "_tether_land_edit", None) or {}
+        sys._tether_land_edit = state
+        R = unreal.RenderingLibrary
+        world = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_editor_world()
+        if step == "cancel":
+            state.clear()
+            return json.dumps({"step": "cancel"})
+        if step == "begin":
+            if _game_world() is not None:
+                raise RuntimeError("PIE is running (ue pie stop)")
+            lands = [a for a in unreal.GameplayStatics.get_all_actors_of_class(world, unreal.Landscape)]
+            if not lands:
+                raise RuntimeError("no landscape in the edited level")
+            land = lands[0]
+            comps = [c for a in unreal.GameplayStatics.get_all_actors_of_class(world, unreal.LandscapeProxy)
+                     for c in a.get_components_by_class(unreal.LandscapeComponent)]
+            boxes = [unreal.SystemLibrary.get_component_bounds(c) for c in comps]
+            min_x = min(o.x - e.x for o, e, _ in boxes)
+            min_y = min(o.y - e.y for o, e, _ in boxes)
+            max_x = max(o.x + e.x for o, e, _ in boxes)
+            max_y = max(o.y + e.y for o, e, _ in boxes)
+            scale = land.get_actor_scale3d()
+            w = int(round((max_x - min_x) / scale.x)) + 1
+            h = int(round((max_y - min_y) / scale.y)) + 1
+            rt = R.create_render_target2d(world, w, h, unreal.TextureRenderTargetFormat.RTF_RGBA8)
+            if not land.landscape_export_heightmap_to_render_target(rt, True, True):
+                raise RuntimeError("the heightmap export failed")
+            state.clear()
+            state.update(land=land, rt=rt, w=w, h=h, min_x=min_x, min_y=min_y, scale=(scale.x, scale.y, scale.z),
+                         z0=land.get_actor_location().z, action=action, args=(x, y, radius, value, strength, backup))
+            return json.dumps({"step": "begin", "vertices": [w, h]})
+        if not state.get("rt"):
+            raise RuntimeError("no landscape edit in progress (begin first)")
+        w, h, sx, sy, sz = state["w"], state["h"], *state["scale"]
+        to_raw = lambda z: 32768.0 + (z - state["z0"]) / sz * 128.0  # noqa: E731
+        to_z = lambda raw: state["z0"] + (raw - 32768.0) / 128.0 * sz  # noqa: E731
+        if step == "apply":
+            x, y, radius, value, strength, backup_file = state["args"]
+            if state["action"] == "restore":
+                with open(backup_file, encoding="utf-8") as f:
+                    saved = json.load(f)
+                x0, y0, x1, y1 = saved["square"]
+                patch = saved["raw"]
+            else:
+                cx, cy = (x - state["min_x"]) / sx, (y - state["min_y"]) / sy
+                r = radius / sx
+                x0, y0 = max(0, int(math.floor(cx - r)) - 1), max(0, int(math.floor(cy - r)) - 1)
+                x1, y1 = min(w - 1, int(math.ceil(cx + r)) + 1), min(h - 1, int(math.ceil(cy + r)) + 1)
+                if x0 > x1 or y0 > y1:
+                    raise RuntimeError("the circle is outside the landscape")
+                pixels = _read_square(world, state["rt"], w, h, x0, y0, x1, y1)
+                cols = x1 - x0 + 1
+                raw = _rg16(pixels)
+                old = list(raw)
+                centre = raw[min(len(raw) - 1, int(round(cy - y0)) * cols + int(round(cx - x0)))]
+                target = to_raw(value) if state["action"] == "flatten" and value > -1e29 else centre
+                passes = max(1, int(round(strength))) if state["action"] == "smooth" else 1
+                for _ in range(passes):
+                    src = list(raw)
+                    for j in range(y1 - y0 + 1):
+                        for i in range(cols):
+                            d = math.hypot(x0 + i - cx, y0 + j - cy)
+                            if d > r:
+                                continue
+                            fade = 1.0 if d <= 0.75 * r else max(0.0, (r - d) / (0.25 * r))
+                            k = j * cols + i
+                            if state["action"] == "flatten":
+                                goal = target
+                            elif state["action"] == "raise":
+                                goal = src[k] + value / sz * 128.0
+                            elif state["action"] == "smooth":
+                                near = [src[(j + dj) * cols + i + di] for dj in (-1, 0, 1) for di in (-1, 0, 1)
+                                        if 0 <= j + dj <= y1 - y0 and 0 <= i + di < cols]
+                                goal = sum(near) / len(near)
+                            else:
+                                raise RuntimeError("action: flatten, raise, smooth or restore")
+                            amount = fade * (1.0 if state["action"] == "smooth" else max(0.0, min(1.0, strength)))
+                            raw[k] = int(round(max(0, min(65535, src[k] + (goal - src[k]) * amount))))
+                patch = raw
+                folder = os.path.join(unreal.Paths.convert_relative_path_to_full(unreal.Paths.project_saved_dir()),
+                                      "Tether", "landscape")
+                os.makedirs(folder, exist_ok=True)
+                backup_file = os.path.normpath(os.path.join(folder, time.strftime("backup-%Y%m%d-%H%M%S.json")))
+                with open(backup_file, "w", encoding="utf-8") as f:
+                    json.dump({"landscape": state["land"].get_path_name(), "square": [x0, y0, x1, y1], "raw": old}, f)
+                state["before"] = (to_z(centre), max(abs(a - b) for a, b in zip(old, raw)) / 128.0 * sz)
+            cols, rows = x1 - x0 + 1, y1 - y0 + 1
+            rgba = []
+            for v in patch:
+                rgba += [v >> 8, v & 255, 0, 255]
+            texture = R.import_buffer_as_texture2d(world, list(_png_rgba8(cols, rows, rgba)))
+            if texture is None:
+                raise RuntimeError("could not make the patch texture")
+            texture.set_editor_property("srgb", False)
+            texture.set_editor_property("filter", unreal.TextureFilter.TF_NEAREST)
+            canvas, _, context = R.begin_draw_canvas_to_render_target(world, state["rt"])
+            canvas.draw_texture(texture, unreal.Vector2D(x0, y0), unreal.Vector2D(cols, rows), unreal.Vector2D(0, 0),
+                                unreal.Vector2D(1, 1), unreal.LinearColor(1, 1, 1, 1), unreal.BlendMode.BLEND_OPAQUE)
+            R.end_draw_canvas_to_render_target(world, context)
+            state.update(square=(x0, y0, x1, y1), patch=patch, texture=texture, backup=backup_file)
+            return json.dumps({"step": "apply", "square": [x0, y0, x1, y1], "backup": backup_file})
+        if step == "commit":
+            x0, y0, x1, y1 = state["square"]
+            pixels = _read_square(world, state["rt"], w, h, x0, y0, x1, y1)
+            back = _rg16(pixels)
+            wrong = sum(1 for a, b in zip(back, state["patch"]) if a != b)
+            if wrong or len(back) != len(state["patch"]):
+                state.clear()
+                raise RuntimeError(f"the patch did not read back exactly ({wrong} of {len(back)} vertices differ); "
+                                   "nothing was changed")
+            land = state["land"]
+            with unreal.ScopedEditorTransaction(f"ue landscape {state['action']}"):
+                land.modify()
+                ok = land.landscape_import_heightmap_from_render_target(state["rt"], True, 0)
+            result = {"step": "commit", "ok": bool(ok), "action": state["action"], "backup": state.get("backup"),
+                      "vertices": len(back)}
+            if state.get("before"):
+                result.update(centre_before=round(state["before"][0], 1), max_change_cm=round(state["before"][1], 1))
+            state.clear()
+            return json.dumps(result)
+        raise RuntimeError("step: begin, apply, commit or cancel")
 
     @_tool
     @staticmethod

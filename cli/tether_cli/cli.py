@@ -17,7 +17,7 @@ from .calls import (
 from .images import cmd_look, cmd_shot
 from .testing import cmd_test
 from .assets import cmd_diff, cmd_overview, cmd_size, cmd_table, cmd_usages, cmd_validate
-from .content import cmd_import, cmd_lint, cmd_unused
+from .content import cmd_import, cmd_landscape, cmd_lint, cmd_unused
 from .jobs import cmd_job, cmd_package
 from .play import cmd_audio, cmd_mem, cmd_soak, cmd_ui, cmd_world
 from .playtest import bp_command, cmd_input, perf_command, pie_command
@@ -130,6 +130,15 @@ def build_parser():
     s.add_argument("--seed", type=int, default=0, help="same seed, same layout")
     s.add_argument("--align", action="store_true", help="tilt each to the surface")
     s.add_argument("--label", help="label prefix (default: the asset name)")
+    s = add("landscape", cmd_landscape, "landscape: info, at x,y, map [x,y,size], flatten|raise|smooth x,y,r, restore")
+    s.add_argument("action", nargs="?", default="info", choices=["info", "at", "map", "flatten", "raise", "smooth", "restore"])
+    s.add_argument("where", nargs="?", help="at: x,y; map: x,y,size (default: all); flatten/raise/smooth: x,y,radius")
+    s.add_argument("--height", type=float, help="flatten: target z (default: the height at the centre)")
+    s.add_argument("--by", type=float, help="raise: cm (negative lowers)")
+    s.add_argument("--strength", type=float, help="0..1 toward the result (smooth: number of passes, 2)")
+    s.add_argument("--px", type=int, default=128, help="map: pixels per side (128, max 256)")
+    s.add_argument("-o", "--output", help="map: PNG path (default Saved/Tether/shots/)")
+    s.add_argument("--backup", help="restore: the backup file an edit printed")
     s = add("foliage", cmd_foliage, "foliage instances: list by type, add over an area (snapped to the ground), remove")
     s.add_argument("action", nargs="?", default="list", choices=["list", "add", "remove"])
     s.add_argument("what", nargs="?", help="a FoliageType asset or a static mesh (add: required; remove: default all)")

@@ -1,11 +1,13 @@
-"""Content hygiene and intake: ue import, ue unused, ue lint."""
+"""Content and world editing: ue import, unused, lint, landscape."""
 import fnmatch
 import json
 import os
 import re
+import time
 
-from .core import CliError, filter_log, human_bytes, log_end, log_path
+from .core import CliError, filter_log, human_bytes, log_end, log_path, state_dir
 from .calls import flush_editor_log
+from .images import png_write
 from .assets import SKIP_DIRS, SOURCE_EXTS, package_bytes, project_code_roots
 
 IMPORT_EXTS = {
@@ -279,3 +281,99 @@ def cmd_lint(ctx, args):
             print(f"  ... +{len(items) - per_rule} more (ue lint --rule {rule} --limit N)")
     ctx.data = [{"rule": r, "package": p, "message": m} for r, p, m in found]
     return 1 if found and args.strict else 0
+
+
+LAYER_COLOURS = [(110, 160, 70), (140, 130, 120), (190, 170, 120), (90, 120, 160), (170, 110, 80), (200, 200, 200)]
+
+
+def landscape_png(grid, path):
+    """A height/layer picture of a landscape grid: brightness is height, colour is the dominant paint layer."""
+    px, heights, dominant, layers = grid["px"], grid["heights"], grid["dominant"], grid["layers"]
+    values = [v for row in heights for v in row if v is not None]
+    lo, hi = (min(values), max(values)) if values else (0, 1)
+    span = (hi - lo) or 1.0
+    rgb = bytearray()
+    for row in reversed(range(px)):  # north (+y) up
+        for col in range(px):
+            z = heights[row][col]
+            if z is None:
+                rgb += bytes((255, 0, 255))
+                continue
+            shade = 0.35 + 0.65 * (z - lo) / span
+            layer = dominant[row][col]
+            base = LAYER_COLOURS[layers.index(layer) % len(LAYER_COLOURS)] if layer in layers else (255, 255, 255)
+            rgb += bytes(min(255, int(c * shade)) for c in base)
+    png_write(path, px, px, bytes(rgb))
+    return lo, hi
+
+
+def cmd_landscape(ctx, args):
+    """Landscape: summary, the surface at a point, a height/layer picture, or sculpting a circle."""
+    import math
+    nums = [float(v) for v in (args.where or "").replace(" ", "").split(",") if v] if args.where else []
+    if args.action == "info":
+        print(ctx.tether("landscape", action="info", x=0.0, y=0.0, size=0.0, px=2))
+        return 0
+    if args.action == "at":
+        if len(nums) != 2:
+            raise CliError("ue landscape at x,y")
+        data = ctx.tether("landscape", action="at", x=nums[0], y=nums[1], size=0.0, px=2)
+        data = json.loads(data) if isinstance(data, str) else data
+        weights = ", ".join(f"{k} {v:g}" for k, v in data["weights"].items() if v) or "no paint layers"
+        print(f"{data['landscape']} at {data['x']}, {data['y']}: z {data['z']}, slope {data['slope']} deg; {weights}")
+        ctx.data = data
+        return 0
+    if args.action == "map":
+        if len(nums) not in (0, 3):
+            raise CliError("ue landscape map [x,y,size]  (default: the whole landscape)")
+        x, y, size = nums if nums else (0.0, 0.0, 0.0)
+        grid = ctx.tether("landscape", action="grid", x=x, y=y, size=size, px=args.px)
+        grid = json.loads(grid) if isinstance(grid, str) else grid
+        path = args.output or os.path.join(state_dir(ctx.project), "shots", time.strftime("landscape-%Y%m%d-%H%M%S.png"))
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        lo, hi = landscape_png(grid, path)
+        legend = ", ".join(f"{name} {LAYER_COLOURS[i % len(LAYER_COLOURS)]}" for i, name in enumerate(grid["layers"]))
+        print(f"{path}  ({grid['size'] / 100:.0f} m square around {grid['x']:.0f}, {grid['y']:.0f}; z {lo:.0f} to {hi:.0f}, "
+              f"brighter is higher, north up" + (f"; colours: {legend}" if legend else "") + ")")
+        ctx.data = {"png": path, "z_min": lo, "z_max": hi}
+        return 0
+    if args.action == "restore":
+        if not args.backup:
+            raise CliError("ue landscape restore --backup <file> (each edit prints its backup)")
+        x = y = radius = 0.0
+    else:
+        if len(nums) != 3:
+            raise CliError(f"ue landscape {args.action} x,y,radius")
+        x, y, radius = nums
+    value = {"flatten": args.height if args.height is not None else -1e30, "raise": args.by or 0.0}.get(args.action, 0.0)
+    strength = args.strength if args.strength is not None else (2.0 if args.action == "smooth" else 1.0)
+    tool = lambda step: ctx.tether("landscape_edit", step=step, action=args.action, x=x, y=y, radius=radius,  # noqa: E731
+                                   value=value, strength=strength,
+                                   backup=os.path.abspath(args.backup) if args.backup else "-")
+    tool("begin")
+    try:
+        time.sleep(0.3)  # the export renders on a later frame
+        applied = tool("apply")
+        time.sleep(0.3)  # and so does the patch
+        result = tool("commit")
+    except CliError:
+        tool("cancel")
+        raise
+    result = json.loads(result) if isinstance(result, str) else result
+    applied = json.loads(applied) if isinstance(applied, str) else applied
+    if not result.get("ok"):
+        raise CliError("the landscape refused the heightmap import (ue log)")
+    if args.action == "restore":
+        print(f"restored {result['vertices']} vertices from {args.backup}")
+    else:
+        now, deadline = None, time.time() + 5
+        while time.time() < deadline:  # collision follows the heightmap a frame or two later
+            at = ctx.tether("landscape", action="at", x=x, y=y, size=0.0, px=2)
+            now = (json.loads(at) if isinstance(at, str) else at)["z"]
+            if abs(now - result["centre_before"]) > 0.5 or not result["max_change_cm"]:
+                break
+            time.sleep(0.25)
+        print(f"{args.action}: centre z {result['centre_before']} -> {now}, largest change {result['max_change_cm']} cm "
+              f"over {result['vertices']} vertices; undo with ue landscape restore --backup {applied['backup']}")
+    ctx.data = result
+    return 0

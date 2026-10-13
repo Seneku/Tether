@@ -1374,6 +1374,22 @@ class BpTrace(unittest.TestCase):
                                  (1.5, "BP_Door", "OnInteract", 1)])
 
 
+class LandscapePicture(unittest.TestCase):
+    def test_height_is_brightness_and_layer_is_colour(self):
+        grid = {"px": 2, "layers": ["Grass", "Rock"], "heights": [[0.0, 100.0], [None, 50.0]],
+                "dominant": [["Grass", "Rock"], [None, None]]}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "l.png")
+            self.assertEqual(ue.landscape_png(grid, path), (0.0, 100.0))
+            with open(path, "rb") as f:
+                width, height, _, rgb = ue.png_read(f.read())
+        self.assertEqual((width, height), (2, 2))
+        pixel = lambda x, y: tuple(rgb[(y * width + x) * 3:(y * width + x) * 3 + 3])  # noqa: E731
+        self.assertEqual(pixel(0, 1), (38, 56, 24))     # bottom row is the first grid row (north up): low grass
+        self.assertEqual(pixel(1, 1), (140, 130, 120))  # high rock, full brightness
+        self.assertEqual(pixel(0, 0), (255, 0, 255))    # no landscape there
+
+
 class JsonEnvelope(unittest.TestCase):
     def run_json(self, project, *argv):
         out = io.StringIO()
