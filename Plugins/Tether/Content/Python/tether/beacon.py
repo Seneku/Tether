@@ -218,7 +218,8 @@ def start():
     _state["headless"] = _headless()
     _state["nullrhi"] = bool(re.search(r"(^|\s)-nullrhi\b", _command_line(), re.I))
     _state["sound"] = not re.search(r"(^|\s)-nosound\b", _command_line(), re.I)
-    _state["launched"] = "-TetherLaunched" in _command_line()
+    # `ue open` adds -TetherLaunched; before 0.11 it was recognisable by -ModelContextProtocolStartServer alone
+    _state["launched"] = any(flag in _command_line() for flag in ("-TetherLaunched", "-ModelContextProtocolStartServer"))
     _write_session()
     _state["port"] = _ensure_mcp_server()
     try:
