@@ -287,7 +287,8 @@ def build_parser():
                    help="also the assets changed in git (uncommitted, plus committed since REV if given)")
     s.add_argument("--map-check", action="store_true", help="also Map Check the open level (default without paths)")
     s.add_argument("--strict", action="store_true", help="fail on warnings too")
-    s = add("mat", cmd_mat, "material parameters with values and sources; Name=value sets them (undoable)")
+    s = add("mat", cmd_mat, "material parameters with values and sources; Name=value sets them (undoable); "
+                            "`mat graph <material> [op ...]` reads or edits the node graph")
     s.add_argument("target", help="material or instance path, or an actor (lists its materials)")
     s.add_argument("assignments", nargs="*", metavar="Name=value", help="scalar, r,g,b[,a], true/false, texture path")
     s.add_argument("--reset", action="append", metavar="NAME", help="stop overriding NAME (instances; repeatable)")

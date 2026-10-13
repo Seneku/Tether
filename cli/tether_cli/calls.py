@@ -241,7 +241,18 @@ def cmd_asset(ctx, args):
 
 
 def cmd_mat(ctx, args):
-    """Material parameters: list them (with where each value comes from), or set them (undoable)."""
+    """Material parameters: list them (with where each value comes from), or set them (undoable). `ue mat graph`
+    reads or edits the node graph."""
+    if args.target == "graph":
+        if not args.assignments:
+            raise CliError("ue mat graph <material> [add|connect|set|delete ...]")
+        material, *rest = args.assignments
+        out = ctx.tether("mat_graph", target=material, op=rest[0] if rest else "-", args=json.dumps(rest[1:]))
+        print(out)
+        if rest:
+            text = ctx.tether("material", target=material, compile=True, limit=0)
+            print(text[text.find("compiled "):] if "compiled " in text else text.splitlines()[-1])
+        return 0
     if args.assignments or args.reset:
         values = {}
         for item in args.assignments:

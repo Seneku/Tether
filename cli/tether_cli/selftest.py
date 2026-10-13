@@ -154,6 +154,8 @@ def cmd_selftest(ctx, args):
     check("drop", ["drop", "TetherSelftestProbe"], skip=probe_skip,
           ok=lambda c, o: c == 0 and ("-> " in o or "no ground below" in o))
     check("mat", ["mat", "/Engine/BasicShapes/BasicShapeMaterial"], ok=lambda c, o: c == 0 and "vector  Color" in o)
+    check("mat graph", ["mat", "graph", "/Engine/BasicShapes/BasicShapeMaterial"],
+          ok=lambda c, o: c == 0 and "BaseColor <- #1" in o)
     instance = check("mat: transient instance", ["py",
         "mi = unreal.find_object(None, '/Engine/Transient.MI_TetherSelftest') or "
         "unreal.new_object(unreal.MaterialInstanceConstant, name='MI_TetherSelftest')\n"

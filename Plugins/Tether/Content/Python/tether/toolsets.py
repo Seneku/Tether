@@ -1304,6 +1304,61 @@ def _png_rgba8(width, height, rgba):
             + chunk(b"IDAT", zlib.compress(rows)) + chunk(b"IEND", b""))
 
 
+def _mat_node_text(expr, kind):
+    """One material node in a few words: its kind, parameter name and the setting that matters."""
+    name = _try(lambda: str(expr.get_editor_property("parameter_name")))
+    text = kind + (f" '{name}'" if name and name != "None" else "")
+    for prop, fmt in (("default_value", None), ("r", None), ("constant", None), ("texture", "asset"),
+                      ("material_function", "asset"), ("coordinate_index", "uv"), ("text", None)):
+        value = _try(lambda: expr.get_editor_property(prop), None)
+        if value is None:
+            continue
+        if fmt == "asset":
+            text += f" = {value.get_name()}" if value else " = none"
+        elif fmt == "uv":
+            text += f" UV{value}"
+        elif isinstance(value, unreal.LinearColor):
+            text += f" = ({value.r:g}, {value.g:g}, {value.b:g}, {value.a:g})"
+        elif isinstance(value, (int, float)) and not isinstance(value, bool):
+            text += f" {prop}={value:g}" if prop.startswith("const_") else f" = {value:g}"
+        elif isinstance(value, str) and value:
+            text += f" '{value[:40]}'"
+        if prop in ("default_value", "r", "constant", "texture", "material_function"):
+            break
+    group = _try(lambda: str(expr.get_editor_property("group")))
+    return text + (f" [group {group}]" if group and group != "None" else "")
+
+
+def _mat_parse_value(text, old):
+    """A typed value for a material expression property, shaped like its current value."""
+    if isinstance(old, bool):
+        return text.lower() in ("1", "true", "yes", "on")
+    if isinstance(old, (int, float)):
+        return type(old)(float(text))
+    if isinstance(old, unreal.LinearColor) or (old is None and "," in text):
+        nums = (_numbers(text) or []) + [1.0] * 4
+        return unreal.LinearColor(*nums[:4])
+    if isinstance(old, unreal.Object) or text.startswith("/"):
+        asset = unreal.load_asset(text.split(".")[0])
+        if asset is None:
+            raise RuntimeError(f"no asset at {text}")
+        return asset
+    return text
+
+
+def _mat_set_default(expr, text):
+    """Set a parameter's or constant's value, whichever property it has."""
+    for prop in ("default_value", "texture", "r", "constant"):
+        old = _try(lambda: expr.get_editor_property(prop), _MISSING)
+        if old is not _MISSING:
+            expr.set_editor_property(prop, _mat_parse_value(text, old))
+            return
+    raise RuntimeError(f"{expr.get_class().get_name()} has no value to set; use set <node> prop=value")
+
+
+_MISSING = object()
+
+
 def _rot_tuple(rot):
     return rot.pitch, rot.yaw, rot.roll
 
@@ -2074,6 +2129,166 @@ class TetherCore(_Base):
         zs = [a.get_actor_location().z for a in placed]
         return (f"placed {len(placed)} of {count} {prefix}" + (f" (z {min(zs):.0f} to {max(zs):.0f})" if zs else "")
                 + (": " + "; ".join(notes) if notes else "") + (f"; labels {prefix}_01.." if placed else ""))
+
+    @_tool
+    @staticmethod
+    def mat_graph(target: str, op: str = "-", args: str = "[]", token: str = "") -> str:
+        """A material's (or material function's) node graph as text, or a small edit to it.
+
+        Args:
+            target: Material or MaterialFunction path.
+            op: '-' to read; add <ExpressionClass> [name] [value]; connect <from>[.Output] <to>.<Input> | <Property>;
+                set <node> prop=value ...; delete <node>. Nodes are '#n' from the last read, a parameter name, or a
+                class name used once (e.g. Multiply).
+            args: JSON list of the op's arguments.
+            token: Session token from Saved/Tether/editors/<pid>.token (the ue CLI sends it; edits only).
+
+        Returns:
+            The graph as text (after an edit too, with a line saying what changed).
+        """
+        lib = unreal.MaterialEditingLibrary
+        asset = unreal.load_asset(target.split(".")[0])
+        if not isinstance(asset, (unreal.Material, unreal.MaterialFunction)):
+            raise RuntimeError(f"{target} is not a Material or MaterialFunction (ue mat lists an instance's parameters)")
+        is_fn = isinstance(asset, unreal.MaterialFunction)
+        exprs = lambda: list((lib.get_material_function_expressions if is_fn else lib.get_material_expressions)(asset))  # noqa: E731
+
+        def short(expr):
+            return expr.get_class().get_name().replace("MaterialExpression", "")
+
+        def resolve(ref, nodes):
+            ref = ref.strip()
+            if ref.startswith("#") and ref[1:].isdigit() and 0 < int(ref[1:]) <= len(nodes):
+                return nodes[int(ref[1:]) - 1]
+            named = [e for e in nodes if str(_try(lambda: e.get_editor_property("parameter_name"), "")) == ref]
+            if len(named) == 1:
+                return named[0]
+            by_class = [e for e in nodes if short(e).lower() == ref.lower()]
+            if len(by_class) == 1:
+                return by_class[0]
+            raise RuntimeError(f"no single node '{ref}' (use #n from `ue mat graph`, a parameter name, or a class used once)")
+
+        note = ""
+        if op not in ("", "-"):
+            _authorize(token)
+            argv = json.loads(args)
+            nodes = exprs()
+            if op == "add":
+                if not argv:
+                    raise RuntimeError("add <ExpressionClass> [parameter name] [value]")
+                cls_name = argv[0] if argv[0].startswith("MaterialExpression") else "MaterialExpression" + argv[0]
+                cls = getattr(unreal, cls_name, None)
+                if cls is None:
+                    raise RuntimeError(f"no expression class {cls_name}")
+                xs = [lib.get_material_expression_node_position(e)[0] for e in nodes] or [0]
+                create = lib.create_material_expression_in_function if is_fn else lib.create_material_expression
+                expr = create(asset, cls, min(xs) - 300, 200 * len(nodes) % 1200)
+                if len(argv) > 1 and _try(lambda: expr.get_editor_property("parameter_name"), None) is not None:
+                    expr.set_editor_property("parameter_name", argv[1])
+                if len(argv) > 2:
+                    _mat_set_default(expr, argv[2])
+                note = f"added #{len(nodes) + 1} {short(expr)}" + (f" '{argv[1]}'" if len(argv) > 1 else "")
+            elif op == "connect":
+                if len(argv) != 2:
+                    raise RuntimeError("connect <from>[.Output] <to>.<Input> | <MaterialProperty>")
+                source, _, out_pin = argv[0].partition(".")
+                src = resolve(source, nodes)
+                dest, _, in_pin = argv[1].partition(".")
+                prop = getattr(unreal.MaterialProperty, "MP_" + re.sub(r"(?<!^)(?=[A-Z])", "_", dest).upper(), None)
+                if prop is not None and not in_pin and not is_fn:
+                    if not lib.connect_material_property(src, out_pin, prop):
+                        raise RuntimeError(f"could not connect {argv[0]} to {dest}")
+                    note = f"connected {argv[0]} -> {dest}"
+                else:
+                    dst = resolve(dest, nodes)
+                    if not lib.connect_material_expressions(src, out_pin, dst, in_pin):
+                        names = list(lib.get_material_expression_input_names(dst))
+                        raise RuntimeError(f"could not connect {argv[0]} to {argv[1]} (inputs of {short(dst)}: "
+                                           f"{', '.join(names) or 'none'})")
+                    note = f"connected {argv[0]} -> {argv[1]}"
+            elif op == "set":
+                if len(argv) < 2:
+                    raise RuntimeError("set <node> prop=value ...")
+                expr = resolve(argv[0], nodes)
+                for pair in argv[1:]:
+                    name, _, value = pair.partition("=")
+                    if name in ("value", "default"):
+                        _mat_set_default(expr, value)
+                    else:
+                        old = expr.get_editor_property(name)
+                        expr.set_editor_property(name, _mat_parse_value(value, old))
+                note = f"set {argv[0]}: {', '.join(argv[1:])}"
+            elif op == "delete":
+                expr = resolve(argv[0], nodes)
+                (lib.delete_material_expression_in_function if is_fn else lib.delete_material_expression)(asset, expr)
+                note = f"deleted {argv[0]} ({short(expr)})"
+            else:
+                raise RuntimeError("op: add, connect, set or delete")
+            if is_fn:
+                lib.update_material_function(asset, None)
+            else:
+                lib.recompile_material(asset)
+            _try(lambda: (lib.refresh_material_function_editor if is_fn else lib.refresh_material_editor)(asset))
+
+        nodes = exprs()
+        ids = {e.get_path_name(): i + 1 for i, e in enumerate(nodes)}
+        ref = lambda e, out="": f"#{ids.get(e.get_path_name(), '?')}" + (f".{out}" if out else "")  # noqa: E731
+        lines = []
+        if is_fn:
+            lines.append(f"{asset.get_name()} (MaterialFunction), {len(nodes)} node(s)")
+        else:
+            info = [str(_try(lambda: asset.get_editor_property(p), "")).split(".")[-1].split(":")[0]
+                    for p in ("material_domain", "blend_mode", "shading_model")]
+            two_sided = _try(lambda: asset.get_editor_property("two_sided"), False)
+            lines.append(f"{asset.get_name()} (Material: {', '.join(i.replace('MD_', '').replace('BLEND_', '').replace('MSM_', '') for i in info if i)}"
+                         + (", two-sided" if two_sided else "") + f"), {len(nodes)} node(s)")
+        used = set()
+
+        def walk(expr):
+            key = expr.get_path_name()
+            if key in used:
+                return
+            used.add(key)
+            getter = lib.get_inputs_for_material_function_expression if is_fn else lib.get_inputs_for_material_expression
+            for inp in _try(lambda: list(getter(asset, expr)), []) or []:
+                if inp:
+                    walk(inp)
+        if not is_fn:
+            outputs = []
+            for name in ("BASE_COLOR", "METALLIC", "SPECULAR", "ROUGHNESS", "ANISOTROPY", "EMISSIVE_COLOR", "OPACITY",
+                         "OPACITY_MASK", "NORMAL", "TANGENT", "WORLD_POSITION_OFFSET", "SUBSURFACE_COLOR",
+                         "AMBIENT_OCCLUSION", "REFRACTION", "PIXEL_DEPTH_OFFSET", "SHADING_MODEL", "SURFACE_THICKNESS",
+                         "DISPLACEMENT", "FRONT_MATERIAL"):
+                prop = getattr(unreal.MaterialProperty, "MP_" + name, None)
+                node = _try(lambda: lib.get_material_property_input_node(asset, prop)) if prop is not None else None
+                if node:
+                    out = _try(lambda: lib.get_material_property_input_node_output_name(asset, prop), "") or ""
+                    outputs.append(f"  {name.title().replace('_', '')} <- {ref(node, out)} {_mat_node_text(node, short(node))}")
+                    walk(node)
+            lines.append("outputs:" if outputs else "outputs: none connected")
+            lines += outputs
+        else:
+            for expr in nodes:
+                if short(expr) == "FunctionOutput":
+                    walk(expr)
+        lines.append("nodes:")
+        getter = lib.get_inputs_for_material_function_expression if is_fn else lib.get_inputs_for_material_expression
+        for i, expr in enumerate(nodes):
+            if expr.get_path_name() not in used:
+                continue
+            names = list(_try(lambda: lib.get_material_expression_input_names(expr), []) or [])
+            inputs = list(_try(lambda: getter(asset, expr), []) or [])
+            wired = []
+            for name, inp in zip(names, inputs):
+                if inp:
+                    out = _try(lambda: lib.get_input_node_output_name_for_material_expression(expr, inp), "") or ""
+                    wired.append(f"{name or 'In'} <- {ref(inp, out)}")
+            lines.append(f"  #{i + 1} {_mat_node_text(expr, short(expr))}" + (f" ({', '.join(wired)})" if wired else ""))
+        unused = [f"#{i + 1} {_mat_node_text(e, short(e))}" for i, e in enumerate(nodes)
+                  if e.get_path_name() not in used and short(e) != "Comment"]
+        if unused:
+            lines.append("not connected to an output: " + "; ".join(unused[:12]) + (f" +{len(unused) - 12}" if len(unused) > 12 else ""))
+        return (note + "\n" if note else "") + "\n".join(lines)
 
     @_tool
     @staticmethod
