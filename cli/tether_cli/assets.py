@@ -1031,3 +1031,226 @@ def cmd_overview(ctx, args):
     for line in lines:
         print(line)
     return 0
+
+
+NIAGARA_STAGES = (("systemSpawnScript", "system spawn"), ("systemUpdateScript", "system update"),
+                  ("emitterSpawnScript", "emitter spawn"), ("emitterUpdateScript", "emitter update"),
+                  ("particleSpawnScript", "particle spawn"), ("particleUpdateScript", "particle update"))
+
+
+def niagara_value(value):
+    """A user variable's value from Epic's JSON ({"struct": ..., "value": {...}}) as short text."""
+    if isinstance(value, dict):
+        inner = value.get("value", value)
+        if isinstance(inner, dict):
+            nums = [inner[k] for k in ("x", "y", "z", "w", "r", "g", "b", "a", "value") if k in inner]
+            if nums:
+                return ", ".join(f"{n:g}" if isinstance(n, (int, float)) else str(n) for n in nums)
+        return json.dumps(inner, separators=(",", ":"))[:60]
+    return str(value)
+
+
+def niagara_type(var):
+    """'LinearColor' from a user variable's type reference."""
+    kind = var.get("type") or var.get("typeDef") or {}
+    ref = (kind.get("classStructOrEnum") or {}).get("refPath") if isinstance(kind, dict) else None
+    return (ref or str(kind) or "?").rsplit(".", 1)[-1].replace("Niagara", "") or "?"
+
+
+def niagara_lines(summary, topologies, user):
+    """`ue fx <system>`: emitters with sim target, renderers and modules per stage; user parameters."""
+    emitters = summary.get("emitters") or []
+    lines = [f"{summary.get('systemName', '?')}: {len(emitters)} emitter(s), {len(user)} user parameter(s)"]
+    for var in user:
+        name = var.get("name") or (var.get("variable") or {}).get("name", "?")
+        value = var.get("value") or var.get("defaultValue")
+        lines.append(f"  user {name}: {niagara_type(var)}" + (f" = {niagara_value(value)}" if value is not None else ""))
+    for emitter in emitters:
+        name = emitter.get("emitterName", "?")
+        renderers = [(r.get("refPath") or "?").rsplit(".", 1)[-1].replace("Niagara", "").replace("RendererProperties", "")
+                     for r in emitter.get("rendererClasses") or []]
+        sim = (emitter.get("simTarget") or "?").replace("Sim", "").replace("ComputeShader", "GPU")
+        lines.append(f"  {name}" + ("" if emitter.get("bEnabled", True) else " (disabled)")
+                     + f": {sim}, " + (", ".join(r.lower() for r in renderers) or "no") + " renderer(s)")
+        topology = topologies.get(name) or {}
+        for key, label in NIAGARA_STAGES:
+            modules = (topology.get(key) or {}).get("modules") or []
+            if modules:
+                lines.append(f"    {label}: " + ", ".join(m.get("moduleName", "?") + ("" if m.get("enabled", True) else " (off)")
+                                                         for m in modules))
+        extra = [k for k, v in topology.items() if k.endswith("Script") and k not in dict(NIAGARA_STAGES)
+                 and isinstance(v, dict) and v.get("modules")]
+        for key in extra:
+            lines.append(f"    {key}: " + ", ".join(m.get("moduleName", "?") for m in topology[key]["modules"]))
+    return lines
+
+
+def cmd_fx(ctx, args):
+    """Niagara: a system as text, user parameters on a placed component, or the components in the level/PIE."""
+    target = args.target or ""
+    sets = [a for a in args.assignments if "=" in a]
+    if target.startswith("/") and not args.pie:
+        system = target if "." in target.rsplit("/", 1)[-1] else f"{target}.{target.rsplit('/', 1)[-1]}"
+        summary = mcp_tool(ctx, "NiagaraToolset_System", "GetSystemSummary", {"system": system})
+        user = mcp_tool(ctx, "NiagaraToolset_System", "GetUserVariables", {"system": system})
+        user = (user or {}).get("userVariables", []) if isinstance(user, dict) else []
+        topologies = {}
+        for emitter in summary.get("emitters") or []:
+            ref = {"system": system, "emitterName": emitter.get("emitterName"), "scriptName": "", "moduleName": "",
+                   "rendererIndex": -1, "inputNameStack": []}
+            try:
+                topologies[emitter.get("emitterName")] = mcp_tool(ctx, "NiagaraToolset_System", "GetEmitterTopology",
+                                                                  {"emitterRef": ref})
+            except CliError as exc:
+                topologies[emitter.get("emitterName")] = {}
+                print(f"note: {emitter.get('emitterName')}: {exc}")
+        for line in niagara_lines(summary, topologies, user)[: args.limit + 1]:
+            print(line)
+        ctx.data = {"summary": summary, "user": user, "topology": topologies}
+        return 0
+    if target and sets:
+        print(ctx.tether("set_niagara", target=target, values=json.dumps(dict(a.split("=", 1) for a in sets)),
+                         pie=args.pie))
+        return 0
+    rows = ctx.tether("niagara_components", match="" if target.startswith("/") else target, pie=args.pie,
+                      limit=args.limit)
+    rows = json.loads(rows) if isinstance(rows, str) else rows
+    print(f"{len(rows)} Niagara component(s) in {'PIE' if args.pie else 'the level'}"
+          + (f" matching '{target}'" if target else ""))
+    for row in rows:
+        state = "active" if row["active"] else "inactive" + (" (auto-activates)" if row["auto_activate"] else "")
+        print(f"  {row['actor']}.{row['component']}: {row['system'] or 'no system'}, {state}"
+              + ("" if row["visible"] else ", hidden"))
+        if target and len(rows) == 1 and row["system"]:  # one component: its user parameter values too
+            try:
+                values = mcp_tool(ctx, "NiagaraToolset_Component", "GetUserVariables", {"component": row["path"]})
+            except CliError:
+                values = None
+            values = (values or {}).get("userVariables", []) if isinstance(values, dict) else values or []
+            for var in values:
+                name = var.get("name") or (var.get("variable") or {}).get("name", "?")
+                print(f"    {name}: {niagara_type(var)} = {niagara_value(var.get('value'))}")
+    ctx.data = rows
+    return 0
+
+
+def pcg_value(value):
+    """A PCG node parameter as short text: refPaths to their last part, floats rounded, structures cut short."""
+    if isinstance(value, dict) and set(value) == {"refPath"}:
+        return (value["refPath"] or "None").rsplit("/", 1)[-1].rsplit(".", 1)[-1]
+    if isinstance(value, float):
+        return f"{value:.4g}"
+    if isinstance(value, (dict, list)):
+        text = json.dumps(value, separators=(",", ":"))
+        return text if len(text) <= 60 else text[:57] + "..."
+    return str(value)
+
+
+def pcg_graph_lines(structure, params=None, meshes=None):
+    """`ue pcg <graph>`: nodes in dataflow order, each with what feeds it and its non-default settings."""
+    nodes = {n["name"]: n for n in structure.get("nodes") or []}
+    edges = structure.get("edges") or []
+    inputs = {}
+    for e in edges:
+        inputs.setdefault(e["destNode"], []).append(e)
+    order, seen = [], set()
+
+    def visit(name):  # sources first, so the text reads top to bottom like the data flows
+        if name in seen or name not in nodes:
+            return
+        seen.add(name)
+        for e in inputs.get(name, []):
+            visit(e["srcNode"])
+        order.append(name)
+    for name in sorted(nodes, key=lambda n: (nodes[n].get("nodeType") != "Input Node", n == "DefaultOutputNode")):
+        visit(name)
+    lines = [f"{structure.get('name', '?')}: {len(nodes)} node(s), {len(edges)} edge(s)"
+             + (f" - {structure['description']}" if structure.get("description") else "")]
+    for name in order:
+        node = nodes[name]
+        kind = node.get("nodeType", "?")
+        title = node.get("title")
+        head = name + (f' "{title}"' if title and title not in (kind, name) else "") + f" ({kind})"
+        if not node.get("bEnabled", True):
+            head += " (disabled)"
+        feeds = [f"{e['srcNode']}.{e['srcPin']}" + (f"->{e['destPin']}" if e["destPin"] not in ("In", "Out") else "")
+                 for e in inputs.get(name, [])]
+        settings = {k: v for k, v in (node.get("paramOverrides") or {}).items()
+                    if not (kind in ("Input Node", "Output Node") and k == "pins")}
+        if (meshes or {}).get(name):
+            settings.pop("meshSelectorParameters", None)
+            settings["meshes"] = ", ".join(meshes[name])
+        line = "  " + head + (f" <- {', '.join(feeds)}" if feeds else "")
+        if settings:
+            line += "; " + ", ".join(f"{k} {pcg_value(v)}" for k, v in settings.items())
+        lines.append(line)
+        if node.get("comment"):
+            lines.append(f"    # {node['comment']}")
+    unused = [n for n in nodes if not any(e["srcNode"] == n for e in edges) and nodes[n].get("nodeType") != "Output Node"]
+    if unused:
+        lines.append("feeding nothing: " + ", ".join(unused))
+    for name, value in (params or {}).items():
+        lines.append(f"  param {name} = {pcg_value(value)}")
+    return lines
+
+
+PCG_TRIGGERS = {"generateonload": "generates on load", "generateondemand": "on demand",
+                "generateatruntime": "at runtime"}
+
+
+def pcg_row_line(row):
+    spawned = ", ".join(f"{n} x{c}" for n, c in sorted(row["instances"].items(), key=lambda kv: -kv[1]))
+    state = "generating" if row["generating"] else "generated" if row["generated"] else "not generated"
+    return (f"{row['actor']}.{row['component']}: {row['graph'] or 'no graph'}, seed {row['seed']}, "
+            f"{PCG_TRIGGERS.get(row['trigger'], row['trigger'])}, "
+            f"{state}" + (", partitioned" if row["partitioned"] else "")
+            + (f"; {sum(row['instances'].values())} instances ({spawned})" if row["instances"] else "")
+            + (f"; {row['actors']} actor(s)" if row["actors"] else ""))
+
+
+def cmd_pcg(ctx, args):
+    """PCG: a graph as text, the level's PCG components, or generate/clean up one."""
+    if args.action in ("generate", "cleanup"):
+        if not args.target:
+            raise CliError(f"ue pcg {args.action} <actor>")
+        rows = ctx.tether("pcg", action=args.action, target=args.target, seed=-1 if args.seed is None else args.seed)
+        rows = json.loads(rows) if isinstance(rows, str) else rows
+        deadline = time.time() + args.wait
+        while time.time() < deadline:  # both finish on later editor ticks
+            time.sleep(0.5)
+            rows = ctx.tether("pcg", action="status", target=args.target)
+            rows = json.loads(rows) if isinstance(rows, str) else rows
+            if args.action == "generate" and not rows[0]["generating"] or                     args.action == "cleanup" and not rows[0]["generated"] and not rows[0]["instances"]:
+                break
+        row = rows[0]
+        if args.action == "generate" and row["generating"]:
+            print(f"still generating after {args.wait:g}s (ue pcg status {args.target})")
+        print(pcg_row_line(row))
+        ctx.data = row
+        return 0
+    if args.action == "graph" or (args.action and args.action.startswith("/")):
+        graph = args.target if args.action == "graph" else args.action
+        if not graph:
+            raise CliError("ue pcg <graph path>")
+        graph = graph if "." in graph.rsplit("/", 1)[-1] else f"{graph}.{graph.rsplit('/', 1)[-1]}"
+        structure = mcp_tool(ctx, "PCGToolset.PCGToolset", "GetGraphStructure", {"graph": graph})
+        try:
+            schema = mcp_tool(ctx, "PCGToolset.PCGToolset", "GetGraphSchema", {"graph": graph})
+        except CliError:
+            schema = None
+        params = schema.get("properties") if isinstance(schema, dict) and isinstance(schema.get("properties"), dict) else {}
+        params = {k: (v.get("default") if isinstance(v, dict) else v) for k, v in params.items()}
+        meshes = ctx.tether("pcg", action="meshes", target=graph)
+        meshes = json.loads(meshes) if isinstance(meshes, str) else meshes
+        for line in pcg_graph_lines(structure, params, meshes)[: args.limit + 1]:
+            print(line)
+        ctx.data = structure
+        return 0
+    match = args.target if args.action in (None, "list", "status") else args.action
+    rows = ctx.tether("pcg", action="list", target=match or "", limit=args.limit)
+    rows = json.loads(rows) if isinstance(rows, str) else rows
+    print(f"{len(rows)} PCG component(s) in the level" + (f" matching '{match}'" if match else ""))
+    for row in rows:
+        print("  " + pcg_row_line(row))
+    ctx.data = rows
+    return 0

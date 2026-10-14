@@ -204,6 +204,51 @@ NORMAL_NAME = re.compile(r"_(N|Normal|Nrm)$", re.I)
 MASK_NAME = re.compile(r"_(ORM|ARM|MRA|RMA|ORD|Masks?|AO|Rough(ness)?|Metal(lic)?|Height)$", re.I)
 
 
+TEXTURE_CLASSES = ("Texture2D", "TextureCube", "Texture2DArray", "VolumeTexture")
+FORMAT_BITS = {  # bits per pixel by pixel format (the registry's Format tag, PF_ dropped)
+    "DXT1": 4, "BC1": 4, "BC4": 4, "ETC2_RGB": 4, "DXT3": 8, "DXT5": 8, "BC2": 8, "BC3": 8, "BC5": 8, "BC6H": 8,
+    "BC7": 8, "ETC2_RGBA": 8, "ASTC_4x4": 8, "ASTC_6x6": 4, "ASTC_8x8": 2, "G8": 8, "A8": 8, "R8": 8, "L8": 8,
+    "G16": 16, "R16F": 16, "R16_UINT": 16, "V8U8": 16, "R8G8": 16, "B8G8R8A8": 32, "R8G8B8A8": 32, "A2B10G10R10": 32,
+    "FloatR11G11B10": 32, "R32_FLOAT": 32, "R32F": 32, "G16R16": 32, "G16R16F": 32, "FloatRGBA": 64,
+    "A16B16G16R16": 64, "R16G16B16A16_UNORM": 64, "A32B32G32R32F": 128,
+}
+UNCOMPRESSED_FORMATS = {f for f, bits in FORMAT_BITS.items() if bits >= 16 and not f.startswith(("BC", "DXT", "ETC", "ASTC"))}
+
+
+def texture_format(tag):
+    return (tag or "").replace("PF_", "")
+
+
+# Compression settings that store uncompressed on purpose (HDR, float data, displacement, editor icons).
+UNCOMPRESSED_ON_PURPOSE = {"TC_HDR", "TC_HDR_F32", "TC_HalfFloat", "TC_SingleFloat", "TC_VectorDisplacementmap",
+                           "TC_DistanceFieldFont", "TC_EditorIcon", "TC_HDR_Compressed", "TC_LQ"}
+
+
+def texture_size(tags):
+    """(width, height) from the Dimensions tag ('2048x2048'; arrays and volume textures add a third number)."""
+    parts = (tags.get("Dimensions") or "0x0").split("x")
+    try:
+        return int(parts[0]), int(parts[1])
+    except (ValueError, IndexError):
+        return 0, 0
+
+
+def texture_bytes(w, h, tags):
+    """GPU memory at full resolution (capped by its max size) with its mip chain (a third more): x6 for a cube,
+    x slices or depth for arrays and volumes."""
+    cap = int(tags.get("MaxTextureSize") or 0)
+    if cap and max(w, h) > cap:
+        scale = cap / max(w, h)
+        w, h = max(1, int(w * scale)), max(1, int(h * scale))
+    depth = (tags.get("Dimensions") or "").split("x")[2:3]
+    size = w * h * FORMAT_BITS.get(texture_format(tags.get("Format")), 8) / 8
+    size *= int(depth[0]) if depth and depth[0].isdigit() else 1
+    pow2 = w and h and not (w & (w - 1) or h & (h - 1))
+    if pow2 and tags.get("MipGenSettings") != "TMGS_NoMipmaps":
+        size *= 4 / 3
+    return int(size * (6 if tags.get("_class") == "TextureCube" else 1))
+
+
 def lint_rules(rows, config=None):
     """[(rule, package, message)] for `ue lint`, from lint_data rows and the project's lint.json."""
     config = config or {}
@@ -225,9 +270,8 @@ def lint_rules(rows, config=None):
             add("naming", package, f"{cls}: expected {' or '.join(wanted)}")
         if " " in name or not name.isascii():
             add("characters", package, "spaces or non-ASCII characters in the name break some platforms and tools")
-        if cls == "Texture2D" and tags.get("Dimensions"):
-            w, _, h = tags["Dimensions"].partition("x")
-            w, h = int(w or 0), int(h or 0)
+        if cls in TEXTURE_CLASSES and tags.get("Dimensions"):
+            w, h = texture_size(tags)
             ui = "UI" in (tags.get("LODGroup") or "")
             if not ui and w and h and (w & (w - 1) or h & (h - 1)):
                 add("texture-pow2", package, f"{w}x{h} is not a power of two: no mips, no streaming")
@@ -237,6 +281,12 @@ def lint_rules(rows, config=None):
                 add("texture-normal", package, f"named as a normal map but compressed as {tags['CompressionSettings']}")
             if MASK_NAME.search(name) and tags.get("SRGB") == "True":
                 add("texture-mask-srgb", package, "a mask/packed texture with sRGB on (its values get gamma-curved)")
+            fmt = texture_format(tags.get("Format"))
+            if not ui and fmt in UNCOMPRESSED_FORMATS and w * h >= 512 * 512                     and tags.get("CompressionSettings") not in UNCOMPRESSED_ON_PURPOSE:
+                add("texture-uncompressed", package, f"{w}x{h} stored as {fmt} ({human_bytes(texture_bytes(w, h, tags))}, "
+                                                     f"{tags.get('CompressionSettings') or 'TC_Default'})")
+            if tags.get("NeverStream") == "True" and max(w, h) >= 1024 and tags.get("VirtualTextureStreaming") != "True":
+                add("texture-never-stream", package, f"{w}x{h} never streams: all its mips stay in memory")
         if cls == "StaticMesh" and tags.get("Triangles"):
             tris = int(tags["Triangles"])
             if tags.get("CollisionPrims") == "0" and tags.get("CollisionComplexity") != "CTF_UseComplexAsSimple" \
@@ -270,8 +320,8 @@ def lint_plan(found, rules=None):
     return plan
 
 
-def cmd_lint(ctx, args):
-    """Content rules beyond Epic's validators, from asset registry tags (nothing is loaded)."""
+def lint_config(ctx):
+    """(path, settings) of the project's Config/Tether/lint.json ({} when there is none)."""
     config_path = os.path.join(os.path.dirname(ctx.project), "Config", "Tether", "lint.json")
     config = {}
     if os.path.isfile(config_path):
@@ -280,6 +330,114 @@ def cmd_lint(ctx, args):
                 config = json.load(f)
         except ValueError as exc:
             raise CliError(f"{config_path}: {exc}")
+    return config_path, config
+
+
+def texture_rows(rows, config=None):
+    """`ue tex` rows from lint_data rows: [{package, class, w, h, format, bytes, group, flags, issues}], largest first."""
+    out = []
+    for package, cls, tags in rows:
+        if cls not in TEXTURE_CLASSES:
+            continue
+        tags = dict(tags, _class=cls)
+        w, h = texture_size(tags)
+        flags = [f for f, on in (("sRGB", tags.get("SRGB") == "True"), ("never streams", tags.get("NeverStream") == "True"),
+                                 ("virtual", tags.get("VirtualTextureStreaming") == "True"),
+                                 ("alpha", tags.get("HasAlphaChannel") == "True"),
+                                 ("no mips", tags.get("MipGenSettings") == "TMGS_NoMipmaps")) if on]
+        if tags.get("MaxTextureSize") not in (None, "0"):
+            flags.append(f"max {tags['MaxTextureSize']}")
+        issues = [(rule, message) for rule, _, message in lint_rules([[package, cls, tags]], config)
+                  if rule.startswith("texture-")]
+        out.append({"package": package, "class": cls, "w": w, "h": h, "format": texture_format(tags.get("Format")) or "?",
+                    "compression": tags.get("CompressionSettings") or "",
+                    "group": (tags.get("LODGroup") or "").replace("TEXTUREGROUP_", ""),
+                    "bytes": texture_bytes(w, h, tags), "flags": flags, "issues": issues})
+    out.sort(key=lambda r: -r["bytes"])
+    return out
+
+
+def texture_line(row):
+    return (f"{human_bytes(row['bytes']):>9}  {row['w']}x{row['h']} {row['format']} {row['group']}"
+            + (f" ({', '.join(row['flags'])})" if row["flags"] else "") + f"  {row['package']}")
+
+
+def tex_streaming(ctx, args):
+    data = ctx.tether("texture_streaming", limit=args.top)
+    data = json.loads(data) if isinstance(data, str) else data
+    pool = data["pool_mb"]
+    print(f"{data['count']} textures in memory: {data['in_mem_mb']:.0f} MB ({data['streaming_mb']:.0f} MB streaming"
+          + (f", {100 * data['streaming_mb'] / pool:.0f}% of the {pool} MB pool" if pool else "")
+          + f"; {data['non_streaming_mb']:.0f} MB never streams)")
+    if data["wanting_count"]:
+        full = pool and data["streaming_mb"] + data["wanting_mb"] > pool
+        print(f"{data['wanting_count']} want more mips than they have (~{data['wanting_mb']:.0f} MB more): "
+              + ("over the pool, so the streamer is holding them back" if full else "still streaming in"))
+    print("largest in memory:")
+    for t in data["largest"]:
+        print(f"  {t['kb'] / 1024:>7.1f} MB  {t['current']} of {t['max']} {t['format']} {t['group']}"
+              + ("" if t["streaming"] else " (never streams)") + (" (virtual)" if t["vt"] else "") + f"  {t['path']}")
+    if data["wanting"]:
+        print("wanting more:")
+        for w in data["wanting"]:
+            print(f"  {w['current']} -> {w['wanted']}" + (f" (+{w['missing_kb'] / 1024:.1f} MB)" if w["missing_kb"] else "")
+                  + f"  {w['path']}")
+    ctx.data = data
+    return 0
+
+
+def cmd_tex(ctx, args):
+    """Texture audit from registry tags (sizes, formats, estimated memory, issues), or the live streaming pool."""
+    if args.streaming:
+        return tex_streaming(ctx, args)
+    path = (args.path or "/Game").split(".")[0].rstrip("/") or "/Game"
+    _, config = lint_config(ctx)
+    if args.max:
+        config["max_texture_size"] = args.max
+
+    def textures_under(folder):
+        rows = ctx.tether("lint_data", path=folder)
+        return texture_rows(json.loads(rows) if isinstance(rows, str) else rows, config)
+    textures = textures_under(path)
+    parent = path.rsplit("/", 1)[0]
+    exact = [t for t in textures_under(parent) if t["package"] == path] if not textures and parent else []
+    if exact:
+        t = exact[0]
+        print(f"{t['package']} ({t['class']}): {t['w']}x{t['h']} {t['format']}, {t['compression']}, group {t['group']}, "
+              f"~{human_bytes(t['bytes'])} at full resolution" + (f"; {', '.join(t['flags'])}" if t["flags"] else ""))
+        for rule, message in t["issues"]:
+            print(f"  {rule}: {message}")
+        ctx.data = t
+        return 1 if t["issues"] and args.strict else 0
+    total = sum(t["bytes"] for t in textures)
+    streamed = sum(t["bytes"] for t in textures if "never streams" not in t["flags"] and "virtual" not in t["flags"])
+    issues = {}
+    for t in textures:
+        for rule, message in t["issues"]:
+            issues.setdefault(rule, []).append((t, message))
+    print(f"{len(textures)} textures under {path}: ~{human_bytes(total)} at full resolution with mips"
+          + (f" ({human_bytes(total - streamed)} of it never streams or is virtual)" if total - streamed else "")
+          + (f"; {sum(len(v) for v in issues.values())} issue(s)" if issues else ""))
+    if not textures:
+        return 0
+    print("largest:")
+    for t in textures[: args.top]:
+        print("  " + texture_line(t))
+    per_rule = min(args.limit, 6)
+    for rule, items in sorted(issues.items(), key=lambda kv: -len(kv[1])):
+        print(f"{rule} ({len(items)}):")
+        for t, message in items[:per_rule]:
+            print(f"  {t['package']}  {message}")
+        if len(items) > per_rule:
+            print(f"  ... +{len(items) - per_rule} more (ue lint {path} --rule {rule})")
+    ctx.data = {"total_bytes": total, "streamed_bytes": streamed, "count": len(textures),
+                "issues": {rule: len(items) for rule, items in issues.items()}, "textures": textures[: args.limit]}
+    return 1 if issues and args.strict else 0
+
+
+def cmd_lint(ctx, args):
+    """Content rules beyond Epic's validators, from asset registry tags (nothing is loaded)."""
+    config_path, config = lint_config(ctx)
     if args.ignore:
         config["ignore"] = config.get("ignore", []) + args.ignore
     rows = ctx.tether("lint_data", path=args.path)

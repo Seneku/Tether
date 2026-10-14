@@ -8,11 +8,11 @@ import time
 
 from .core import (
     CliError, compact_error, crash_summary, editor_executable, editor_live, engine_root, filter_log, host_platform,
-    human_bytes, log_end, log_path, read_json, recent_crash, state_dir, subprocess, unwrap, write_json,
+    human_bytes, log_end, log_path, read_json, recent_crash, short, state_dir, subprocess, unwrap, write_json,
 )
 from .transport import catalog, py_json, resolve_toolset
 from .build import csharp_changes, csharp_layout, csharp_reload_build
-from .calls import flush_editor_log
+from .calls import flush_editor_log, scoped_cvars
 from .images import cmd_shot, image_diff, png_read, png_write
 from .assets import mcp_tool
 from .jobs import cmd_job, jobs_dir
@@ -564,6 +564,166 @@ def unthrottled(ctx):
     finally:
         if throttled:
             ctx.tether("py", code=throttle.format(True))
+
+
+GPU_LINE = re.compile(r"^( *)(\d+(?:\.\d+)?)%\s+([\d.]+)ms(?: \+ ([\d.]+) Wait)?\s+(.*?)\s*$")
+GPU_HEAD = re.compile(r"GPU Profile for Frame (\d+) - (.+?) - GPU (\d+)")
+GPU_KINDS = [  # (kind, name regex), first match from a pass up through its parents
+    ("UI", r"Slate"), ("Lumen", r"Lumen"), ("shadows", r"Shadow"), ("Nanite", r"Nanite"),
+    ("ray tracing", r"RayTracing|PathTracing"), ("ambient occlusion", r"AmbientOcclusion|ScreenSpace AO|^AO\b"),
+    ("reflections", r"Reflection|SSR\b"), ("translucency", r"Translucen"), ("particles", r"Niagara|GPUParticles|FXSystem"),
+    ("fog, sky and clouds", r"Volumetric|Fog|Cloud|SkyAtmosphere|SkyPass|^Sky"),
+    ("post processing", r"PostProcess|TemporalSuperResolution|^TSR|Bloom|Tonemap|MotionBlur|DOF|DepthOfField|Upscale"),
+    ("lighting", r"Light|Deferred"), ("base pass", r"^BasePass"), ("depth pre-pass", r"^PrePass|DepthPass"),
+    ("visibility and culling", r"HZB|Occlusion|Cull|GPUScene|InstanceCulling|Visibility|BuildRenderingCommands"),
+]
+
+
+def gpu_profile_blocks(lines):
+    """Every ProfileGPU block in log lines (plain-text format): [{frame, pipeline, frame_ms, nodes}], each node
+    {name, depth, ms, wait, children: [indexes]} in tree order; node 0 is <root>."""
+    blocks, block, base = [], None, None
+    for raw in lines:
+        text = re.sub(r"^\[[^\]]*\]\[[^\]]*\]", "", raw)
+        text = re.sub(r"^LogRHI: (?:Display: )?", "", text)
+        head = GPU_HEAD.search(text)
+        if head:
+            block = {"frame": int(head.group(1)), "pipeline": head.group(2), "frame_ms": None, "nodes": []}
+            blocks.append(block)
+            base = None
+            continue
+        if block is None:
+            continue
+        m = re.search(r"- Frame Time\s*:\s*([\d.]+)ms", text)
+        if m:
+            block["frame_ms"] = float(m.group(1))
+            continue
+        m = GPU_LINE.match(text)
+        if not m:
+            if block["nodes"] and not text.strip():
+                block = None  # a blank line ends the tree
+            continue
+        indent = len(m.group(1))
+        base = indent if base is None else base
+        block["nodes"].append({"name": m.group(5), "depth": (indent - base) // 3, "ms": float(m.group(3)),
+                               "wait": float(m.group(4) or 0), "children": []})
+    for block in blocks:
+        stack = []
+        for index, node in enumerate(block["nodes"]):
+            while stack and block["nodes"][stack[-1]]["depth"] >= node["depth"]:
+                stack.pop()
+            node["parent"] = stack[-1] if stack else None
+            if stack:
+                block["nodes"][stack[-1]]["children"].append(index)
+            stack.append(index)
+    return blocks
+
+
+def gpu_kind(block, index):
+    node = index
+    while node is not None:
+        name = block["nodes"][node]["name"]
+        for kind, rx in GPU_KINDS:
+            if re.search(rx, name):
+                return kind
+        node = block["nodes"][node]["parent"]
+    return "other"
+
+
+def gpu_summary(blocks):
+    """Average the graphics-pipeline blocks: {frames, gpu_ms, kinds: {kind: ms}, passes: [(path, ms)], scene}."""
+    graphics = [b for b in blocks if b["nodes"] and "Graphics" in b["pipeline"]]
+    if not graphics:
+        return None
+    kinds, passes, total = {}, {}, 0.0
+    scene_seen = False
+    for block in graphics:
+        nodes = block["nodes"]
+        total += nodes[0]["ms"]
+        for index, node in enumerate(nodes):
+            exclusive = max(0.0, node["ms"] - sum(nodes[c]["ms"] for c in node["children"]))
+            if exclusive and index:
+                kind = gpu_kind(block, index)
+                kinds[kind] = kinds.get(kind, 0.0) + exclusive
+            if node["name"] == "Scene" or node["name"].startswith("SceneRender"):
+                scene_seen = True
+        scene = next((i for i, n in enumerate(nodes) if n["name"] == "Scene"), None)
+        # The passes worth naming: the Scene's children, and whatever else the frame did outside the scene.
+        frame = next((i for i in nodes[0]["children"] if nodes[i]["name"].startswith("Frame")), 0)
+        roots = list(nodes[scene]["children"]) if scene is not None else []
+        roots += [c for c in nodes[frame]["children"] if c != scene and not _contains(nodes, c, scene)]
+        roots += [c for c in nodes[0]["children"] if c != frame]
+        for c in roots:
+            passes[nodes[c]["name"]] = passes.get(nodes[c]["name"], 0.0) + nodes[c]["ms"]
+    n = len(graphics)
+    return {"frames": n, "gpu_ms": round(total / n, 3), "scene": scene_seen,
+            "frame_numbers": [b["frame"] for b in graphics],
+            "kinds": {k: round(v / n, 3) for k, v in sorted(kinds.items(), key=lambda kv: -kv[1])},
+            "passes": sorted(((name, round(ms / n, 3)) for name, ms in passes.items()), key=lambda p: -p[1])}
+
+
+def _contains(nodes, ancestor, index):
+    while index is not None:
+        if index == ancestor:
+            return True
+        index = nodes[index]["parent"]
+    return False
+
+
+GPU_CVARS = {"r.ProfileGPU.ShowUI": "0", "r.ProfileGPU.TableFormatting": "0", "r.ProfileGPU.UnicodeOutput": "0",
+             "r.ProfileGPU.ShowEmptyQueues": "0"}
+
+
+def cmd_gpu(ctx, args):
+    """GPU time per pass from ProfileGPU (PIE if it runs, else the editor's viewports), averaged over --frames."""
+    pie = str(ctx.tether("pie", action="status")).strip() == "running"
+    if args.pie and not pie:
+        raise CliError("PIE is not running (ue pie start)")
+    blocks, timeout = [], time.time() + 20 + 3 * args.frames
+    with unthrottled(ctx), scoped_cvars(ctx, GPU_CVARS):  # ShowUI=0: no profiler window on the user's screen
+        for _ in range(args.frames):
+            start = log_end(ctx.project)
+            ctx.tether("console", command="ProfileGPU", pie=pie)
+            got = []
+            while time.time() < timeout:
+                flush_editor_log(ctx)
+                with open(log_path(ctx.project), "rb") as f:
+                    f.seek(start)
+                    got = gpu_profile_blocks(f.read().decode("utf-8", "replace").splitlines())
+                if any("Graphics" in b["pipeline"] and b["nodes"] for b in got):
+                    time.sleep(0.2)  # let the other pipelines' blocks land too
+                    break
+                time.sleep(0.3)
+            else:
+                raise CliError("no GPU profile in the log (does this editor render? ue open --headless needs --render)", 4)
+            blocks += got
+    summary = gpu_summary(blocks)
+    if summary is None:
+        raise CliError("ProfileGPU logged no graphics pipeline")
+    where = "PIE" if pie else "editor"
+    print(f"GPU {summary['gpu_ms']:.2f} ms per frame ({where}, " + (f"average of {summary['frames']} frames"
+          if summary["frames"] > 1 else f"frame {summary['frame_numbers'][0]}") + ")")
+    if not summary["scene"]:
+        print("note: no 3D scene was rendered in " + ("that frame" if summary["frames"] == 1 else "those frames")
+              + (": the PIE viewport is not drawing" if pie else ": start PIE (ue pie start) or make a level viewport "
+                 "realtime") + "; what is left is editor UI")
+    total = summary["gpu_ms"] or 1.0
+    kinds = [(k, ms) for k, ms in summary["kinds"].items() if ms >= args.min]
+    print("by kind: " + ", ".join(f"{k} {ms:.2f} ms ({100 * ms / total:.0f}%)" for k, ms in kinds[: args.top]))
+    print("passes:")
+    for name, ms in [p for p in summary["passes"] if p[1] >= args.min][: args.top]:
+        print(f"  {ms:7.2f} ms {100 * ms / total:4.0f}%  {short(name, 100)}")
+    other = [b for b in blocks if b["nodes"] and "Graphics" not in b["pipeline"] and b["nodes"][0]["ms"] >= args.min]
+    for b in other[:2]:
+        print(f"{b['pipeline']}: {b['nodes'][0]['ms']:.2f} ms (overlaps the graphics pipeline)")
+    if args.tree:
+        block = next(b for b in reversed(blocks) if "Graphics" in b["pipeline"] and b["nodes"])
+        print(f"tree (frame {block['frame']}, >= {args.min} ms):")
+        for node in block["nodes"]:
+            if node["ms"] >= args.min and node["depth"] <= args.tree:
+                print(f"  {'  ' * node['depth']}{node['ms']:.2f} ms  {short(node['name'], 100)}")
+    ctx.data = summary
+    return 0
 
 
 def read_profile_csv(path):

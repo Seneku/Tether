@@ -1,4 +1,5 @@
 """Thin commands over one editor tool each: tools, call, py, props, set, spawn and friends."""
+import contextlib
 import json
 import os
 import re
@@ -6,7 +7,8 @@ import sys
 import time
 
 from .core import (
-    CliError, GATED, TETHER, compact_error, editor_token, emit, filter_log, human_bytes, log_end, log_path, pid_alive,
+    CliError, GATED, TETHER, UE_SCRIPT, compact_error, editor_token, emit, filter_log, human_bytes, log_end, log_ignore_entries,
+    log_ignore_path, log_path, pid_alive, summarize_log, write_json,
     port_open,
     read_json, read_new_log, short, state_dir, unwrap,
 )
@@ -412,14 +414,50 @@ def flush_editor_log(ctx):
 
 
 def cmd_log(ctx, args):
+    if args.ignore:
+        return add_log_ignore(ctx, args.ignore, args.why)
     flush_editor_log(ctx)
+    if args.summary:
+        lines = read_new_log(ctx.project, from_start=True, advance=False)
+        rows, hidden = summarize_log(lines, args.level, ignore=not args.all)
+        total = sum(r["count"] for r in rows)
+        print(f"{total} entries (>= {args.level}) in {len(rows)} group(s) from {len(lines)} lines this session"
+              + (f"; {hidden} known noise hidden (--all)" if hidden else ""))
+        for row in rows[: args.limit]:
+            print(f"{row['count']:>5}x {row['level'][0]} {row['category']}: {short(row['first'], 160)}")
+        if len(rows) > args.limit:
+            print(f"... +{len(rows) - args.limit} more group(s) (--limit)")
+        ctx.data = {"groups": rows, "hidden": hidden}
+        return 0
     lines = read_new_log(ctx.project, from_start=args.since == "start")
-    shown = filter_log(lines, args.level, args.cat, args.grep)
-    print(f"{len(shown)} entries (>= {args.level}) from {len(lines)} new lines")
+    shown = filter_log(lines, args.level, args.cat, args.grep, ignore=not args.all)
+    print(f"{len(shown)} entries (>= {args.level}) from {len(lines)} new lines"
+          + (f"; {shown.hidden} known noise hidden (--all)" if shown.hidden else ""))
     for line in shown[-args.limit:] if args.since == "start" else shown[: args.limit]:
         print(line)
     if len(shown) > args.limit:
         print(f"... +{len(shown) - args.limit} more (--limit)")
+    return 0
+
+
+def add_log_ignore(ctx, pattern, why=None):
+    """`ue log --ignore REGEX`: add a known-noise pattern to Config/Tether/log-ignore.json."""
+    try:
+        re.compile(pattern)
+    except re.error as exc:
+        raise CliError(f"not a valid regex: {exc}")
+    path = log_ignore_path(ctx.project)
+    data = read_json(path) if os.path.exists(path) else {"ignore": []}
+    if data is None:
+        raise CliError(f"{path} is not valid JSON")
+    items = data.setdefault("ignore", []) if isinstance(data, dict) else data
+    if pattern in log_ignore_entries(ctx.project):
+        print(f"already ignored: {pattern}")
+        return 0
+    items.append({"pattern": pattern, "why": why} if why else pattern)
+    write_json(path, data)
+    print(f"ignoring {pattern!r} in ue log, pie and ci ({os.path.relpath(path, os.path.dirname(ctx.project))}, "
+          f"{len(items)} pattern(s)); ue log --all shows everything")
     return 0
 
 
@@ -497,6 +535,11 @@ def cmd_collision(ctx, args):
     return 0
 
 
+def cmd_tree(ctx, args):
+    print(ctx.tether("component_tree", target=args.target, pie=args.pie, limit=args.limit))
+    return 0
+
+
 def cmd_class(ctx, args):
     print(ctx.tether("class_info", name=args.name, limit=args.limit))
     return 0
@@ -555,3 +598,73 @@ def cmd_wp(ctx, args):
     print(ctx.tether("wp", action=args.action, match=match, area=area, limit=args.limit))
     return 0
 
+
+
+def as_json(result):
+    """A tool's JSON result: the transport hands it back already decoded, unless it came as text."""
+    return json.loads(result) if isinstance(result, str) else result
+
+
+def cvar_line(row):
+    """`name = value  (SetBy; default D)`; nothing in brackets when it is the built-in value."""
+    if row["setby"] == "Constructor":
+        return f"{row['name']} = {row['value']}"
+    default = row.get("default")
+    same = default is None or str(default) == str(row["value"]) or row.get("same_as_default")
+    return f"{row['name']} = {row['value']}  ({row['setby']}" + ("" if same else f"; default {default}") + ")"
+
+
+def restore_cvars(ctx, changed):
+    """Undo a set_cvars result: unset the console layer, or put back the old value where the console had set it."""
+    restore = {r["name"]: r["before"] for r in changed if r["setby_before"] == "Console"}
+    unset = [r["name"] for r in changed if r["setby_before"] != "Console"]
+    return as_json(ctx.tether("set_cvars", values=json.dumps(restore), reset=json.dumps(unset)))
+
+
+@contextlib.contextmanager
+def scoped_cvars(ctx, values):
+    """Console variables set for the duration of a block, then restored exactly (see restore_cvars)."""
+    changed = as_json(ctx.tether("set_cvars", values=json.dumps(values), reset="[]"))
+    try:
+        yield changed
+    finally:
+        restore_cvars(ctx, changed)
+
+
+def cmd_cvar(ctx, args):
+    """Console variables: list (value, who set it, default), set, reset, or set only while a command runs."""
+    sets = [item for item in args.items if "=" in item]
+    if args.reset or sets:
+        values = {}
+        for item in sets:
+            name, _, value = item.partition("=")
+            values[name.strip()] = value
+        changed = as_json(ctx.tether("set_cvars", values=json.dumps(values), reset=json.dumps(args.reset or [])))
+        for row in changed:
+            print(f"{row['name']}: {row['before']} ({row['setby_before']}) -> {row['after']} ({row['setby']})")
+        ctx.data = changed
+        if not args.run:
+            return 0
+        import shlex
+        import subprocess
+        child = [sys.executable, UE_SCRIPT, "--project", ctx.project] + shlex.split(args.run)
+        env = dict(os.environ, **({"UE_EDITOR_PID": str(ctx.beacon["pid"])} if ctx.beacon else {}))
+        try:
+            sys.stdout.flush()
+            code = subprocess.call(child, env=env)
+        finally:
+            back = restore_cvars(ctx, changed)
+            print("restored " + ", ".join(f"{r['name']} = {r['after']} ({r['setby']})" for r in back))
+        return code
+    if args.run:
+        raise CliError("--for needs Name=value to set while it runs")
+    match = " ".join(args.items)
+    data = as_json(ctx.tether("cvars", match=match, changed=args.changed, limit=args.limit))
+    what = "differ from their default" if args.changed else "match"
+    print(f"{data['matched']} of {data['total']} console variables {what}" + (f" '{match}'" if match else ""))
+    for row in data["rows"]:
+        print("  " + cvar_line(row))
+    if data["matched"] > len(data["rows"]):
+        print(f"  ... +{data['matched'] - len(data['rows'])} more (--limit N, or a narrower regex)")
+    ctx.data = data
+    return 0

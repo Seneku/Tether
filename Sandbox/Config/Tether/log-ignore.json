@@ -1,0 +1,8 @@
+{
+  "ignore": [
+    {
+      "pattern": "^LogAutomationTest: Condition failed",
+      "why": "the engine's own boot-time error tests (UnifiedErrorTest) in 5.8"
+    }
+  ]
+}

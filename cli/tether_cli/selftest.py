@@ -120,6 +120,22 @@ def cmd_selftest(ctx, args):
           ok=lambda c, o: c == 0 and "reference" in o)
     check("asset", ["asset", "/Engine/BasicShapes/Cube"], ok=lambda c, o: c == 0 and "triangles" in o)
     check("log", ["log", "--level", "Error"])
+    check("log --summary", ["log", "--summary"], ok=lambda c, o: c == 0 and "group(s)" in o)
+    check("cvar", ["cvar", "r.Shadow.MaxResolution"], ok=lambda c, o: c == 0 and "r.Shadow.MaxResolution = " in o)
+    check("cvar --for", ["cvar", "r.Shadow.MaxResolution=777", "--for", "cvar r.Shadow.MaxResolution"],
+          skip="needs UE 5.8+" if remote else None,
+          ok=lambda c, o: c == 0 and "r.Shadow.MaxResolution = 777  (Console" in o and "restored r.Shadow.MaxResolution" in o)
+    check("tex", ["tex", "/Engine/EngineSky", "--top", "2"], ok=lambda c, o: c == 0 and "textures under /Engine/EngineSky" in o)
+    check("tex --streaming", ["tex", "--streaming", "--top", "2"], ok=lambda c, o: c == 0 and "textures in memory" in o)
+    toolsets = set() if remote else set(catalog(ctx))
+    check("fx (system)", ["fx", "/Niagara/DefaultAssets/Templates/Systems/RadialBurst"],
+          skip=None if "NiagaraToolsets.NiagaraToolset_System" in toolsets else "no Epic Niagara toolset",
+          ok=lambda c, o: c == 0 and "emitter(s)" in o and "particle update:" in o)
+    check("fx (list)", ["fx"], ok=lambda c, o: (c == 0 and "Niagara component(s)" in o) or "NiagaraComponent" in o)
+    check("pcg (list)", ["pcg"], ok=lambda c, o: (c == 0 and "PCG component(s)" in o) or "PCGComponent" in o)
+    check("pcg (graph)", ["pcg", "/PCG/EdMode/DrawSpline/SpacingTool"],
+          skip=None if "PCGToolset.PCGToolset" in toolsets else "no Epic PCG toolset",
+          ok=lambda c, o: c == 0 and "node(s)" in o)
     check("changes", ["changes"], ok=lambda c, o: c == 0 and "unsaved package" in o)
     check("size", ["size", "--top", "3"], ok=lambda c, o: c == 0 and "packages" in o)
     check("lint", ["lint", "/Engine/BasicShapes"], ok=lambda c, o: c == 0 and "naming" in o)
@@ -180,6 +196,8 @@ def cmd_selftest(ctx, args):
     check("bp edit add-component", ["bp", "edit", "/Game/TetherSelftest/BP_SelftestNew", "add-component", "Body",
                                     "StaticMesh", "StaticMesh=/Engine/BasicShapes/Cube"],
           skip=edit_skip, ok=lambda c, o: c == 0 and "added Body" in o and "BasicShapes/Cube" in o)
+    check("tree (Blueprint)", ["tree", "/Game/TetherSelftest/BP_SelftestNew"], skip=edit_skip,
+          ok=lambda c, o: c == 0 and "Body: StaticMeshComponent" in o)
     check("class (Blueprint)", ["class", "/Game/TetherSelftest/BP_SelftestNew"], skip=None if created else "nothing created",
           ok=lambda c, o: c == 0 and "Health" in o and ": Actor (C++)" in o)
     check("rm (new asset)", ["rm", "/Game/TetherSelftest/BP_SelftestNew"], skip=None if created else "nothing created",
@@ -267,6 +285,8 @@ def cmd_selftest(ctx, args):
     check("perf --trace", ["perf", "--seconds", "2", "--no-record", "--trace"], timeout=600,
           skip="needs 5.8" if remote else None if rendering else "headless with -nullrhi (no render timings)",
           ok=lambda c, o: c == 0 and "top scopes" in o)
+    check("perf --scalability", ["perf", "--scalability", "low,epic", "--seconds", "1"], timeout=600,
+          skip="needs 5.8" if remote else None, ok=lambda c, o: c == 0 and "original levels restored" in o and "epic" in o)
     check("perf load", ["perf", "load", "--seconds", "1"], timeout=300, skip="needs 5.8" if remote else None,
           ok=lambda c, o: c == 0 and "PIE start:" in o and "frames, median" in o)
     has_budget = os.path.isfile(os.path.join(os.path.dirname(project), "Config", "Tether", "budget.json"))
@@ -281,6 +301,9 @@ def cmd_selftest(ctx, args):
           ok=lambda c, o: c == 0 and "sample(s)" in o and "player  " in o)
     check("pie record", ["pie", "record", "--seconds", "1", "-o", os.path.join(tempfile.gettempdir(), "tether-selftest-rec.txt")],
           ok=lambda c, o: (c == 0 and "recorded" in o) or "no keys to record" in o)
+    check("tree (player)", ["tree", "player"], ok=lambda c, o: c == 0 and "component(s)" in o)
+    check("gpu", ["gpu", "--frames", "1"], timeout=300, skip="needs 5.8" if remote else None if rendering else
+          "headless with -nullrhi (nothing renders)", ok=lambda c, o: c == 0 and "GPU " in o and "by kind:" in o)
     check("trace (player view)", ["trace", "--distance", "2000"], ok=lambda c, o: c == 0 and "trace on Visibility" in o)
     check("ui", ["ui"], ok=lambda c, o: c == 0)
     check("ai", ["ai"], ok=lambda c, o: c == 0 and ("AI" in o))

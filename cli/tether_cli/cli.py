@@ -12,14 +12,14 @@ from .editor import cmd_build, cmd_close, cmd_crash, cmd_open, cmd_status
 from .calls import (
     cmd_actors, cmd_ai, cmd_anim, cmd_api, cmd_asset, cmd_call, cmd_changes, cmd_config, cmd_delete, cmd_drop,
     cmd_duplicate, cmd_exec, cmd_find, cmd_log, cmd_mat, cmd_mv, cmd_nav, cmd_new, cmd_props, cmd_py, cmd_refs,
-    cmd_class, cmd_collision, cmd_foliage, cmd_lights, cmd_wp, cmd_level, cmd_rm, cmd_statetree, cmd_trace, cmd_save, cmd_savegame, cmd_scatter, cmd_set, cmd_spawn, cmd_tools, cmd_undo, cmd_watch,
+    cmd_class, cmd_collision, cmd_cvar, cmd_tree, cmd_foliage, cmd_lights, cmd_wp, cmd_level, cmd_rm, cmd_statetree, cmd_trace, cmd_save, cmd_savegame, cmd_scatter, cmd_set, cmd_spawn, cmd_tools, cmd_undo, cmd_watch,
 )
 from .images import cmd_look, cmd_shot
 from .testing import cmd_test
-from .assets import cmd_diff, cmd_overview, cmd_size, cmd_table, cmd_usages, cmd_validate
-from .content import cmd_import, cmd_landscape, cmd_lint, cmd_unused
+from .assets import cmd_diff, cmd_fx, cmd_overview, cmd_pcg, cmd_size, cmd_table, cmd_usages, cmd_validate
+from .content import cmd_import, cmd_landscape, cmd_lint, cmd_tex, cmd_unused
 from .jobs import cmd_job, cmd_package
-from .play import cmd_audio, cmd_mem, cmd_soak, cmd_ui, cmd_world
+from .play import cmd_audio, cmd_gpu, cmd_mem, cmd_soak, cmd_ui, cmd_world
 from .playtest import bp_command, cmd_budget, cmd_input, perf_command, pie_command
 from .hooks import cmd_hook
 from .setup import cmd_doctor, cmd_init, cmd_reload
@@ -40,7 +40,8 @@ def undo_msys_paths(argv):
     if not bash:
         return argv
     root = os.path.dirname(os.path.dirname(os.path.dirname(bash))).replace("\\", "/")  # ...\Git\usr\bin\bash
-    rx = re.compile(re.escape(root) + "(?=/(?:" + "|".join(UNREAL_ROOTS) + r")(?!\w))", re.I)
+    # Unreal mount points are capitalised (/Game, /Engine, plugin ones like /Niagara); Git's own folders are not.
+    rx = re.compile(re.escape(root) + r"(?=/(?:(?i:" + "|".join(UNREAL_ROOTS) + r")(?!\w)|[A-Z]\w*(?:[/.\s'\"]|$)))")
     return [rx.sub("", a) for a in argv]
 
 
@@ -150,7 +151,24 @@ def build_parser():
     s = add("wp", cmd_wp, "World Partition: info, actors [regex|x,y,r] (unloaded too), load|unload <x,y,r|regex>")
     s.add_argument("action", nargs="?", default="info", choices=["info", "actors", "load", "unload"])
     s.add_argument("where", nargs="?", help="a name/class regex, or an area x,y,radius")
+    s = add("gpu", cmd_gpu, "GPU time per pass (ProfileGPU): by kind (Lumen, shadows, base pass, post...) and the top passes")
+    s.add_argument("--frames", type=int, default=3, help="frames to profile and average (3)")
+    s.add_argument("--pie", action="store_true", help="require PIE (default: PIE when it runs, else the editor)")
+    s.add_argument("--top", type=int, default=12, help="how many passes to list (12)")
+    s.add_argument("--min", type=float, default=0.05, help="leave out passes under this many ms (0.05)")
+    s.add_argument("--tree", type=int, nargs="?", const=6, metavar="DEPTH", help="also print the last frame's tree")
+    s = add("tex", cmd_tex, "textures: size, format, memory and issues under a folder (or one), or --streaming: the live pool")
+    s.add_argument("path", nargs="?", help="a folder (default /Game) or one texture")
+    s.add_argument("--streaming", action="store_true", help="what is in memory now: pool use, largest, ones wanting more mips")
+    s.add_argument("--top", type=int, default=10, help="how many of the largest to list (10)")
+    s.add_argument("--max", type=int, help="flag textures over this many pixels a side (lint.json max_texture_size, 4096)")
+    s.add_argument("--strict", action="store_true", help="exit 1 when any issue is found")
     add("lights", cmd_lights, "lighting overview: lights, sky, fog, exposure, and what commonly goes wrong")
+    s = add("cvar", cmd_cvar, "console variables: value, who set it, default; set, --reset, or set only --for a command")
+    s.add_argument("items", nargs="*", metavar="regex | Name=value", help="a name regex/prefix to list, or Name=value to set")
+    s.add_argument("--changed", action="store_true", help="only variables that differ from their built-in default")
+    s.add_argument("--reset", nargs="+", metavar="NAME", help="undo console-set values (back to ini/scalability/default)")
+    s.add_argument("--for", dest="run", metavar="'UE COMMAND'", help="with Name=value: set only while this ue command runs")
     s = add("trace", cmd_trace, "what a trace hits (PIE by default): from the player's view, or between points/actors")
     s.add_argument("--from", dest="start", default="player", help="player (PIE camera), camera (editor view), an actor, or x,y,z")
     s.add_argument("--to", default="look", help="look (along the view), an actor, or x,y,z")
@@ -159,6 +177,19 @@ def build_parser():
     s.add_argument("--sphere", type=float, default=0, help="sweep a sphere of this radius")
     s.add_argument("--simple", action="store_true", help="trace simple collision only (default: complex)")
     s.add_argument("--editor", action="store_true", help="trace the edited level instead of PIE")
+    s = add("fx", cmd_fx, "Niagara: a system as text (emitters, modules, user parameters), set user parameters on a "
+                          "placed component, or list the level's/PIE's Niagara components")
+    s.add_argument("target", nargs="?", help="a system /Game/... path, an actor (or regex to list), or nothing for all")
+    s.add_argument("assignments", nargs="*", metavar="Name=value", help="with an actor: user parameters to set")
+    s.add_argument("--pie", action="store_true", help="the PIE world's components")
+    s = add("pcg", cmd_pcg, "PCG: a graph as text (ue pcg /Game/PCG_X), the level's PCG components, generate|cleanup <actor>")
+    s.add_argument("action", nargs="?", help="a graph path, list (default), status, generate or cleanup")
+    s.add_argument("target", nargs="?", help="with generate/cleanup/status: the actor; with list: a name regex")
+    s.add_argument("--seed", type=int, help="with generate: use this seed (undoable)")
+    s.add_argument("--wait", type=float, default=60, help="with generate: seconds to wait for it to finish (60)")
+    s = add("tree", cmd_tree, "an actor's or Blueprint's components as a tree: sockets, transforms, mobility, meshes, flags")
+    s.add_argument("target", help="actor label, 'player' (PIE pawn), or a Blueprint /Game/... path")
+    s.add_argument("--pie", action="store_true", help="the PIE world's actor")
     s = add("collision", cmd_collision, "an actor's collision: profiles, object types, responses per channel")
     s.add_argument("actor")
     s.add_argument("--pie", action="store_true", help="the PIE world's actor")
@@ -234,8 +265,12 @@ def build_parser():
     s = add("exec", cmd_exec, "console command; prints the log lines it produced")
     s.add_argument("command", nargs="+")
     s.add_argument("--pie", action="store_true", help="run in the PIE world")
-    s = add("log", cmd_log, "new log entries since the last call (cursor kept on disk)")
+    s = add("log", cmd_log, "new log entries since the last call; --summary: the session grouped; --ignore: known noise")
     s.add_argument("--since", choices=["last", "start"], default="last")
+    s.add_argument("--summary", action="store_true", help="the whole session's warnings/errors grouped by message shape")
+    s.add_argument("--ignore", metavar="REGEX", help="add known noise to Config/Tether/log-ignore.json (hidden from log, pie, ci)")
+    s.add_argument("--why", help="with --ignore: a note kept next to the pattern")
+    s.add_argument("--all", action="store_true", help="show known noise too")
     s.add_argument("--level", default="Warning", help="Error, Warning, Display, Log, Verbose")
     s.add_argument("--cat", help="only this log category")
     s.add_argument("--grep", help="regex filter")
@@ -301,6 +336,9 @@ def build_parser():
     s.add_argument("--no-record", action="store_true", help="do not make this capture the comparison baseline")
     s.add_argument("--trace", action="store_true", help="also an Unreal Insights trace: top CPU scopes per thread")
     s.add_argument("--top", type=int, default=6, help="with --trace: scopes per thread (6)")
+    s.add_argument("--scalability", nargs="?", const="low,medium,high,epic", metavar="LEVELS",
+                   help="one capture per scalability level (low,medium,high,epic[,cinematic]; 5 s each), then restore")
+    s.add_argument("--shots", action="store_true", help="with --scalability: a screenshot at each level")
     add("budget", cmd_budget, "measure what Config/Tether/budget.json limits (frame time, memory, sizes, load) and compare")
     s = add("asset", cmd_asset, "a few lines about assets, by type (mesh, texture, material, Blueprint, ...)")
     s.add_argument("paths", nargs="+", help="/Game/... asset paths")

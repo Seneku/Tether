@@ -80,6 +80,11 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
 - Terrain: `ue landscape` (size, layers), `ue landscape at x,y` (height, slope, layer weights: use it before placing
   things), `ue landscape map` (a PNG of the shape). `ue landscape flatten x,y,r [--height z]` (a pad for a
   building), `raise x,y,r --by cm`, `smooth x,y,r`; each prints a backup for `ue landscape restore --backup`.
+- Component layout: `ue tree BP_Door` (or an actor label, or `player` in PIE) shows the component hierarchy
+  with sockets, transforms, meshes and collision/visibility flags.
+- Effects: `ue fx /Game/FX/NS_Fire` reads a Niagara system (emitters, modules per stage, user parameters);
+  `ue fx Torch_3 Intensity=4` sets a user parameter on a placed one. Procedural content: `ue pcg /Game/PCG/PCG_Forest`
+  reads a PCG graph; `ue pcg` lists the level's PCG components; `ue pcg generate ForestVolume --seed 3`.
 - Before changing a class or Blueprint: `ue class AEnemyCharacter` (or `ue class BP_Door`) shows its parents, own
   properties and functions, a Blueprint's components/variables/events, what derives from it and what uses it.
 - "Can't interact with / pick up / shoot X": `ue pie start`, aim with `ue pie do "look X"`, then `ue trace --channel
@@ -109,6 +114,10 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
   `fill_data_table_from_json_string`, which wipes every row).
 - `ue log [--level Warning|Display|Log] [--cat X] [--grep re]`: only entries that are new since the last
   `ue log`, de-duplicated. Run it after anything that might have warned or errored.
+- `ue log --summary`: the whole session's warnings and errors grouped by message shape with counts. Noise the
+  project knows about goes in Config/Tether/log-ignore.json (`ue log --ignore '^LogX: known thing' --why ...`);
+  ue log, pie and ci then hide it and say how many lines they hid (`--all` shows them). Add an entry only for
+  noise the user agrees is noise, never to make a real error go away.
 - `ue reload`: hot-reloads `Plugins/Tether/Content/Python/tether` after you edit or add a tool.
   To make a throwaway inspection script reusable, add it there as a `@toolset_registry.tool_call`.
 
@@ -207,6 +216,13 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
 
 ## Play testing
 - Performance: `ue perf` before and after a change; each run prints the difference from the previous one.
+  GPU bound: `ue gpu` (needs a rendering editor) splits GPU time by kind (Lumen, shadows, base pass, post...)
+  and names the top passes; `ue perf --scalability` measures low/medium/high/epic in one table.
+  Settings behind it: `ue cvar r.Shadow` lists console variables with who set them; `ue cvar --changed` shows
+  everything the project and device profile changed; to try a value, `ue cvar r.X=1 --for "gpu"` sets it only
+  for that one command.
+- Texture memory: `ue tex /Game/Folder` (largest textures, estimated memory, oversized/uncompressed/never
+  streaming ones) and `ue tex --streaming` (what is resident now, pool use, textures held back).
   `ue perf --trace` adds which scopes (functions, Blueprint events, render passes) take the time per thread.
   Limits the project must stay within live in Config/Tether/budget.json; `ue budget` checks them all (exit 1
   when over), and `ue ci --budget` makes CI fail on a regression.

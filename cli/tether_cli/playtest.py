@@ -1,5 +1,6 @@
 """Play testing: input maps, recording and watching play, regression baselines, load hitches, budgets."""
 import argparse
+import contextlib
 import csv
 import datetime
 import json
@@ -10,8 +11,10 @@ import shutil
 import time
 
 from .core import CliError, editor_mode, log_end, log_path, read_json, state_dir
-from .calls import flush_editor_log
+from .calls import flush_editor_log, scoped_cvars
 from .assets import cmd_bp, cmd_size, code_usages, folder_packages, package_bytes
+from .content import cmd_tex
+from .images import cmd_shot
 from .play import cmd_mem, cmd_perf, cmd_pie, insights_exe, insights_export, pie_do, unthrottled
 
 
@@ -680,10 +683,75 @@ def bp_command(ctx, args):
 
 
 def perf_command(ctx, args):
-    """`ue perf`: load lives here; the frame-time capture is play.cmd_perf."""
+    """`ue perf`: load and --scalability live here; the frame-time capture is play.cmd_perf."""
     if getattr(args, "action", None) == "load":
         return perf_load(ctx, args)
+    if getattr(args, "scalability", None):
+        return perf_scalability(ctx, args)
     return cmd_perf(ctx, args)
+
+
+SCALABILITY_LEVELS = {"low": 0, "medium": 1, "high": 2, "epic": 3, "cinematic": 4}
+SCALABILITY_GROUPS = ("ViewDistance", "AntiAliasing", "Shadow", "GlobalIllumination", "Reflection", "PostProcess",
+                      "Texture", "Effects", "Foliage", "Shading", "Landscape")
+
+
+def scalability_cvars(level):
+    """The sg.*Quality console variables for a level name or number (low=0 ... cinematic=4)."""
+    name = str(level).strip().lower()
+    value = SCALABILITY_LEVELS.get(name, int(name) if name.isdigit() and int(name) <= 4 else None)
+    if value is None:
+        raise CliError(f"unknown scalability level '{level}' (low, medium, high, epic, cinematic or 0-4)")
+    return {f"sg.{group}Quality": str(value) for group in SCALABILITY_GROUPS}
+
+
+def scalability_rows(results):
+    """Table lines for `ue perf --scalability`: one per level, frame/game/render/GPU in ms."""
+    lines = [f"  {'level':<10} {'frame avg':>9} {'p95':>6} {'game':>6} {'render':>6} {'GPU':>6} {'hitches':>7}  bound"]
+    for level, data in results:
+        get = lambda key, stat="avg": data.get(key, {}).get(stat) if isinstance(data.get(key), dict) else None  # noqa: E731
+        cell = lambda v: f"{v:6.1f}" if v else "     -"  # noqa: E731
+        frame = get("FrameTime")
+        lines.append(f"  {level:<10} {cell(frame):>9} {cell(get('FrameTime', 'p95'))} {cell(get('GameThreadTime'))} "
+                     f"{cell(get('RenderThreadTime'))} {cell(get('GPUTime'))} {data.get('hitches', '-'):>7}  "
+                     + (data.get("bound") or "-") + (" (capped)" if data.get("capped") else "")
+                     + (f"  {data['shot']}" if data.get("shot") else ""))
+    return lines
+
+
+def perf_scalability(ctx, args):
+    """The same PIE capture at each scalability level, then the original levels back."""
+    levels = [l for l in args.scalability.split(",") if l.strip()]
+    for level in levels:
+        scalability_cvars(level)  # check them all before starting
+    started = str(ctx.tether("pie", action="status")).strip() != "running"
+    if started and cmd_pie(ctx, argparse.Namespace(action="start", simulate=False, warmup=1.0, limit=0, script=None)):
+        raise CliError("could not start PIE to measure")
+    results = []
+    try:
+        for level in levels:
+            with scoped_cvars(ctx, scalability_cvars(level)):
+                time.sleep(1.0)  # let the new settings settle (shader permutations, render targets, streaming)
+                code, data = _quietly(cmd_perf, ctx, argparse.Namespace(
+                    seconds=args.seconds or 5, editor=False, no_record=True, trace=False, top=6, limit=0, action=None))
+                if code:
+                    raise CliError(f"the capture at {level} failed")
+                if args.shots:
+                    shot = os.path.join(state_dir(ctx.project), "shots", f"scalability-{level.strip().lower()}.png")
+                    _quietly(cmd_shot, ctx, argparse.Namespace(
+                        actor=None, at=None, look_at=None, rot=None, annotate=False, grid_z=0, ui=False, output=shot,
+                        baseline=None, compare=None, tolerance=0.5, threshold=32))
+                    data["shot"] = shot
+            results.append((level.strip().lower(), data))
+            print(f"{level.strip().lower()}: frame {data['FrameTime']['avg']:.1f} ms", flush=True)
+    finally:
+        if started:
+            cmd_pie(ctx, argparse.Namespace(action="stop", simulate=False, warmup=0, limit=0, script=None))
+    print(f"scalability ({args.seconds or 5:g}s of PIE each; original levels restored):")
+    for line in scalability_rows(results):
+        print(line)
+    ctx.data = [dict(data, level=level) for level, data in results]
+    return 0
 
 
 def pie_command(ctx, args):
@@ -710,6 +778,7 @@ BUDGET_KEYS = {
     "frame_ms_p95": ("frame time p95", "ms"), "game_ms_p95": ("game thread p95", "ms"),
     "render_ms_p95": ("render thread p95", "ms"), "gpu_ms_p95": ("GPU p95", "ms"), "hitches": ("hitches", ""),
     "memory_mb": ("editor + PIE memory", "MB"), "textures_mb": ("texture memory", "MB"),
+    "texture_assets_mb": ("/Game textures at full resolution", "MB"),
     "map_mb": ("map on disk", "MB"), "content_mb": ("content on disk", "MB"),
     "pie_start_s": ("PIE start", "s"), "streaming_s": ("streaming done", "s"), "load_hitches": ("load hitches", ""),
 }
@@ -755,7 +824,7 @@ def cmd_budget(ctx, args):
     except ValueError as exc:
         raise CliError(f"{path}: {exc}")
     limits = {k: v for k, v in config.items() if k in BUDGET_KEYS}
-    unknown = [k for k in config if k not in BUDGET_KEYS and k not in ("map", "route", "seconds")]
+    unknown = [k for k in config if k not in BUDGET_KEYS and k not in ("map", "route", "seconds", "scalability")]
     if unknown:
         print(f"note: ignoring unknown keys {', '.join(unknown)} (known: {', '.join(BUDGET_KEYS)})")
     measured, seconds = {}, float(config.get("seconds", 10))
@@ -767,8 +836,10 @@ def cmd_budget(ctx, args):
         measured.update(pie_start_s=data.get("pie_start_s"), streaming_s=data.get("streaming_done_s"),
                         load_hitches=len(data.get("hitches", [])))
     if wanted & (set(PERF_STATS) | {"hitches"}):
-        _, data = _quietly(cmd_perf, ctx, argparse.Namespace(seconds=seconds, editor=False, no_record=True, trace=False,
-                                                             top=6, limit=0, action=None))
+        level = config.get("scalability")
+        with scoped_cvars(ctx, scalability_cvars(level)) if level is not None else contextlib.nullcontext():
+            _, data = _quietly(cmd_perf, ctx, argparse.Namespace(seconds=seconds, editor=False, no_record=True,
+                                                                 trace=False, top=6, limit=0, action=None))
         for key, stat in PERF_STATS.items():
             if isinstance(data.get(stat), dict):
                 measured[key] = round(data[stat].get("p95", 0.0), 1)
@@ -776,6 +847,10 @@ def cmd_budget(ctx, args):
     if wanted & {"memory_mb", "textures_mb"}:
         _, data = _quietly(cmd_mem, ctx, argparse.Namespace(full="textures_mb" in wanted, top=3, timeout=args.timeout))
         measured.update(memory_mb=data.get("process_mb"), textures_mb=data.get("textures_mb"))
+    if "texture_assets_mb" in wanted:
+        _, data = _quietly(cmd_tex, ctx, argparse.Namespace(path="/Game", streaming=False, top=1, max=None, strict=False,
+                                                            limit=1))
+        measured["texture_assets_mb"] = round(data.get("total_bytes", 0) / 1048576, 1)
     if "content_mb" in wanted:
         _, data = _quietly(cmd_size, ctx, argparse.Namespace(path="/Game", deps=False, top=1, limit=1))
         measured["content_mb"] = round(data.get("total_bytes", 0) / 1048576, 1)
@@ -789,7 +864,8 @@ def cmd_budget(ctx, args):
             measured["map_mb"] = round(((package_bytes(ctx.project, level) or 0) + sum(actors.values())) / 1048576, 1)
     rows = budget_rows(limits, measured)
     width = max(len(r[0]) for r in rows) if rows else 0
-    print(f"budget ({os.path.relpath(path, os.path.dirname(ctx.project))}" + (f", map {config['map']}" if config.get("map") else "") + "):")
+    print(f"budget ({os.path.relpath(path, os.path.dirname(ctx.project))}" + (f", map {config['map']}" if config.get("map") else "")
+          + (f", scalability {config['scalability']}" if config.get("scalability") is not None else "") + "):")
     for label, text, limit, verdict in rows:
         print(f"  {verdict:<4} {label:<{width}}  {text} (limit {limit:g})")
     over = [r for r in rows if r[3] == "OVER"]

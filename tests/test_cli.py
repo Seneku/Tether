@@ -94,9 +94,12 @@ class ToolSchemas(unittest.TestCase):
         with unittest.mock.patch("shutil.which", return_value=r"C:\Program Files\Git\usr\bin\bash.EXE"):
             out = ue.undo_msys_paths(["props", "C:/Program Files/Git/Game/Maps/L.L", "graph=C:/Program Files/Git/Game/BP.BP:G",
                                       "D:/Projects/Game/Source", "C:/Program Files/Git/usr/bin", "C:/Program Files/Git/Game",
-                                      "under=C:/Program Files/Git/Engine", "C:/Program Files/Git/Gameplay"])
+                                      "under=C:/Program Files/Git/Engine", "C:/Program Files/Git/Niagara/DefaultAssets",
+                                      "C:/Program Files/Git/mingw64/bin", "C:/Program Files/Git/game/x"])
+        # Plugin mount points (/Niagara) are capitalised like /Game; Git's own folders are lowercase.
         self.assertEqual(out, ["props", "/Game/Maps/L.L", "graph=/Game/BP.BP:G", "D:/Projects/Game/Source",
-                               "C:/Program Files/Git/usr/bin", "/Game", "under=/Engine", "C:/Program Files/Git/Gameplay"])
+                               "C:/Program Files/Git/usr/bin", "/Game", "under=/Engine", "/Niagara/DefaultAssets",
+                               "C:/Program Files/Git/mingw64/bin", "/game/x"])
 
 
 class Logs(unittest.TestCase):
@@ -1569,3 +1572,145 @@ class ContactSheet(unittest.TestCase):
         self.assertEqual(px(1, 1), b"\xff\x00\x00")  # first tile starts after the gap
         self.assertEqual(px(4, 1), b"\x00\x00\xff")  # second tile, RGBA reduced to RGB
         self.assertEqual(px(0, 0), b"\x18\x18\x18")  # background
+
+
+class LogSummary(unittest.TestCase):
+    def test_shape_folds_numbers_paths_and_instances(self):
+        a = ue.log_shape("Failed to load /Game/Props/SM_Rock_12.SM_Rock_12 after 3.5 s")
+        b = ue.log_shape("Failed to load /Game/Props/SM_Tree.SM_Tree after 12 s")
+        self.assertEqual(a, b)
+        self.assertEqual(ue.log_shape("Actor BP_Door_C_12 has no mesh"), ue.log_shape("Actor BP_Door_C_7 has no mesh"))
+
+    def test_summary_groups_and_orders_errors_first(self):
+        lines = [stamped("LogTemp: Warning: slow frame 41 ms"), stamped("LogTemp: Warning: slow frame 55 ms"),
+                 stamped("LogBlueprint: Error: BP_X_C_3 failed"), stamped("LogTemp: Display: fine"),
+                 stamped("LogModelContextProtocol: Warning: ours")]
+        rows, hidden = ue.summarize_log(lines, ignore=False)
+        self.assertEqual(hidden, 0)
+        self.assertEqual([(r["level"], r["category"], r["count"]) for r in rows],
+                         [("Error", "LogBlueprint", 1), ("Warning", "LogTemp", 2)])
+        self.assertEqual(rows[1]["first"], "slow frame 41 ms")
+
+    def test_known_noise_is_hidden_and_counted(self):
+        project = Project()
+        project.write("Config/Tether/log-ignore.json", json.dumps(
+            {"ignore": ["^LogAutomationTest: Condition failed", {"pattern": "slow frame", "why": "editor"}]}))
+        lines = [stamped("LogAutomationTest: Error: Condition failed"), stamped("LogTemp: Warning: slow frame 3 ms"),
+                 stamped("LogTemp: Warning: real")]
+        try:
+            ue.load_log_ignore(project.uproject)
+            shown = ue.filter_log(lines)
+            self.assertEqual(list(shown), ["W LogTemp: real"])
+            self.assertEqual(shown.hidden, 2)
+            self.assertEqual(len(ue.filter_log(lines, ignore=False)), 3)
+            rows, hidden = ue.summarize_log(lines)
+            self.assertEqual((len(rows), hidden), (1, 2))
+        finally:
+            ue.LOG_IGNORE[:] = []
+
+    def test_add_ignore_appends_once(self):
+        project = Project()
+        ctx = types.SimpleNamespace(project=project.uproject)
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            ue.add_log_ignore(ctx, "^LogFoo: bar", "noise")
+            ue.add_log_ignore(ctx, "^LogFoo: bar")
+        self.assertIn("already ignored", out.getvalue())
+        self.assertEqual(ue.log_ignore_entries(project.uproject), ["^LogFoo: bar"])
+        with self.assertRaises(ue.CliError):
+            ue.add_log_ignore(ctx, "([")
+
+
+class Cvars(unittest.TestCase):
+    def test_cvar_line(self):
+        self.assertEqual(ue.cvar_line({"name": "r.A", "value": "1", "setby": "Constructor"}), "r.A = 1")
+        self.assertEqual(ue.cvar_line({"name": "r.A", "value": "512", "setby": "Scalability", "default": "2048"}),
+                         "r.A = 512  (Scalability; default 2048)")
+        self.assertEqual(ue.cvar_line({"name": "r.A", "value": "160", "setby": "Ini", "default": "160.0",
+                                       "same_as_default": True}), "r.A = 160  (Ini)")
+
+    def test_scalability_levels(self):
+        cvars = ue.scalability_cvars("Epic")
+        self.assertEqual(cvars["sg.ShadowQuality"], "3")
+        self.assertEqual(len(cvars), len(ue.SCALABILITY_GROUPS))
+        self.assertEqual(ue.scalability_cvars("0")["sg.TextureQuality"], "0")
+        with self.assertRaises(ue.CliError):
+            ue.scalability_cvars("ultra")
+
+    def test_scalability_table(self):
+        data = {"FrameTime": {"avg": 8.4, "p95": 9.0}, "GameThreadTime": {"avg": 7.5}, "GPUTime": {"avg": 1.2},
+                "hitches": 0, "bound": "Game"}
+        lines = ue.scalability_rows([("low", data)])
+        self.assertIn("level", lines[0])
+        self.assertRegex(lines[1], r"low\s+8\.4\s+9\.0\s+7\.5\s+-\s+1\.2\s+0\s+Game")
+
+
+class Textures(unittest.TestCase):
+    def tags(self, **extra):
+        return dict({"Dimensions": "2048x2048", "Format": "PF_DXT1", "CompressionSettings": "TC_Default",
+                     "SRGB": "True", "LODGroup": "TEXTUREGROUP_World", "NeverStream": "False",
+                     "MipGenSettings": "TMGS_FromTextureGroup"}, **extra)
+
+    def test_bytes_include_mips_cubes_and_volumes(self):
+        self.assertEqual(ue.texture_bytes(2048, 2048, self.tags()), int(2048 * 2048 / 2 * 4 / 3))
+        self.assertEqual(ue.texture_bytes(128, 128, {"Dimensions": "128x128x128", "Format": "B8G8R8A8",
+                                                     "MipGenSettings": "TMGS_NoMipmaps"}), 128 ** 3 * 4)
+        self.assertEqual(ue.texture_bytes(512, 512, {"Format": "FloatRGBA", "_class": "TextureCube"}),
+                         int(512 * 512 * 8 * 4 / 3 * 6))
+        self.assertEqual(ue.texture_bytes(4096, 4096, self.tags(MaxTextureSize="1024")),
+                         ue.texture_bytes(1024, 1024, self.tags()))
+
+    def test_rows_flags_and_issues(self):
+        rows = [["/Game/T/T_Big_N", "Texture2D", self.tags(Dimensions="8192x8192", Format="PF_B8G8R8A8")],
+                ["/Game/T/T_Sky", "Texture2D", self.tags(NeverStream="True")],
+                ["/Game/T/T_HDR", "TextureCube", self.tags(Format="FloatRGBA", CompressionSettings="TC_HDR")],
+                ["/Game/M/SM_X", "StaticMesh", {}]]
+        out = ue.texture_rows(rows)
+        self.assertEqual([r["package"] for r in out], ["/Game/T/T_Big_N", "/Game/T/T_HDR", "/Game/T/T_Sky"])
+        rules = {r["package"]: {i[0] for i in r["issues"]} for r in out}
+        self.assertEqual(rules["/Game/T/T_Big_N"], {"texture-size", "texture-normal", "texture-uncompressed"})
+        self.assertEqual(rules["/Game/T/T_Sky"], {"texture-never-stream"})
+        self.assertEqual(rules["/Game/T/T_HDR"], set())  # uncompressed on purpose
+        self.assertIn("never streams", out[2]["flags"])
+        self.assertIn("8192x8192 B8G8R8A8 World", ue.texture_line(out[0]))
+
+
+def rhi(text):
+    return stamped("LogRHI: Display: " + text)
+
+
+class GpuProfile(unittest.TestCase):
+    LOG = [rhi("GPU Profile for Frame 1804 - Graphics pipeline 0 - GPU 0"), rhi(""),
+           rhi("    - Frame Time                    : 2.68ms"), rhi(""),
+           rhi("100.0%  2.40ms + 0.20 Wait   <root>"),
+           rhi("   99.5%  2.40ms   Frame 1781"),
+           rhi("      60.0%  1.50ms   SceneRender - ViewFamilies"),
+           rhi("         58.0%  1.40ms   Scene"),
+           rhi("            20.0%  0.50ms   ShadowDepths"),
+           rhi("               20.0%  0.50ms   ParallelDraw"),
+           rhi("            30.0%  0.70ms   BasePass"),
+           rhi("            8.0%  0.20ms   PostProcessing"),
+           rhi("               8.0%  0.20ms   TSR UpdateHistory"),
+           rhi("      36.0%  0.90ms   RenderGraphExecute - Slate"),
+           rhi(""),
+           rhi("GPU Profile for Frame 1804 - Async compute pipeline 0 - GPU 0"),
+           rhi("100.0%  0.30ms   <root>"), rhi("")]
+
+    def test_parse_tree(self):
+        blocks = ue.gpu_profile_blocks(self.LOG)
+        self.assertEqual([b["pipeline"] for b in blocks], ["Graphics pipeline 0", "Async compute pipeline 0"])
+        nodes = blocks[0]["nodes"]
+        self.assertEqual(blocks[0]["frame_ms"], 2.68)
+        self.assertEqual((nodes[0]["name"], nodes[0]["wait"], nodes[0]["depth"]), ("<root>", 0.2, 0))
+        scene = next(i for i, n in enumerate(nodes) if n["name"] == "Scene")
+        self.assertEqual([nodes[c]["name"] for c in nodes[scene]["children"]], ["ShadowDepths", "BasePass", "PostProcessing"])
+
+    def test_summary_kinds_and_passes(self):
+        summary = ue.gpu_summary(ue.gpu_profile_blocks(self.LOG + self.LOG))
+        self.assertEqual(summary["frames"], 2)
+        self.assertEqual(summary["gpu_ms"], 2.4)
+        self.assertTrue(summary["scene"])
+        self.assertEqual(summary["kinds"]["shadows"], 0.5)
+        self.assertEqual(summary["kinds"]["UI"], 0.9)
+        self.assertEqual(summary["kinds"]["post processing"], 0.2)
+        self.assertEqual(summary["passes"][:2], [("RenderGraphExecute - Slate", 0.9), ("BasePass", 0.7)])
+        self.assertNotIn("SceneRender - ViewFamilies", dict(summary["passes"]))

@@ -7,7 +7,7 @@ import time
 
 from .core import (
     CliError, GATED, TETHER, chosen_editor, compact_error, editor_label, editor_token, engine_root, find_project,
-    live_editors, pid_alive, port_from_log, read_json, socket, stall_report, state_dir, unwrap, write_json,
+    live_editors, load_log_ignore, pid_alive, port_from_log, read_json, socket, stall_report, state_dir, unwrap, write_json,
 )
 
 
@@ -172,6 +172,7 @@ class Ctx:
     def project(self):
         if self._project is None:
             self._project = find_project(self.args.project)
+            load_log_ignore(self._project)
         return self._project
 
     @property

@@ -22,7 +22,7 @@ socket, subprocess, zlib = _Lazy("socket"), _Lazy("subprocess"), _Lazy("zlib")
 CLI_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # cli/
 UE_SCRIPT = os.path.join(CLI_DIR, "ue.py")  # the entry point, for the CLI's own child processes
 TETHER = "tether.toolsets.TetherCore"
-GATED = {"py", "console", "set_props", "undo", "save", "spawn", "delete", "duplicate", "mv", "rm", "set_material", "pie_step", "set_config", "umg", "new_asset", "drop", "pie_net", "look_stage", "scatter", "bp_component", "set_savegame", "import_files", "reimport_assets", "fix_redirectors", "foliage", "landscape_edit", "mat_graph", "editor_undo", "lint_fix", "set_assets", "wp"}  # tools that need the session token (see beacon.session_token)
+GATED = {"py", "console", "set_props", "undo", "save", "spawn", "delete", "duplicate", "mv", "rm", "set_material", "pie_step", "set_config", "umg", "new_asset", "drop", "pie_net", "look_stage", "scatter", "bp_component", "set_savegame", "import_files", "reimport_assets", "fix_redirectors", "foliage", "landscape_edit", "mat_graph", "editor_undo", "lint_fix", "set_assets", "wp", "set_cvars", "set_niagara", "pcg"}  # tools that need the session token (see beacon.session_token)
 LEVELS = {"Fatal": 0, "Error": 1, "Warning": 2, "Display": 3, "Log": 4, "Verbose": 5, "VeryVerbose": 6}
 NOISE = {"LogModelContextProtocol", "LogToolsetRegistry"}  # our own transport chatter
 # Epic logs this whenever a schema is generated for a class with delegates (props, set, describe_toolset).
@@ -369,10 +369,39 @@ def user_frame(lines, start):
     return ""
 
 
-def filter_log(lines, level="Warning", category=None, pattern=None):
+LOG_IGNORE = []  # compiled known-noise regexes from the project's Config/Tether/log-ignore.json (load_log_ignore)
+
+
+def log_ignore_path(project):
+    return os.path.join(os.path.dirname(project), "Config", "Tether", "log-ignore.json")
+
+
+def log_ignore_entries(project):
+    """The known-noise patterns: log-ignore.json is a list, or {"ignore": [...]}, of regexes or {"pattern", "why"}."""
+    data = read_json(log_ignore_path(project)) or []
+    items = data.get("ignore", []) if isinstance(data, dict) else data
+    return [item if isinstance(item, str) else (item or {}).get("pattern", "") for item in items]
+
+
+def load_log_ignore(project):
+    LOG_IGNORE[:] = []
+    for pattern in log_ignore_entries(project):
+        try:
+            LOG_IGNORE.append(re.compile(pattern, re.I))
+        except re.error as exc:
+            print(f"warning: log-ignore.json: bad regex {pattern!r}: {exc}", file=sys.stderr)
+
+
+class LogLines(list):
+    """filter_log's result; `hidden` counts the entries the project's known-noise list left out."""
+    hidden = 0
+
+
+def filter_log(lines, level="Warning", category=None, pattern=None, ignore=True):
     max_level = LEVELS.get(level.capitalize() if level.lower() != "veryverbose" else "VeryVerbose", 2)
     rx = re.compile(pattern, re.I) if pattern else None
-    order, counts = [], {}
+    known = LOG_IGNORE if ignore else []
+    order, counts, hidden = [], {}, 0
     # Tether's own /Temp copies of assets (ue diff, ue bp, ue usages) compile on load, and a copy can fail where
     # the real asset does not; leave out compiler output from the frames that loaded one.
     frame = lambda line: (LOG_FRAME.match(line) or [None, None])[1]  # the editor's frame counter, [342]
@@ -400,11 +429,55 @@ def filter_log(lines, level="Warning", category=None, pattern=None):
             continue
         if rx and not rx.search(line):
             continue
+        if known and any(k.search(f"{cat}: {msg}") for k in known):
+            hidden += 1
+            continue
         key = (lvl[0], cat, msg.strip())
         if key not in counts:
             order.append(key)
         counts[key] = counts.get(key, 0) + 1
-    return [f"{l} {c}: {m}" + (f"  x{counts[(l, c, m)]}" if counts[(l, c, m)] > 1 else "") for l, c, m in order]
+    result = LogLines(f"{l} {c}: {m}" + (f"  x{counts[(l, c, m)]}" if counts[(l, c, m)] > 1 else "") for l, c, m in order)
+    result.hidden = hidden
+    return result
+
+
+LOG_SHAPE = [  # what varies between otherwise identical messages, for `ue log --summary`
+    (re.compile(r"(?:[A-Za-z]:)?[/\\](?:[\w .+-]+[/\\])+[\w .+-]*"), "<path>"),
+    (re.compile(r"/(?:Game|Engine|Script|Temp|Memory)/[\w/.:-]*"), "<asset>"),
+    (re.compile(r"'[^']*'|\"[^\"]*\""), "'…'"),
+    (re.compile(r"\b0x[0-9a-fA-F]+\b"), "<hex>"),
+    (re.compile(r"(?<![A-Za-z])-?\d+(?:\.\d+)?"), "<n>"),
+    (re.compile(r"\b(\w+?)_(?:C_)?\d+\b"), r"\1_<n>"),  # instance names: BP_Door_C_12
+]
+
+
+def log_shape(message):
+    for rx, repl in LOG_SHAPE:
+        message = rx.sub(repl, message)
+    return re.sub(r"\s+", " ", message).strip()
+
+
+def summarize_log(lines, level="Warning", ignore=True):
+    """Warnings and errors grouped by (level, category, message shape): [{level, category, shape, count, first}],
+    errors first, then by count. Also returns how many entries the known-noise list hid."""
+    groups, hidden = {}, 0
+    max_level = LEVELS.get(level.capitalize(), 2)
+    known = LOG_IGNORE if ignore else []
+    for line in lines:
+        m = LOG_LINE.match(line)
+        if not m:
+            continue
+        cat, lvl, msg = m.group(1), m.group(2) or "Log", m.group(3).strip()
+        if LEVELS[lvl] > max_level or cat in NOISE or (cat == "LogJson" and NOISE_MESSAGE.match(msg)):
+            continue
+        if known and any(k.search(f"{cat}: {msg}") for k in known):
+            hidden += 1
+            continue
+        key = (lvl, cat, log_shape(msg))
+        group = groups.setdefault(key, {"level": lvl, "category": cat, "shape": key[2], "count": 0, "first": msg})
+        group["count"] += 1
+    rows = sorted(groups.values(), key=lambda g: (LEVELS[g["level"]], -g["count"]))
+    return rows, hidden
 
 
 def modal_dialogs(pid):

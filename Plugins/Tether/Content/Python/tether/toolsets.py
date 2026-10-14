@@ -1651,6 +1651,10 @@ def _vec_tuple(vec):
     return vec.x, vec.y, vec.z
 
 
+def _fmt3(values):
+    return "(" + ", ".join(f"{round(v, 2) + 0.0:g}" for v in values) + ")"  # + 0.0: no "-0"
+
+
 def _slope_degrees(normal):
     import math
     return math.degrees(math.acos(max(-1.0, min(1.0, normal.z))))
@@ -1852,6 +1856,68 @@ def _schedule_reload():
         unreal.log("Tether: reloaded")
 
     _reload["handle"] = unreal.register_slate_post_tick_callback(_do)
+
+
+def _console_output(world, commands):
+    """Run console commands and return the log lines they wrote (timestamps stripped). Commands print to the
+    log, which Python cannot hook, so read this editor's own log file across a flush."""
+    from tether import beacon
+    path = beacon._find_log()
+    start = os.path.getsize(path) if path and os.path.isfile(path) else 0
+    for command in commands:
+        unreal.SystemLibrary.execute_console_command(world, command)
+    unreal.SystemLibrary.execute_console_command(None, "FLUSHLOG")
+    if not path:
+        return []
+    with open(path, "rb") as f:
+        f.seek(start)
+        text = f.read().decode("utf-8", "replace")
+    return [re.sub(r"^\[[^\]]*\]\[[^\]]*\]", "", line) for line in text.splitlines()]
+
+
+_CVAR_LAST = re.compile(r'^(\S+) = "(.*)"\s+LastSetBy: (\w+)')
+
+
+def _cvar_histories(names):
+    """{name: {setby: value}} from querying each variable (the engine logs a HISTORY block, then the value)."""
+    out, pending = {}, {}
+    for line in _console_output(None, list(names)):
+        last = _CVAR_LAST.match(line)
+        if last:
+            out[last.group(1)] = pending
+            pending = {}
+            continue
+        m = re.match(r"^(\w+): (.*)$", line)
+        if m and not m.group(1).startswith("Log") and m.group(1) not in ("Cmd", "HISTORY"):
+            pending[m.group(1)] = m.group(2)
+    return out
+
+
+def _cvar_same(a, b):
+    """'160' and '160.000000' (or 'true' and '1') are the same value."""
+    norm = {"true": "1", "false": "0"}
+    a, b = norm.get(str(a).lower(), str(a)), norm.get(str(b).lower(), str(b))
+    try:
+        return float(a) == float(b)
+    except ValueError:
+        return a == b
+
+
+def _cvar_dump(prefix=""):
+    """[{name, value, setby}] for every console variable (or those starting with prefix), via DumpCVars -csv."""
+    import csv
+    path = os.path.join(unreal.Paths.convert_relative_path_to_full(unreal.Paths.project_saved_dir()), "Tether",
+                        f"cvars-{os.getpid()}.csv")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    if os.path.exists(path):
+        os.remove(path)
+    unreal.SystemLibrary.execute_console_command(None, f"DumpCVars {prefix} -csv={path.replace(os.sep, '/')}".replace("  ", " "))
+    if not os.path.exists(path):
+        raise RuntimeError("DumpCVars wrote no file")
+    with open(path, encoding="utf-8-sig", newline="") as f:
+        rows = [{"name": r["NAME"], "value": r["VALUE"], "setby": r["SETBY"]} for r in csv.DictReader(f)]
+    os.remove(path)
+    return rows
 
 
 _Base = getattr(unreal, "ToolsetDefinition", object)
@@ -2237,7 +2303,7 @@ class TetherCore(_Base):
         a Blueprint's generated class) or an asset (a StaticMesh, a Blueprint, ...).
 
         Args:
-            what: Class name, /Script/... class path, or /Game/... asset path.
+            what: Class name, /Script/... class path, or an asset path (/Game/..., /Engine/..., a plugin's /Niagara/...).
             at: Location 'x,y,z'.
             rot: Rotation 'pitch,yaw,roll'.
             label: Actor label to give it.
@@ -2257,7 +2323,7 @@ class TetherCore(_Base):
         r = _numbers(rot) if rot else [0, 0, 0]
         rotation = unreal.Rotator(roll=r[2], pitch=r[0], yaw=r[1])
         before = unreal.ToolsetLibrary.get_active_undo_count() if not _LEGACY else 0
-        if what.startswith(("/Game/", "/Engine/")):  # an asset: mesh, Blueprint, ...
+        if what.startswith("/") and not what.startswith("/Script/"):  # an asset (mesh, Blueprint, Niagara system...)
             asset, cls = unreal.load_asset(what), None
             if asset is None:
                 raise RuntimeError(f"no asset at {what} (ue find)")
@@ -2834,6 +2900,317 @@ class TetherCore(_Base):
                          "phys_mat": phys.get_name() if phys else None})
         return json.dumps({"start": [round(v) for v in _vec_tuple(origin)], "end": [round(v) for v in _vec_tuple(target)],
                            "channel": channel_name, "sphere": sphere, "hits": rows})
+
+    @_tool
+    @staticmethod
+    def niagara_components(match: str = "", pie: bool = False, limit: int = 60) -> str:
+        """Niagara components in the edited level or PIE: actor, component, system, whether it is active and
+        auto-activates. (Live particle counts are not reachable from Python.)
+
+        Args:
+            match: Case-insensitive regex on actor label or system name.
+            pie: Read the PIE world.
+            limit: Maximum rows.
+
+        Returns:
+            JSON list of {actor, component, path, system, active, auto_activate, visible}.
+        """
+        rx = re.compile(match, re.I) if match else None
+        rows = []
+        for actor in _actors(pie):
+            for comp in actor.get_components_by_class(unreal.NiagaraComponent) or []:
+                system = _try(lambda: comp.get_asset())
+                row = {"actor": _label(actor), "component": comp.get_name(),
+                       "system": _short_path(system.get_path_name()) if system else None,
+                       "active": bool(_try(lambda: comp.is_active(), False)),
+                       "auto_activate": bool(_try(lambda: comp.get_editor_property("auto_activate"), False)),
+                       "visible": bool(_try(lambda: comp.get_editor_property("visible"), True))}
+                if rx and not rx.search(row["actor"]) and not rx.search(row["system"] or ""):
+                    continue
+                row["path"] = comp.get_path_name()
+                rows.append(row)
+        return json.dumps(rows[:limit])
+
+    @_tool
+    @staticmethod
+    def set_niagara(target: str, values: str, pie: bool = False, token: str = "") -> str:
+        """Set user parameters on a placed Niagara component (type taken from the parameter itself: float, int,
+        bool, vector 2/3/4, colour or position). In the edited level this is undoable and marks the level dirty.
+
+        Args:
+            target: Actor label (its first Niagara component) or 'Actor.Component'.
+            values: JSON object of parameter name ('Color' or 'User.Color') to value text ('2.5', 'true', '1,0,0,1').
+            pie: Change the PIE world's component (not undoable, not saved).
+            token: Session token from Saved/Tether/editors/<pid>.token (the ue CLI sends it).
+
+        Returns:
+            One 'name (type): old -> new' line per parameter.
+        """
+        _authorize(token)
+        obj = _resolve(target, pie)
+        comp = obj if isinstance(obj, unreal.NiagaraComponent) else \
+            next(iter(obj.get_components_by_class(unreal.NiagaraComponent) or []), None)
+        if comp is None:
+            raise RuntimeError(f"{target} has no Niagara component")
+        kinds = [("float", "get_variable_float", "set_niagara_variable_float", lambda n: float(n[0])),
+                 ("int", "get_variable_int", "set_niagara_variable_int", lambda n: int(n[0])),
+                 ("vec2", "get_variable_vec2", "set_niagara_variable_vec2", lambda n: unreal.Vector2D(*n[:2])),
+                 ("vec3", "get_variable_vec3", "set_niagara_variable_vec3", lambda n: unreal.Vector(*n[:3])),
+                 ("position", "get_variable_position", "set_niagara_variable_position", lambda n: unreal.Vector(*n[:3])),
+                 ("vec4", "get_variable_vec4", "set_niagara_variable_vec4", lambda n: unreal.Vector4(*n[:4])),
+                 ("colour", "get_variable_color", "set_niagara_variable_linear_color",
+                  lambda n: unreal.LinearColor(*(list(n) + [1.0])[:4]))]
+
+        def read(name):
+            for kind, getter, setter, make in kinds:
+                result = _try(lambda: getattr(comp, getter)(name))
+                if isinstance(result, tuple) and len(result) == 2 and result[1]:
+                    return kind, result[0], setter, make
+            value = _try(lambda: comp.get_variable_bool(name))
+            if value is not None:
+                return "bool", value, "set_niagara_variable_bool", None
+            return None
+
+        def text(value):
+            if isinstance(value, float):
+                return f"{value:g}"
+            fields = [f for f in ("x", "y", "z", "w", "r", "g", "b", "a") if hasattr(value, f)]
+            return "(" + ", ".join(f"{getattr(value, f):g}" for f in fields) + ")" if fields else str(value)
+        rows = []
+        context = unreal.ScopedEditorTransaction("ue fx set") if not pie else contextlib.nullcontext()
+        with context:
+            if not pie:
+                comp.modify()
+            for name, raw in json.loads(values).items():
+                found = read(name) or (read(f"User.{name}") if not name.startswith("User.") else None)
+                if found is None:
+                    raise RuntimeError(f"{comp.get_asset().get_name() if comp.get_asset() else 'the system'} has no "
+                                       f"user parameter '{name}' (ue fx {_short_path(comp.get_asset().get_path_name())})")
+                kind, old, setter, make = found
+                key = name if read(name) else f"User.{name}"
+                if kind == "bool":
+                    value = str(raw).strip().lower() in ("1", "true", "yes", "on")
+                else:
+                    nums = _numbers(str(raw))
+                    if not nums:
+                        raise RuntimeError(f"{name}: expected numbers, got '{raw}'")
+                    value = make(nums)
+                getattr(comp, setter)(key.replace("User.", "", 1), value)
+                new = read(key)
+                rows.append(f"{key} ({kind}): {text(old)} -> {text(new[1] if new else value)}")
+        return "\n".join(rows)
+
+    @_tool
+    @staticmethod
+    def pcg(action: str = "list", target: str = "", seed: int = -1, limit: int = 60, token: str = "") -> str:
+        """PCG components in the edited level: list them (graph, seed, trigger, generated state and what they
+        spawned), generate one (optionally with a new seed; generation finishes on later ticks, so poll 'status'),
+        check one's status, or clean one up.
+
+        Args:
+            action: list, status, generate, cleanup, or meshes (target = a graph path: its spawners' meshes).
+            target: Actor label (its first PCG component) or 'Actor.Component'; a regex with list.
+            seed: With generate: set this seed first (undoable); -1 keeps it.
+            limit: Maximum rows with list.
+            token: Session token from Saved/Tether/editors/<pid>.token (the ue CLI sends it; generate and cleanup).
+
+        Returns:
+            JSON: list of {actor, component, graph, seed, trigger, generated, generating, partitioned,
+            instances: {mesh: count}, actors: n}.
+        """
+        get = lambda obj, prop, default=None: _try(lambda: obj.get_editor_property(prop), default)  # noqa: E731
+
+        def spawned(comp):
+            owner = comp.get_owner()
+            holders = [owner]
+            if get(comp, "is_component_partitioned", False):  # the instances live on the partition actors
+                holders += [a for a in _actors() if a.get_class().get_name() == "PCGPartitionActor"]
+            meshes, actors = {}, 0
+            for holder in holders:
+                for ism in holder.get_components_by_class(unreal.InstancedStaticMeshComponent) or []:
+                    if not any("PCG Generated" in str(t) for t in ism.component_tags):
+                        continue
+                    mesh = get(ism, "static_mesh")
+                    name = mesh.get_name() if mesh else ism.get_name()
+                    meshes[name] = meshes.get(name, 0) + ism.get_instance_count()
+            for actor in _actors():
+                if actor != owner and any("PCG Generated" in str(t) for t in actor.tags) \
+                        and actor.get_attach_parent_actor() == owner:
+                    actors += 1
+            return meshes, actors
+
+        def row(comp):
+            graph = _try(lambda: comp.get_graph())
+            meshes, actors = spawned(comp)
+            return {"actor": _label(comp.get_owner()), "component": comp.get_name(),
+                    "graph": _short_path(graph.get_path_name()) if graph else None, "seed": get(comp, "seed"),
+                    "trigger": _enum_name(get(comp, "generation_trigger", "")),
+                    "generated": bool(get(comp, "generated", False)),
+                    "generating": bool(get(comp, "generation_in_progress", False)),
+                    "partitioned": bool(get(comp, "is_component_partitioned", False)),
+                    "instances": meshes, "actors": actors}
+
+        if action == "meshes":  # a graph's Static Mesh Spawner nodes and the meshes they pick from
+            graph = unreal.load_asset(target)
+            out = {}
+            for node in _try(lambda: graph.get_editor_property("nodes"), []) or []:
+                settings = _try(lambda: node.get_settings())
+                selector = get(settings, "mesh_selector_parameters") if settings else None
+                entries = get(selector, "mesh_entries", []) if selector else []
+                if entries:
+                    out[str(node.get_name())] = [_try(lambda: e.get_editor_property("descriptor").get_editor_property(
+                        "static_mesh").get_name(), "?") for e in entries]
+            return json.dumps(out)
+        if action == "list":
+            rx = re.compile(target, re.I) if target else None
+            rows = []
+            for actor in _actors():
+                for comp in actor.get_components_by_class(unreal.PCGComponent) or []:
+                    if rx and not rx.search(_label(actor)):
+                        continue
+                    rows.append(row(comp))
+            return json.dumps(rows[:limit])
+        obj = _resolve(target)
+        comp = obj if isinstance(obj, unreal.PCGComponent) else \
+            next(iter(obj.get_components_by_class(unreal.PCGComponent) or []), None)
+        if comp is None:
+            raise RuntimeError(f"{target} has no PCG component")
+        if action == "status":
+            return json.dumps([row(comp)])
+        _authorize(token)
+        if action == "generate":
+            if seed >= 0:
+                with unreal.ScopedEditorTransaction(f"ue pcg seed {seed}"):
+                    comp.modify()
+                    comp.set_editor_property("seed", seed)
+            comp.generate(True)
+        elif action == "cleanup":
+            comp.cleanup(True)
+        else:
+            raise RuntimeError("action must be list, status, generate or cleanup")
+        return json.dumps([row(comp)])
+
+    @_tool
+    @staticmethod
+    def component_tree(target: str, pie: bool = False, limit: int = 120) -> str:
+        """An actor's (or a Blueprint's) components as an indented tree: class, attach socket, relative transform
+        (when not identity), mobility, mesh or other asset, and visibility/shadow/collision flags; components that
+        are not scene components (movement, AI, custom logic) are listed after the tree.
+
+        Args:
+            target: Actor label or name, 'player' (the PIE pawn), or a Blueprint asset path.
+            pie: Read the PIE world's actor.
+            limit: Maximum lines.
+
+        Returns:
+            Text.
+        """
+        get = lambda obj, prop, default=None: _try(lambda: obj.get_editor_property(prop), default)  # noqa: E731
+
+        def describe(comp, socket=""):
+            bits = [comp.get_class().get_name().replace("_C", "")]
+            asset = None
+            for prop in ("static_mesh", "skeletal_mesh_asset", "skinned_asset", "skeletal_mesh", "asset", "sound",
+                         "template", "child_actor_class", "widget_class"):
+                asset = get(comp, prop)
+                if asset is not None:
+                    break
+            if asset is not None:
+                bits.append(asset.get_name())
+            if socket and socket != "None":
+                bits.append(f"socket {socket}")
+            if isinstance(comp, unreal.SceneComponent):
+                loc, rot, scale = (get(comp, p) for p in ("relative_location", "relative_rotation", "relative_scale3d"))
+                if loc is not None and any(abs(v) > 1e-3 for v in (loc.x, loc.y, loc.z)):
+                    bits.append(f"at {_fmt3(_vec_tuple(loc))}")
+                if rot is not None and any(abs(v) > 1e-3 for v in (rot.pitch, rot.yaw, rot.roll)):
+                    bits.append(f"rot {_fmt3(_rot_tuple(rot))}")
+                if scale is not None and any(abs(v - 1) > 1e-3 for v in (scale.x, scale.y, scale.z)):
+                    bits.append(f"scale {_fmt3(_vec_tuple(scale))}")
+                bits.append(_enum_name(get(comp, "mobility", "")) or "?")
+                if get(comp, "visible", True) is False:
+                    bits.append("invisible")
+                if get(comp, "hidden_in_game", False):
+                    bits.append("hidden in game")
+            if isinstance(comp, unreal.PrimitiveComponent):
+                profile = str(_try(lambda: comp.get_collision_profile_name(), "") or "")
+                enabled = _enum_name(_try(lambda: comp.get_collision_enabled(), ""))
+                bits.append("no collision" if enabled == "nocollision" else f"collision {profile}")
+                if not get(comp, "cast_shadow", True):
+                    bits.append("no shadow")
+            if _try(lambda: comp.get_editor_property("is_editor_only"), False):
+                bits.append("editor only")
+            return ", ".join(b for b in bits if b)
+
+        lines = []
+        if "/" in target and not pie:
+            bp = unreal.load_asset(target)
+            if not isinstance(bp, unreal.Blueprint):
+                raise RuntimeError(f"{target} is not a Blueprint")
+            subsystem = unreal.get_engine_subsystem(unreal.SubobjectDataSubsystem)
+            lib = unreal.SubobjectDataBlueprintFunctionLibrary
+            nodes, order = {}, []
+            for handle in subsystem.k2_gather_subobject_data_for_blueprint(bp) or []:
+                data = lib.get_data(handle)
+                if lib.is_actor(data):
+                    continue
+                name = str(lib.get_variable_name(data))
+                parent = lib.get_data(lib.get_parent_handle(data))
+                parent_name = str(lib.get_variable_name(parent)) if lib.is_valid(parent) and not lib.is_actor(parent) else ""
+                obj = lib.get_object(data)
+                if obj is None:
+                    continue
+                origin = "inherited" if lib.is_inherited_component(data) else "native" if lib.is_native_component(data) else ""
+                nodes[name] = {"obj": obj, "parent": parent_name, "origin": origin,
+                               "socket": str(_try(lambda: obj.get_editor_property("attach_socket_name"), "") or "")}
+                order.append(name)
+            parent_class = unreal.BlueprintEditorLibrary.get_blueprint_parent_class(bp)
+            lines.append(f"{bp.get_name()} (Blueprint of {parent_class.get_name() if parent_class else '?'}), "
+                         f"{len(order)} component(s)")
+            scene = [n for n in order if isinstance(nodes[n]["obj"], unreal.SceneComponent)]
+
+            def walk(name, depth):
+                node = nodes[name]
+                lines.append("  " * (depth + 1) + f"{name}: {describe(node['obj'], node['socket'])}"
+                             + (f" ({node['origin']})" if node["origin"] else ""))
+                for child in scene:
+                    if nodes[child]["parent"] == name:
+                        walk(child, depth + 1)
+            for root in [n for n in scene if nodes[n]["parent"] not in nodes]:
+                walk(root, 0)
+            others = [n for n in order if n not in scene]
+        else:
+            if target.lower() in ("player", "pawn") or pie and target.lower() in ("player", "pawn"):
+                actor = _pie_player()[1]
+            else:
+                obj = _resolve(target, pie)
+                actor = obj if isinstance(obj, unreal.Actor) else obj.get_owner()
+            comps = actor.get_components_by_class(unreal.ActorComponent)
+            lines.append(f"{_label(actor)} ({actor.get_class().get_name()}), {len(comps)} component(s)")
+            root = actor.get_editor_property("root_component")
+            seen = set()
+
+            def walk(comp, depth):
+                seen.add(comp.get_name())
+                socket = str(_try(lambda: comp.get_attach_socket_name(), "") or "")
+                lines.append("  " * (depth + 1) + f"{comp.get_name()}: {describe(comp, socket)}")
+                for child in _try(lambda: comp.get_children_components(False), []) or []:
+                    if child.get_owner() == actor:
+                        walk(child, depth + 1)
+                    else:
+                        lines.append("  " * (depth + 2) + f"(attached actor {_label(child.get_owner())})")
+            if root is not None:
+                walk(root, 0)
+            attached = [a for a in _try(lambda: actor.get_attached_actors(), []) or []]
+            if attached:
+                lines.append("attached actors: " + ", ".join(_label(a) for a in attached))
+            nodes = {c.get_name(): {"obj": c} for c in comps}
+            others = [c.get_name() for c in comps if c.get_name() not in seen]
+        if others:
+            lines.append("not in the tree: " + "; ".join(f"{n} ({describe(nodes[n]['obj'])}"
+                                                         + (f", {nodes[n]['origin']})" if nodes[n].get("origin") else ")")
+                                                         for n in others))
+        return _capped(lines[0], lines[1:], limit)
 
     @_tool
     @staticmethod
@@ -4673,6 +5050,77 @@ class TetherCore(_Base):
 
     @_tool
     @staticmethod
+    def cvars(match: str = "", changed: bool = False, limit: int = 60) -> str:
+        """Console variables with their value, who set it last (Constructor, Scalability, ProjectSetting,
+        SystemSettingsIni, DeviceProfile, Commandline, Code, Console, ...) and the built-in default.
+
+        Args:
+            match: Case-insensitive regex on the name ('' = all); a plain prefix like 'r.Shadow.' is fastest.
+            changed: Only variables whose value differs from the built-in (constructor) default.
+            limit: Maximum rows to return in detail (with history).
+
+        Returns:
+            JSON: {total, matched, rows: [{name, value, setby, default, history}]}.
+        """
+        prefix = match if re.fullmatch(r"[\w.]+", match or "") else ""
+        rows = _cvar_dump(prefix)
+        total = len(rows)
+        if match and not prefix:
+            rx = re.compile(match, re.I)
+            rows = [r for r in rows if rx.search(r["name"])]
+        elif prefix:
+            rows = [r for r in rows if r["name"].lower().startswith(prefix.lower())]
+        if changed:
+            rows = [r for r in rows if r["setby"] != "Constructor"]
+            history = _cvar_histories([r["name"] for r in rows[:3000]])
+            for r in rows:
+                r["history"] = history.get(r["name"], {})
+                r["default"] = r["history"].get("Constructor")
+            rows = [r for r in rows if r["default"] is None or not _cvar_same(r["default"], r["value"])]
+        else:
+            history = _cvar_histories([r["name"] for r in rows[:limit] if r["setby"] != "Constructor"])
+            for r in rows[:limit]:
+                r["history"] = history.get(r["name"], {})
+                r["default"] = r["history"].get("Constructor", r["value"] if r["setby"] == "Constructor" else None)
+        for r in rows[:limit]:
+            r["same_as_default"] = r.get("default") is not None and _cvar_same(r["default"], r["value"])
+        return json.dumps({"total": total, "matched": len(rows), "rows": rows[:limit]})
+
+    @_tool
+    @staticmethod
+    def set_cvars(values: str = "{}", reset: str = "[]", token: str = "") -> str:
+        """Set console variables (as the console does: highest priority, not saved), or reset ones set that way
+        back to what the next priority level says (UnsetCVar -setby=Console).
+
+        Args:
+            values: JSON object of name to value text.
+            reset: JSON list of names to reset.
+            token: Session token from Saved/Tether/editors/<pid>.token (the ue CLI sends it).
+
+        Returns:
+            JSON: [{name, before, after, setby_before, setby}].
+        """
+        _authorize(token)
+        values, reset = json.loads(values), json.loads(reset)
+        names = list(values) + [n for n in reset if n not in values]
+        known = {r["name"].lower(): r for r in _cvar_dump()}
+        missing = [n for n in names if n.lower() not in known]
+        if missing:
+            import difflib
+            close = difflib.get_close_matches(missing[0].lower(), list(known), n=3, cutoff=0.7)
+            raise RuntimeError(f"no console variable '{missing[0]}'"
+                               + (f" (did you mean: {', '.join(known[c]['name'] for c in close)})" if close else ""))
+        before = {n: known[n.lower()] for n in names}
+        commands = [f"{before[n]['name']} {v}" for n, v in values.items()]
+        commands += [f"UnsetCVar {before[n]['name']} -setby=Console" for n in reset if n not in values]
+        for command in commands:
+            unreal.SystemLibrary.execute_console_command(None, command)
+        after = {r["name"].lower(): r for r in _cvar_dump()}
+        return json.dumps([{"name": before[n]["name"], "before": before[n]["value"], "setby_before": before[n]["setby"],
+                            "after": after[n.lower()]["value"], "setby": after[n.lower()]["setby"]} for n in names])
+
+    @_tool
+    @staticmethod
     def umg(click: str = "", token: str = "") -> str:
         """UMG widgets on the PIE viewport as a compact tree: texts, buttons (by their label), text boxes and
         check boxes. The fallback for `ue ui` when Epic's SlateInspectorToolset is not enabled: raw Slate
@@ -5193,10 +5641,12 @@ class TetherCore(_Base):
             path: Content folder.
 
         Returns:
-            JSON list of [package, class, {tag: value}] (tags for textures and static meshes only).
+            JSON list of [package, class, {tag: value}] (tags for textures and static meshes only; `ue tex` uses it too).
         """
         registry = unreal.AssetRegistryHelpers.get_asset_registry()
-        wanted = {"Texture2D": ("Dimensions", "CompressionSettings", "SRGB", "LODGroup"),
+        texture = ("Dimensions", "CompressionSettings", "SRGB", "LODGroup", "Format", "NeverStream", "MipGenSettings",
+                   "VirtualTextureStreaming", "HasAlphaChannel", "MaxTextureSize")
+        wanted = {"Texture2D": texture, "TextureCube": texture, "Texture2DArray": texture, "VolumeTexture": texture,
                   "StaticMesh": ("Triangles", "LODs", "CollisionPrims", "CollisionComplexity", "NaniteEnabled",
                                  "DefaultCollision")}
         rows, seen = [], set()
@@ -5208,6 +5658,57 @@ class TetherCore(_Base):
             tags = {t: data.get_tag_value(t) for t in wanted.get(cls, ())}
             rows.append([package, cls, {k: v for k, v in tags.items() if v is not None}])
         return json.dumps(rows)
+
+    @_tool
+    @staticmethod
+    def texture_streaming(limit: int = 15) -> str:
+        """Texture memory as the engine holds it now (ListTextures and ListStreamingRenderAssets): the streaming
+        pool size, what is resident (streaming and not), the largest textures, and the ones that want more mips
+        than they have (pool too small, or still streaming in). Covers PIE too: textures are shared.
+
+        Args:
+            limit: How many of the largest textures to return.
+
+        Returns:
+            JSON: {pool_mb, in_mem_mb, streaming_mb, non_streaming_mb, count, largest: [...], wanting: [...]}.
+        """
+        lines = _console_output(None, ["ListTextures", "ListStreamingRenderAssets"])
+        row = re.compile(r"^(\d+)x(\d+) \((\d+) KB, -?\d+\), (\d+)x(\d+) \((\d+) KB\), (?:PF_)?(\w+), TEXTUREGROUP_(\w+), "
+                         r"(\S+), (YES|NO), (?:YES|NO), (YES|NO), \d+, (\d+)")
+        textures, wanting, current = {}, [], None
+        for line in lines:
+            m = row.match(line)
+            if m:
+                textures[m.group(9).split(".")[0]] = {
+                    "path": m.group(9).split(".")[0], "max": f"{m.group(1)}x{m.group(2)}", "max_kb": int(m.group(3)),
+                    "current": f"{m.group(4)}x{m.group(5)}", "kb": int(m.group(6)), "format": m.group(7),
+                    "group": m.group(8), "streaming": m.group(10) == "YES", "vt": m.group(11) == "YES",
+                    "mips": int(m.group(12))}
+                continue
+            head = re.search(r"Texture \[\d+\] : \w+ (\S+)", line)
+            if head:
+                current = head.group(1).split(".")[0]
+                continue
+            dims = re.search(r"Current=(\d+)x(\d+) Wanted=(\d+)x(\d+) MaxAllowed=(\d+)x(\d+)", line)
+            if dims and current:
+                cw, ch, ww, wh = (int(dims.group(i)) for i in range(1, 5))
+                if ww * wh > cw * ch:
+                    wanting.append({"path": current, "current": f"{cw}x{ch}", "wanted": f"{ww}x{wh}",
+                                    "ratio": (ww * wh) / max(1, cw * ch)})
+                current = None
+        for w in wanting:
+            kb = textures.get(w["path"], {}).get("kb")
+            w["missing_kb"] = int(kb * (w.pop("ratio") - 1)) if kb else None
+        wanting.sort(key=lambda w: -(w["missing_kb"] or 0))
+        rows = sorted(textures.values(), key=lambda t: -t["kb"])
+        streaming = sum(t["kb"] for t in rows if t["streaming"])
+        pool = _try(lambda: unreal.SystemLibrary.get_console_variable_int_value("r.Streaming.PoolSize"), 0)
+        return json.dumps({"pool_mb": pool, "count": len(rows), "in_mem_mb": round(sum(t["kb"] for t in rows) / 1024, 1),
+                           "streaming_mb": round(streaming / 1024, 1),
+                           "non_streaming_mb": round(sum(t["kb"] for t in rows if not t["streaming"]) / 1024, 1),
+                           "largest": rows[:limit], "wanting_count": len(wanting),
+                           "wanting_mb": round(sum(w["missing_kb"] or 0 for w in wanting) / 1024, 1),
+                           "wanting": wanting[:limit]})
 
     @_tool
     @staticmethod
@@ -5655,7 +6156,13 @@ class TetherCore(_Base):
             if not os.path.exists(_play_saved()):
                 return "nothing to restore"
             with open(_play_saved(), encoding="utf-8") as f:
-                unreal.ToolsetLibrary.set_object_properties(settings, f.read())
+                saved = f.read()
+            # Through the settings registry, which also writes the user's config: setting the object alone left the
+            # multiplayer values on disk (saved when PIE started) for an editor closed without its own config flush.
+            try:
+                _settings("SetSectionProperties", "Editor", "LevelEditor", "PlayIn", saved)
+            except Exception:  # noqa: BLE001 - no settings section: at least fix the running editor
+                unreal.ToolsetLibrary.set_object_properties(settings, saved)
             os.remove(_play_saved())
             return "play settings restored"
         if action == "target":

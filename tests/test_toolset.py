@@ -211,3 +211,26 @@ class CollisionChannels(unittest.TestCase):
                                          ("ECC_GAME_TRACE_CHANNEL2", "Interact", True)])
         self.assertEqual([c[1] for c in channels if c[2]], ["Visibility", "Camera", "Interact"])
 
+
+
+class Cvars(unittest.TestCase):
+    def test_same_value(self):
+        self.assertTrue(toolsets._cvar_same("160", "160.000000"))
+        self.assertTrue(toolsets._cvar_same("true", "1"))
+        self.assertFalse(toolsets._cvar_same("2048", "512"))
+        self.assertFalse(toolsets._cvar_same("abc", "abd"))
+
+    def test_histories_from_console_output(self):
+        lines = ["Cmd: r.A", "", "HISTORY", "Constructor: 2048", "Scalability: 512",
+                 'r.A = "512"      LastSetBy: Scalability', "LogModelContextProtocol: Running tool",
+                 "Cmd: r.B", "HISTORY", "Constructor: 0", 'r.B = "0"      LastSetBy: Constructor']
+        saved = toolsets._console_output
+        toolsets._console_output = lambda world, commands: lines
+        try:
+            self.assertEqual(toolsets._cvar_histories(["r.A", "r.B"]),
+                             {"r.A": {"Constructor": "2048", "Scalability": "512"}, "r.B": {"Constructor": "0"}})
+        finally:
+            toolsets._console_output = saved
+
+    def test_fmt3(self):
+        self.assertEqual(toolsets._fmt3((1.0, -0.004, 250.126)), "(1, 0, 250.13)")
