@@ -1,6 +1,6 @@
 {
   "name": "tether",
-  "version": "0.18.0",
+  "version": "0.18.1",
   "description": "Drive a running Unreal Editor (UE 5.8+) from Claude Code: the `ue` CLI on PATH, the unreal-tether skill, and hooks that guard C# edits, report editor state and route builds.",
   "author": {
     "name": "Seneku",
