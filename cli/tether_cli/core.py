@@ -409,7 +409,7 @@ class LogLines(list):
     hidden = 0
 
 
-def filter_log(lines, level="Warning", category=None, pattern=None, ignore=True):
+def filter_log(lines, level="Warning", category=None, pattern=None, ignore=True, consecutive=False):
     max_level = LEVELS.get(level.capitalize() if level.lower() != "veryverbose" else "VeryVerbose", 2)
     rx = re.compile(pattern, re.I) if pattern else None
     known = LOG_IGNORE if ignore else []
@@ -447,9 +447,19 @@ def filter_log(lines, level="Warning", category=None, pattern=None, ignore=True)
             hidden += 1
             continue
         key = (lvl[0], cat, msg.strip())
+        if consecutive:  # order matters (a sequence of events): fold only repeats in a row
+            if order and order[-1][0] == key:
+                order[-1][1] += 1
+            else:
+                order.append([key, 1])
+            continue
         if key not in counts:
             order.append(key)
         counts[key] = counts.get(key, 0) + 1
+    if consecutive:
+        result = LogLines(f"{k[0]} {k[1]}: {k[2]}" + (f"  x{n}" if n > 1 else "") for k, n in order)
+        result.hidden = hidden
+        return result
     result = LogLines(f"{l} {c}: {m}" + (f"  x{counts[(l, c, m)]}" if counts[(l, c, m)] > 1 else "") for l, c, m in order)
     result.hidden = hidden
     return result

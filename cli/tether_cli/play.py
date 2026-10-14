@@ -13,7 +13,9 @@ from .core import (
 from .transport import catalog, py_json, resolve_toolset
 from .build import csharp_changes, csharp_layout, csharp_reload_build
 from .calls import flush_editor_log, scoped_cvars
-from .images import cmd_shot, image_diff, png_read, png_write, shot_args
+from .images import (
+    cmd_shot, contact_sheet, draw_text, hud_screenshot, image_diff, png_read, png_write, shot_args,
+)
 from .assets import mcp_tool
 from .jobs import cmd_job, jobs_dir
 
@@ -496,6 +498,8 @@ def active_sounds(ctx):
 
 
 def cmd_audio(ctx, args):
+    if getattr(args, "match", None) == "mix":
+        return audio_mix(ctx, args)
     """Sounds playing in PIE: what, from where, how loud."""
     if not (ctx.beacon or {}).get("pie"):
         raise CliError("PIE is not running (ue pie start)")
@@ -1122,6 +1126,59 @@ def pie_run(ctx, args):
 WITHIN = re.compile(r"\s+within\s+([\d.]+)\s*s?\s*$", re.I)
 
 
+def start_film(ctx, args):
+    """Capture the PIE view every `args.film` seconds on a second connection while the steps run."""
+    import threading
+    from .transport import Ctx
+    state = {"frames": [], "stop": threading.Event(), "t0": time.time(), "errors": 0, "hud": {}}
+
+    def loop():
+        own = Ctx(ctx.args)  # its own MCP connection: the steps keep theirs
+        while not state["stop"].is_set():
+            try:
+                # The window capture (HUD included); HighResShot at this cadence starved game time almost to a stop.
+                raw = hud_screenshot(own, state["hud"])
+                state["frames"].append((time.time() - state["t0"], raw))
+            except Exception:  # noqa: BLE001 - PIE ending under it, a slow frame: keep the rest of the film
+                state["errors"] += 1
+            state["stop"].wait(max(0.0, args.film - 0.2))
+    state["thread"] = threading.Thread(target=loop, daemon=True)
+    state["thread"].start()
+    return state
+
+
+def finish_film(ctx, args, state):
+    """Stop the film and lay its frames out as one timestamped contact sheet."""
+    state["stop"].set()
+    state["thread"].join(timeout=30)
+    frames = state["frames"]
+    if not frames:
+        print("film: no frames captured" + (f" ({state['errors']} failed)" if state["errors"] else ""))
+        return
+    tiles = []
+    for t, raw in frames[:48]:
+        try:
+            tiles.append((t, png_read(raw)))
+        except CliError:
+            pass
+    columns = min(4, len(tiles))
+    width, height, rgb = contact_sheet([tile for _, tile in tiles], columns=columns, tile_width=320)
+    sheet = bytearray(rgb)
+    tile_h = max(round(tile[1] * 320 / tile[0]) for _, tile in tiles)
+    for i, (t, _) in enumerate(tiles):  # each tile's time, top left
+        x0, y0 = 4 + (i % columns) * 324 + 4, 4 + (i // columns) * (tile_h + 4) + tile_h - 14  # bottom left
+        draw_text(sheet, width, x0, y0, f"{t:.1f}")
+    path = getattr(args, "film_output", None) or os.path.join(state_dir(ctx.project), "shots",
+                                                             time.strftime("film-%Y%m%d-%H%M%S.png"))
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    png_write(path, width, height, bytes(sheet))
+    gaps = [b[0] - a[0] for a, b in zip(frames, frames[1:])]
+    actual = sum(gaps) / len(gaps) if gaps else args.film
+    print(f"film: {len(tiles)} frame(s), one every {actual:.1f}s" + (f" (asked {args.film:g}s; a window capture takes about "
+                                                                     f"that long)" if actual > args.film * 1.5 else "")
+          + f" -> {path}" + (" (first 48)" if len(frames) > 48 else ""))
+
+
 def pie_do(ctx, args):
     """Drive the player through a list of steps in PIE and check the results. Exit 0/1."""
     steps, wanted_map = list(args.script or []), None
@@ -1238,15 +1295,14 @@ def pie_do(ctx, args):
         if verb == "shot-check":
             return shot_check(ctx, rest)
         if verb == "shot":
-            shot_args = argparse.Namespace(actor=None, at=None, look_at=None, rot=None, annotate=False, grid_z=0,
-                                           ui=False, output=rest or None)
             buf = __import__("io").StringIO()
             with __import__("contextlib").redirect_stdout(buf):
-                cmd_shot(ctx, shot_args)
+                cmd_shot(ctx, shot_args(output=rest or None, hud=bool(getattr(args, "hud", False))))
             return True, buf.getvalue().strip()
         return tool(step)
 
     failures, held = [], set()
+    film = start_film(ctx, args) if getattr(args, "film", None) else None
     try:
         for number, step in enumerate(steps, 1):
             try:
@@ -1270,6 +1326,8 @@ def pie_do(ctx, args):
                 ctx.tether("pie_step", step=f"release {name}")
             except CliError:
                 pass
+        if film:
+            finish_film(ctx, args, film)
         if not (args.keep or was_running):
             cmd_pie(ctx, argparse.Namespace(action="stop", simulate=False, warmup=0, limit=0, script=None))
     if failures or not getattr(args, "quiet", False):
@@ -1462,3 +1520,65 @@ def pie_rate(ctx):
 def pie_net(ctx, action, clients=1, net="", target=-1, game="-"):
     # Epic's MCP layer treats a string parameter with an empty default as required, so pass them all.
     return ctx.tether("pie_net", action=action, clients=clients, net=net or "-", target=target, game=game)
+
+
+def tree_lines(rows, describe):
+    """[name, parent, ...] rows as an indented tree (names shortened to the asset name)."""
+    children, names = {}, {r[0] for r in rows}
+    for row in rows:
+        children.setdefault(row[1] if row[1] in names else "", []).append(row)
+    out = []
+
+    def walk(parent, depth):
+        for row in sorted(children.get(parent, []), key=lambda r: r[0]):
+            out.append("  " * depth + row[0].rsplit("/", 1)[-1] + describe(row))
+            walk(row[0], depth + 1)
+    walk("", 1)
+    return out
+
+
+def cmd_sound(ctx, args):
+    """`ue sound <asset>`: a sound in a few lines; `ue audio mix` is the class/submix tree (see cmd_audio)."""
+    info = ctx.tether("sound_info", target=args.asset)
+    info = json.loads(info) if isinstance(info, str) else info
+    duration = info.get("duration")
+    head = f"{info['sound']} ({info['class']})" + (f": {duration:.2f} s" if isinstance(duration, (int, float)) and 0 < duration < 1e5 else "")
+    if info.get("channels"):
+        head += f", {'mono' if info['channels'] == 1 else 'stereo' if info['channels'] == 2 else str(info['channels']) + ' channels'}"
+        head += f", {info['sample_rate']} Hz" if info.get("sample_rate") else ""
+    head += ", looping" if info.get("looping") else ""
+    print(head)
+    if info.get("compression"):
+        print(f"  compression {info['compression']}" + (f" quality {info['quality']}" if info.get("quality") else "")
+              + (f", loading {info['streaming']}" if info.get("streaming") else ""))
+    att = info.get("attenuation")
+    if att:
+        print(f"  attenuation {att['asset']}" + (f": falls off over {att['falloff_m']} m" if att.get("falloff_m") else "")
+              + (f" after {att['inner_m']} m" if att.get("inner_m") else "") + ("" if att.get("spatialized", True) else ", not spatialized"))
+    else:
+        print("  no attenuation: as loud everywhere and not positioned (fine for UI and music, not for 3D sounds)")
+    if info.get("channels", 1) and info.get("channels", 1) > 1 and att:
+        print("  ! stereo with attenuation: a 3D sound should be mono")
+    print("  sound class " + (" < ".join(info["sound_class"]) if info["sound_class"] else "none (volume settings won't reach it)")
+          + (f", submix {info['submix']}" if info.get("submix") else ""))
+    if info.get("concurrency"):
+        print("  concurrency " + ", ".join(info["concurrency"]))
+    for wave in info.get("waves", []):
+        print(f"  plays {wave}")
+    print(f"  used by {info['used_by']} asset(s)")
+    ctx.data = info
+    return 0
+
+
+def audio_mix(ctx, args):
+    data = ctx.tether("audio_mix")
+    data = json.loads(data) if isinstance(data, str) else data
+    print(f"{len(data['classes'])} sound class(es):" if data["classes"] else "no sound classes under /Game (everything plays at default volume)")
+    for line in tree_lines(data["classes"], lambda r: f"  volume {r[2]:g}" + (f", pitch {r[3]:g}" if r[3] not in (None, 1) else "")):
+        print(line)
+    print(f"{len(data['submixes'])} submix(es):" if data["submixes"] else "no submixes under /Game (all audio goes to the master submix)")
+    for line in tree_lines(data["submixes"], lambda r: (f"  volume {r[2]:g}" if isinstance(r[2], (int, float)) else "")
+                           + (f", {r[3]} effect(s)" if r[3] else "")):
+        print(line)
+    ctx.data = data
+    return 0

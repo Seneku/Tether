@@ -7,7 +7,7 @@ import sys
 import time
 
 from .core import (
-    CliError, GATED, TETHER, UE_SCRIPT, compact_error, editor_process, editor_token, emit, filter_log, human_bytes, log_end, log_ignore_entries,
+    CliError, GATED, LEVELS, TETHER, UE_SCRIPT, compact_error, editor_process, editor_token, emit, filter_log, human_bytes, log_end, log_ignore_entries,
     log_ignore_path, log_path, pid_alive, PY_OUTPUT, summarize_log, write_json,
     port_open,
     read_json, read_new_log, short, state_dir, unwrap,
@@ -478,13 +478,34 @@ def flush_editor_log(ctx):
             pass  # hung or busy editor: read whatever is on disk
 
 
-PIE_START = re.compile(r"LogPlayLevel: Creating play world package: \S*UEDPIE_0_")  # each PIE session's first world
+# A PIE session's start ("PlayLevel: ..." comes once per session; a map travel inside PIE also creates a
+# UEDPIE_0_ world package, so that line only counts when the session start is missing).
+PIE_START = re.compile(r"LogPlayLevel: PlayLevel: ")
+PIE_WORLD = re.compile(r"LogPlayLevel: Creating play world package: \S*UEDPIE_0_")
+LOG_STAMP = re.compile(r"^\[(\d{4})\.(\d\d)\.(\d\d)-(\d\d)\.(\d\d)\.(\d\d):(\d{3})\]")
 
 
 def since_pie(lines):
     """The lines from the start of the last PIE session on (all of them when there was none)."""
-    starts = [i for i, line in enumerate(lines) if PIE_START.search(line)]
+    starts = [i for i, line in enumerate(lines) if PIE_START.search(line)] or \
+        [i for i, line in enumerate(lines) if PIE_WORLD.search(line)]
     return lines[starts[-1]:] if starts else lines
+
+
+def since_duration(lines, text, now=None):
+    """The lines logged in the last `text` ('90s', '2m', '1h'); log stamps are UTC."""
+    import calendar
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)([smh])", text.strip())
+    if not m:
+        raise CliError(f"--since takes last, start, pie or a duration like 90s, 2m, 1h (not '{text}')")
+    cutoff = (now if now is not None else time.time()) - float(m.group(1)) * {"s": 1, "m": 60, "h": 3600}[m.group(2)]
+    for i, line in enumerate(lines):
+        stamp = LOG_STAMP.match(line)
+        if stamp:
+            y, mo, d, h, mi, sec, ms = (int(v) for v in stamp.groups())
+            if calendar.timegm((y, mo, d, h, mi, sec)) + ms / 1000 >= cutoff:
+                return lines[i:]
+    return []
 
 
 def cmd_log(ctx, args):
@@ -511,15 +532,20 @@ def cmd_log(ctx, args):
     if args.since == "pie":
         lines = since_pie(read_new_log(ctx.project, from_start=True, advance=False))
         where = "since the last PIE start"
+    elif args.since not in ("last", "start"):
+        lines = since_duration(read_new_log(ctx.project, from_start=True, advance=False), args.since)
+        where = f"in the last {args.since}"
     else:
         lines = read_new_log(ctx.project, from_start=args.since == "start")
         where = "this session" if args.since == "start" else "new since the last ue log"
-    shown = filter_log(lines, level, args.cat, args.grep, ignore=not args.all)
+    # Reading events (info lines, or a search): keep their order, folding only repeats in a row.
+    ordered = bool(args.grep) or LEVELS.get(level.capitalize(), 2) >= LEVELS["Display"]
+    shown = filter_log(lines, level, args.cat, args.grep, ignore=not args.all, consecutive=ordered)
     filters = [f">= {level}"] + ([f"category {args.cat}"] if args.cat else []) + ([f"matching /{args.grep}/"] if args.grep else [])
     print(f"{len(shown)} entries ({', '.join(filters)}) of {len(lines)} lines {where}"
           + (f"; {shown.hidden} known noise hidden (--all)" if shown.hidden else "")
           + ("" if shown or level in ("Log", "Verbose", "VeryVerbose") else f" (--level Log shows info lines too)"))
-    for line in shown[-args.limit:] if args.since in ("start", "pie") else shown[: args.limit]:
+    for line in shown[-args.limit:] if args.since != "last" else shown[: args.limit]:
         print(line)
     if len(shown) > args.limit:
         print(f"... +{len(shown) - args.limit} more (--limit)")

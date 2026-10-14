@@ -16,11 +16,11 @@ from .calls import (
 )
 from .images import cmd_look, cmd_shot
 from .testing import cmd_test
-from .assets import cmd_diff, cmd_fx, cmd_net, cmd_overview, cmd_pcg, cmd_size, cmd_table, cmd_usages, cmd_validate
-from .content import cmd_import, cmd_landscape, cmd_lint, cmd_tex, cmd_unused
-from .jobs import cmd_job, cmd_package
-from .play import cmd_audio, cmd_gpu, cmd_mem, cmd_soak, cmd_ui, cmd_world
-from .playtest import bp_command, cmd_budget, cmd_input, perf_command, pie_command
+from .assets import cmd_data, cmd_diff, cmd_fx, cmd_net, cmd_overview, cmd_pcg, cmd_skel, cmd_size, cmd_table, cmd_usages, cmd_validate
+from .content import cmd_import, cmd_landscape, cmd_lint, cmd_map, cmd_mesh, cmd_tex, cmd_unused
+from .jobs import cmd_game, cmd_job, cmd_package
+from .play import cmd_audio, cmd_gpu, cmd_mem, cmd_sound, cmd_soak, cmd_ui, cmd_world
+from .playtest import bp_command, cmd_budget, cmd_input, package_command, perf_command, pie_command
 from .hooks import cmd_hook
 from .setup import cmd_doctor, cmd_init, cmd_reload
 from .selftest import cmd_ci, cmd_selftest
@@ -174,6 +174,13 @@ def build_parser():
     s.add_argument("--top", type=int, default=10, help="how many of the largest to list (10)")
     s.add_argument("--max", type=int, help="flag textures over this many pixels a side (lint.json max_texture_size, 4096)")
     s.add_argument("--strict", action="store_true", help="exit 1 when any issue is found")
+    s = add("map", cmd_map, "the level from above as a picture: mesh footprints, landscape height, gameplay actors by class")
+    s.add_argument("area", nargs="?", help="x,y,radius (default: the whole level)")
+    s.add_argument("--match", help="only markers whose label or class matches this regex")
+    s.add_argument("--pie", action="store_true", help="the PIE world (spawned actors where they are now)")
+    s.add_argument("--px", type=int, default=800, help="picture size (800)")
+    s.add_argument("--numbers", type=int, default=60, help="number the markers when there are at most this many (60)")
+    s.add_argument("-o", "--output", help="PNG path (default Saved/Tether/shots/map-<time>.png)")
     add("lights", cmd_lights, "lighting overview: lights, sky, fog, exposure, and what commonly goes wrong")
     s = add("cvar", cmd_cvar, "console variables: value, who set it, default; set, --reset, or set only --for a command")
     s.add_argument("items", nargs="*", metavar="regex | Name=value", help="a name regex/prefix to list, or Name=value to set")
@@ -204,6 +211,8 @@ def build_parser():
     s.add_argument("prop", nargs="?", help="with compare: Actor.Property (or player.Health, Actor.location)")
     s.add_argument("--pie", action="store_true", help="look the actor up in PIE (the world ue pie target picked)")
     s.add_argument("--all", action="store_true", help="every parent class in full, not just counts")
+    s = add("skel", cmd_skel, "a skeleton or skeletal mesh: bone tree with sockets, virtual bones, LODs, materials, physics, rigs")
+    s.add_argument("target", help="a SkeletalMesh or Skeleton /Game/... path")
     s = add("tree", cmd_tree, "an actor's or Blueprint's components as a tree: sockets, transforms, mobility, meshes, flags")
     s.add_argument("target", help="actor label, 'player' (PIE pawn), or a Blueprint /Game/... path")
     s.add_argument("--pie", action="store_true", help="the PIE world's actor")
@@ -284,8 +293,9 @@ def build_parser():
     s.add_argument("command", nargs="+")
     s.add_argument("--pie", action="store_true", help="run in the PIE world")
     s = add("log", cmd_log, "new log entries since the last call; --summary: the session grouped; --ignore: known noise")
-    s.add_argument("--since", choices=["last", "start", "pie"], default="last",
-                   help="last: new since the previous ue log (default); start: this editor session; pie: the last PIE")
+    s.add_argument("--since", default="last",
+                   help="last: new since the previous ue log (default); start: this editor session; pie: the last PIE "
+                        "session; or a duration: 90s, 2m, 1h")
     s.add_argument("--summary", action="store_true", help="the whole session's warnings/errors grouped by message shape")
     s.add_argument("--tail", type=int, metavar="N", help="the session's last N entries (--since start --limit N)")
     s.add_argument("--ignore", metavar="REGEX", help="add known noise to Config/Tether/log-ignore.json (hidden from log, pie, ci)")
@@ -300,6 +310,10 @@ def build_parser():
                                              "with watch: Actor.Property ... (an actor alone: its location)")
     s.add_argument("-f", "--file", help="with do: a file of steps, one per line (# comments); with watch: run it while sampling")
     s.add_argument("--keep-going", action="store_true", help="with do: run every step even after a failure")
+    s.add_argument("--film", type=float, metavar="SECONDS", help="with do: capture the view every N seconds into a "
+                                                                  "timestamped contact sheet")
+    s.add_argument("--hud", action="store_true", help="with do: shot steps include the game's UMG HUD (film frames always do)")
+    s.add_argument("--film-output", metavar="PNG", help="with --film: where the contact sheet goes")
     s.add_argument("--clients", type=int, help="with start: multiplayer PIE with this many clients")
     s.add_argument("--game", metavar="CLASS", help="with start: play with this game mode (/Script/Module.Class or "
                                                   "/Game/BP_X.BP_X_C) instead of the project default; put back on stop")
@@ -362,6 +376,22 @@ def build_parser():
                    help="one capture per scalability level (low,medium,high,epic[,cinematic]; 5 s each), then restore")
     s.add_argument("--shots", action="store_true", help="with --scalability: a screenshot at each level")
     add("budget", cmd_budget, "measure what Config/Tether/budget.json limits (frame time, memory, sizes, load) and compare")
+    s = add("mesh", cmd_mesh, "mesh check <mesh|folder>...: size and units, pivot, UVs/lightmap UV, inward faces, "
+                              "collision, sockets, empty material slots")
+    s.add_argument("action", choices=["check"])
+    s.add_argument("paths", nargs="+", help="StaticMesh/SkeletalMesh paths, or folders")
+    s.add_argument("--height", type=float, help="expected height in cm (e.g. 200): catches unit and up-axis mistakes")
+    s.add_argument("--strict", action="store_true", help="exit 1 when any mesh has issues")
+    s = add("data", cmd_data, "balancing tables: one property per line across data assets or Blueprint class defaults")
+    s.add_argument("query", help="a class (its data assets, or the Blueprints deriving from it), a folder, or a /Game/...glob")
+    s.add_argument("--columns", metavar="REGEX", help="only these properties")
+    s.add_argument("--all", action="store_true", help="also properties that are the same everywhere")
+    s.add_argument("--csv", metavar="FILE", help="write the table to a CSV (differing columns first)")
+    s.add_argument("--import", dest="import_csv", metavar="FILE", help="apply a CSV's changed cells")
+    s.add_argument("--dry-run", action="store_true", help="with --import: show what would change")
+    s.add_argument("--save", action="store_true", help="with --import: save the changed assets")
+    s = add("sound", cmd_sound, "a sound asset: duration, channels, rate, compression, looping, attenuation, class, submix, users")
+    s.add_argument("asset", help="SoundWave, SoundCue or MetaSound source path")
     s = add("asset", cmd_asset, "a few lines about assets, by type (mesh, texture, material, Blueprint, ...)")
     s.add_argument("paths", nargs="+", help="/Game/... asset paths")
     s = add("diff", cmd_diff, "what changed in an asset between git revisions, or a revision and the editor now")
@@ -432,7 +462,7 @@ def build_parser():
     s.add_argument("--force", action="store_true", help="run a builder even though the map is open in the editor")
     s.add_argument("--no-wait", action="store_true", help="with builders: start the job and return")
     s.add_argument("--wait", type=float, default=1800, help="seconds to wait for nav or lighting (1800)")
-    s = add("audio", cmd_audio, "sounds playing in PIE: sound, owner, distance, volume, attenuation")
+    s = add("audio", cmd_audio, "sounds playing in PIE: sound, owner, distance, volume, attenuation; `audio mix`: classes and submixes")
     s.add_argument("match", nargs="?", help="regex filter")
     s = add("soak", cmd_soak, "long PIE run (a step file in a loop, or wandering): memory trend, fps, errors, crashes")
     s.add_argument("--minutes", type=float, default=5, help="how long (5)")
@@ -489,6 +519,24 @@ def build_parser():
     s = add("api", cmd_api, "the unreal Python API: a class's methods and properties, or one member's doc")
     s.add_argument("name", help="class or class.member, e.g. EditorActorSubsystem or Actor.set_actor_location")
     s.add_argument("match", nargs="?", help="regex filter on member names")
+    s = add("game", cmd_game, "multiplayer outside PIE: server + clients as game processes (start|status|log|stop)")
+    s.add_argument("action", nargs="?", choices=["start", "status", "log", "stop"])
+    s.add_argument("index", nargs="?", type=int, help="with log: which process (0 = the server)")
+    s.add_argument("--clients", type=int, default=1, help="with start: how many clients (1)")
+    s.add_argument("--server", choices=["listen", "dedicated", "none"], default="listen",
+                   help="with start: listen server (a player hosts), dedicated (-server), or none (clients only)")
+    s.add_argument("--map", help="with start: the server's map (default: the project's GameDefaultMap)")
+    s.add_argument("--game", metavar="CLASS", help="with start: ?game= game mode for the server's map")
+    s.add_argument("--packaged", action="store_true", help="with start: run the packaged build (ue package first)")
+    s.add_argument("--windowed", action="store_true", help="with start: windows on screen (default: headless, -nullrhi)")
+    s.add_argument("--game-port", type=int, help="with start: the server's port (17777)")
+    s.add_argument("--server-args", default="", help="with start: extra command-line arguments for the server")
+    s.add_argument("--client-args", default="", help="with start: extra command-line arguments for each client")
+    s.add_argument("--wait", type=float, default=120, help="with start: seconds to wait for the clients to join (120)")
+    s.add_argument("--server-delay", type=float, default=3, help="with start: seconds between server and clients (3)")
+    s.add_argument("--level", help="with log: Error, Warning (default), Display, Log")
+    s.add_argument("--grep", help="with log: regex filter")
+    s.add_argument("--platform", help=argparse.SUPPRESS)
     s = add("job", cmd_job, "background jobs for long work: start -- <cmd>, cook, status, wait, log")
     s.add_argument("action", choices=["start", "cook", "package", "status", "wait", "log", "stop", "_run"])
     s.add_argument("id", nargs="?", help="job id (default: the latest)")
@@ -496,7 +544,7 @@ def build_parser():
     s.add_argument("--platform", help="with cook: target platform (default: this host)")
     s.add_argument("--wait", type=float, default=7200, help="with wait: seconds before giving up (7200)")
     s.add_argument("-v", "--verbose", action="store_true", help="with wait: also print warnings")
-    s = add("package", cmd_package, "package the game (background job), then boot it headless and report crashes")
+    s = add("package", package_command, "package the game (background job), then boot it headless and report crashes")
     s.add_argument("--platform", help="target platform (default: this host)")
     s.add_argument("--config", default="Development", help="Development (default), Shipping, DebugGame")
     s.add_argument("--seconds", type=float, default=20, help="how long the boot test runs (20)")
@@ -506,6 +554,11 @@ def build_parser():
     s.add_argument("--boot-only", action="store_true", help="boot-test the last package without rebuilding")
     s.add_argument("--nullrhi", action="store_true", help="boot without rendering (-nullrhi)")
     s.add_argument("--strict", action="store_true", help="fail on logged errors too")
+    s.add_argument("--play", type=int, metavar="CLIENTS", help="instead of the boot test: a listen server and N clients "
+                                                               "from the packaged build (ue game start --packaged)")
+    s.add_argument("--perf", type=float, metavar="SECONDS", help="instead of the boot test: frame times in the packaged "
+                                                                 "game for about N seconds (after ue package)")
+    s.add_argument("--map", help="with --perf: the map to measure (default: the game's start map)")
     s = add("ci", cmd_ci, "project checks in one pass/fail: open if needed, tests, Blueprint compile, validation, cook, close")
     s.add_argument("--tests", help="test filter (default ^<Project>.)")
     s.add_argument("--bp", help="content path for the Blueprint check (default /Game)")

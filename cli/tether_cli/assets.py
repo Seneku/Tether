@@ -1485,3 +1485,170 @@ def cmd_net(ctx, args):
         print(line)
     ctx.data = info
     return 0
+
+
+def bone_tree_lines(bones, budget=120, sockets=None):
+    """A bone hierarchy as indented lines; past `budget` lines, deeper branches fold into '(+N bones)'.
+    Sockets show under their bone as '@Name'."""
+    children, roots = {}, []
+    for name, parent in bones:
+        (children.setdefault(parent, []) if parent else roots).append(name)
+    on_bone = {}
+    for sock in sockets or []:
+        on_bone.setdefault(sock["bone"], []).append(sock["name"])
+
+    def size(name):
+        return 1 + sum(size(c) for c in children.get(name, []))
+    depth_limit = 99
+    while depth_limit > 1:  # the deepest level that still fits the budget
+        count = [0]
+
+        def walk(name, depth):
+            count[0] += 1
+            if depth < depth_limit:
+                for c in children.get(name, []):
+                    walk(c, depth + 1)
+        for r in roots:
+            walk(r, 0)
+        if count[0] <= budget:
+            break
+        depth_limit -= 1
+    lines = []
+
+    def emit(name, depth):
+        hidden = size(name) - 1 if depth >= depth_limit else 0
+        marks = "".join(f"  @{n}" for n in on_bone.get(name, []))
+        lines.append("  " * depth + name + marks + (f"  (+{hidden} bones)" if hidden else ""))
+        if depth < depth_limit:
+            for c in children.get(name, []):
+                emit(c, depth + 1)
+    for r in roots:
+        emit(r, 0)
+    return lines
+
+
+def cmd_skel(ctx, args):
+    """A skeleton or skeletal mesh: bone tree with sockets, virtual bones, LODs, materials, physics bodies, rigs."""
+    info = ctx.tether("skel_info", target=args.target)
+    info = json.loads(info) if isinstance(info, str) else info
+    head = (f"{info['mesh'] or info['skeleton']}: {len(info['bones'])} bones, {len(info['sockets'])} socket(s)"
+            + (f", {len(info['virtual_bones'])} virtual bone(s)" if info["virtual_bones"] else "")
+            + (f", {info['lods']} LOD(s)" if info.get("lods") else "") + (f", {info['morphs']} morph target(s)" if info["morphs"] else ""))
+    print(head)
+    if info["mesh"] and info["skeleton"]:
+        print(f"  skeleton {info['skeleton']}")
+    for line in bone_tree_lines(info["bones"], args.limit * 4, info["sockets"]):
+        print("  " + line)
+    for sock in info["sockets"]:
+        print(f"  socket {sock['name']} on {sock['bone']} at {sock['at']}" + (f" rot {sock['rot']}" if sock["rot"] else "")
+              + ("" if sock["on"] == "mesh" else " (skeleton)"))
+    if info["virtual_bones"]:
+        print("  virtual bones: " + ", ".join(info["virtual_bones"]))
+    for slot, material in info["materials"]:
+        print(f"  material {slot or '(unnamed slot)'}: {material or 'NONE (renders with the default material)'}")
+    if info["physics_asset"]:
+        line = f"  physics asset {info['physics_asset']}"
+        pa = info["physics_asset"] + "." + info["physics_asset"].rsplit("/", 1)[-1]  # Epic's tools want the object path
+        try:
+            bodies = mcp_tool(ctx, "PhysicsAssetToolset", "GetBodyNames", {"physicsAsset": pa})
+            bodies = bodies.get("bodyNames", bodies) if isinstance(bodies, dict) else bodies
+            constraints = mcp_tool(ctx, "PhysicsAssetToolset", "GetConstraints", {"physicsAsset": pa})
+            constraints = constraints.get("constraints", constraints) if isinstance(constraints, dict) else constraints
+            line += f": {len(bodies or [])} bodies, {len(constraints or [])} constraints"
+            missing = [b for b, _ in info["bones"] if b in set(bodies or [])]
+            if bodies and len(missing) != len(bodies):
+                line += f" ({len(bodies) - len(missing)} on bones this skeleton lacks)"
+        except CliError:
+            pass
+        print(line)
+    elif info["mesh"]:
+        print("  no physics asset (no ragdoll, no per-bone hits)")
+    for path, cls in info["rigs"]:
+        print(f"  used by {cls} {path}")
+    ctx.data = info
+    return 0
+
+
+def data_text(value):
+    """A cell: plain text for strings and numbers, compact JSON for the rest."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, float):
+        return f"{value:g}"
+    return json.dumps(value, separators=(",", ":"))
+
+
+def data_columns(rows):
+    """(differing, equal) property names across the rows, in first-seen order."""
+    names = []
+    for row in rows:
+        names += [n for n in row["values"] if n not in names]
+    differ = [n for n in names if len({data_text(r["values"].get(n)) for r in rows}) > 1]
+    return differ, [n for n in names if n not in differ]
+
+
+def cmd_data(ctx, args):
+    """Property values across data assets or Blueprint class defaults: what differs, CSV out and back in."""
+    import csv
+    data = ctx.tether("data_table", query=args.query, limit=500)
+    rows = (json.loads(data) if isinstance(data, str) else data)["rows"]
+    if not rows:
+        raise CliError(f"nothing found for {args.query} (a class name, a folder, or a /Game/...glob)")
+    rx = re.compile(args.columns, re.I) if args.columns else None
+    differ, equal = data_columns(rows)
+    if rx:
+        differ, equal = [n for n in differ if rx.search(n)], [n for n in equal if rx.search(n)]
+    short = {r["asset"]: r["asset"].rsplit("/", 1)[-1] for r in rows}
+    if args.import_csv:
+        with open(args.import_csv, encoding="utf-8-sig", newline="") as f:
+            table = list(csv.DictReader(f))
+        by_asset = {r["asset"]: r for r in rows}
+        changes = []
+        for line in table:
+            row = by_asset.get(line.get("asset", ""))
+            if row is None:
+                print(f"skipped {line.get('asset')}: not among the {len(rows)} rows of {args.query}")
+                continue
+            new = {k: v for k, v in line.items() if k != "asset" and v is not None and k in row["values"]
+                   and v != data_text(row["values"][k])}
+            if new:
+                changes.append((row, new))
+        for row, new in changes:
+            print(f"{short[row['asset']]}: " + ", ".join(f"{k} {data_text(row['values'][k])} -> {v}" for k, v in new.items()))
+            if not args.dry_run:
+                ctx.tether("set_props", target=row["object"], values=json.dumps(new))
+        if not changes:
+            print("nothing to change: the CSV matches the assets")
+        elif args.dry_run:
+            print(f"{len(changes)} asset(s) would change (without --dry-run they do)")
+        else:
+            print(f"{len(changes)} asset(s) changed" + ("" if args.save else "; not saved (ue save, or --save)"))
+            if args.save:
+                print(ctx.tether("save", paths=",".join(r["asset"] for r, _ in changes)))
+        return 0
+    if args.csv:
+        names = differ + equal
+        with open(args.csv, "w", encoding="utf-8", newline="") as f:
+            out = csv.writer(f)
+            out.writerow(["asset"] + names)
+            for row in rows:
+                out.writerow([row["asset"]] + [data_text(row["values"].get(n)) for n in names])
+        print(f"wrote {len(rows)} row(s) x {len(names)} column(s) to {args.csv} (differing columns first); edit it, "
+              f"then ue data {args.query} --import {args.csv} --dry-run")
+        return 0
+    print(f"{len(rows)} row(s) for {args.query}: {len(differ)} propert{'y differs' if len(differ) == 1 else 'ies differ'}"
+          + (f", {len(equal)} the same everywhere" if len(rows) > 1 else ""))
+    shown = (differ + (equal if args.all or len(rows) == 1 else []))[: args.limit]
+    for name in shown:
+        if len(rows) == 1:
+            print(f"  {name} = {short_value(data_text(rows[0]['values'].get(name)))}")
+        else:
+            print(f"  {name}: " + ", ".join(f"{short[r['asset']]}={short_value(data_text(r['values'].get(name)))}" for r in rows))
+    if len(rows) > 1 and equal and not args.all:
+        print(f"  (same in all: {', '.join(equal[:8])}" + (f" +{len(equal) - 8} more" if len(equal) > 8 else "") + "; --all lists them)")
+    ctx.data = {"rows": rows, "differ": differ}
+    return 0
+
+
+def short_value(text, width=40):
+    return text if len(text) <= width else text[: width - 3] + "..."

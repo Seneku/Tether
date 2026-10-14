@@ -53,11 +53,12 @@ def hud_rect(snapshot, view_w, view_h):
         m = SNAPSHOT_BOX.match(line)
         if m:
             boxes.append(tuple(int(v) for v in m.groups()[2:]))
-    fits = [b for b in boxes if abs(b[2] - view_w) <= 2 and view_h - 2 <= b[3] < view_h + 200]
+    # The viewport's panel: as wide as the viewport (give or take a border), taller by its tab and toolbar.
+    fits = [b for b in boxes if abs(b[2] - view_w) <= 4 and view_h - 4 <= b[3] < view_h + 600]
     if not fits:
         return None
     x, y, w, h = min(fits, key=lambda b: b[3])
-    return x, y + h - view_h, view_w, view_h
+    return x + (w - view_w) / 2, y + h - view_h, view_w, view_h
 
 
 def png_crop(raw, rect, scale=1.0):
@@ -72,7 +73,7 @@ def png_crop(raw, rect, scale=1.0):
     return png_bytes(x1 - x0, y1 - y0, b"".join(rows))
 
 
-def hud_screenshot(ctx):
+def hud_screenshot(ctx, cache=None):
     """The PIE viewport as the player sees it, UMG HUD included. HighResShot renders the scene only; `shot showui`
     grabs the whole editor window (UI and all), so take that and crop it to the game viewport, located through
     Epic's Slate inspector."""
@@ -99,6 +100,9 @@ def hud_screenshot(ctx):
     with open(path, "rb") as f:
         raw = f.read()
     os.remove(path)  # it moves to Saved/Tether/shots (or -o)
+    if cache and cache.get("rect"):  # a film: the viewport stays put, so locate it once
+        image_w = int.from_bytes(raw[16:20], "big")
+        return png_crop(raw, cache["rect"], image_w / cache["window_w"])
     text, is_error = ctx.mcp.call("SlateInspectorToolset.SlateInspectorToolset", "Snapshot",
                                   {"ref": "", "maxDepth": 60, "bIncludeSourceLocations": False})
     snapshot = unwrap(text) if not is_error else ""
@@ -110,7 +114,10 @@ def hud_screenshot(ctx):
               "its own window): this is the whole window")
         return raw
     image_w = int.from_bytes(raw[16:20], "big")
-    scale = image_w / int(window.group(5)) if window and int(window.group(5)) else 1.0  # DPI scaling
+    window_w = int(window.group(5)) if window and int(window.group(5)) else image_w
+    scale = image_w / window_w  # DPI scaling
+    if cache is not None:
+        cache.update(rect=rect, window_w=window_w)
     return png_crop(raw, rect, scale)
 
 
@@ -127,6 +134,29 @@ def capture_viewport(ctx, pose, annotations=None, ui=False):
         raise CliError("CaptureViewport returned no image")
     import base64
     return base64.b64decode(image["data"])
+
+
+# 3x5 pixel glyphs (drawn 2x): numbers and times on pictures, stdlib only.
+GLYPHS = {"0": "111101101101111", "1": "010110010010111", "2": "111001111100111", "3": "111001111001111",
+          "4": "101101111001001", "5": "111100111001111", "6": "111100111101111", "7": "111001010010010",
+          "8": "111101111101111", "9": "111101111001111", ".": "000000000000010", "-": "000000111000000",
+          "s": "000011010001110"}
+
+
+def draw_text(rgb, width, x, y, text, colour=(255, 255, 255), shadow=(0, 0, 0)):
+    """Draw digits (and . - s) into an RGB bytearray `width` pixels wide, 2x scale, with a dark shadow."""
+    height = len(rgb) // (width * 3)
+    for dx, dy, col in ((1, 1, shadow), (0, 0, colour)):
+        for k, ch in enumerate(text):
+            for i, bit in enumerate(GLYPHS.get(ch, "")):
+                if bit != "1":
+                    continue
+                for sy in range(2):
+                    for sx in range(2):
+                        px, py = x + dx + k * 8 + (i % 3) * 2 + sx, y + dy + (i // 3) * 2 + sy
+                        if 0 <= px < width and 0 <= py < height:
+                            o = (py * width + px) * 3
+                            rgb[o:o + 3] = bytes(col)
 
 
 def contact_sheet(tiles, columns=3, tile_width=400, gap=4):

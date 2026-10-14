@@ -141,6 +141,15 @@ def cmd_selftest(ctx, args):
     check("changes", ["changes"], ok=lambda c, o: c == 0 and "unsaved package" in o)
     check("size", ["size", "--top", "3"], ok=lambda c, o: c == 0 and "packages" in o)
     check("lint", ["lint", "/Engine/BasicShapes"], ok=lambda c, o: c == 0 and "naming" in o)
+    check("mesh check", ["mesh", "check", "/Engine/BasicShapes/Cube", "--height", "100"],
+          ok=lambda c, o: c == 0 and "100 x 100 x 100 cm" in o and "lightmap UV" in o)
+    check("skel", ["skel", "/Engine/EngineMeshes/SkeletalCube"], ok=lambda c, o: c == 0 and "2 bones" in o and "Bone02" in o)
+    check("sound", ["sound", "/Engine/EngineSounds/WhiteNoise"], ok=lambda c, o: c == 0 and "mono, 44100 Hz" in o)
+    check("audio mix", ["audio", "mix"], ok=lambda c, o: c == 0)
+    check("data", ["data", "/Engine/BasicShapes", "--limit", "3"], ok=lambda c, o: c == 0 and "row(s) for" in o)
+    check("map", ["map", "--px", "200", "-o", os.path.join(tempfile.gettempdir(), "tether-selftest-map.png")],
+          ok=lambda c, o: c == 0 and "x right, y up" in o)
+    check("log --since 1m", ["log", "--since", "1m"], ok=lambda c, o: c == 0 and "in the last 1m" in o)
     check("unused", ["unused", "--top", "3"], ok=lambda c, o: c == 0 and "are unused" in o)
     check("unused --redirectors", ["unused", "--redirectors"], ok=lambda c, o: c == 0 and "redirector" in o)
     check("mem", ["mem", "--top", "3"], timeout=300, ok=lambda c, o: c == 0 and "process:" in o)
@@ -306,6 +315,12 @@ def cmd_selftest(ctx, args):
     check("tree (player)", ["tree", "player"], ok=lambda c, o: c == 0 and "component(s)" in o)
     check("pie status (frame rate)", ["pie", "status"], ok=lambda c, o: c == 0 and "fps" in o)
     check("pie do wait (game time)", ["pie", "do", "wait 0.5 game"], ok=lambda c, o: c == 0 and "of game time" in o)
+    check("pie do --film", ["pie", "do", "wait 4", "--film", "1", "--film-output",
+                            os.path.join(tempfile.gettempdir(), "tether-selftest-film.png")], timeout=300,
+          skip="needs 5.8" if remote else None if rendering else "headless with -nullrhi",
+          ok=lambda c, o: c == 0 and "film: " in o and "frame(s)" in o)
+    check("map --pie", ["map", "--pie", "--px", "200", "-o", os.path.join(tempfile.gettempdir(), "tether-selftest-map.png")],
+          ok=lambda c, o: c == 0 and "x right, y up" in o)
     check("py (engine's own message)", ["py", "print(unreal.EditorAssetLibrary.load_asset('/Engine/BasicShapes/Cube'))"],
           ok=lambda c, o: c == 0 and "engine:" in o and "play mode" in o)
     imc = "/Game/TetherFixtures/Input/IMC_TetherProbe"
@@ -354,6 +369,13 @@ def cmd_selftest(ctx, args):
           ok=lambda c, o: c in (0, 1) and "2 PIE world(s)" in o)
     check("pie stop (restores)", ["pie", "stop"], skip=None if clients else "no multiplayer session",
           ok=lambda c, o: c == 0 and "restored" in o)
+    game = check("game start (listen + 1 client)", ["game", "start", "--clients", "1", "--wait", "180"]
+                 + (["--map", "/Game/TetherFixtures/L_TetherProbe", "--game", "/Script/Sandbox.TetherProbeNetGameMode"]
+                    if net_fixture else []), timeout=400,
+                 skip=None if net_fixture else "no net fixture (Sandbox's TetherProbeNetGameMode)",
+                 ok=lambda c, o: c == 0 and "1 of 1 client(s) joined" in o)
+    check("game stop", ["game", "stop"], skip=None if game else "no game session",
+          ok=lambda c, o: c == 0 and "stopped" in o)
     if args.reload:
         check("reload", ["reload"])
         time.sleep(1.5)

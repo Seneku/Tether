@@ -2217,8 +2217,8 @@ def _raw_input(world, verb, rest):
             unreal.SystemLibrary.execute_console_command(world, f"Input.-key {key}")
         else:
             force(key, " ".join(parts[2:]))
-            if action == "tap":
-                release(key)  # pressed for one frame
+            if action == "tap":  # held a few frames: down and up in one frame never fires a Started trigger
+                release(key, 0.1)
         return f"{key} {action}"
     if verb == "mouse":
         nums = _numbers(",".join(parts))
@@ -2227,7 +2227,7 @@ def _raw_input(world, verb, rest):
         dx, dy = nums
         if "Mouse2D" in _mapped_keys() or not ({"MouseX", "MouseY"} & _mapped_keys()):
             force("Mouse2D", f"X={dx:g} Y={dy:g}")
-            release("Mouse2D")
+            release("Mouse2D")  # one frame: a mouse delta is per frame
             return f"Mouse2D ({dx:g}, {dy:g}) for one frame"
         for key, value in (("MouseX", dx), ("MouseY", dy)):
             if value:
@@ -3577,6 +3577,397 @@ class TetherCore(_Base):
                          "value": value(match) if match else None,
                          "distance": round((match.get_actor_location() - loc).length(), 1) if match else None})
         return json.dumps(rows)
+
+    @_tool
+    @staticmethod
+    def skel_info(target: str) -> str:
+        """A skeleton or skeletal mesh: bones with parents (in hierarchy order), sockets with their bone and offset,
+        virtual bones, LODs, materials, morph targets, its physics asset, and the IK rigs / retargeters that use it.
+
+        Args:
+            target: A SkeletalMesh or Skeleton asset path.
+
+        Returns:
+            JSON: {mesh, skeleton, bones: [[name, parent]], sockets: [...], virtual_bones, lods, materials,
+            morphs, physics_asset, rigs: [[path, class]]}.
+        """
+        asset = unreal.load_asset(target.split(".")[0])
+        if isinstance(asset, unreal.Skeleton):
+            skeleton, mesh = asset, _try(lambda: asset.get_skeleton_preview_mesh(True))
+        elif isinstance(asset, unreal.SkeletalMesh):
+            mesh, skeleton = asset, asset.get_editor_property("skeleton")
+        else:
+            raise RuntimeError(f"{target} is not a SkeletalMesh or Skeleton")
+        names = [str(n) for n in unreal.AnimPoseExtensions.get_bone_names(skeleton.get_reference_pose())] if skeleton else []
+        bones = []
+        for name in names:
+            parent = str(_try(lambda: mesh.get_bone_parent(name), "")) if mesh else ""
+            bones.append([name, "" if parent in ("None", name) else parent])
+        sockets = []
+        for i in range(_try(lambda: mesh.num_sockets(), 0) if mesh else 0):
+            sock = mesh.get_socket_by_index(i)
+            get = lambda p, d=None: _try(lambda: sock.get_editor_property(p), d)  # noqa: E731
+            loc, rot = get("relative_location"), get("relative_rotation")
+            sockets.append({"name": str(get("socket_name")), "bone": str(get("bone_name")), "on": "mesh",
+                            "at": _fmt3(_vec_tuple(loc)) if loc else "", "rot": _fmt3(_rot_tuple(rot)) if rot else ""})
+        dumped = _try(lambda: _dump_props(skeleton), []) if skeleton else []
+        for owner, name, value in dumped:
+            if name == "Sockets":  # skeleton sockets (not Python-visible): their paths; read each socket object
+                for path in re.findall(r"'([^']+)'", value):
+                    sock = _try(lambda: unreal.find_object(None, path))
+                    if sock is not None and not any(s["name"] == str(sock.get_editor_property("socket_name")) for s in sockets):
+                        loc = sock.get_editor_property("relative_location")
+                        sockets.append({"name": str(sock.get_editor_property("socket_name")),
+                                        "bone": str(sock.get_editor_property("bone_name")), "on": "skeleton",
+                                        "at": _fmt3(_vec_tuple(loc)), "rot": ""})
+        virtual = [m.group(1) for owner, name, value in dumped if name == "VirtualBones"
+                   for m in re.finditer(r"VirtualBoneName=\"?(\w+)", value)]
+        materials = _try(lambda: mesh.get_editor_property("materials"), []) if mesh else []
+        slots = [[str(_try(lambda: m.get_editor_property("material_slot_name"), "")),
+                  _short_path(_try(lambda: m.get_editor_property("material_interface").get_path_name(), "") or "")]
+                 for m in materials]
+        physics = _try(lambda: mesh.get_editor_property("physics_asset")) if mesh else None
+        registry = unreal.AssetRegistryHelpers.get_asset_registry()
+        rigs = []
+        for source in [p for p in (mesh, skeleton) if p is not None]:
+            package = source.get_outermost().get_name()
+            for ref in registry.get_referencers(package, _dependency_options()) or []:
+                for data in registry.get_assets_by_package_name(str(ref)) or []:
+                    cls = str(data.asset_class_path.asset_name)
+                    if cls in ("IKRigDefinition", "IKRetargeter", "ControlRigBlueprint", "PhysicsAsset", "PoseAsset") \
+                            and [str(ref), cls] not in rigs:
+                        rigs.append([str(ref), cls])
+        lods = _try(lambda: unreal.EditorSkeletalMeshLibrary.get_lod_count(mesh), None) if mesh else None
+        if lods is None and mesh:
+            lods = _try(lambda: len(mesh.get_editor_property("lod_info")), None)
+        return json.dumps({"mesh": _short_path(mesh.get_path_name()) if mesh else None,
+                           "skeleton": _short_path(skeleton.get_path_name()) if skeleton else None,
+                           "bones": bones, "sockets": sockets, "virtual_bones": virtual, "lods": lods,
+                           "materials": slots,
+                           "morphs": len(_try(lambda: mesh.get_editor_property("morph_targets"), []) or []) if mesh else 0,
+                           "physics_asset": _short_path(physics.get_path_name()) if physics else None,
+                           "rigs": rigs})
+
+    @_tool
+    @staticmethod
+    def mesh_check(target: str, height: float = -1.0) -> str:
+        """Sanity checks for a static or skeletal mesh, aimed at meshes made in Blender and other DCC tools:
+        size (against an expected height when given), where the pivot sits, UV channels and the lightmap UV,
+        faces pointing inward, collision, sockets, empty material slots, LODs and Nanite.
+
+        Args:
+            target: A StaticMesh or SkeletalMesh asset path.
+            height: Expected height in cm (e.g. 200 for a robot), or -1.
+
+        Returns:
+            JSON: {mesh, class, size: [x, y, z], pivot, facts: [...], issues: [...]}.
+        """
+        mesh = unreal.load_asset(target.split(".")[0])
+        if not isinstance(mesh, (unreal.StaticMesh, unreal.SkeletalMesh)):
+            raise RuntimeError(f"{target} is not a StaticMesh or SkeletalMesh")
+        facts, issues = [], []
+        bounds = mesh.get_bounds()
+        o, e = bounds.origin, bounds.box_extent
+        size = [round(e.x * 2, 1), round(e.y * 2, 1), round(e.z * 2, 1)]
+        biggest = max(size)
+        # Size: Blender works in metres; an export at the wrong scale comes in 100x too small or too large.
+        if height > 0:
+            ratio = size[2] / height if size[2] else 0
+            if ratio and (0.005 < ratio < 0.02 or 50 < ratio < 200):
+                issues.append(f"{size[2]:g} cm tall, expected about {height:g}: {round(1 / ratio) if ratio < 1 else round(ratio)}x off "
+                              "(metres vs centimetres: set the export or import scale)")
+            elif max(size[0], size[1]) > 1.5 * size[2] and 0.5 < max(size[0], size[1]) / height < 2:
+                issues.append(f"lies on its side: {size[0]:g} x {size[1]:g} x {size[2]:g} cm, the expected height is along "
+                              "X or Y (Y-up export? rotate 90 degrees on import, or export Z-up)")
+            elif ratio and not 0.5 < ratio < 2:
+                issues.append(f"{size[2]:g} cm tall, expected about {height:g}")
+        elif biggest and biggest < 2:
+            issues.append(f"only {biggest:g} cm across: exported in metres with a 0.01 scale? (import with a scale of 100)")
+        elif biggest > 50000:
+            issues.append(f"{biggest / 100:g} m across: exported in centimetres twice? (import with a scale of 0.01)")
+        # Pivot: the mesh's local origin against its bounds.
+        bottom = o.z - e.z
+        centred = abs(o.x) <= max(1.0, 0.05 * e.x * 2) and abs(o.y) <= max(1.0, 0.05 * e.y * 2)
+        if centred and abs(bottom) <= max(1.0, 0.02 * size[2]):
+            pivot = "at the base, centred"
+        elif centred and abs(o.z) <= max(1.0, 0.05 * size[2]):
+            pivot = "at the centre"
+        else:
+            off = (o.x ** 2 + o.y ** 2 + bottom ** 2) ** 0.5
+            pivot = f"{off:.0f} cm from the base centre (bounds centre at {_fmt3((o.x, o.y, o.z))})"
+            if off > max(size) * 0.5:
+                issues.append(f"pivot is {off:.0f} cm away from the mesh: it rotates and places around a far point "
+                              "(apply transforms / set the origin in the DCC)")
+        get = lambda p, d=None: _try(lambda: mesh.get_editor_property(p), d)  # noqa: E731
+        if isinstance(mesh, unreal.StaticMesh):
+            lib = unreal.EditorStaticMeshLibrary
+            lods, uvs = lib.get_lod_count(mesh), lib.get_num_uv_channels(mesh, 0)
+            verts = lib.get_number_verts(mesh, 0)
+            nanite = bool(_try(lambda: get("nanite_settings").get_editor_property("enabled"), False))
+            lightmap = get("light_map_coordinate_index", 0)
+            facts.append(f"{verts} vertices, {lods} LOD(s), {uvs} UV channel(s), lightmap UV {lightmap}"
+                         + (", Nanite" if nanite else ""))
+            generated = bool(_try(lambda: lib.get_lod_build_settings(mesh, 0).get_editor_property("generate_lightmap_u_vs"), False))
+            if generated and lightmap >= uvs:
+                uvs += 1  # the build adds the lightmap channel
+            if lightmap >= uvs:
+                issues.append(f"lightmap UV channel {lightmap} does not exist ({uvs} channel(s)): static lighting will fail; "
+                              "turn on Generate Lightmap UVs in the build settings")
+            elif uvs < 2 and not nanite:
+                facts.append("one UV channel: the lightmap shares the texture UVs (overlapping UVs bake badly)")
+            simple = lib.get_simple_collision_count(mesh) + lib.get_convex_collision_count(mesh)
+            complexity = _enum_name(_try(lambda: lib.get_collision_complexity(mesh), ""))
+            facts.append(f"collision: {simple} simple shape(s)" + (", complex as simple" if "complexassimple" in complexity else ""))
+            if not simple and "complexassimple" not in complexity:
+                issues.append("no simple collision: characters and physics pass through it (UCX_ shapes from Blender, "
+                              "or ue lint --fix)")
+            sockets = [str(s.get_editor_property("socket_name")) for s in get("sockets", []) or []]
+            slots = [(str(m.get_editor_property("material_slot_name")), m.get_editor_property("material_interface"))
+                     for m in get("static_materials", []) or []]
+            # Faces turned inward: the signed volume of a closed mesh (Unreal's winding gives a negative one).
+            desc = _try(lambda: mesh.get_static_mesh_description(0))
+            if desc is not None:
+                count = desc.get_triangle_count()
+                stride = max(1, count // 30000)
+                volume = 0.0
+                for i in range(0, count, stride):
+                    tid = unreal.TriangleID()
+                    tid.set_editor_property("id_value", i)
+                    a, b, c = (desc.get_vertex_position(desc.get_vertex_instance_vertex(desc.get_triangle_vertex_instance(tid, k)))
+                               for k in range(3))
+                    volume += a.x * (b.y * c.z - b.z * c.y) - a.y * (b.x * c.z - b.z * c.x) + a.z * (b.x * c.y - b.y * c.x)
+                volume = volume * stride / 6
+                box = size[0] * size[1] * size[2]
+                if box and volume > 0.1 * box:
+                    issues.append("faces point inward (inside-out): flip the normals / recalculate outside in the DCC")
+        else:
+            sub = unreal.get_editor_subsystem(unreal.SkeletalMeshEditorSubsystem) if hasattr(unreal, "SkeletalMeshEditorSubsystem") else None
+            lods = _try(lambda: sub.get_lod_count(mesh), 0) if sub else 0
+            verts = _try(lambda: sub.get_num_verts(mesh, 0), 0) if sub else 0
+            skeleton = get("skeleton")
+            bones = len(unreal.AnimPoseExtensions.get_bone_names(skeleton.get_reference_pose())) if skeleton else 0
+            facts.append(f"{verts} vertices, {lods} LOD(s), {bones} bones" + ("" if get("physics_asset") else ", no physics asset"))
+            sockets = [str(mesh.get_socket_by_index(i).get_editor_property("socket_name")) for i in range(mesh.num_sockets())]
+            slots = [(str(m.get_editor_property("material_slot_name")), m.get_editor_property("material_interface"))
+                     for m in get("materials", []) or []]
+        if sockets:
+            facts.append("sockets: " + ", ".join(sockets[:12]) + (f" +{len(sockets) - 12}" if len(sockets) > 12 else ""))
+        empty = [name or "(unnamed)" for name, material in slots if material is None]
+        facts.append(f"{len(slots)} material slot(s)")
+        if empty:
+            issues.append(f"empty material slot(s): {', '.join(empty)} (renders with the default material)")
+        return json.dumps({"mesh": _short_path(mesh.get_path_name()), "class": mesh.get_class().get_name(),
+                           "size": size, "pivot": pivot, "facts": facts, "issues": issues})
+
+    @_tool
+    @staticmethod
+    def sound_info(target: str) -> str:
+        """A sound asset (SoundWave, SoundCue, MetaSound source): duration, channels, sample rate, compression,
+        looping, attenuation (with its falloff), concurrency, sound class and submix routing, the waves a cue
+        plays, and how many assets use it.
+
+        Args:
+            target: The sound asset path.
+
+        Returns:
+            JSON with those fields.
+        """
+        sound = unreal.load_asset(target.split(".")[0])
+        if not isinstance(sound, unreal.SoundBase):
+            raise RuntimeError(f"{target} is not a sound")
+        get = lambda obj, p, d=None: _try(lambda: obj.get_editor_property(p), d)  # noqa: E731
+        name = lambda o: _short_path(o.get_path_name()) if o else None  # noqa: E731
+        info = {"sound": name(sound), "class": sound.get_class().get_name(), "duration": get(sound, "duration"),
+                "looping": bool(get(sound, "looping", False)) or (get(sound, "duration", 0) or 0) > 1e5}
+        if isinstance(sound, unreal.SoundWave):
+            info.update(channels=get(sound, "num_channels"), sample_rate=get(sound, "sample_rate"),
+                        compression=_enum_name(get(sound, "sound_asset_compression_type", "")),
+                        quality=get(sound, "compression_quality"),
+                        streaming=_enum_name(get(sound, "loading_behavior", "")))
+        attenuation = get(sound, "attenuation_settings")
+        if attenuation is not None:
+            settings = get(attenuation, "attenuation")
+            falloff = _try(lambda: settings.get_editor_property("falloff_distance"))
+            inner = _try(lambda: settings.get_editor_property("attenuation_shape_extents").x)
+            info["attenuation"] = {"asset": name(attenuation), "falloff_m": round(falloff / 100, 1) if falloff else None,
+                                   "inner_m": round(inner / 100, 1) if inner else None,
+                                   "spatialized": bool(_try(lambda: settings.get_editor_property("spatialize"), True))}
+        override = get(sound, "attenuation_overrides") if get(sound, "override_attenuation", False) else None
+        if override is not None and attenuation is None:
+            info["attenuation"] = {"asset": "(set on the asset)", "falloff_m": round((get(override, "falloff_distance", 0) or 0) / 100, 1)}
+        concurrency = [name(c) for c in get(sound, "concurrency_set", []) or []]
+        if get(sound, "override_concurrency", False):
+            max_count = _try(lambda: get(sound, "concurrency_overrides").get_editor_property("max_count"))
+            concurrency.append(f"override: max {max_count}")
+        info["concurrency"] = concurrency
+        sound_class = get(sound, "sound_class_object")
+        chain = []
+        while sound_class is not None and len(chain) < 8:
+            chain.append(sound_class.get_name())
+            sound_class = get(sound_class, "parent_class")
+        info["sound_class"] = chain
+        info["submix"] = name(get(sound, "sound_submix_object"))
+        if isinstance(sound, unreal.SoundCue):  # the waves it plays
+            registry = unreal.AssetRegistryHelpers.get_asset_registry()
+            waves = []
+            for dep in registry.get_dependencies(sound.get_outermost().get_name(), _dependency_options()) or []:
+                for data in registry.get_assets_by_package_name(str(dep)) or []:
+                    if str(data.asset_class_path.asset_name) == "SoundWave":
+                        waves.append(str(dep))
+            info["waves"] = waves
+        registry = unreal.AssetRegistryHelpers.get_asset_registry()
+        info["used_by"] = len(registry.get_referencers(sound.get_outermost().get_name(), _dependency_options()) or [])
+        return json.dumps(info)
+
+    @_tool
+    @staticmethod
+    def audio_mix() -> str:
+        """The project's sound classes and submixes as trees: each class with volume, pitch and children; each
+        submix with its output volume, effect count and children.
+
+        Returns:
+            JSON: {classes: [[name, parent, volume, pitch]], submixes: [[name, parent, volume, effects]]}.
+        """
+        registry = unreal.AssetRegistryHelpers.get_asset_registry()
+        get = lambda obj, p, d=None: _try(lambda: obj.get_editor_property(p), d)  # noqa: E731
+        classes, submixes = [], []
+        for cls_name, out in (("SoundClass", classes), ("SoundSubmix", submixes)):
+            for data in registry.get_assets_by_class(unreal.TopLevelAssetPath("/Script/Engine", cls_name)):
+                package = str(data.package_name)
+                if not package.startswith("/Game/"):
+                    continue
+                asset = data.get_asset()
+                if cls_name == "SoundClass":
+                    props = get(asset, "properties")
+                    parent = get(asset, "parent_class")
+                    out.append([package, _short_path(parent.get_path_name()) if parent else "",
+                                _try(lambda: props.get_editor_property("volume")), _try(lambda: props.get_editor_property("pitch"))])
+                else:
+                    parent = get(asset, "parent_submix")
+                    out.append([package, _short_path(parent.get_path_name()) if parent else "",
+                                get(asset, "output_volume"), len(get(asset, "submix_effect_chain", []) or [])])
+        return json.dumps({"classes": classes, "submixes": submixes})
+
+    @_tool
+    @staticmethod
+    def data_table(query: str, limit: int = 200) -> str:
+        """Property values across many assets, for balancing: the data assets of a class, the class defaults of
+        the Blueprints deriving from a class, or the assets (Blueprints: their class defaults) in a folder or
+        matching a path glob (/Game/Robots/BP_*).
+
+        Args:
+            query: A class name (C++ or Blueprint), a folder, or a /Game/... glob.
+            limit: Maximum rows.
+
+        Returns:
+            JSON: {rows: [{asset, object, values: {prop: value}}]} (values compact; references to the row's own
+            asset written as ~).
+        """
+        import fnmatch
+        registry = unreal.AssetRegistryHelpers.get_asset_registry()
+        objects = []
+
+        def add(asset_path, obj):
+            if obj is not None and len(objects) < limit:
+                objects.append((asset_path, obj))
+
+        def cdo_of(bp):
+            cls = unreal.BlueprintEditorLibrary.generated_class(bp)
+            return unreal.get_default_object(cls) if cls else None
+        if query.startswith("/"):
+            folder, glob = query, "*"
+            if any(ch in query.rsplit("/", 1)[-1] for ch in "*?["):
+                folder, glob = query.rsplit("/", 1)
+            for data in sorted(registry.get_assets_by_path(folder.rstrip("/"), recursive=True), key=lambda d: str(d.package_name)):
+                package = str(data.package_name)
+                if "/__External" in package or not fnmatch.fnmatch(package.rsplit("/", 1)[-1], glob):
+                    continue
+                asset = data.get_asset()
+                add(package, cdo_of(asset) if isinstance(asset, unreal.Blueprint) else asset)
+        else:
+            py_type = getattr(unreal, query, None) or getattr(unreal, query[1:], None)
+            base = py_type.static_class() if py_type and hasattr(py_type, "static_class") else None
+            if base is None:  # a Blueprint class by asset name
+                hits = [d for d in registry.get_assets_by_class(unreal.TopLevelAssetPath("/Script/Engine", "Blueprint"))
+                        if str(d.asset_name).lower() == query.lower()]
+                bp = hits[0].get_asset() if hits else None
+                base = unreal.BlueprintEditorLibrary.generated_class(bp) if bp else None
+            if base is None:
+                raise RuntimeError(f"no class or Blueprint '{query}' (ue class {query})")
+            if unreal.MathLibrary.class_is_child_of(base, unreal.DataAsset.static_class()):  # its instances
+                flt = unreal.ARFilter(class_paths=[unreal.TopLevelAssetPath(base.get_path_name().rsplit(".", 1)[0],
+                                                                            base.get_name())],
+                                      recursive_classes=True)
+                for data in sorted(registry.get_assets(flt), key=lambda d: str(d.package_name)):
+                    add(str(data.package_name), data.get_asset())
+            for path in unreal.ToolsetLibrary.get_derived_classes(base) or []:  # Blueprints deriving from it
+                text = str(path.export_text()).strip('"')
+                if text.startswith("/Game/"):
+                    package = text.split(".")[0]
+                    bp = unreal.load_asset(package)
+                    if isinstance(bp, unreal.Blueprint):
+                        add(package, cdo_of(bp))
+        rows = []
+        for package, obj in objects:
+            values = _try(lambda: _props_json(obj), {}) or {}
+            own, name = obj.get_path_name().split(".")[0], package.rsplit("/", 1)[-1]
+            # References into the row's own asset (its components) would differ by name alone: write them as ~.
+            text = json.dumps({k: _rebase(_round(v), own, "~") for k, v in values.items()}).replace(name, "~")
+            rows.append({"asset": package, "object": obj.get_path_name(), "values": json.loads(text)})
+        return json.dumps({"rows": rows})
+
+    @_tool
+    @staticmethod
+    def map_data(area: str = "-", pie: bool = False, limit: int = 20000) -> str:
+        """The level from above, as data for `ue map`: every actor's footprint (axis-aligned bounds) and kind:
+        geometry (meshes, blocking volumes), marker (gameplay actors: pawns, starts, triggers, Blueprints...), or
+        landscape. Lights, sky, fog, post-process and other invisible infrastructure are left out.
+
+        Args:
+            area: 'x,y,radius' to keep only what overlaps it, or '-' for the whole level.
+            pie: Read the PIE world.
+            limit: Maximum actors.
+
+        Returns:
+            JSON: {actors: [[label, class, kind, x, y, z_top, half_x, half_y]], landscape: bool}.
+        """
+        skip = ("WorldSettings", "Light", "SkyAtmosphere", "SkyLight", "ExponentialHeightFog", "VolumetricCloud",
+                "PostProcessVolume", "NavMeshBoundsVolume", "RecastNavMesh", "AbstractNavData", "NavigationData",
+                "WorldPartitionHLOD", "WorldPartitionMiniMap", "LevelBounds", "GameplayDebugger", "Note",
+                "ReflectionCapture", "LightmassImportanceVolume", "PrecomputedVisibilityVolume", "AudioVolume",
+                "WorldDataLayers", "LevelInstance", "SceneCapture", "CameraActor", "DefaultPhysicsVolume", "Brush",
+                "ChaosDebugDraw", "PlayerCameraManager", "GameMode", "GameState", "PlayerState", "HUD", "GameSession",
+                "GameNetworkManager", "ParticleEventManager")
+        geometry = ("StaticMeshActor", "BlockingVolume", "InstancedFoliageActor", "Brush")
+        want = _numbers(area) if area and area != "-" else None
+        rows, landscape = [], False
+        for actor in _actors(pie):
+            cls = actor.get_class().get_name()
+            if cls.startswith(("Landscape",)):
+                landscape = True
+                continue
+            if any(cls == s or (cls.endswith(s) and s not in ("Brush",)) for s in skip) or cls in ("Brush",) and not \
+                    isinstance(actor, unreal.BlockingVolume):
+                continue
+            if isinstance(actor, (unreal.Controller, unreal.Info)) and not isinstance(actor, unreal.PlayerStart):
+                continue
+            origin, extent = actor.get_actor_bounds(False)
+            if extent.x > 500000 or extent.y > 500000:
+                continue
+            if not extent.x and not extent.y:  # a point actor (no visible component): use its location
+                origin = actor.get_actor_location()
+            if want and len(want) == 3:
+                dx, dy = abs(origin.x - want[0]) - extent.x, abs(origin.y - want[1]) - extent.y
+                if max(dx, 0) ** 2 + max(dy, 0) ** 2 > want[2] ** 2:
+                    continue
+            kind = "geometry" if cls in geometry or (isinstance(actor, unreal.StaticMeshActor)) else "marker"
+            if kind == "geometry" and cls == "InstancedFoliageActor":
+                continue  # foliage: thousands of instances; drawn as nothing rather than one huge box
+            rows.append([_label(actor), cls, kind, round(origin.x, 1), round(origin.y, 1), round(origin.z + extent.z, 1),
+                         round(extent.x, 1), round(extent.y, 1)])
+            if len(rows) >= limit:
+                break
+        return json.dumps({"actors": rows, "landscape": landscape})
 
     @_tool
     @staticmethod
@@ -6144,7 +6535,8 @@ class TetherCore(_Base):
                    "VirtualTextureStreaming", "HasAlphaChannel", "MaxTextureSize")
         wanted = {"Texture2D": texture, "TextureCube": texture, "Texture2DArray": texture, "VolumeTexture": texture,
                   "StaticMesh": ("Triangles", "LODs", "CollisionPrims", "CollisionComplexity", "NaniteEnabled",
-                                 "DefaultCollision")}
+                                 "DefaultCollision"),
+                  "SoundWave": ("NumChannels", "Duration", "SampleRate", "bLooping")}
         rows, seen, classes = [], set(), {}
         options = _dependency_options()
 
@@ -6167,6 +6559,8 @@ class TetherCore(_Base):
                 tags["_missing"] = missing[:10]
             if cls in ("StaticMesh", "SkeletalMesh"):
                 tags["_materials"] = sum(1 for d in deps if "Material" in (class_of(d) or ""))
+            if cls == "SoundWave":
+                tags["_attenuated"] = any(class_of(d) == "SoundAttenuation" for d in deps)
             rows.append([package, cls, tags])
         return json.dumps(rows)
 

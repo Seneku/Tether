@@ -66,6 +66,16 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
   --collision box --lods 3 --save` (meshes, textures, sounds; folders keep their subfolders; no dialogs; not
   while PIE runs). Names ending in _ORM/_Mask/_AO/... become linear mask textures. After the source files
   change: `ue import --reimport /Game/Props` reimports the changed ones and re-applies those options.
+- After importing a mesh: `ue mesh check /Game/Props/SM_Crate --height 80` (the size you expect, in cm) catches
+  the wrong unit (x100), a mesh lying on its side, an off pivot, missing lightmap UVs or collision, and faces
+  pointing inward. `ue skel <SK_ or skeleton>` shows a character's bone tree, sockets, physics bodies and rigs:
+  read it before naming a socket or bone in code. `ue sound <S_asset>` says whether a sound is stereo (no 3D
+  position), attenuated, in a sound class; `ue audio mix` shows the class tree and mixes.
+- Data-driven content (enemy stats, weapon tuning): `ue data <ClassName|/Game/Folder>` compares every DataAsset
+  or Blueprint subclass of a class side by side, only the properties that differ. To retune many at once:
+  `--csv tuning.csv`, edit, `--import tuning.csv --dry-run`, then `--import tuning.csv --save`.
+- Where things are in a level: `ue map` (or `ue map x,y,r`, `--pie` for the running game) draws it from above
+  (works headless) with player starts, spawners, AI and triggers as numbered dots; read the PNG to plan placement.
 - On terrain, never guess heights: `ue spawn /Game/X/SM_Rock --at 1200,-300,0 --ground` (or `ue drop Rock1 Rock2`,
   `--align` to follow the slope) puts things on the surface below.
 - Materials as text: `ue mat graph /Game/X/M_Rock` (outputs, nodes, wiring). Edit in small steps:
@@ -121,8 +131,8 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
   `fill_data_table_from_json_string`, which wipes every row).
 - `ue log [--level Warning|Display|Log] [--cat X] [--grep re]`: only entries that are new since the last
   `ue log`, de-duplicated. Run it after anything that might have warned or errored.
-- `ue log --since pie` reads from the last PIE start; `--grep` searches every line (Log and up) unless `--level`
-  is given.
+- `ue log --since pie` reads from the last PIE start (`--since 2m` for the last two minutes); `--grep` searches
+  every line (Log and up) unless `--level` is given, and keeps the lines in order.
 - `ue log --summary`: the whole session's warnings and errors grouped by message shape with counts. Noise the
   project knows about goes in Config/Tether/log-ignore.json (`ue log --ignore '^LogX: known thing' --why ...`);
   ue log, pie and ci then hide it and say how many lines they hid (`--all` shows them). Add an entry only for
@@ -203,7 +213,12 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
   rows).
 - Does the shipped game boot? `ue package` (minutes to an hour: it is a background job it waits on) packages,
   then runs the packaged game headless for 20 s and reports crashes and errors; `--boot-only` re-tests the last
-  package.
+  package. `ue package --perf 20 --map /Game/Maps/L` measures frame times in the packaged game (editor numbers
+  are not the shipped game's).
+- Real multiplayer outside the editor (separate processes, real network, the dedicated-server code path):
+  `ue game start --clients 2 [--server dedicated] [--map M] [--game MODE]` waits until the clients join;
+  `ue game status` (crashes, errors per process), `ue game log 1` (client 1), `ue game stop`. `--packaged` (or
+  `ue package --play 2`) runs the shipped build. Prefer `ue pie start --clients N` for quick checks.
 - Cooks and other long commands: `ue job cook` or `ue job start -- <cmd>`, then `ue job wait` (errors only)
   or `ue job status`. Do not block a shell on them.
 
@@ -239,6 +254,8 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
   `player.control` and getters like `player.GetVelocity()`.
 - When `ue py` prints `engine: ...` lines, that is why a call returned None (e.g. Editor Scripting refusing in PIE).
 - UI checks: `ue shot --hud` in PIE captures the game view with its UMG HUD (plain `ue shot` has the 3D view only).
+- To see what happened between checks: `ue pie do -f steps.txt --film 1` adds a contact sheet of the game's view
+  (with HUD), one frame a second with times on them; read that one image instead of many screenshots.
 - Engine traps worth knowing (`ue py` warns about the first two):
   - `StaticMesh.build_from_static_mesh_descriptions` on a mesh that already has render data crashes the editor;
     build into a new mesh instead.

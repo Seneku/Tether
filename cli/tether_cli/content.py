@@ -118,6 +118,14 @@ def cmd_import(ctx, args):
             for asset in result["assets"]:
                 count += 1
                 print(f"+ {asset['path']}  {asset['class']}" + (f"  {asset['detail']}" if asset["detail"] else ""))
+                if asset["class"] in ("StaticMesh", "SkeletalMesh"):  # what DCC exports get wrong, right away
+                    try:
+                        check = ctx.tether("mesh_check", target=asset["path"], height=-1.0)
+                        check = json.loads(check) if isinstance(check, str) else check
+                        for issue in check["issues"]:
+                            print(f"    ! {issue}")
+                    except CliError:
+                        pass
         print(f"{count} asset(s) from {len(results)} file(s)" + ("" if args.save else ", not saved yet (ue save, or --save)"))
         ctx.data = results
     warnings, more = _import_warnings(ctx, start)
@@ -315,6 +323,9 @@ def lint_rules(rows, config=None):
         if tags.get("_missing"):
             add("missing-ref", package, f"references {len(tags['_missing'])} package(s) that do not exist: "
                                         + ", ".join(tags["_missing"][:3]) + " (they load as None)")
+        if cls == "SoundWave" and tags.get("_attenuated") and int(tags.get("NumChannels") or 1) > 1:
+            add("sound-stereo-3d", package, f"{tags['NumChannels']} channels with attenuation: a 3D sound should be mono "
+                                            "(stereo plays from both speakers, spread only by its stereo spread)")
         if cls in ("StaticMesh", "SkeletalMesh") and tags.get("_materials") == 0:
             add("mesh-no-material", package, "depends on no material: its slots are empty (renders with the default "
                                              "material) or point at assets that are gone")
@@ -695,4 +706,170 @@ def cmd_landscape(ctx, args):
         print(f"{args.action}: centre z {result['centre_before']} -> {now}, largest change {result['max_change_cm']} cm "
               f"over {result['vertices']} vertices; undo with ue landscape restore --backup {applied['backup']}")
     ctx.data = result
+    return 0
+
+
+def cmd_mesh(ctx, args):
+    """`ue mesh check <mesh|folder>...`: sanity checks for meshes from DCC tools."""
+    targets = []
+    for path in args.paths:
+        rows = ctx.tether("lint_data", path=path.rstrip("/")) if "." not in path.rsplit("/", 1)[-1] else []
+        rows = json.loads(rows) if isinstance(rows, str) else rows
+        meshes = [r[0] for r in rows if r[1] in ("StaticMesh", "SkeletalMesh")]
+        targets += meshes or [path]
+    flagged = 0
+    for target in targets[: args.limit]:
+        data = ctx.tether("mesh_check", target=target, height=args.height or -1.0)
+        data = json.loads(data) if isinstance(data, str) else data
+        flagged += bool(data["issues"])
+        print(f"{data['mesh']} ({data['class']}): {data['size'][0]:g} x {data['size'][1]:g} x {data['size'][2]:g} cm, "
+              f"pivot {data['pivot']}")
+        for fact in data["facts"]:
+            print(f"  {fact}")
+        for issue in data["issues"]:
+            print(f"  ! {issue}")
+    if len(targets) > 1:
+        print(f"{len(targets)} mesh(es) checked, {flagged} with issues" + (f" (first {args.limit}; --limit N)"
+                                                                           if len(targets) > args.limit else ""))
+    return 1 if flagged and args.strict else 0
+
+
+# 3x5 pixel digits for numbering markers on `ue map` (stdlib only: no fonts).
+DIGITS = {"0": "111101101101111", "1": "010110010010111", "2": "111001111100111", "3": "111001111001111",
+          "4": "101101111001001", "5": "111100111001111", "6": "111100111101111", "7": "111001010010010",
+          "8": "111101111101111", "9": "111101111001111"}
+MAP_COLOURS = [((230, 60, 60), "red"), ((60, 160, 255), "blue"), ((250, 210, 40), "yellow"), ((80, 210, 90), "green"),
+               ((220, 90, 230), "magenta"), ((255, 140, 30), "orange"), ((60, 225, 220), "cyan"), ((255, 255, 255), "white"),
+               ((150, 110, 70), "brown"), ((160, 160, 255), "lavender")]
+
+
+class Canvas:
+    """An RGB picture to draw a map on, y down."""
+
+    def __init__(self, size, colour=(36, 38, 42)):
+        self.size = size
+        self.px = bytearray(bytes(colour) * size * size)
+
+    def put(self, x, y, colour):
+        if 0 <= x < self.size and 0 <= y < self.size:
+            i = (y * self.size + x) * 3
+            self.px[i:i + 3] = bytes(colour)
+
+    def rect(self, x0, y0, x1, y1, fill, edge=None):
+        for y in range(max(0, y0), min(self.size, y1 + 1)):
+            for x in range(max(0, x0), min(self.size, x1 + 1)):
+                border = edge and (x in (x0, x1) or y in (y0, y1))
+                self.put(x, y, edge if border else fill)
+
+    def dot(self, x, y, colour, r=4):
+        for dy in range(-r - 1, r + 2):
+            for dx in range(-r - 1, r + 2):
+                d = dx * dx + dy * dy
+                if d <= r * r:
+                    self.put(x + dx, y + dy, colour)
+                elif d <= (r + 1) * (r + 1):
+                    self.put(x + dx, y + dy, (0, 0, 0))
+
+    def number(self, x, y, text, colour=(255, 255, 255)):
+        for k, ch in enumerate(text):
+            bits = DIGITS.get(ch)
+            for i, bit in enumerate(bits or ""):
+                if bit == "1":
+                    for sy in range(2):
+                        for sx in range(2):
+                            self.put(x + k * 8 + (i % 3) * 2 + sx, y + (i // 3) * 2 + sy, colour)
+
+
+def map_picture(data, size, centre, half, grid=None, numbers=True):
+    """(canvas, legend rows, numbered markers) for `ue map`: x right, y up, `half` cm from the centre to an edge."""
+    canvas = Canvas(size)
+    scale = size / (2 * half)
+
+    def to_px(x, y):
+        return int((x - (centre[0] - half)) * scale), int(((centre[1] + half) - y) * scale)
+    if grid:  # landscape: brightness is height
+        heights = [v for row in grid["heights"] for v in row if v is not None]
+        lo, hi = (min(heights), max(heights)) if heights else (0, 1)
+        n = grid["px"]
+        for py in range(size):
+            for px in range(size):
+                row, col = n - 1 - int(py * n / size), int(px * n / size)
+                z = grid["heights"][row][col] if 0 <= row < n else None
+                if z is not None:
+                    v = int(60 + 120 * (z - lo) / ((hi - lo) or 1))
+                    canvas.put(px, py, (v - 20, v, v - 30))
+    geometry = sorted((a for a in data["actors"] if a[2] == "geometry"), key=lambda a: a[5])
+    tops = [a[5] for a in geometry] or [0]
+    lo, hi = min(tops), max(tops)
+    for label, cls, kind, x, y, top, hx, hy in geometry:
+        x0, y1 = to_px(x - hx, y - hy)
+        x1, y0 = to_px(x + hx, y + hy)
+        v = int(110 + 110 * (top - lo) / ((hi - lo) or 1))
+        canvas.rect(x0, y0, max(x0, x1), max(y0, y1), (v, v, v), (v - 50, v - 50, v - 50))
+    markers = [a for a in data["actors"] if a[2] == "marker"]
+    classes = sorted({a[1] for a in markers}, key=lambda c: -sum(1 for a in markers if a[1] == c))
+    colour_of = {c: MAP_COLOURS[i % len(MAP_COLOURS)] for i, c in enumerate(classes)}
+    numbered = []
+    for i, (label, cls, kind, x, y, top, hx, hy) in enumerate(sorted(markers, key=lambda a: (-a[4], a[3]))):
+        px, py = to_px(x, y)
+        canvas.dot(px, py, colour_of[cls][0])
+        if numbers:
+            canvas.number(px + 6, py - 4, str(i + 1))
+            numbered.append((i + 1, label, cls, x, y))
+    legend = [(colour_of[c][1], c, sum(1 for a in markers if a[1] == c)) for c in classes]
+    return canvas, legend, numbered
+
+
+def cmd_map(ctx, args):
+    """`ue map`: the level (or an area) from above as a picture, with gameplay actors marked by class."""
+    import math
+    data = ctx.tether("map_data", area=args.area or "-", pie=args.pie)
+    data = json.loads(data) if isinstance(data, str) else data
+    if args.match:
+        rx = re.compile(args.match, re.I)
+        data["actors"] = [a for a in data["actors"] if a[2] == "geometry" or rx.search(a[0]) or rx.search(a[1])]
+    actors = data["actors"]
+    if args.area:
+        nums = [float(v) for v in args.area.split(",")]
+        centre, half = (nums[0], nums[1]), nums[2]
+    else:
+        if not actors and not data["landscape"]:
+            raise CliError("nothing to draw: the level has no meshes or gameplay actors")
+        xs = [a[3] - a[6] for a in actors] + [a[3] + a[6] for a in actors]
+        ys = [a[4] - a[7] for a in actors] + [a[4] + a[7] for a in actors]
+        if data["landscape"]:
+            try:
+                info = ctx.tether("landscape", action="grid", x=0.0, y=0.0, size=0.0, px=2)
+                info = json.loads(info) if isinstance(info, str) else info
+                xs += [info["x"] - info["size"] / 2, info["x"] + info["size"] / 2]
+                ys += [info["y"] - info["size"] / 2, info["y"] + info["size"] / 2]
+            except (CliError, KeyError, TypeError):
+                pass
+        centre = ((min(xs) + max(xs)) / 2, (min(ys) + max(ys)) / 2)
+        half = max(max(xs) - min(xs), max(ys) - min(ys)) / 2 * 1.05 + 100
+    grid = None
+    if data["landscape"]:
+        try:
+            grid = ctx.tether("landscape", action="grid", x=centre[0], y=centre[1], size=half * 2, px=128)
+            grid = json.loads(grid) if isinstance(grid, str) else grid
+            grid = grid if isinstance(grid, dict) and grid.get("heights") else None
+        except CliError:
+            grid = None
+    markers = [a for a in actors if a[2] == "marker"]
+    canvas, legend, numbered = map_picture(data, args.px, centre, half, grid, numbers=len(markers) <= args.numbers)
+    path = args.output or os.path.join(state_dir(ctx.project), "shots", time.strftime("map-%Y%m%d-%H%M%S.png"))
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    png_write(path, args.px, args.px, bytes(canvas.px))
+    geometry = len(actors) - len(markers)
+    print(f"{path}  {args.px}x{args.px}, {half * 2 / 100:.0f} m across centred on ({centre[0]:.0f}, {centre[1]:.0f}); "
+          f"x right, y up; 1 px = {half * 2 / args.px:.0f} cm")
+    print(f"{geometry} mesh footprint(s) in grey (lighter = taller)" + (", landscape height underneath" if grid else "")
+          + f"; {len(markers)} marker(s):")
+    for colour, cls, count in legend:
+        print(f"  {colour:<9} {cls} x{count}")
+    for n, label, cls, x, y in numbered[: args.limit]:
+        print(f"  {n:>3} {label} ({cls}) at {x:.0f}, {y:.0f}")
+    if markers and not numbered:
+        print(f"  (markers not numbered: more than {args.numbers}; --match narrows them)")
+    ctx.data = {"path": path, "centre": centre, "half": half, "legend": legend, "numbered": numbered}
     return 0

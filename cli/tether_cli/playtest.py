@@ -11,11 +11,13 @@ import shutil
 import sys
 import time
 
-from .core import CliError, editor_mode, log_end, log_path, read_json, state_dir
+from .core import CliError, editor_mode, log_end, log_path, read_json, state_dir, subprocess
 from .calls import flush_editor_log, scoped_cvars
 from .assets import cmd_bp, cmd_size, code_usages, folder_packages, package_bytes
 from .content import cmd_tex
 from .images import cmd_shot, shot_args
+from .jobs import cmd_package, packaged_executable
+from .play import frame_stats, read_profile_csv
 from .play import cmd_mem, cmd_perf, cmd_pie, insights_exe, insights_export, pie_do, unthrottled
 
 
@@ -940,3 +942,69 @@ def cmd_budget(ctx, args):
     ctx.data = [{"limit": lim, "label": lab, "value": text, "verdict": v} for lab, text, lim, v in rows]
     return 1 if over else 0
 
+
+def package_command(ctx, args):
+    """`ue package`: --perf lives here (it reads profiler captures like ue perf); the rest is jobs.cmd_package."""
+    if getattr(args, "perf", None):
+        return package_perf(ctx, args)
+    return cmd_package(ctx, args)
+
+
+def package_perf(ctx, args):
+    """Frame times in the packaged game: run it with the CSV profiler for a fixed number of frames on a map, then
+    report like ue perf, next to the last editor capture (editor numbers flatter or punish a game unfairly)."""
+    from .core import host_platform
+    platform = args.platform or host_platform()
+    exe = packaged_executable(ctx.project, platform)
+    if not exe:
+        raise CliError("no packaged game (ue package first)")
+    name = os.path.splitext(os.path.basename(ctx.project))[0]
+    csv_dir = os.path.join(os.path.dirname(exe), name, "Saved", "Profiling", "CSV")
+    before = set(os.listdir(csv_dir)) if os.path.isdir(csv_dir) else set()
+    warmup = 90  # loading and shader warm-up frames, left out of the numbers
+    frames = int(args.perf * 60) + warmup
+    command = [exe] + ([args.map] if getattr(args, "map", None) else []) + [
+        "-RenderOffscreen", "-nosound", "-unattended", "-windowed", "-ResX=1280", "-ResY=720",
+        f"-csvCaptureFrames={frames}", "-csvExitOnCompletion"]
+    started = time.time()
+    proc = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
+    try:
+        proc.wait(timeout=max(180.0, args.perf * 20))
+    except subprocess.TimeoutExpired:
+        from .jobs import kill_tree
+        kill_tree(proc.pid)
+        raise CliError(f"the packaged game did not finish {frames} frames in time (stuck at a menu? pass a map)", 4)
+    new = [f for f in (os.listdir(csv_dir) if os.path.isdir(csv_dir) else []) if f.endswith(".csv") and f not in before]
+    if not new:
+        raise CliError(f"the packaged game wrote no profiler capture (exit code {proc.returncode}); is it a Shipping build? "
+                       "CSV profiling needs Development")
+    path = os.path.join(csv_dir, max(new, key=lambda f: os.path.getmtime(os.path.join(csv_dir, f))))
+    try:
+        columns = read_profile_csv(path)
+    except (IndexError, OSError):
+        columns = {}
+    if not columns.get("FrameTime"):
+        log = os.path.join(os.path.dirname(exe), name, "Saved", "Logs", name + ".log")
+        raise CliError(f"the capture is empty: the game exited (code {proc.returncode}) before profiling any frames; "
+                       f"its log: {log} (ue package --boot-only shows why)")
+    stats = {k: frame_stats(v[warmup:] or v) for k, v in columns.items()
+             if k in ("FrameTime", "GameThreadTime", "RenderThreadTime", "GPUTime") and v}
+    if "FrameTime" not in stats:
+        raise CliError(f"no FrameTime column in {path}")
+    ft = stats["FrameTime"]
+    count = len(columns["FrameTime"][warmup:])
+    hitches = sum(1 for t in columns["FrameTime"][warmup:] if t > max(2 * ft["p50"], 33.3))
+    editor = read_json(os.path.join(state_dir(ctx.project), "perf", "last.json")) or {}
+    print(f"packaged game: {count} frames in {time.time() - started:.0f}s: frame avg {ft['avg']:.1f} ms "
+          f"({1000 / ft['avg']:.0f} fps), p95 {ft['p95']:.1f}, max {ft['max']:.1f}; {hitches} hitch(es)")
+    for key, label in (("GameThreadTime", "game"), ("RenderThreadTime", "render"), ("GPUTime", "GPU")):
+        if key in stats:
+            ed = editor.get(key, {}).get("avg")
+            print(f"  {label:<6} {stats[key]['avg']:6.1f} ms avg, p95 {stats[key]['p95']:.1f}"
+                  + (f"   (editor PIE last capture: {ed:.1f})" if ed else ""))
+    if editor.get("FrameTime"):
+        print(f"  editor PIE frame avg was {editor['FrameTime']['avg']:.1f} ms (ue perf); the packaged game has no editor "
+              "overhead, cooked assets and its own scalability settings")
+    print(f"  csv: {path}")
+    ctx.data = dict(stats, frames=count, hitches=hitches, csv=path)
+    return 0

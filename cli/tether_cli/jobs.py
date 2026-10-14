@@ -6,10 +6,11 @@ import sys
 import time
 
 from .core import (
-    CliError, UE_SCRIPT, describe_crash, engine_root, filter_log, host_platform, pid_alive, read_json,
+    CliError, UE_SCRIPT, describe_crash, editor_executable, engine_root, filter_log, host_platform, pid_alive, read_json,
     recent_crash, state_dir, subprocess, uat_command, write_json,
 )
 from .build import compact_diagnostics, editor_env, print_diagnostics
+from .assets import ini_value
 
 
 def jobs_dir(project):
@@ -167,6 +168,10 @@ def boot_test(ctx, exe, seconds, nullrhi=False, strict=False):
     log = os.path.join(game_dir, "Saved", "Logs", project_name + ".log")
     started = time.time()
     flags = ["-nullrhi"] if nullrhi else ["-RenderOffscreen"]
+    # Garbage collection early and every few seconds: cooked games fail at their first GC on references the editor
+    # allows (a settings default object holding a loaded asset: "Disregard for GC object ... not part of root set"),
+    # which a short boot otherwise never reaches.
+    flags += ["-ExecCmds=obj gc", "-ini:Engine:[/Script/Engine.GarbageCollectionSettings]:gc.TimeBetweenPurgingPendingKillObjects=3"]
     proc = subprocess.Popen([exe, *flags, "-nosound", "-unattended", "-log", "-ResX=640", "-ResY=360", "-windowed"],
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
     exited = None
@@ -205,9 +210,47 @@ def boot_test(ctx, exe, seconds, nullrhi=False, strict=False):
     return 1 if failed else 0
 
 
+def package_processes(project, platform):
+    """PIDs of processes running an executable from the package folder (test runs left behind: they lock its
+    files, and the next package loops on "file is being used by another process")."""
+    root = os.path.normcase(os.path.abspath(package_dir(project, platform)))
+    found = []
+    if os.name == "nt":
+        out = subprocess.run(["powershell", "-NoProfile", "-Command",
+                              "Get-CimInstance Win32_Process | ForEach-Object { \"$($_.ProcessId)|$($_.ExecutablePath)\" }"],
+                             capture_output=True, text=True).stdout
+        for line in out.splitlines():
+            pid, _, path = line.partition("|")
+            if path and os.path.normcase(path).startswith(root) and pid.strip().isdigit():
+                found.append(int(pid))
+    else:
+        out = subprocess.run(["ps", "-eo", "pid=,args="], capture_output=True, text=True).stdout
+        for line in out.splitlines():
+            pid, _, cmd = line.strip().partition(" ")
+            if os.path.normcase(cmd).startswith(root):
+                found.append(int(pid))
+    return found
+
+
+def kill_tree(pid):
+    if os.name == "nt":
+        subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True)
+    else:
+        subprocess.run(["kill", "-9", str(pid)], capture_output=True)
+
+
 def cmd_package(ctx, args):
     """Package the game (BuildCookRun as a background job), then boot-test the result."""
     platform = args.platform or host_platform()
+    leftovers = package_processes(ctx.project, platform)
+    if leftovers:
+        for pid in leftovers:
+            kill_tree(pid)
+        print(f"stopped {len(leftovers)} process(es) still running from the last package (they lock its files)")
+    if getattr(args, "play", None):
+        return cmd_game(ctx, argparse.Namespace(action="start", packaged=True, clients=args.play, server="listen", map=None,
+                                                game=None, windowed=False, game_port=None, server_args="", client_args="",
+                                                wait=120, server_delay=3, platform=platform, limit=args.limit))
     if not args.boot_only:
         cmd_job(ctx, argparse.Namespace(action="package", platform=platform, config=args.config, id=None,
                                         name=None, limit=args.limit, project=args.project, job_command=[]))
@@ -272,3 +315,171 @@ def job_line(folder, job_id):
             tail = [l for l in f.read().decode("utf-8", "replace").splitlines() if l.strip()]
             last = f" | {tail[-1].strip()[:90]}" if tail else ""
     return f"{job_id}  {meta.get('name', '?')}  {state}  {end - meta.get('started', end):.0f}s{last}"
+
+
+GAME_JOIN = re.compile(r"LogNet: Join succeeded: (\S+)")
+GAME_WELCOMED = re.compile(r"Welcomed by server|LogNet: Browse: .*\?|Join request")
+GAME_LISTENING = re.compile(r"IpNetDriver listening on port (\d+)")
+
+
+def free_udp_port(start, tries=50):
+    """The first UDP port from `start` nobody holds (PIE and other projects' games use 17777 too)."""
+    import socket
+    for port in range(start, start + tries):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sock.bind(("0.0.0.0", port))
+            return port
+        except OSError:
+            continue
+        finally:
+            sock.close()
+    return start
+
+
+def listening_port(lines):
+    """The port a game server's log says it listens on (the engine moves on to the next one when it is taken)."""
+    ports = [int(m.group(1)) for line in lines for m in [GAME_LISTENING.search(line)] if m]
+    return ports[-1] if ports else None
+
+
+def game_dir(project):
+    return os.path.join(state_dir(project), "game")
+
+
+def default_map(project):
+    value = ini_value(project, "DefaultEngine.ini", "GameDefaultMap") or ""
+    return value.split(".")[0] or None
+
+
+def game_command(ctx, args, role, index, port, log):
+    """The command line of one game process: listen/dedicated server or client, editor binary or packaged."""
+    headless = not args.windowed
+    if args.packaged:
+        exe = packaged_executable(ctx.project, args.platform or host_platform())
+        if not exe:
+            raise CliError("no packaged game (ue package first)")
+        if role == "dedicated":
+            raise CliError("a packaged client build has no dedicated server: use --server listen")
+        base = [exe]
+    else:
+        # -DisablePython: the editor plugins' Python startup scripts (Tether's, Epic's toolsets) expect an editor
+        base = [editor_executable(engine_root(ctx.project)), ctx.project, "-DisablePython"]
+    level = args.map or default_map(ctx.project)
+    if role in ("listen", "dedicated") and not level:
+        raise CliError("no map: pass --map /Game/Maps/MyMap (the project has no GameDefaultMap)")
+    url = (level + ("?listen" if role == "listen" else "") + (f"?game={args.game}" if args.game else "")) \
+        if role != "client" else f"127.0.0.1:{port}"
+    mode = ["-server"] if role == "dedicated" else ([] if args.packaged else ["-game"])
+    extra = (args.server_args if role != "client" else args.client_args) or ""
+    view = ["-nullrhi", "-nosound"] if headless else ["-windowed", "-ResX=960", "-ResY=540", f"-WinX={60 + index * 40}",
+                                                       f"-WinY={60 + index * 40}"]
+    return base + [url] + mode + [f"-port={port}", "-log", f"-abslog={log}", "-unattended", "-nosplash",
+                                 "-NoVerifyGC"] + view + extra.split()
+
+
+def read_game_log(path):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return f.read().splitlines()
+    except OSError:
+        return []
+
+
+def cmd_game(ctx, args):
+    """Multiplayer outside PIE: a server and clients as separate game processes (editor binary, or the packaged
+    build), each with its own log; start, status, log, stop."""
+    folder = game_dir(ctx.project)
+    state_file = os.path.join(folder, "session.json")
+    state = read_json(state_file) or {}
+    action = args.action or "status"
+    if action == "start":
+        if state.get("instances") and any(pid_alive(i["pid"]) for i in state["instances"]):
+            raise CliError("a game session is running (ue game status; ue game stop first)")
+        os.makedirs(folder, exist_ok=True)
+        asked = getattr(args, "game_port", None)
+        port = asked or free_udp_port(17777)
+        roles = ([args.server] if args.server != "none" else []) + ["client"] * args.clients
+        env = editor_env(ctx.project) if not args.packaged else None
+        instances = []
+        started = time.time()
+        for index, role in enumerate(roles):
+            log = os.path.join(folder, f"{index}-{role}.log")
+            if os.path.exists(log):
+                os.remove(log)
+            command = game_command(ctx, args, role, index, port, log)
+            proc = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+                                    env=env)
+            instances.append({"index": index, "role": role, "pid": proc.pid, "log": log, "command": command})
+            if role != "client" and args.clients:
+                # Clients go to the port the server really listens on: the engine silently takes the next port
+                # when the asked one is busy, and a client knocking on the old one may reach someone else's game.
+                time.sleep(args.server_delay)
+                deadline = time.time() + max(args.wait, 30)
+                while time.time() < deadline and pid_alive(proc.pid):
+                    heard = listening_port(read_game_log(log))
+                    if heard:
+                        if heard != port:
+                            print(f"note: port {port} was taken; the server listens on {heard}")
+                        port = heard
+                        break
+                    time.sleep(0.5)
+        state = {"started": started, "port": port, "instances": instances, "packaged": bool(args.packaged)}
+        write_json(state_file, state)
+        server = next((i for i in instances if i["role"] != "client"), None)
+        joined, deadline = [], time.time() + args.wait
+        while server and args.clients and time.time() < deadline:
+            joined = [m.group(1) for line in read_game_log(server["log"]) for m in [GAME_JOIN.search(line)] if m]
+            dead = [i for i in instances if not pid_alive(i["pid"])]
+            if len(joined) >= args.clients or dead:
+                break
+            time.sleep(1)
+        print(f"game: {len(instances)} process(es) on port {port} ({'packaged' if args.packaged else 'editor binary'}, "
+              f"{'windowed' if args.windowed else 'headless'})")
+        for i in instances:
+            print(f"  {i['index']} {i['role']:<9} pid {i['pid']}  log {i['log']}" + ("" if pid_alive(i["pid"]) else "  EXITED"))
+        if server and args.clients:
+            ok = len(joined) >= args.clients
+            print(f"{len(joined)} of {args.clients} client(s) joined the server" + (f" ({', '.join(joined)})" if joined else "")
+                  + ("" if ok else f" within {args.wait:g}s (ue game log 0)"))
+            return 0 if ok else 1
+        return 0
+    if not state.get("instances"):
+        raise CliError("no game session (ue game start --clients 1)")
+    instances = state["instances"]
+    if action == "log":
+        index = args.index if args.index is not None else 0
+        inst = next((i for i in instances if i["index"] == index), None)
+        if inst is None:
+            raise CliError(f"no instance {index} (0..{len(instances) - 1})")
+        lines = read_game_log(inst["log"])
+        shown = filter_log(lines, args.level or ("Log" if args.grep else "Warning"), None, args.grep, consecutive=True)
+        print(f"{inst['role']} {index}: {len(shown)} entries of {len(lines)} lines ({inst['log']})")
+        for line in shown[-args.limit:]:
+            print(line)
+        return 0
+    if action == "stop":
+        for i in instances:
+            if pid_alive(i["pid"]):
+                kill_tree(i["pid"])
+        time.sleep(1)
+    crash = recent_crash(ctx.project, state.get("started", 0) - 1) if not state.get("packaged") else None
+    worst = 0
+    for i in instances:
+        lines = read_game_log(i["log"])
+        errors = filter_log(lines, "Error")
+        joins = sum(1 for line in lines if GAME_JOIN.search(line))
+        fatal = [line for line in lines if re.search(r"\bFatal\b|Assertion failed", line)]
+        alive = pid_alive(i["pid"])
+        state_text = "stopped" if action == "stop" else ("running" if alive else "EXITED")
+        print(f"  {i['index']} {i['role']:<9} {state_text}, {len(errors)} error line(s)"
+              + (f", {joins} join(s)" if i["role"] != "client" else "") + (f", FATAL: {fatal[0].split(']')[-1].strip()[:120]}" if fatal else ""))
+        for line in errors[:3]:
+            print(f"      {line[:160]}")
+        worst = max(worst, 1 if fatal or (not alive and action != "stop") else 0)
+    if crash:
+        print("  crash: " + describe_crash(ctx.project, crash).splitlines()[0])
+        worst = 1
+    if action == "stop":
+        print(f"stopped {len(instances)} process(es)")
+    return worst

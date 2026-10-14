@@ -1945,3 +1945,100 @@ window "Message Log" [pos=200,300 size=400,200] [ref=w2]
         self.assertEqual(ue.covering_window(nodes, button), "Message Log")
         far = dict(button, pos="900,600")
         self.assertIsNone(ue.covering_window(nodes + [far], far))
+
+
+class Round14(unittest.TestCase):
+    def test_bone_tree_folds_deep_branches(self):
+        bones = [["root", ""], ["pelvis", "root"], ["spine", "pelvis"], ["hand", "spine"]] + \
+            [[f"finger{i}", "hand"] for i in range(10)]
+        full = ue.bone_tree_lines(bones, budget=100, sockets=[{"name": "Grip", "bone": "hand"}])
+        self.assertIn("      hand  @Grip", full)
+        self.assertEqual(len(full), 14)
+        folded = ue.bone_tree_lines(bones, budget=5)
+        self.assertTrue(any("(+" in line for line in folded))
+        self.assertLessEqual(len(folded), 5)
+
+    def test_data_columns(self):
+        rows = [{"asset": "/Game/A", "values": {"Health": 100, "Speed": 600.0, "Tags": ["a"]}},
+                {"asset": "/Game/B", "values": {"Health": 150, "Speed": 600.0, "Tags": ["a"]}}]
+        self.assertEqual(ue.data_columns(rows), (["Health"], ["Speed", "Tags"]))
+        self.assertEqual(ue.data_text(600.0), "600")
+        self.assertEqual(ue.data_text(["a"]), '["a"]')
+
+    def test_map_picture_places_markers(self):
+        data = {"actors": [["Start", "PlayerStart", "marker", 0, 0, 0, 0, 0],
+                           ["Wall", "StaticMeshActor", "geometry", 500, 0, 300, 100, 400]], "landscape": False}
+        canvas, legend, numbered = ue.map_picture(data, 100, (0, 0), 1000)
+        self.assertEqual(legend, [("red", "PlayerStart", 1)])
+        self.assertEqual(numbered[0][:2], (1, "Start"))
+        i = (50 * 100 + 50) * 3
+        self.assertEqual(bytes(canvas.px[i:i + 3]), bytes((230, 60, 60)))  # the marker at the centre
+        j = (50 * 100 + 75) * 3
+        self.assertNotEqual(bytes(canvas.px[j:j + 3]), bytes((36, 38, 42)))  # the wall east of it
+
+    def test_draw_text(self):
+        rgb = bytearray(20 * 12 * 3)
+        ue.draw_text(rgb, 20, 0, 0, "1")
+        self.assertIn(bytes((255, 255, 255)), bytes(rgb))
+
+    def test_since_duration(self):
+        lines = ["[2026.10.14-10.00.00:000][1]LogTemp: old", "[2026.10.14-10.04.30:000][2]LogTemp: new", "tail"]
+        import calendar
+        now = calendar.timegm((2026, 10, 14, 10, 5, 0))
+        self.assertEqual(ue.since_duration(lines, "2m", now=now), lines[1:])
+        self.assertEqual(ue.since_duration(lines, "1h", now=now), lines)
+        with self.assertRaises(ue.CliError):
+            ue.since_duration(lines, "2x")
+
+    def test_log_keeps_event_order(self):
+        lines = [stamped("LogTemp: Display: a"), stamped("LogTemp: Display: b"), stamped("LogTemp: Display: a"),
+                 stamped("LogTemp: Display: a")]
+        self.assertEqual(list(ue.filter_log(lines, "Display", consecutive=True)),
+                         ["D LogTemp: a", "D LogTemp: b", "D LogTemp: a  x2"])
+        self.assertEqual(list(ue.filter_log(lines, "Display")), ["D LogTemp: a  x3", "D LogTemp: b"])
+
+    def test_pie_start_marker_ignores_travel(self):
+        lines = ["x", stamped("LogPlayLevel: PlayLevel: No blueprints needed recompiling"),
+                 stamped("LogPlayLevel: Creating play world package: /Game/UEDPIE_0_L"), "leaving for the menu",
+                 stamped("LogPlayLevel: Creating play world package: /Game/UEDPIE_0_Menu"), "menu"]
+        self.assertEqual(ue.since_pie(lines), lines[1:])  # the travel's world package is not a new session
+
+    def test_hud_rect_with_a_taller_panel(self):
+        snap = 'window "Ed" [pos=0,0 size=1920,1080] [ref=w1]\n  splitter [pos=10,100 size=1202,900] [ref=sp]'
+        self.assertEqual(ue.hud_rect(snap, 1200, 640), (11.0, 360, 1200, 640))
+
+    def test_game_command(self):
+        project = Project()
+        args = argparse.Namespace(packaged=False, windowed=False, map="/Game/Maps/Arena", game="/Script/G.Mode",
+                                  server_args="-SDHost", client_args="", platform=None)
+        with unittest.mock.patch("tether_cli.jobs.engine_root", return_value="E:/UE"):
+            server = ue.game_command(types.SimpleNamespace(project=project.uproject), args, "listen", 0, 17777, "s.log")
+            client = ue.game_command(types.SimpleNamespace(project=project.uproject), args, "client", 1, 17777, "c.log")
+            dedicated = ue.game_command(types.SimpleNamespace(project=project.uproject), args, "dedicated", 0, 7777, "d.log")
+        self.assertIn("/Game/Maps/Arena?listen?game=/Script/G.Mode", server)
+        self.assertIn("-game", server)
+        self.assertIn("-SDHost", server)
+        self.assertIn("-DisablePython", server)
+        self.assertIn("127.0.0.1:17777", client)
+        self.assertIn("-server", dedicated)
+        self.assertIn("-nullrhi", client)
+        project.close()
+
+    def test_stereo_3d_sound_rule(self):
+        rows = [["/Game/S_Stereo", "SoundWave", {"NumChannels": "2", "_attenuated": True}],
+                ["/Game/S_Mono", "SoundWave", {"NumChannels": "1", "_attenuated": True}],
+                ["/Game/S_Music", "SoundWave", {"NumChannels": "2", "_attenuated": False}]]
+        found = [(r, p) for r, p, _ in ue.lint_rules(rows) if r == "sound-stereo-3d"]
+        self.assertEqual(found, [("sound-stereo-3d", "/Game/S_Stereo")])
+
+    def test_game_port_follows_the_server(self):
+        import socket
+        held = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        held.bind(("0.0.0.0", 0))
+        taken = held.getsockname()[1]
+        try:
+            self.assertNotEqual(ue.free_udp_port(taken), taken)
+        finally:
+            held.close()
+        self.assertEqual(ue.listening_port(["LogNet: Name:GameNetDriver IpNetDriver listening on port 17778"]), 17778)
+        self.assertIsNone(ue.listening_port(["LogNet: nothing"]))
