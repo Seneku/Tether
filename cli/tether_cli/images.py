@@ -14,12 +14,25 @@ ANNOTATIONS = {"gridSpacing": 500, "gridExtent": 10000, "gridHeight": 0, "maxLab
                "classFilter": {"refPath": ""}, "maxLabels": 15}
 
 
-def pie_screenshot(ctx, args):
+def pie_screenshot(ctx, args, pose=None):
     """The PIE world as the player sees it. Epic's CaptureViewport renders the *editor* world even during
-    PIE (from whatever pose it is given), so take a HighResShot in the PIE world and collect the file."""
-    if args.actor or args.at or args.look_at or args.rot or args.annotate:
-        raise CliError("during PIE, ue shot shows the player's view; --actor/--at/--look-at/--rot/--annotate "
-                       "only work outside PIE, or in Simulate (ue pie start --simulate), which has a free camera")
+    PIE (from whatever pose it is given), so take a HighResShot in the PIE world and collect the file.
+    With --actor/--at/--look-at/--rot, a spectator shot: the player's view moves to a camera at that pose for
+    the one shot, then comes back (the game keeps running)."""
+    if args.annotate:
+        raise CliError("--annotate works outside PIE, or in Simulate (ue pie start --simulate)")
+    if pose and (args.actor or args.at or args.look_at or args.rot):
+        # The debug camera takes the console (HighResShot would go to it), so capture through the Slate inspector.
+        ctx.tether("pie_view", pose=json.dumps({"location": pose["location"], "rotation": pose["rotation"]}))
+        try:
+            time.sleep(0.2)  # a frame or two from the new viewpoint
+            raw = widget_screenshot(ctx, {})
+        finally:
+            ctx.tether("pie_view", pose="")
+        if raw is None:
+            raise CliError("a spectator shot in PIE needs the game viewport inside the editor window and Epic's Slate "
+                           "inspector (ue init); or use Simulate (ue pie start --simulate) and ue shot --at")
+        return raw
     if getattr(args, "hud", False):
         return hud_screenshot(ctx)
     start = log_end(ctx.project)
@@ -42,6 +55,7 @@ def pie_screenshot(ctx, args):
 
 
 SNAPSHOT_BOX = re.compile(r"^(\s*)(\w+).*?\[pos=(-?\d+),(-?\d+) size=(\d+),(\d+)\]")
+SNAPSHOT_REF = re.compile(r"\[ref=(\w+)\]")
 
 
 def hud_rect(snapshot, view_w, view_h, dpi=1.0):
@@ -66,6 +80,53 @@ def hud_rect(snapshot, view_w, view_h, dpi=1.0):
         return None
     x, y, w, h = min(fits, key=lambda b: b[3])
     return x + (w - view_w) / 2, y + h - view_h, view_w, view_h
+
+
+def hud_widget(snapshot, view_w, view_h):
+    """(ref, (w, h) in DPI-independent units, dpi) of the panel holding the game viewport, for a widget capture;
+    the DPI scale is unknown here, so the usual ones are tried. None when no panel fits."""
+    for dpi in (1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0):
+        rect = hud_rect(snapshot, view_w, view_h, dpi)
+        if rect is None:
+            continue
+        for line in snapshot.splitlines()[1:]:
+            m, ref = SNAPSHOT_BOX.match(line), SNAPSHOT_REF.search(line)
+            if m and ref and abs(int(m.group(5)) * dpi - (rect[2] + 2 * (rect[0] - int(m.group(3))))) < 1.5 \
+                    and int(m.group(4)) + int(m.group(6)) * dpi - (rect[1] + rect[3]) < 1.5 \
+                    and int(m.group(3)) <= rect[0] + 1 and int(m.group(4)) <= rect[1] + 1:
+                return ref.group(1), (int(m.group(5)), int(m.group(6))), dpi
+    return None
+
+
+def widget_screenshot(ctx, cache):
+    """The game viewport with its UMG HUD in about 0.05 s: Epic's Slate inspector renders the viewport's panel,
+    cropped to the viewport. Canvas-drawn text (AHUD::DrawText, on-screen debug messages) is not in it; None when
+    the panel cannot be found (PIE in its own window, no inspector), so callers fall back to hud_screenshot."""
+    import base64
+    if "widget" not in cache:
+        size = str(ctx.tether("py", code="s = unreal.WidgetLayoutLibrary.get_viewport_size(unreal.get_editor_subsystem("
+                                         "unreal.UnrealEditorSubsystem).get_game_world())\nf'{s.x:.0f} {s.y:.0f}'"))
+        view_w, view_h = (int(v) for v in size.strip().strip("'").split())
+        text, failed = ctx.mcp.call("SlateInspectorToolset.SlateInspectorToolset", "Snapshot",
+                                    {"ref": "", "maxDepth": 60, "bIncludeSourceLocations": False})
+        snapshot = unwrap(text) if not failed else ""
+        found = hud_widget(snapshot if isinstance(snapshot, str) else "", view_w, view_h)
+        cache["widget"] = (found, view_w, view_h)
+    found, view_w, view_h = cache["widget"]
+    if not found:
+        return None
+    ref, (box_w, box_h), dpi = found
+    text, failed = ctx.mcp.call("SlateInspectorToolset.SlateInspectorToolset", "Screenshot", {"ref": ref})
+    value = unwrap(text) if not failed else None
+    value = value.get("returnValue", value) if isinstance(value, dict) else None
+    if not isinstance(value, dict) or not value.get("data"):
+        return None
+    raw = base64.b64decode(value["data"])
+    image_w = int.from_bytes(raw[16:20], "big")
+    image_h = int.from_bytes(raw[20:24], "big")
+    scale = image_w / (box_w * dpi)  # screenshot pixels per screen pixel
+    w, h = view_w * scale, view_h * scale
+    return png_crop(raw, ((image_w - w) / 2, image_h - h, w, h))
 
 
 def png_crop(raw, rect, scale=1.0):
@@ -267,7 +328,7 @@ def cmd_shot(ctx, args):
     if getattr(args, "hud", False) and not (pie and not simulate):
         raise CliError("--hud needs PIE (ue pie start): it shows the game's UMG HUD over the player's view")
     if pie and not simulate:  # Play: CaptureViewport would render the editor world, so HighResShot the game
-        raw = pie_screenshot(ctx, args)
+        raw = pie_screenshot(ctx, args, pose)
     else:  # editor, or Simulate-In-Editor, whose simulation the level viewport shows
         annotations = dict(ANNOTATIONS, gridHeight=args.grid_z) if args.annotate else NO_ANNOTATIONS
         raw = capture_viewport(ctx, pose, annotations, args.ui)

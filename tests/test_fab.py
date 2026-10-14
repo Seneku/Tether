@@ -192,6 +192,28 @@ class FabFiles(unittest.TestCase):
         self.assertEqual(code, 1)
 
 
+class PackagedPerf(unittest.TestCase):
+    def test_capture_from_an_earlier_run_is_never_taken(self):
+        with tempfile.TemporaryDirectory() as root:
+            csv_dir = os.path.join(root, "Game", "Saved", "Profiling", "CSV")
+            os.makedirs(csv_dir)
+            os.makedirs(os.path.join(root, "Game", "Binaries", "Win64"))
+            for name in ("Profile(old).csv", "Profile(new).csv"):
+                with open(os.path.join(csv_dir, name), "w") as f:
+                    f.write("FrameTime\n1\n")
+            log = os.path.join(root, "run.log")
+            line = "LogCsvProfiler: Display: Capture Ended. Writing CSV to file : ../../../Game/Saved/Profiling/CSV/{}\n"
+            with open(log, "w") as f:
+                f.write(line.format("Profile(old).csv"))
+            exited = unittest.mock.Mock(poll=lambda: 0)
+            self.assertIsNone(ue.wait_for_capture(exited, log, {"Profile(old).csv"}, root, "Game", "Win64", 5))
+            with open(log, "w") as f:
+                f.write(line.format("Profile(new).csv"))
+            running = unittest.mock.Mock(poll=lambda: None)
+            found = ue.wait_for_capture(running, log, {"Profile(old).csv"}, root, "Game", "Win64", 5)
+            self.assertEqual(os.path.basename(found), "Profile(new).csv")
+
+
 class FabGuard(unittest.TestCase):
     SNAPSHOT = 'window "Ed" [pos=0,0 size=100,100] [ref=w1]\n  tab "Fab" [pos=1,1 size=10,10] [ref=t3]'
 

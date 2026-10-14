@@ -357,6 +357,13 @@ def cmd_selftest(ctx, args):
     check("shot --hud", ["shot", "--hud", "-o", os.path.join(tempfile.gettempdir(), "tether-selftest-hud.png")],
           skip="needs 5.8" if remote else None if rendering else "headless with -nullrhi",
           ok=lambda c, o: c == 0 and "(PIE, with HUD)" in o)
+    check("shot --at (PIE spectator)", ["shot", "--at", "0,-300,200", "--look-at", "0,0,0", "-o",
+                                        os.path.join(tempfile.gettempdir(), "tether-selftest-spectator.png")],
+          skip="needs 5.8" if remote else None if rendering else "headless with -nullrhi",
+          ok=lambda c, o: c == 0 and "(PIE)" in o and "camera at (0, -300, 200)" in o)
+    check("pie status (view restored)", ["py", "from tether import toolsets as t\n"
+                                         "type(unreal.GameplayStatics.get_player_controller(t._game_world(), 0)).__name__"],
+          ok=lambda c, o: c == 0 and not o.rstrip().endswith("DebugCameraController"))
     check("bp trace", ["bp", "trace", "--seconds", "1", "--keep"], timeout=600, skip="needs 5.8" if remote else None,
           ok=lambda c, o: c == 0 and "Blueprint function(s)/event(s) ran" in o)
     check("pie stop", ["pie", "stop"], ok=lambda c, o: c == 0 and "OK" in o)

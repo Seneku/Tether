@@ -15,7 +15,7 @@ from .transport import catalog, py_json, resolve_toolset
 from .build import csharp_changes, csharp_layout, csharp_reload_build
 from .calls import flush_editor_log, scoped_cvars
 from .images import (
-    cmd_shot, contact_sheet, draw_text, hud_screenshot, image_diff, png_read, png_write, shot_args,
+    cmd_shot, contact_sheet, draw_text, hud_screenshot, image_diff, png_read, png_write, shot_args, widget_screenshot,
 )
 from .assets import mcp_tool
 from .jobs import cmd_job, jobs_dir
@@ -1132,18 +1132,24 @@ def start_film(ctx, args):
     """Capture the PIE view every `args.film` seconds on a second connection while the steps run."""
     import threading
     from .transport import Ctx
-    state = {"frames": [], "stop": threading.Event(), "t0": time.time(), "errors": 0, "hud": {}}
+    state = {"frames": [], "stop": threading.Event(), "t0": time.time(), "errors": 0, "hud": {}, "widget": {},
+             "how": "viewport widget"}
 
     def loop():
         own = Ctx(ctx.args)  # its own MCP connection: the steps keep theirs
         while not state["stop"].is_set():
+            began = time.time()
             try:
-                # The window capture (HUD included); HighResShot at this cadence starved game time almost to a stop.
-                raw = hud_screenshot(own, state["hud"])
+                # The viewport widget through Epic's Slate inspector (UMG HUD included, ~0.05 s), else the window
+                # capture (~1.4 s). HighResShot at this cadence starved game time almost to a stop.
+                raw = widget_screenshot(own, state["widget"]) if state["how"] == "viewport widget" else None
+                if raw is None:
+                    state["how"] = "window"
+                    raw = hud_screenshot(own, state["hud"])
                 state["frames"].append((time.time() - state["t0"], raw))
             except Exception:  # noqa: BLE001 - PIE ending under it, a slow frame: keep the rest of the film
                 state["errors"] += 1
-            state["stop"].wait(max(0.0, args.film - 0.2))
+            state["stop"].wait(max(0.0, args.film - (time.time() - began)))
     state["thread"] = threading.Thread(target=loop, daemon=True)
     state["thread"].start()
     return state
@@ -1157,8 +1163,11 @@ def finish_film(ctx, args, state):
     if not frames:
         print("film: no frames captured" + (f" ({state['errors']} failed)" if state["errors"] else ""))
         return
+    if len(frames) > 48:  # a long film: evenly spaced frames, first and last included
+        step = (len(frames) - 1) / 47
+        frames = [frames[round(i * step)] for i in range(48)]
     tiles = []
-    for t, raw in frames[:48]:
+    for t, raw in frames:
         try:
             tiles.append((t, png_read(raw)))
         except CliError:
@@ -1174,11 +1183,13 @@ def finish_film(ctx, args, state):
                                                              time.strftime("film-%Y%m%d-%H%M%S.png"))
     os.makedirs(os.path.dirname(path), exist_ok=True)
     png_write(path, width, height, bytes(sheet))
-    gaps = [b[0] - a[0] for a, b in zip(frames, frames[1:])]
+    taken = state["frames"]
+    gaps = [b[0] - a[0] for a, b in zip(taken, taken[1:])]
     actual = sum(gaps) / len(gaps) if gaps else args.film
-    print(f"film: {len(tiles)} frame(s), one every {actual:.1f}s" + (f" (asked {args.film:g}s; a window capture takes about "
-                                                                     f"that long)" if actual > args.film * 1.5 else "")
-          + f" -> {path}" + (" (first 48)" if len(frames) > 48 else ""))
+    slow = f" (asked {args.film:g}s; a {state['how']} capture takes about that long)" if actual > args.film * 1.5 else ""
+    note = "" if state["how"] == "window" else "; canvas-drawn text (AHUD, debug messages) is not in widget captures"
+    print(f"film: {len(taken)} frame(s), one every {actual:.2f}s{slow}" + (f", {len(tiles)} on the sheet" if len(taken) > len(tiles) else "")
+          + f" -> {path}" + note)
 
 
 def pie_do(ctx, args):

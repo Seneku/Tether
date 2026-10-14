@@ -957,17 +957,19 @@ def package_command(ctx, args):
 CAPTURE_WRITTEN = re.compile(r"Capture Ended\. Writing CSV to file\s*:\s*(.+\.csv)")
 
 
-def wait_for_capture(proc, log, log_start, root, name, platform, timeout):
-    """The CSV path once the packaged game's log says its capture ended and the file stops growing; None when the
-    game exits first or the time runs out. The log names it relative to the game's Binaries/<Platform> folder."""
+def wait_for_capture(proc, log, before, root, name, platform, timeout):
+    """The CSV path once this run's log (its own -abslog file) says the capture ended and the file stops growing;
+    None when the game exits first or the time runs out. The log names it relative to the game's
+    Binaries/<Platform> folder; a file that was already there (an earlier run's) never counts."""
     deadline, path, size = time.time() + timeout, None, -1
     binaries = os.path.join(root, name, "Binaries", platform)
     while time.time() < deadline:
-        if path is None and os.path.isfile(log) and os.path.getmtime(log) >= log_start:
+        if path is None and os.path.isfile(log):
             with open(log, encoding="utf-8", errors="replace") as f:
                 m = CAPTURE_WRITTEN.search(f.read())
             if m:
-                path = os.path.normpath(os.path.join(binaries, m.group(1).strip()))
+                found = os.path.normpath(os.path.join(binaries, m.group(1).strip()))
+                path = found if os.path.basename(found) not in before else None
         if path and os.path.isfile(path):
             now = os.path.getsize(path)
             if now and now == size:
@@ -992,18 +994,22 @@ def package_perf(ctx, args):
         print(f"warning: {stale}")
     name = os.path.splitext(os.path.basename(ctx.project))[0]
     csv_dir = os.path.join(os.path.dirname(exe), name, "Saved", "Profiling", "CSV")
-    game_log = os.path.join(os.path.dirname(exe), name, "Saved", "Logs", f"{name}.log")
-    log_start = os.path.getmtime(game_log) if os.path.isfile(game_log) else 0.0
+    # This run's own log: the game's default one still holds the previous run's "Capture Ended" line until the
+    # new process rewrites it, and that line names the previous run's CSV.
+    game_log = os.path.join(state_dir(ctx.project), "perf", "packaged.log")
+    os.makedirs(os.path.dirname(game_log), exist_ok=True)
+    if os.path.exists(game_log):
+        os.remove(game_log)
     before = set(os.listdir(csv_dir)) if os.path.isdir(csv_dir) else set()
     warmup = 90  # loading and shader warm-up frames, left out of the numbers
     frames = int(args.perf * 60) + warmup
     command = [exe] + ([args.map] if getattr(args, "map", None) else []) + [
         "-RenderOffscreen", "-nosound", "-unattended", "-windowed", "-ResX=1280", "-ResY=720",
-        f"-csvCaptureFrames={frames}", "-csvExitOnCompletion"]
+        f"-csvCaptureFrames={frames}", "-csvExitOnCompletion", f"-abslog={game_log}"]
     started = time.time()
     proc = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
     # -csvExitOnCompletion does not always quit the game: wait for the capture to be written, then end it.
-    written = wait_for_capture(proc, game_log, log_start, os.path.dirname(exe), name, platform, max(180.0, args.perf * 20))
+    written = wait_for_capture(proc, game_log, before, os.path.dirname(exe), name, platform, max(180.0, args.perf * 20))
     exited = proc.poll() is not None
     from .jobs import kill_tree
     kill_tree(proc.pid)
@@ -1022,9 +1028,12 @@ def package_perf(ctx, args):
     except (IndexError, OSError):
         columns = {}
     if not columns.get("FrameTime"):
-        log = os.path.join(os.path.dirname(exe), name, "Saved", "Logs", name + ".log")
         raise CliError(f"the capture is empty: the game exited (code {proc.poll()}) before profiling any frames; "
-                       f"its log: {log} (ue package --boot-only shows why)")
+                       f"its log: {game_log} (ue package --boot-only shows why)")
+    captured = sum(columns["FrameTime"]) / 1000
+    if captured > time.time() - started + 2:  # frames that took longer than the run itself: not this run's file
+        raise CliError(f"{path} holds {captured:.0f}s of frames but the game ran {time.time() - started:.0f}s: not this "
+                       f"run's capture (its log: {game_log})")
     stats = {k: frame_stats(v[warmup:] or v) for k, v in columns.items()
              if k in ("FrameTime", "GameThreadTime", "RenderThreadTime", "GPUTime") and v}
     if "FrameTime" not in stats:

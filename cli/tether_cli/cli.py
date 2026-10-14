@@ -111,7 +111,7 @@ def build_parser():
     s.add_argument("kv", nargs="*")
     s.add_argument("--args", help="raw JSON arguments instead of k=v")
     s = add("py", cmd_py, "run Python in the live editor (code, -f file, or - for stdin)")
-    s.add_argument("code", nargs="*")
+    s.add_argument("code", nargs="*", help="Python code; with -f, the script's arguments (its sys.argv[1:])")
     s.add_argument("-f", "--file")
     s = add("props", cmd_props, "reflected properties of an object/actor/component")
     s.add_argument("target")

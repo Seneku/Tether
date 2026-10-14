@@ -2713,6 +2713,55 @@ class TetherCore(_Base):
 
     @_tool
     @staticmethod
+    def pie_view(pose: str = "", token: str = "") -> str:
+        """Show the PIE player's screen from another point (a spectator shot), or give the view back.
+
+        Uses the engine's debug camera (the player's pawn and controller are left alone, and the game keeps
+        running): it is turned on, its help text hidden, and its camera moved to the pose. Python cannot spawn
+        actors in the PIE world, so this is the one free camera there is. While it is on, console commands go
+        to the debug camera, so capture through the Slate inspector. An empty pose turns it off again.
+
+        Args:
+            pose: {"location": {x,y,z}, "rotation": {pitch,yaw,roll}} as from shot_pose, or "" to restore.
+            token: Session token from Saved/Tether/editors/<pid>.token (the ue CLI sends it).
+
+        Returns:
+            What was done.
+        """
+        _authorize(token)
+        game = _game_world()
+        if game is None:
+            raise RuntimeError("PIE is not running")
+        current = unreal.GameplayStatics.get_player_controller(game, 0)
+        debug = current if isinstance(current, unreal.DebugCameraController) else None
+        if not pose:
+            if debug is None:
+                return "no spectator view to restore"
+            debug.get_editor_property("cheat_manager").disable_debug_camera()
+            return "view restored"
+        if debug is None:
+            cheats = current.get_editor_property("cheat_manager") if current else None
+            if cheats is None:
+                raise RuntimeError("no cheat manager on the player controller (cheats are off), so no debug camera")
+            cheats.enable_debug_camera()
+            debug = unreal.GameplayStatics.get_player_controller(game, 0)
+            if not isinstance(debug, unreal.DebugCameraController):
+                raise RuntimeError("the debug camera did not start")
+        hud = _try(lambda: debug.get_hud())
+        if hud:
+            _try(lambda: hud.set_editor_property("show_hud", False))  # its help text and hit info
+        data = json.loads(pose)
+        loc, rot = data["location"], data["rotation"]
+        location = unreal.Vector(loc["x"], loc["y"], loc["z"])
+        rotation = unreal.Rotator(roll=rot["roll"], pitch=rot["pitch"], yaw=rot["yaw"])
+        pawn = debug.get_spectator_pawn()
+        if pawn:
+            pawn.set_actor_location_and_rotation(location, rotation, False, True)
+        debug.set_control_rotation(rotation)
+        return "spectator view"
+
+    @_tool
+    @staticmethod
     def drop(targets: str, align: bool = False, token: str = "") -> str:
         """Put actors on the ground: move each straight down (or up, if buried) so the bottom of its bounds rests
         on the first blocking surface below it. One undoable step.

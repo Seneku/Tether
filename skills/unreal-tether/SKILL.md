@@ -36,8 +36,9 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
   Needs a rendering editor: `ue open --headless --render` (plain `--headless` is `-nullrhi`).
 
 ## Doing things
-- `ue py "<code>"`, `ue py -f script.py` or `ue py -` (stdin): unrestricted editor Python. `unreal` is
-  pre-imported, the namespace persists between calls, and a trailing expression is printed.
+- `ue py "<code>"`, `ue py -f script.py [args]` or `ue py -` (stdin): unrestricted editor Python. `unreal` is
+  pre-imported, the namespace persists between calls, and a trailing expression is printed. Words after the
+  script file arrive as `sys.argv[1:]`.
 - `ue set <target> name=value [name+=delta ...]`: write properties as one undoable transaction, and
   print `old -> new` for each. Values: numbers, true/false, enum names, object paths, JSON, or tuples
   for structs (`location+=0,0,200`, `lightColor=1,0.5,0.2`; missing trailing fields keep their values).
@@ -260,8 +261,10 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
   `player.control` and getters like `player.GetVelocity()`.
 - When `ue py` prints `engine: ...` lines, that is why a call returned None (e.g. Editor Scripting refusing in PIE).
 - UI checks: `ue shot --hud` in PIE captures the game view with its UMG HUD (plain `ue shot` has the 3D view only).
-- To see what happened between checks: `ue pie do -f steps.txt --film 1` adds a contact sheet of the game's view
-  (with HUD), one frame a second with times on them; read that one image instead of many screenshots.
+- To see what happened between checks: `ue pie do -f steps.txt --film 0.25` adds a contact sheet of the game's view
+  (with HUD), four frames a second with times on them; read that one image instead of many screenshots.
+- A side view during play (an enemy's wind-up, a door from outside): `ue shot --at x,y,z --look-at Enemy_1` in PIE
+  takes one spectator shot from there and puts the player's view back.
 - Engine traps worth knowing (`ue py` warns about the first two):
   - `StaticMesh.build_from_static_mesh_descriptions` on a mesh that already has render data crashes the editor;
     build into a new mesh instead.
