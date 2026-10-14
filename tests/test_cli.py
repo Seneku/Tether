@@ -2068,3 +2068,22 @@ class Round14(unittest.TestCase):
         os.utime(exe, None)
         self.assertIsNone(ue.package_staleness(project.uproject, exe))
         project.close()
+
+    def test_crop_pixels_drops_alpha(self):
+        rgba = bytes([1, 2, 3, 255, 4, 5, 6, 255, 7, 8, 9, 255, 10, 11, 12, 255])  # 2x2
+        self.assertEqual(ue.crop_pixels((2, 2, 4, rgba), (1, 0, 1, 2)), (1, 2, 3, bytes([4, 5, 6, 10, 11, 12])))
+        self.assertEqual(ue.crop_pixels((2, 1, 1, bytes([7, 9])), (0, 0, 2, 1)), (2, 1, 3, bytes([7, 7, 7, 9, 9, 9])))
+
+    def test_audio_pairs_components_by_sound_and_name(self):
+        sounds = [{"sound": "Ambient_Wind_Loop_1", "duration": 100.0, "component": "None", "waves": [{"wave": "w", "volume": 1.28}]},
+                  {"sound": "Drone_Hum", "duration": 10000.0, "component": "AudioComponent", "waves": [{"wave": "h", "volume": 0.4}]}]
+        comps = [{"component": "AudioComponent", "sound": "Drone_Hum", "owner": f"SDRobot_{i}", "distance": 7064 + i,
+                  "volume": 1.0, "attenuation": "SoundAttenuation_0"} for i in range(4)]
+        ctx = types.SimpleNamespace(beacon={"pie": True}, data=None, tether=lambda *a, **k: json.dumps(comps))
+        out = io.StringIO()
+        with unittest.mock.patch("tether_cli.play.active_sounds", return_value=sounds), contextlib.redirect_stdout(out):
+            ue.cmd_audio(ctx, argparse.Namespace(match=None, limit=20))
+        text = out.getvalue()
+        self.assertIn("Ambient_Wind_Loop_1 (100.0 s), volume 1.28\n", text)  # no drone owner or attenuation on the bed
+        self.assertIn("Drone_Hum (loop) on SDRobot_0, 7064 cm away", text)
+        self.assertEqual(text.count("(component only)"), 3)

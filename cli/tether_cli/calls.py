@@ -103,8 +103,10 @@ def cmd_py(ctx, args):
         with open(args.file, encoding="utf-8") as f:
             code = f.read()
         # Words after the file are the script's arguments, as with `python script.py clean`.
+        path = os.path.abspath(args.file)
         argv = [os.path.basename(args.file)] + list(args.code)
-        code = f"import sys as _tether_sys\n_tether_sys.argv = {argv!r}\ndel _tether_sys\n" + code.lstrip("﻿")
+        code = (f"import sys as _tether_sys\n_tether_sys.argv = {argv!r}\n__file__ = {path!r}\ndel _tether_sys\n"
+                + code.lstrip("﻿"))
     elif args.code == ["-"]:
         code = sys.stdin.read()
     else:

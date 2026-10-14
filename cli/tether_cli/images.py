@@ -99,9 +99,16 @@ def hud_widget(snapshot, view_w, view_h):
 
 
 def widget_screenshot(ctx, cache):
-    """The game viewport with its UMG HUD in about 0.05 s: Epic's Slate inspector renders the viewport's panel,
-    cropped to the viewport. Canvas-drawn text (AHUD::DrawText, on-screen debug messages) is not in it; None when
-    the panel cannot be found (PIE in its own window, no inspector), so callers fall back to hud_screenshot."""
+    """The game viewport with its UMG HUD: Epic's Slate inspector renders the viewport's panel, cropped to the
+    viewport. Canvas-drawn text (AHUD::DrawText, on-screen debug messages) is not in it; None when the panel
+    cannot be found (PIE in its own window, no inspector), so callers fall back to hud_screenshot."""
+    captured = widget_capture(ctx, cache)
+    return png_crop(*captured) if captured else None
+
+
+def widget_capture(ctx, cache):
+    """(PNG of the viewport's panel, the viewport's rectangle in it) in a few hundredths of a second, or None. The
+    crop is left to the caller: decoding a large PNG in Python takes far longer than the capture."""
     import base64
     if "widget" not in cache:
         size = str(ctx.tether("py", code="s = unreal.WidgetLayoutLibrary.get_viewport_size(unreal.get_editor_subsystem("
@@ -126,19 +133,31 @@ def widget_screenshot(ctx, cache):
     image_h = int.from_bytes(raw[20:24], "big")
     scale = image_w / (box_w * dpi)  # screenshot pixels per screen pixel
     w, h = view_w * scale, view_h * scale
-    return png_crop(raw, ((image_w - w) / 2, image_h - h, w, h))
+    return raw, ((image_w - w) / 2, image_h - h, w, h)
 
 
-def png_crop(raw, rect, scale=1.0):
-    """PNG bytes of a rectangle (window units, times scale for pixels) of a PNG."""
-    width, height, channels, pixels = png_read(raw)
+def crop_pixels(image, rect, scale=1.0):
+    """(width, height, 3, RGB bytes) of a rectangle (times scale for pixels) of a decoded image (png_read)."""
+    width, height, channels, pixels = image
     x0, y0 = max(0, round(rect[0] * scale)), max(0, round(rect[1] * scale))
     x1, y1 = min(width, round((rect[0] + rect[2]) * scale)), min(height, round((rect[1] + rect[3]) * scale))
     rows = []
     for y in range(y0, y1):
         line = pixels[(y * width + x0) * channels:(y * width + x1) * channels]
-        rows.append(line if channels == 3 else bytes(b for i, b in enumerate(line) if i % channels < 3))
-    return png_bytes(x1 - x0, y1 - y0, b"".join(rows))
+        if channels == 3:
+            rows.append(bytes(line))
+        else:  # drop alpha (or widen grey) with slices, not a loop per byte
+            rgb = bytearray((x1 - x0) * 3)
+            for c in range(3):
+                rgb[c::3] = line[min(c, channels - 1)::channels] if channels >= 3 else line[0::channels]
+            rows.append(bytes(rgb))
+    return x1 - x0, y1 - y0, 3, b"".join(rows)
+
+
+def png_crop(raw, rect, scale=1.0):
+    """PNG bytes of a rectangle (window units, times scale for pixels) of a PNG."""
+    width, height, _, rgb = crop_pixels(png_read(raw), rect, scale)
+    return png_bytes(width, height, rgb)
 
 
 def hud_screenshot(ctx, cache=None):

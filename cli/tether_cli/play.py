@@ -15,7 +15,7 @@ from .transport import catalog, py_json, resolve_toolset
 from .build import csharp_changes, csharp_layout, csharp_reload_build
 from .calls import flush_editor_log, scoped_cvars
 from .images import (
-    cmd_shot, contact_sheet, draw_text, hud_screenshot, image_diff, png_read, png_write, shot_args, widget_screenshot,
+    cmd_shot, contact_sheet, draw_text, crop_pixels, hud_screenshot, image_diff, png_read, png_write, shot_args, widget_capture,
 )
 from .assets import mcp_tool
 from .jobs import cmd_job, jobs_dir
@@ -507,11 +507,15 @@ def cmd_audio(ctx, args):
     sounds = active_sounds(ctx)
     comps = ctx.tether("audio_components", limit=200)
     comps = json.loads(comps) if isinstance(comps, str) else comps
-    by_name = {c["component"]: c for c in comps}
     rx = re.compile(args.match, re.I) if args.match else None
     rows = []
+    # The dump names a component by its short name only ("AudioComponent" on every actor that has one), so pair
+    # on the sound too, and use each component once; components the dump missed are listed after.
+    unused = list(comps)
     for s in sounds:
-        comp = next((c for n, c in by_name.items() if n and n in s["component"]), None)
+        comp = next((c for c in unused if c["component"] == s["component"] and c.get("sound") == s["sound"]), None)
+        if comp:
+            unused.remove(comp)
         length = "loop" if s["duration"] >= 10000 else f"{s['duration']:.1f} s"
         volume = max((w["volume"] for w in s["waves"]), default=None)
         row = (f"{s['sound']} ({length})" + (f" on {comp['owner']}" if comp and comp.get("owner") else
@@ -519,6 +523,12 @@ def cmd_audio(ctx, args):
                + (f", {comp['distance']} cm away" if comp and comp.get("distance") is not None else "")
                + (f", volume {volume:.2f}" if volume is not None else "")
                + (f", attenuation {comp['attenuation']}" if comp and comp.get("attenuation") else ""))
+        if not rx or rx.search(row):
+            rows.append(row)
+    for comp in unused:  # playing components the device dump did not list (virtualized, or starting)
+        row = (f"{comp.get('sound')} on {comp.get('owner') or comp['component']}"
+               + (f", {comp['distance']} cm away" if comp.get("distance") is not None else "")
+               + (f", attenuation {comp['attenuation']}" if comp.get("attenuation") else "") + " (component only)")
         if not rx or rx.search(row):
             rows.append(row)
     ctx.data = {"sounds": sounds, "components": comps}
@@ -1142,11 +1152,12 @@ def start_film(ctx, args):
             try:
                 # The viewport widget through Epic's Slate inspector (UMG HUD included, ~0.05 s), else the window
                 # capture (~1.4 s). HighResShot at this cadence starved game time almost to a stop.
-                raw = widget_screenshot(own, state["widget"]) if state["how"] == "viewport widget" else None
-                if raw is None:
+                # Kept as captured (PNG + crop rectangle): decoding is slow in Python, so it waits for the sheet.
+                captured = widget_capture(own, state["widget"]) if state["how"] == "viewport widget" else None
+                if captured is None:
                     state["how"] = "window"
-                    raw = hud_screenshot(own, state["hud"])
-                state["frames"].append((time.time() - state["t0"], raw))
+                    captured = (hud_screenshot(own, state["hud"]), None)
+                state["frames"].append((time.time() - state["t0"],) + tuple(captured))
             except Exception:  # noqa: BLE001 - PIE ending under it, a slow frame: keep the rest of the film
                 state["errors"] += 1
             state["stop"].wait(max(0.0, args.film - (time.time() - began)))
@@ -1167,9 +1178,10 @@ def finish_film(ctx, args, state):
         step = (len(frames) - 1) / 47
         frames = [frames[round(i * step)] for i in range(48)]
     tiles = []
-    for t, raw in frames:
+    for t, raw, rect in frames:
         try:
-            tiles.append((t, png_read(raw)))
+            image = png_read(raw)
+            tiles.append((t, crop_pixels(image, rect) if rect else image))
         except CliError:
             pass
     columns = min(4, len(tiles))
@@ -1569,10 +1581,12 @@ def cmd_sound(ctx, args):
         print(f"  attenuation {att['asset']}" + (f": falls off over {att['falloff_m']} m" if att.get("falloff_m") else "")
               + (f" after {att['inner_m']} m" if att.get("inner_m") else "") + ("" if att.get("spatialized", True) else ", not spatialized"))
     else:
-        print("  no attenuation: as loud everywhere and not positioned (fine for UI and music, not for 3D sounds)")
+        print("  no attenuation on the asset (code may add one when it plays it; if not, it is as loud everywhere and "
+              "not positioned: fine for UI and music)")
     if info.get("channels", 1) and info.get("channels", 1) > 1 and att:
         print("  ! stereo with attenuation: a 3D sound should be mono")
-    print("  sound class " + (" < ".join(info["sound_class"]) if info["sound_class"] else "none (volume settings won't reach it)")
+    print("  sound class " + (" < ".join(info["sound_class"]) if info["sound_class"] else
+                              "none on the asset (unless code sets one when it plays it, class volumes won't reach it)")
           + (f", submix {info['submix']}" if info.get("submix") else ""))
     if info.get("concurrency"):
         print("  concurrency " + ", ".join(info["concurrency"]))

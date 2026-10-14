@@ -109,15 +109,23 @@ def _headless():
     return bool(re.search(r"(^|\s)-(nullrhi|RenderOffscreen)\b", _command_line(), re.I))
 
 
+def _read_version():
+    try:
+        here = os.path.dirname(os.path.abspath(__file__))  # Plugins/Tether/Content/Python/tether
+        with open(os.path.join(here, "..", "..", "..", "Tether.uplugin"), encoding="utf-8") as f:
+            return json.load(f).get("VersionName")
+    except (OSError, ValueError):
+        return None
+
+
+# Read when this module is (re)loaded: Tether is Python only, so after `ue reload` the new version is what runs
+# (_state survives reloads, so the version must not live there).
+_VERSION = _read_version()
+_state.pop("version", None)
+
+
 def _plugin_version():
-    if "version" not in _state:
-        try:
-            here = os.path.dirname(os.path.abspath(__file__))  # Plugins/Tether/Content/Python/tether
-            with open(os.path.join(here, "..", "..", "..", "Tether.uplugin"), encoding="utf-8") as f:
-                _state["version"] = json.load(f).get("VersionName")
-        except (OSError, ValueError):
-            _state["version"] = None
-    return _state["version"]
+    return _VERSION
 
 
 def _snapshot():
