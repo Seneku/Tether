@@ -216,6 +216,16 @@ def _round(value):
     return value
 
 
+_SECRET = re.compile(r"token|password|secret|api_?key|credential", re.I)
+
+
+def _masked(name, value):
+    """A credential-like property's value is never printed (e.g. Fab's CustomAuthToken)."""
+    if _SECRET.search(name or "") and value not in (None, "", "None", "null"):
+        return f"(hidden: {len(str(value))} chars)"
+    return value
+
+
 def _short(value, width=90):
     if isinstance(value, dict) and set(value) == {"refPath"}:
         text = _short_path(value["refPath"])
@@ -404,7 +414,7 @@ def _legacy_props(obj, match, limit):
     rows = []
     for name in names:
         try:
-            rows.append(f"{name}: {schema[name]} = {_short(text(obj.get_editor_property(name)))}")
+            rows.append(f"{name}: {schema[name]} = {_short(_masked(name, text(obj.get_editor_property(name))))}")
         except Exception:  # write-only or unreadable in this context
             rows.append(f"{name}: {schema[name]} = ?")
     cls = obj if isinstance(obj, unreal.Struct) else obj.get_class()
@@ -2344,7 +2354,7 @@ class TetherCore(_Base):
             rx = re.compile(match, re.I)
             names = [n for n in names if rx.search(n) or rx.search(_type_name(schema[n]))]
         values = _reflect(unreal.ToolsetLibrary.get_object_properties(obj, names), obj) if names else {}
-        rows = [f"{n}: {_type_name(schema[n])} = {_short(_round(values.get(n)))}" for n in names]
+        rows = [f"{n}: {_type_name(schema[n])} = {_short(_masked(n, _round(values.get(n))))}" for n in names]
         hidden = []
         if not isinstance(obj, unreal.Struct):  # UPROPERTYs that are not Blueprint-visible: the engine's export
             seen = {n.lower() for n in schema}
@@ -2354,7 +2364,7 @@ class TetherCore(_Base):
             if hidden:
                 rows.append(f"not Blueprint-visible ({len(hidden)}, read through the engine's export; "
                             "pie watch reads them too):")
-                rows += [f"  {name} = {_short(value)}  ({owner})" for owner, name, value in hidden]
+                rows += [f"  {name} = {_short(_masked(name, value))}  ({owner})" for owner, name, value in hidden]
         head = (f"{_label(obj)} ({cls.get_name()}, {len(schema)} props" + (f" + {len(hidden)} hidden" if hidden else "")
                 + (f", {len(names) + len(hidden)} match" if match else "") + ")")
         return _capped(head, rows, limit)

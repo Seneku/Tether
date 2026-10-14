@@ -18,6 +18,7 @@ from .images import cmd_look, cmd_shot
 from .testing import cmd_test
 from .assets import cmd_data, cmd_diff, cmd_fx, cmd_net, cmd_overview, cmd_pcg, cmd_skel, cmd_size, cmd_table, cmd_usages, cmd_validate
 from .content import cmd_import, cmd_landscape, cmd_lint, cmd_map, cmd_mesh, cmd_tex, cmd_unused
+from .fab import cmd_fab
 from .jobs import cmd_game, cmd_job, cmd_package
 from .play import cmd_audio, cmd_gpu, cmd_mem, cmd_sound, cmd_soak, cmd_ui, cmd_world
 from .playtest import bp_command, cmd_budget, cmd_input, package_command, perf_command, pie_command
@@ -492,6 +493,21 @@ def build_parser():
     s.add_argument("--texture-group", help="textures: LOD group, e.g. World, Character, UI, Effects")
     s.add_argument("--no-replace", action="store_true", help="skip files whose asset already exists")
     s.add_argument("--save", action="store_true", help="save the imported assets")
+    s = add("fab", cmd_fab, "Fab content you have: in the project, downloaded packs, other projects; add it in "
+                            "(never buys or claims anything)")
+    s.add_argument("action", nargs="?", choices=["list", "library", "add", "open", "settings", "clean"],
+                   help="list (default): Fab content in this project; library: packs you have downloaded and Fab "
+                        "content in nearby projects; add: copy one in; open: a listing's URL for the user; settings: "
+                        "download quality/format/cache; clean: unused Fab content and cache sizes")
+    s.add_argument("rest", nargs="*", help="a name or regex (list, library, add, open), or key=value (settings)")
+    s.add_argument("--from", dest="from_", metavar="PROJECT", help="library/add: another local project's folder")
+    s.add_argument("--dry-run", action="store_true", help="add: show what would be copied")
+    s.add_argument("--skip-existing", action="store_true", help="add: copy only new files when some differ")
+    s.add_argument("--top", type=int, default=20, help="rows to show (20)")
+    s.add_argument("--all", action="store_true", help="show every row")
+    s.add_argument("--no-use", action="store_true", help="list: skip what-the-game-uses (faster)")
+    s.add_argument("--library", action="store_true", help="open: the user's Fab library page")
+    s.add_argument("--show", action="store_true", help="open: also open it in the default browser")
     s = add("unused", cmd_unused, "assets nothing uses (from maps, config, code, cook settings), biggest first; redirectors")
     s.add_argument("path", nargs="?", default="/Game", help="content folder to report on (default /Game)")
     s.add_argument("--top", type=int, default=20, help="rows in the biggest list (20)")

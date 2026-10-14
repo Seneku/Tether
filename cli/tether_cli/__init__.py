@@ -8,6 +8,7 @@ Exit codes: 0 ok, 1 tool/command failed, 2 editor unavailable, 3 restart require
 
 Modules, lowest layer first (each imports only from those above it):
   core       project/beacon files, engine discovery, ports, dialogs, crash reports, git, rendering, logs
+  fabfiles   Fab content from files: the launcher's vault, each project's Fab record, nearby projects
   transport  Epic's MCP server, Python remote execution (5.4-5.7), the toolset catalog
   build      UBT, Live Coding, the UnrealSharp C# build, compiler diagnostics
   editor     status, open, close, build, crash
@@ -16,6 +17,7 @@ Modules, lowest layer first (each imports only from those above it):
   testing    ue test
   assets     Blueprints, data tables, diff, validate, size, usages, overview
   content    ue import, unused, lint, landscape
+  fab        ue fab
   jobs       ue job, ue package
   play       pie, ui, perf, mem, world, audio, soak
   playtest   ue input, pie record/watch, baselines, perf load, bp trace, budget
@@ -28,6 +30,7 @@ Everything is re-exported here, so `import tether_cli` reaches any name; patch a
 defines it, since the others hold their own reference.
 """
 from .core import *  # noqa: F401,F403
+from .fabfiles import *  # noqa: F401,F403
 from .transport import *  # noqa: F401,F403
 from .build import *  # noqa: F401,F403
 from .editor import *  # noqa: F401,F403
@@ -36,6 +39,7 @@ from .images import *  # noqa: F401,F403
 from .testing import *  # noqa: F401,F403
 from .assets import *  # noqa: F401,F403
 from .content import *  # noqa: F401,F403
+from .fab import *  # noqa: F401,F403
 from .jobs import *  # noqa: F401,F403
 from .play import *  # noqa: F401,F403
 from .playtest import *  # noqa: F401,F403

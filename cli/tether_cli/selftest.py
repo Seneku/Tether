@@ -150,6 +150,10 @@ def cmd_selftest(ctx, args):
     check("map", ["map", "--px", "200", "-o", os.path.join(tempfile.gettempdir(), "tether-selftest-map.png")],
           ok=lambda c, o: c == 0 and "x right, y up" in o)
     check("log --since 1m", ["log", "--since", "1m"], ok=lambda c, o: c == 0 and "in the last 1m" in o)
+    check("fab", ["fab"], ok=lambda c, o: c == 0 and "Fab content" in o)
+    check("fab library", ["fab", "library"], ok=lambda c, o: c == 0 and "does not read your account" in o)
+    check("fab settings", ["fab", "settings"], ok=lambda c, o: c == 0 and "Megascans quality" in o)
+    check("fab open", ["fab", "open", "mossy rock"], ok=lambda c, o: c == 0 and "fab.com/search?q=mossy%20rock" in o)
     check("unused", ["unused", "--top", "3"], ok=lambda c, o: c == 0 and "are unused" in o)
     check("unused --redirectors", ["unused", "--redirectors"], ok=lambda c, o: c == 0 and "redirector" in o)
     check("mem", ["mem", "--top", "3"], timeout=300, ok=lambda c, o: c == 0 and "process:" in o)

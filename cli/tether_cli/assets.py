@@ -1293,7 +1293,7 @@ def replication_in_header(text, name):
             if not re.search(r"\bReplicated(Using)?\b", flat, re.I):  # specifiers are case-insensitive
                 continue
             decl = decl.split(";", 1)[0]
-            decl = re.split(r"[={\[:]", decl, 1)[0]  # initialisers, arrays, bitfields (uint8 bFlag : 1)
+            decl = re.split(r"[={\[:]", decl, maxsplit=1)[0]  # initialisers, arrays, bitfields (uint8 bFlag : 1)
             prop = re.findall(r"\b(\w+)\s*$", decl.strip())
             notify = re.search(r"ReplicatedUsing\s*=\s*(\w+)", flat, re.I)
             if prop:

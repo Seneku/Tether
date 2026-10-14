@@ -62,6 +62,12 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
 - Cleaning up content: `ue unused [/Game/Folder]` lists assets nothing reaches from the maps, the config, the
   code and the cook settings, biggest first. Confirm with `ue usages <asset>` before `ue rm` (paths built at
   runtime are invisible to it). `ue unused --redirectors --fix` repoints references and deletes redirectors.
+- Needs an asset (a rock, a tree, a sky, a character)? Use what the user already has first: `ue fab library rock`
+  lists downloaded Fab packs and Fab content in their other projects; `ue fab add "<name>" [--from <project>]
+  --dry-run`, then without --dry-run, copies it in. `ue fab` shows what this project already has from Fab. If
+  nothing fits, suggest listings with `ue fab open "<search>"` (it prints a fab.com link) and let the user decide:
+  claiming, buying and downloading are always theirs. Never click, type or press keys in the Fab tab or the store
+  page, by any route (Tether refuses while a Fab tab is open; ask the user to close it if a step needs input).
 - Files into the project (from Blender, a generator, a download): `ue import Art/Crate.fbx Art/Textures /Game/Props
   --collision box --lods 3 --save` (meshes, textures, sounds; folders keep their subfolders; no dialogs; not
   while PIE runs). Names ending in _ORM/_Mask/_AO/... become linear mask textures. After the source files

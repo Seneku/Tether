@@ -388,7 +388,7 @@ def file_scope_names(source):
                 if decl and ch == "{":
                     names.append(decl.group(1))
                 elif (private or head.startswith(("static ", "static\t"))) and not decl:
-                    body = re.split(r"[=(\[{]", head, 1)
+                    body = re.split(r"[=(\[{]", head, maxsplit=1)
                     m = re.search(r"(\w+)\s*$", body[0])
                     if m and m.group(1) not in ("operator", "const", "constexpr", "static", "auto"):
                         names.append(m.group(1))

@@ -9,6 +9,7 @@ from .core import (
     CliError, chosen_editor, editor_label, editor_live, editor_process, live_editors, find_project, pid_alive, project_of, read_json, stall_report, state_dir,
     write_json,
 )
+from .transport import FAB_GUARD, SLATE_INPUT, Mcp, fab_tab_open
 from .build import classify_changes, csharp_changes, csharp_layout
 from .assets import project_overview
 
@@ -32,6 +33,30 @@ def hook_pre_edit(payload):
 
 
 def hook_pre_mcp(payload):
+    """Deny Slate input while a Fab tab is open, and Epic's StartPIE while saved C# is not hot-reloaded."""
+    return hook_fab_input(payload) or hook_start_pie(payload)
+
+
+def hook_fab_input(payload):
+    """Deny Epic's Slate inspector input tools (click, type, keys, drag) while the editor shows a Fab tab: the
+    store page is a web browser the inspector cannot see into, so input could land on Buy or Add to My Library."""
+    args = payload.get("tool_input") or {}
+    if args.get("tool_name") not in SLATE_INPUT or "SlateInspector" not in str(args.get("toolset_name", "")):
+        return None
+    os.chdir(payload.get("cwd") or os.getcwd())
+    project = find_project(None)
+    beacon = editor_live(project)
+    if not beacon or not beacon.get("mcp_port"):
+        return None
+    try:
+        mcp = Mcp(beacon["mcp_port"], 5).connect(None)
+        text, failed = mcp.call(args["toolset_name"], "Snapshot", {"ref": "", "maxDepth": 120})
+    except CliError:
+        return None
+    return FAB_GUARD if not failed and fab_tab_open(text) else None
+
+
+def hook_start_pie(payload):
     """Deny Epic's StartPIE (called directly or from a batch script) while saved C# is not hot-reloaded:
     UnrealSharp would recompile the stale type on its first lookup and drop its subsystems from PIE."""
     if "StartPIE" not in (payload.get("tool_name") or "") + json.dumps(payload.get("tool_input") or {}):

@@ -12,6 +12,7 @@ from .core import (
     port_open,
     read_json, read_new_log, short, state_dir, unwrap,
 )
+from .fabfiles import fab_origin, listing_url, project_fab
 from .transport import catalog, fill_args, resolve_toolset, schema, signature
 
 
@@ -315,8 +316,15 @@ def cmd_watch(ctx, args):
 
 
 def cmd_asset(ctx, args):
+    items = None
     for path in args.paths:
         print(ctx.tether("asset_info", path=path))
+        if path.startswith("/Game/"):
+            items = project_fab(ctx.project) if items is None else items
+            item = fab_origin(ctx.project, path.split(".")[0], items)
+            if item:
+                url = listing_url(item.get("listing"))
+                print(f"  from Fab: {item['title']} ({item['kind']})" + (f" {url}" if url else ""))
     return 0
 
 

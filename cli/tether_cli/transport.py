@@ -13,9 +13,22 @@ from .core import (
 
 # ---------------------------------------------------------------- MCP client
 
+# Epic's Slate inspector tools that send input. While a Fab tab is open none of them run: the store page lives in
+# a web browser the inspector cannot see into, so a click or a key could land on Buy or Add to My Library.
+SLATE_INPUT = {"Click", "Type", "PressKey", "Drag", "FillForm", "SelectOption"}
+FAB_TAB = re.compile(r'^\s*(?:tab|window) "Fab\b', re.M)
+FAB_GUARD = ("a Fab tab is open in the editor: Tether sends no clicks or keys while the Fab store is open (they could "
+             "land on Buy or Add to My Library). Ask the user to close the Fab tab, or to do this step themselves")
+
+
+def fab_tab_open(snapshot):
+    return bool(FAB_TAB.search(snapshot or ""))
+
+
 class Mcp:
     def __init__(self, port, timeout):
         self.port, self.timeout, self.session, self.next_id = port, timeout, None, 0
+        self.slate_checked = 0.0
 
     def _post(self, body):
         import http.client
@@ -73,6 +86,11 @@ class Mcp:
         return self
 
     def call(self, toolset, tool, args):
+        if tool in SLATE_INPUT and "SlateInspector" in toolset and time.time() - self.slate_checked > 2:
+            text, failed = self.call(toolset, "Snapshot", {"ref": "", "maxDepth": 120, "bIncludeSourceLocations": False})
+            if not failed and fab_tab_open(text):
+                raise CliError(FAB_GUARD)
+            self.slate_checked = time.time()
         res = self.request("tools/call", {"name": "call_tool", "arguments": {
             "toolset_name": toolset, "tool_name": tool, "arguments": args}})
         text = "".join(c.get("text", "") for c in res.get("content", []) if c.get("type") == "text")
