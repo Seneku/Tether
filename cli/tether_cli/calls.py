@@ -82,6 +82,11 @@ PY_PITFALLS = [  # (pattern in `ue py` code, what goes wrong): engine behaviour 
     (re.compile(r"build_from_static_mesh_descriptions\s*\("),
      "StaticMesh.build_from_static_mesh_descriptions on a mesh that already has render data crashes the editor "
      "(\"FRenderResource was deleted without being released first\"); building into a new mesh is fine"),
+    (re.compile(r"(?s)(AnimSequence|additive_anim_type|ref_pose_type).*set_editor_properties\s*\(|"
+                r"set_editor_properties\s*\((?:(?!\)\s*$).)*(additive_anim_type|ref_pose_type|ref_frame_index)"),
+     "set_editor_properties (plural) on an AnimSequence posts a change event without the property, so the "
+     "sequence is not recompressed: marking it additive keeps the non-additive compressed data until a restart. "
+     "Use set_editor_property (singular) for each additive setting"),
 ]
 STRUCT_LOOP = re.compile(r"for\s+(\w+)\s+in\s+[^\n]*get_editor_property\([^\n]*:\s*\n((?:[ \t]+[^\n]*\n?)+)")
 

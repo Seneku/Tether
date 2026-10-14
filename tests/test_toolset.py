@@ -32,6 +32,12 @@ class Numbers(unittest.TestCase):
     def test_numbers(self):
         self.assertEqual(toolsets._cpp_property_name("bTelegraphing"), "bTelegraphing")  # bools keep their b
         self.assertEqual(toolsets._cpp_property_name("currentHealth"), "CurrentHealth")
+        props = {"Cues": [{"key": "Explosion", "value": {"Sounds": [{"refPath": "/Game/S/Boom.Boom"}], "Volume": 0.5}}],
+                 "FireSound": {"refPath": "/Game/S/Shot.Shot"}, "Soft": "/Game/S/Whiz.Whiz"}
+        found = toolsets._ref_paths(props, {"/Game/S/Boom", "/Game/S/Shot", "/Game/S/Whiz"})
+        self.assertEqual(found["/Game/S/Boom"], [("Cues[Explosion].Sounds[0]", 0.5)])  # with the struct's Volume
+        self.assertEqual(found["/Game/S/Shot"], [("FireSound", None)])
+        self.assertEqual(found["/Game/S/Whiz"], [("Soft", None)])
         self.assertEqual(toolsets._masked("customAuthToken", "abc123"), "(hidden: 6 chars)")  # never printed
         self.assertEqual(toolsets._masked("customAuthToken", ""), "")
         self.assertEqual(toolsets._masked("health", 5), 5)

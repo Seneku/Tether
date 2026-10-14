@@ -2,6 +2,7 @@
 import argparse
 import contextlib
 import json
+import math
 import os
 import re
 import sys
@@ -1636,10 +1637,11 @@ def sound_usage(ctx, args):
         return sound_stats(ctx, args, waves)
     if stereo:
         print(f"{len(stereo)} stereo wave(s): if played 3D (spatialized), stereo is not positioned per channel "
-              "(make them mono, or give them a StereoSpread / play them 2D):")
+              "(make them mono, set the attenuation's StereoSpread to 0, or play them 2D):")
     shown = stereo + [w for w in waves if w not in stereo] if args.all else stereo[: args.top]
     for w in shown:
-        users = ", ".join(u.rsplit("/", 1)[-1] for u in w["users"][:3]) + (f" +{len(w['users']) - 3}" if len(w["users"]) > 3 else "")
+        users = "; ".join(w.get("refs") or []) or ", ".join(u.rsplit("/", 1)[-1] for u in w["users"][:3]) + (
+            f" +{len(w['users']) - 3}" if len(w["users"]) > 3 else "")
         length = "loop" if w.get("looping") or (w.get("duration") or 0) > 1e5 else f"{w.get('duration') or 0:.1f} s"
         print(f"  {channels_text(w.get('channels')):<7} {length:>7}  {w['path']}" + (f"  <- {users}" if users else ""))
     if not args.all and len(stereo) > args.top:
@@ -1651,7 +1653,7 @@ def sound_usage(ctx, args):
 
 def wave_stats(path, limit_seconds=30.0):
     """Loudness and character of a 16-bit PCM .wav (stdlib only): peak, RMS, loudest 50 ms (dBFS), attack (ms from
-    the first sound to 90 % of its loudest 5 ms), brightness (a zero-crossing estimate of where its energy sits, Hz).
+    the first sound to 90 % of its loudest 5 ms), brightness (the spectral centroid at its loudest moments, Hz).
     Long files: the first `limit_seconds`."""
     import array
     import math
@@ -1682,9 +1684,58 @@ def wave_stats(path, limit_seconds=30.0):
     top = max(windows, default=0)
     first = next((i for i, w in enumerate(windows) if w > top * 0.03), 0)  # about -30 dB under the loudest
     reach = next((i for i, w in enumerate(windows) if w >= top * 0.9), first)
-    crossings = sum(1 for a, b in zip(samples, samples[1:]) if (a < 0) != (b < 0))
+    loud = [i for i, w in enumerate(windows) if w >= top * 0.7]  # the loud part, spread out (not just its onset)
+    loudest = [loud[round(k * (len(loud) - 1) / 3)] for k in range(4)] if loud else []
     return {"seconds": round(frames / rate, 2), "channels": channels, "peak_db": db(peak), "rms_db": db(rms),
-            "loud50_db": db(loud50), "attack_ms": round((reach - first) * 5), "bright_hz": round(crossings * rate / (2 * n))}
+            "loud50_db": db(loud50), "attack_ms": round((reach - first) * 5),
+            "bright_hz": spectral_centroid(samples, rate, [i * step for i in loudest])}
+
+
+def fft(values):
+    """Radix-2 FFT of a list of floats whose length is a power of two (complex results)."""
+    import cmath
+    n = len(values)
+    data = [complex(v) for v in values]
+    j = 0
+    for i in range(1, n):  # bit-reversal permutation
+        bit = n >> 1
+        while j & bit:
+            j ^= bit
+            bit >>= 1
+        j |= bit
+        if i < j:
+            data[i], data[j] = data[j], data[i]
+    size = 2
+    while size <= n:
+        twiddle = cmath.exp(-2j * cmath.pi / size)
+        for start in range(0, n, size):
+            w = 1
+            for k in range(size // 2):
+                a, b = data[start + k], data[start + k + size // 2] * w
+                data[start + k], data[start + k + size // 2] = a + b, a - b
+                w *= twiddle
+        size *= 2
+    return data
+
+
+def spectral_centroid(samples, rate, starts, size=1024):
+    """Where a sound's energy sits (Hz): the magnitude-weighted mean frequency over Hann-windowed blocks at `starts`
+    (the loudest moments), which is what an ear calls bright or dull."""
+    import math
+    if len(samples) < size:
+        size = 1 << max(5, (len(samples) - 1).bit_length() - 1)
+        if len(samples) < size:
+            return None
+    hann = [0.5 - 0.5 * math.cos(2 * math.pi * i / (size - 1)) for i in range(size)]
+    weighted = total = 0.0
+    for start in starts:
+        start = max(0, min(len(samples) - size, start - size // 2))
+        spectrum = fft([samples[start + i] * hann[i] for i in range(size)])
+        for k in range(1, size // 2):
+            magnitude = abs(spectrum[k])
+            weighted += magnitude * k * rate / size
+            total += magnitude
+    return round(weighted / total) if total else None
 
 
 def sound_stats(ctx, args, waves):
@@ -1710,24 +1761,36 @@ def sound_stats(ctx, args, waves):
             stats = wave_stats(files[w["path"]])
         except (OSError, EOFError, CliError) as exc:
             stats = {"error": str(exc)[:80]}
-        rows.append(dict(w, **stats))
+        row = dict(w, **stats)
+        gains = [g for g in w.get("gains") or [] if isinstance(g, (int, float)) and g > 0]
+        if gains and row.get("loud50_db") is not None:  # the level the game plays it at: wave level x its Volume
+            row["played_db"] = round(row["loud50_db"] + 20 * math.log10(max(gains)), 1)
+            row["gain"] = max(gains)
+        rows.append(row)
     good = [r for r in rows if r.get("rms_db") is not None]
-    key = {"loud": lambda r: -(r.get("loud50_db") or -96), "quiet": lambda r: r.get("loud50_db") or -96,
+    played = any(r.get("played_db") is not None for r in good)
+    level = (lambda r: r.get("played_db") if r.get("played_db") is not None else r.get("loud50_db") or -96) if played \
+        else (lambda r: r.get("loud50_db") or -96)
+    key = {"loud": lambda r: -level(r), "quiet": level,
            "length": lambda r: -(r.get("seconds") or 0), "name": lambda r: r["path"]}[args.sort]
     good.sort(key=key)
-    print("dBFS (0 = full scale); loudest 50 ms is what a listener notices; brightness from zero crossings")
-    print(f"  {'peak':>6} {'rms':>6} {'50ms':>6} {'attack':>7} {'bright':>7} {'len':>6}  ch  wave")
+    print("dBFS (0 = full scale); loudest 50 ms is what a listener notices; brightness is the spectral centroid"
+          + ("; played = loudest 50 ms times the Volume next to the sound in its data" if played else ""))
+    print(f"  {'peak':>6} {'rms':>6} {'50ms':>6}" + (f" {'played':>7}" if played else "")
+          + f" {'attack':>7} {'bright':>7} {'len':>6}  ch  wave")
     for r in (good if args.all else good[: args.top]):
-        print(f"  {r['peak_db']:>6} {r['rms_db']:>6} {r['loud50_db']:>6} {r['attack_ms']:>5}ms {r['bright_hz'] / 1000:>6.1f}k "
-              f"{r['seconds']:>5.1f}s  {r['channels']}   {r['path'].rsplit('/', 1)[-1]}")
+        bright = f"{r['bright_hz'] / 1000:>6.1f}k" if r.get("bright_hz") else f"{'-':>7}"
+        print(f"  {r['peak_db']:>6} {r['rms_db']:>6} {r['loud50_db']:>6}"
+              + (f" {r['played_db'] if r.get('played_db') is not None else '-':>7}" if played else "")
+              + f" {r['attack_ms']:>5}ms {bright} {r['seconds']:>5.1f}s  {r['channels']}   {r['path'].rsplit('/', 1)[-1]}")
     if len(good) > args.top and not args.all:
         print(f"  ... +{len(good) - args.top} more (--all)")
     packs = {}
     for r in good:
         parts = r["path"].split("/")
-        packs.setdefault("/".join(parts[:3]), []).append(r["loud50_db"])
+        packs.setdefault("/".join(parts[:3]), []).append(level(r))
     if len(packs) > 1:
-        print("by folder (median loudest 50 ms; level packs toward one another):")
+        print("by folder (median " + ("level as played" if played else "loudest 50 ms") + "; level packs toward one another):")
         for pack, values in sorted(packs.items(), key=lambda kv: -sorted(kv[1])[len(kv[1]) // 2]):
             values = sorted(values)
             print(f"  {values[len(values) // 2]:>6} dB  {pack}  ({len(values)} wave(s), {values[0]} to {values[-1]})")
@@ -1758,7 +1821,11 @@ def audio_log(ctx, args):
     for s in starts:
         key = (s.get("sound_path") or s.get("sound"), s.get("spatialized"), s.get("attenuation"), bool(s.get("attached")))
         groups.setdefault(key, []).append(s)  # one row per way a sound was played
+    cut = sum(1 for s in starts if s.get("cut"))
+    virtual = sum(1 for s in starts if s.get("virtualized"))
     print(f"audio log, {data['seconds']} s: {len(starts)} sound start(s) on components, {len(groups)} sound/way-played pair(s)"
+          + (f"; {cut} cut off at once (a concurrency limit, or stopped by code)" if cut else "")
+          + (f"; {virtual} virtualized (inaudible, not mixed)" if virtual else "")
           + (f" ({data['ended']})" if data.get("ended") else ""))
     stereo_3d, unattenuated = [], []
     for key, items in sorted(groups.items(), key=lambda kv: -len(kv[1])):
@@ -1766,19 +1833,34 @@ def audio_log(ctx, args):
         chans = max((w.get("channels") or 1 for w in s.get("waves", [])), default=None)
         mode = (f"3D, attenuation {s.get('attenuation')}" + (f" ({s['falloff_m']} m)" if s.get("falloff_m") else "")
                 if s.get("spatialized") else ("2D" + (f", attenuated by {s.get('attenuation')}" if s.get("attenuated") else "")))
-        owners = sorted({i.get("owner") or "?" for i in items if i.get("attached")}) or ["no actor (2D)"]
+        owners = sorted({i.get("owner") or "?" for i in items if i.get("attached")})
+        if owners:
+            where = f"on {', '.join(owners[:3])}" + (f" +{len(owners) - 3}" if len(owners) > 3 else "")
+        elif s.get("spatialized"):  # a component created in the world (CreateComponent + SetLocation): no actor, still 3D
+            distances = sorted(i["distance"] for i in items if i.get("distance") is not None)
+            loc = s.get("location")
+            where = "no owner actor" + (f", at ({loc[0]}, {loc[1]}, {loc[2]})" if loc and len(items) == 1 else "") + (
+                f", {distances[0]}" + (f"-{distances[-1]}" if distances[-1] != distances[0] else "") + " cm away" if distances else "")
+        else:
+            where = "no owner actor"
+        lost = [f"{n} cut" for n in [sum(1 for i in items if i.get("cut"))] if n] + \
+            [f"{n} virtualized" for n in [sum(1 for i in items if i.get("virtualized"))] if n]
         line = (f"  x{len(items):<3} {s.get('sound')} ({channels_text(chans)})  {mode}, class {s.get('sound_class') or 'none'}"
-                f", on {', '.join(owners[:3])}" + (f" +{len(owners) - 3}" if len(owners) > 3 else ""))
+                f", {where}" + (f" ({', '.join(lost)})" if lost else ""))
+        spread = s.get("stereo_spread")
         if s.get("spatialized") and chans and chans > 1:
-            stereo_3d.append(s.get("sound"))
-            line += "  ! stereo positioned in 3D" + (f" (stereo spread {s['stereo_spread']:g})" if s.get("stereo_spread") is not None else "")
+            if spread is not None and spread <= 0:  # both channels folded onto the source: positioned correctly
+                line += "  (stereo, spread 0: folded onto the source)"
+            else:
+                stereo_3d.append(s.get("sound"))
+                line += "  ! stereo positioned in 3D" + (f" (stereo spread {spread:g})" if spread is not None else "")
         if not s.get("attenuated") and s.get("attached"):
             unattenuated.append(s.get("sound"))
             line += "  ! attached to an actor but not attenuated (as loud everywhere)"
         print(line)
     if stereo_3d:
-        print(f"{len(stereo_3d)} stereo sound(s) played spatialized: make the waves mono, or set the attenuation's "
-              "StereoSpread / play them 2D")
+        print(f"{len(stereo_3d)} stereo sound(s) played spatialized with their channels spread apart: make the waves "
+              "mono, set the attenuation's StereoSpread to 0, or play them 2D")
     if unattenuated:
         print(f"{len(unattenuated)} attached sound(s) with no attenuation: intended (UI, music)? otherwise give them one")
     print("fire-and-forget sounds (PlaySoundAtLocation, no component) are not in this log: ue audio lists them while they play")

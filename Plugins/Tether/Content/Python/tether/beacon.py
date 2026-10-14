@@ -169,6 +169,7 @@ def _snapshot():
         "headless": _state["headless"],
         "nullrhi": _state["nullrhi"],  # no rendering at all: no ue shot
         "sound": _state["sound"],
+        "unattended": _state.get("unattended"),  # so a restart reopens it the same way (None: started before 0.19.1)
         "launched_by_tether": _state["launched"],  # `ue open` marks its editors; the rest are the user's
         "tether": _plugin_version(),  # the plugin version this editor loaded (ue doctor compares it with the CLI)
         "started": _state["started"],
@@ -253,6 +254,7 @@ def start():
     _state["headless"] = _headless()
     _state["nullrhi"] = bool(re.search(r"(^|\s)-nullrhi\b", _command_line(), re.I))
     _state["sound"] = not re.search(r"(^|\s)-nosound\b", _command_line(), re.I)
+    _state["unattended"] = bool(re.search(r"(^|\s)-unattended\b", _command_line(), re.I))
     # `ue open` adds -TetherLaunched; before 0.11 it was recognisable by -ModelContextProtocolStartServer alone
     _state["launched"] = any(flag in _command_line() for flag in ("-TetherLaunched", "-ModelContextProtocolStartServer"))
     _write_session()

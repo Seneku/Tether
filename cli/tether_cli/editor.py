@@ -104,8 +104,12 @@ def cmd_build(ctx, args):
     reopen = {"map": beacon.get("map") if beacon.get("map") and not beacon["map"].startswith("/Temp") else None,
               "started": time.time()}
     if "nullrhi" in beacon:  # how this editor ran (a hand-opened one is windowed), from its beacon
+        # The editor's own flags: launch.json describes the last editor `ue open` started, which may not be this one
+        # (a hand-opened windowed editor must not come back -unattended).
+        unattended = beacon["unattended"] if beacon.get("unattended") is not None else (
+            launch.get("unattended") if beacon.get("headless") else False)
         reopen.update(headless=bool(beacon.get("headless")), render=not beacon.get("nullrhi"),
-                      sound=bool(beacon.get("sound")), unattended=launch.get("unattended"))
+                      sound=bool(beacon.get("sound")), unattended=unattended)
     else:
         reopen.update(headless=launch.get("headless", False), render=launch.get("render", False),
                       sound=launch.get("sound", False), unattended=launch.get("unattended"))
@@ -122,6 +126,10 @@ def cmd_build(ctx, args):
 
 def reopen_editor(ctx, args, how):
     """Open the editor again after a restart build, as it ran before (map, headless or windowed, rendering)."""
+    flags = (("headless" if how.get("headless") else "windowed", True),
+             ("offscreen render", how.get("headless") and how.get("render")),
+             ("sound", how.get("headless") and how.get("sound")), ("unattended", how.get("unattended")))
+    print("reopening the editor as it ran: " + ", ".join(name for name, on in flags if on))
     code = cmd_open(ctx, argparse.Namespace(map=how.get("map"), headless=how.get("headless", False),
                                             render=how.get("render", False), sound=how.get("sound", False),
                                             unattended=how.get("unattended"), no_build=True,

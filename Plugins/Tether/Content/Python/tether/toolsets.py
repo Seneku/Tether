@@ -369,13 +369,34 @@ _POSE_FIELDS = {"location": {"properties": {"x": 0, "y": 0, "z": 0}},
                 "scale": {"properties": {"x": 0, "y": 0, "z": 0}}}
 
 
+def _visible_bounds(actor, game=False):
+    """(centre, extent) of the actor's visible primitive components. GetActorBounds counts hidden ones too (a hidden
+    laser mesh left at the world origin moved a robot's centre 37 m); with none visible, the actor's location."""
+    lo = hi = None
+    for comp in actor.get_components_by_class(unreal.PrimitiveComponent) or []:
+        if not _try(lambda: comp.is_visible(), True) or (game and _try(lambda: comp.get_editor_property("hidden_in_game"), False)):
+            continue
+        bounds = _try(lambda: unreal.SystemLibrary.get_component_bounds(comp))
+        if not bounds:
+            continue
+        origin, extent = bounds[0], bounds[1]
+        if extent.x <= 0 and extent.y <= 0 and extent.z <= 0:
+            continue
+        a, b = origin - extent, origin + extent
+        lo = a if lo is None else unreal.Vector(min(lo.x, a.x), min(lo.y, a.y), min(lo.z, a.z))
+        hi = b if hi is None else unreal.Vector(max(hi.x, b.x), max(hi.y, b.y), max(hi.z, b.z))
+    if lo is None:
+        return actor.get_actor_location(), unreal.Vector(0, 0, 0)
+    return (lo + hi) * 0.5, (hi - lo) * 0.5
+
+
 def _point_and_extent(ref, pie):
-    """An actor's (or component owner's) bounds centre and extent."""
+    """An actor's (or component owner's) visible bounds centre and extent."""
     obj = _resolve(ref, pie)
     actor = obj if isinstance(obj, unreal.Actor) else (obj.get_owner() if isinstance(obj, unreal.ActorComponent) else None)
     if actor is None:
         raise RuntimeError(f"'{ref}' is not an actor or component")
-    return actor.get_actor_bounds(False)
+    return _visible_bounds(actor, pie)
 
 
 def _point(ref, pie):
@@ -709,7 +730,7 @@ def _pie_point(ref, pawn, controller):
         return unreal.Vector(*nums)
     obj = _pie_object(ref, pawn, controller)
     actor = obj if isinstance(obj, unreal.Actor) else obj.get_owner()
-    return actor.get_actor_bounds(False)[0]
+    return _visible_bounds(actor, True)[0]
 
 
 def _input_action(name, pawn):
@@ -1083,6 +1104,51 @@ def _dependency_options():
         include_soft_management_references=False, include_hard_management_references=False)
 
 
+_GAIN_NAME = re.compile(r"^(volume|gain|volume_?multiplier|volume_?scale)$", re.I)
+
+
+def _ref_paths(value, wanted, path="", out=None, gain=None):
+    """{package: [(property path, gain)]} where `value` (props JSON) references one of `wanted` packages: 'FireSound',
+    'Cues[Explosion].Sounds[2]' (map entries by their key). `gain` is a Volume-like number in the nearest struct
+    around the reference (e.g. FSoundCue{Sounds, Volume}), which is what the game multiplies the sound by."""
+    out = {} if out is None else out
+    if isinstance(value, dict):
+        ref = value.get("refPath") if set(value) == {"refPath"} else None
+        if isinstance(ref, str):
+            package = ref.split(".")[0]
+            if package in wanted:
+                out.setdefault(package, []).append((path or "(self)", gain))
+            return out
+        here = next((v for k, v in value.items() if _GAIN_NAME.match(str(k)) and isinstance(v, (int, float))), gain)
+        for key, item in value.items():
+            _ref_paths(item, wanted, f"{path}.{key}" if path else str(key), out, here)
+    elif isinstance(value, list):
+        for i, item in enumerate(value):
+            if isinstance(item, dict) and "key" in item and "value" in item:  # a map entry
+                key = item["key"]
+                key = key.get("refPath", "").rsplit(".", 1)[-1] if isinstance(key, dict) else key
+                _ref_paths(item["value"], wanted, f"{path}[{key}]", out, gain)
+            else:
+                _ref_paths(item, wanted, f"{path}[{i}]", out, gain)
+    elif isinstance(value, str) and value.split(".")[0] in wanted:  # soft references come back as text
+        out.setdefault(value.split(".")[0], []).append((path, gain))
+    return out
+
+
+def _referencing_props(package, wanted):
+    """{sound package: [property paths]} in a data asset or a Blueprint's defaults; {} for anything else."""
+    asset = _try(lambda: unreal.load_asset(package))
+    if asset is None:
+        return {}
+    if isinstance(asset, unreal.Blueprint):
+        generated = _try(lambda: unreal.BlueprintEditorLibrary.generated_class(asset))
+        asset = _try(lambda: unreal.get_default_object(generated)) if generated else None
+    if asset is None or isinstance(asset, (unreal.SoundBase, unreal.World)):
+        return {}
+    data = _try(lambda: _props_json(asset), {}) or {}
+    return _ref_paths(data, wanted)
+
+
 _SOUND_SKIP = {"World", "MapBuildDataRegistry", "Texture2D", "TextureCube", "TextureRenderTarget2D", "Material",
                "MaterialInstanceConstant", "MaterialFunction", "StaticMesh", "SkeletalMesh", "Skeleton", "PhysicsAsset",
                "AnimSequence", "AnimMontage", "BlendSpace", "Font", "LandscapeLayerInfoObject"}
@@ -1161,6 +1227,9 @@ def _audio_log_tick(_delta):
         sound = _try(lambda: comp.get_editor_property("sound"))
         sound_key = sound.get_path_name() if sound else None
         playing[key] = sound_key
+        live = state["live"].get(key)
+        if live is not None and _try(lambda: comp.is_virtualized(), False):
+            state["starts"][live[0]]["virtualized"] = True
         if state["playing"].get(key) == sound_key or len(state["starts"]) >= 2000:
             continue  # still the same sound on the same component
         row = _try(lambda: _audio_resolved(comp), None) or {"sound": sound.get_name() if sound else None}
@@ -1168,8 +1237,17 @@ def _audio_log_tick(_delta):
         where = comp.get_world_location()
         row.update(t=round(now - state["start"], 2), owner=_label(owner) if owner else None,
                    attached=owner is not None and not isinstance(owner, unreal.WorldSettings),
+                   location=[round(where.x), round(where.y), round(where.z)],
                    distance=round(where.distance(listener)) if listener else None)
         state["starts"].append(row)
+        state["live"][key] = (len(state["starts"]) - 1, now)
+    for key, (index, began) in list(state["live"].items()):
+        if key not in playing:  # stopped: right away (a concurrency limit, or code) when far shorter than the sound
+            del state["live"][key]
+            start = state["starts"][index]
+            length = max((w.get("duration") or 0 for w in start.get("waves", [])), default=0)
+            if now - began <= max(0.15, 2 * state["every"]) and length > 0.4:
+                start["cut"] = True
     state["playing"] = playing  # a component that stops and plays again counts as a new start
 
 
@@ -4004,10 +4082,12 @@ class TetherCore(_Base):
                 if not found:
                     raise RuntimeError(f"no asset or folder {path}")
                 roots += sorted({str(a.package_name) for a in found})
-        waves, seen = {}, set()
+        waves, seen, parents, sound_like = {}, set(), {}, set()
         queue = [(root, 0, None) for root in roots]
         while queue and len(seen) < limit:
             package, level, user = queue.pop(0)
+            if user:
+                parents.setdefault(package, set()).add(user)
             row = _wave_row(registry, package)
             if row:
                 entry = waves.setdefault(package, dict(row, path=package, users=[]))
@@ -4018,6 +4098,8 @@ class TetherCore(_Base):
                 continue
             seen.add(package)
             classes = {str(a.asset_class_path.asset_name) for a in registry.get_assets_by_package_name(package) or []}
+            if any(c.startswith(("Sound", "MetaSound")) for c in classes):
+                sound_like.add(package)
             if classes & _SOUND_SKIP or level >= depth:
                 continue
             for dep in registry.get_dependencies(package, _dependency_options()) or []:
@@ -4025,6 +4107,21 @@ class TetherCore(_Base):
                 if dep.startswith("/Script/") or (dep.startswith("/Engine/") and not _wave_row(registry, dep)):
                     continue
                 queue.append((dep, level + 1, package))
+        # Where each sound (wave or cue) is referenced inside the data assets and Blueprints that use it.
+        targets = set(waves) | sound_like
+        users = sorted({u for t in targets for u in parents.get(t, ()) if u not in sound_like})[:60]
+        refs, gains = {}, {}
+        for user in users:
+            for target, found in _referencing_props(user, targets).items():
+                refs.setdefault(target, []).extend(f"{user.rsplit('/', 1)[-1]}: {p}" for p, _ in found[:6])
+                gains.setdefault(target, []).extend(g for _, g in found if g is not None)
+        for path, entry in waves.items():
+            entry["refs"] = refs.get(path, [])[:6]
+            entry["gains"] = gains.get(path, [])[:6]
+            for cue in entry["users"]:
+                if cue in sound_like:
+                    entry["refs"] += [f"via {cue.rsplit('/', 1)[-1]} ({r})" for r in refs.get(cue, [])[:3]]
+                    entry["gains"] += gains.get(cue, [])[:3]
         return json.dumps({"roots": roots, "waves": sorted(waves.values(), key=lambda w: w["path"]),
                            "visited": len(seen)})
 
@@ -4082,7 +4179,7 @@ class TetherCore(_Base):
                 raise RuntimeError("PIE is not running (ue pie start)")
             state.clear()
             state.update(world=game, start=time.time(), last=0.0, every=max(0.0, every), starts=[], playing={},
-                         ended=None)
+                         live={}, ended=None)
             state["handle"] = unreal.register_slate_post_tick_callback(_audio_log_tick)
             return json.dumps({"recording": True})
         if action == "stop":
@@ -5923,18 +6020,20 @@ class TetherCore(_Base):
         ok, detail = True, ""
         if verb == "at":
             where, _, offset = rest.partition(" ")
-            point = _pie_point(where, pawn, controller)
-            if offset:
-                point = point + unreal.Vector(*(_numbers(offset) or [0, 0, 0]))
+            base = _pie_point(where, pawn, controller)
+            point = base + unreal.Vector(*(_numbers(offset) or [0, 0, 0])) if offset else base
             pawn.set_actor_location(point, False, True)
             loc = pawn.get_actor_location()
-            detail = f"player at ({loc.x:.0f}, {loc.y:.0f}, {loc.z:.0f})"
+            detail = f"player at ({loc.x:.0f}, {loc.y:.0f}, {loc.z:.0f})" + (
+                "" if _numbers(where) is not None else f"; {where} is at ({base.x:.0f}, {base.y:.0f}, {base.z:.0f})")
         elif verb == "look":
             camera = unreal.GameplayStatics.get_player_camera_manager(game, 0)
             eye = camera.get_camera_location() if camera else pawn.get_actor_location()
-            rotation = unreal.MathLibrary.find_look_at_rotation(eye, _pie_point(rest, pawn, controller))
+            target = _pie_point(rest, pawn, controller)
+            rotation = unreal.MathLibrary.find_look_at_rotation(eye, target)
             controller.set_control_rotation(rotation)
-            detail = f"looking pitch {rotation.pitch:.0f} yaw {rotation.yaw:.0f}"
+            detail = (f"looking pitch {rotation.pitch:.0f} yaw {rotation.yaw:.0f} at ({target.x:.0f}, {target.y:.0f}, "
+                      f"{target.z:.0f})")
         elif verb == "move":
             goal = _pie_point(rest, pawn, controller)
             path = unreal.NavigationSystemV1.find_path_to_location_synchronously(game, pawn.get_actor_location(), goal)

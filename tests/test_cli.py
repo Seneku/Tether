@@ -2104,7 +2104,7 @@ class Round14(unittest.TestCase):
                 f.writeframes(silence + tone)
             stats = ue.wave_stats(path)
         self.assertEqual((stats["peak_db"], stats["loud50_db"], stats["channels"]), (-6.0, -9.0, 2))
-        self.assertAlmostEqual(stats["bright_hz"], 455, delta=60)  # 500 Hz over 1.1 s, the silence included
+        self.assertAlmostEqual(stats["bright_hz"], 500, delta=40)  # spectral centroid of a 500 Hz tone
         self.assertLessEqual(stats["attack_ms"], 5)
 
     def test_audio_log_flags_what_played(self):
@@ -2122,3 +2122,30 @@ class Round14(unittest.TestCase):
         text = out.getvalue()
         self.assertIn("! stereo positioned in 3D (stereo spread 200)", text)
         self.assertIn("Hum (mono)  2D, class none, on Robot_2  ! attached to an actor but not attenuated", text)
+
+    def test_audio_log_spread_zero_and_ownerless_3d(self):
+        base = {"spatialized": True, "attenuated": True, "attenuation": "ATT", "falloff_m": 80.0, "sound_class": "SFX"}
+        starts = [dict(base, sound="Boom", sound_path="/G/Boom.Boom", stereo_spread=0.0, owner="R1", attached=True,
+                       waves=[{"wave": "Boom", "channels": 2, "duration": 2.0}]),
+                  dict(base, sound="Whiz", sound_path="/G/Whiz.Whiz", stereo_spread=200.0, owner=None, attached=False,
+                       location=[100, 200, 50], distance=640, waves=[{"wave": "Whiz", "channels": 1, "duration": 0.5}],
+                       cut=True),
+                  dict(base, sound="Whiz", sound_path="/G/Whiz.Whiz", stereo_spread=200.0, owner=None, attached=False,
+                       location=[300, 200, 50], distance=900, waves=[{"wave": "Whiz", "channels": 1, "duration": 0.5}],
+                       virtualized=True)]
+        replies = iter([{"recording": True}, {"starts": starts, "seconds": 1.0, "ended": None}])
+        ctx = types.SimpleNamespace(beacon={"pie": True}, data=None, tether=lambda *a, **k: next(replies))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), unittest.mock.patch("time.sleep"):
+            ue.audio_log(ctx, argparse.Namespace(log=1, do=None, limit=20))
+        text = out.getvalue()
+        self.assertIn("(stereo, spread 0: folded onto the source)", text)
+        self.assertNotIn("! stereo", text)
+        self.assertIn("Whiz (mono)  3D, attenuation ATT (80.0 m), class SFX, no owner actor, 640-900 cm away (1 cut, 1 virtualized)", text)
+        self.assertNotIn("(2D)", text)
+        self.assertIn("1 cut off at once", text)
+
+    def test_py_warns_on_additive_set_editor_properties(self):
+        code = "a = unreal.load_asset('/Game/A/AS_Slam')\na.set_editor_properties({'additive_anim_type': t})"
+        self.assertTrue(any("recompressed" in n for n in ue.py_pitfalls(code)))
+        self.assertFalse(ue.py_pitfalls("m.set_editor_properties({'x': 1})"))
