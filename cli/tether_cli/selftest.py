@@ -145,6 +145,9 @@ def cmd_selftest(ctx, args):
           ok=lambda c, o: c == 0 and "100 x 100 x 100 cm" in o and "lightmap UV" in o)
     check("skel", ["skel", "/Engine/EngineMeshes/SkeletalCube"], ok=lambda c, o: c == 0 and "2 bones" in o and "Bone02" in o)
     check("sound", ["sound", "/Engine/EngineSounds/WhiteNoise"], ok=lambda c, o: c == 0 and "mono, 44100 Hz" in o)
+    check("sound (folder: the waves it uses)", ["sound", "/Engine/EngineSounds"], ok=lambda c, o: c == 0 and "sound wave(s)" in o)
+    check("sound --stats", ["sound", "/Engine/EngineSounds/WhiteNoise", "--stats"], timeout=300,
+          ok=lambda c, o: c == 0 and "dBFS" in o and "WhiteNoise" in o)
     check("audio mix", ["audio", "mix"], ok=lambda c, o: c == 0)
     check("data", ["data", "/Engine/BasicShapes", "--limit", "3"], ok=lambda c, o: c == 0 and "row(s) for" in o)
     check("map", ["map", "--px", "200", "-o", os.path.join(tempfile.gettempdir(), "tether-selftest-map.png")],
@@ -348,6 +351,8 @@ def cmd_selftest(ctx, args):
     check("ai", ["ai"], ok=lambda c, o: c == 0 and ("AI" in o))
     check("audio", ["audio"], skip=None if launch.get("sound", not launch.get("headless")) else "no audio device (ue open --headless --sound)",
           ok=lambda c, o: c == 0 and "sound(s) playing" in o)
+    check("audio --log", ["audio", "--log", "1"], skip=None if launch.get("sound", not launch.get("headless")) else
+          "no audio device (ue open --headless --sound)", ok=lambda c, o: c == 0 and "audio log, " in o)
     check("anim", ["anim", "player"], ok=lambda c, o: c == 0 and ("skeletal mesh" in o or "anim instance" in o
                                                                    or "mesh " in o))
     fixture = (ue("py", "hasattr(unreal, 'TetherProbeUILibrary')")[1].splitlines() or [""])[-1] == "True"

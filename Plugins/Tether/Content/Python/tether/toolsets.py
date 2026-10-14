@@ -1083,6 +1083,96 @@ def _dependency_options():
         include_soft_management_references=False, include_hard_management_references=False)
 
 
+_SOUND_SKIP = {"World", "MapBuildDataRegistry", "Texture2D", "TextureCube", "TextureRenderTarget2D", "Material",
+               "MaterialInstanceConstant", "MaterialFunction", "StaticMesh", "SkeletalMesh", "Skeleton", "PhysicsAsset",
+               "AnimSequence", "AnimMontage", "BlendSpace", "Font", "LandscapeLayerInfoObject"}
+_AUDIO_LOG = {"handle": None}
+
+
+def _wave_row(registry, package):
+    """{channels, duration, sample_rate, looping} of a SoundWave from its registry tags (nothing loaded)."""
+    for data in registry.get_assets_by_package_name(package) or []:
+        if str(data.asset_class_path.asset_name) != "SoundWave":
+            continue
+        tag = lambda key: _try(lambda: str(data.get_tag_value(key)), None)  # noqa: E731
+        num = lambda key: _try(lambda: float(tag(key)), None)  # noqa: E731
+        return {"channels": int(num("NumChannels") or 0) or None, "duration": num("Duration"),
+                "sample_rate": int(num("SampleRate") or 0) or None, "looping": tag("bLooping") == "True"}
+    return None
+
+
+def _audio_resolved(comp):
+    """What the mixer uses for a playing component: spatialized?, attenuation (where from), sound class, waves."""
+    get = lambda obj, prop, default=None: _try(lambda: obj.get_editor_property(prop), default)  # noqa: E731
+    sound = get(comp, "sound")
+    settings, source = None, None
+    if get(comp, "override_attenuation", False):
+        settings, source = get(comp, "attenuation_overrides"), "component override"
+    elif get(comp, "attenuation_settings") is not None:
+        asset = get(comp, "attenuation_settings")
+        settings, source = get(asset, "attenuation"), asset.get_name()
+    elif sound is not None and get(sound, "override_attenuation", False):
+        settings, source = get(sound, "attenuation_overrides"), "on the sound"
+    elif sound is not None and get(sound, "attenuation_settings") is not None:
+        asset = get(sound, "attenuation_settings")
+        settings, source = get(asset, "attenuation"), asset.get_name()
+    attenuate = bool(get(settings, "attenuate", True)) if settings is not None else False
+    spatial = settings is not None and bool(get(settings, "spatialize", True)) and bool(get(comp, "allow_spatialization", True))
+    falloff = get(settings, "falloff_distance") if settings is not None else None
+    sound_class = get(comp, "sound_class_override") or (get(sound, "sound_class_object") if sound is not None else None)
+    registry = unreal.AssetRegistryHelpers.get_asset_registry()
+    waves = []
+    if sound is not None:
+        package = sound.get_outermost().get_name()
+        row = _wave_row(registry, package)
+        if row:
+            waves.append(dict(row, wave=sound.get_name()))
+        else:  # a cue or MetaSound: the waves it can play
+            for dep in registry.get_dependencies(package, _dependency_options()) or []:
+                row = _wave_row(registry, str(dep))
+                if row:
+                    waves.append(dict(row, wave=str(dep).rsplit("/", 1)[-1]))
+    return {"sound": sound.get_name() if sound else None, "sound_path": sound.get_path_name() if sound else None,
+            "spatialized": spatial, "attenuated": settings is not None and attenuate, "attenuation": source,
+            "falloff_m": round(falloff / 100, 1) if falloff else None,
+            "stereo_spread": get(settings, "stereo_spread") if settings is not None else None,
+            "sound_class": sound_class.get_name() if sound_class else None, "waves": waves[:16]}
+
+
+def _audio_log_tick(_delta):
+    state = _AUDIO_LOG
+    game = _game_world()
+    if game is None or game != state.get("world"):
+        state["ended"] = state.get("ended") or "PIE ended"
+        unreal.unregister_slate_post_tick_callback(state["handle"])
+        state["handle"] = None
+        return
+    now = time.time()
+    if now - state["last"] < state["every"]:
+        return
+    state["last"] = now
+    camera = unreal.GameplayStatics.get_player_camera_manager(game, 0)
+    listener = camera.get_camera_location() if camera else None
+    playing = {}
+    for comp in unreal.ObjectIterator(unreal.AudioComponent):
+        if _try(lambda: comp.get_world()) != game or not _try(lambda: comp.is_playing(), False):
+            continue
+        key = comp.get_path_name()
+        sound = _try(lambda: comp.get_editor_property("sound"))
+        sound_key = sound.get_path_name() if sound else None
+        playing[key] = sound_key
+        if state["playing"].get(key) == sound_key or len(state["starts"]) >= 2000:
+            continue  # still the same sound on the same component
+        row = _try(lambda: _audio_resolved(comp), None) or {"sound": sound.get_name() if sound else None}
+        owner = comp.get_owner()
+        where = comp.get_world_location()
+        row.update(t=round(now - state["start"], 2), owner=_label(owner) if owner else None,
+                   attached=owner is not None and not isinstance(owner, unreal.WorldSettings),
+                   distance=round(where.distance(listener)) if listener else None)
+        state["starts"].append(row)
+    state["playing"] = playing  # a component that stops and plays again counts as a new start
+
+
 def _fixup_redirector(package, vcs):
     """Point everything that references a redirector at its target, then delete it. Python has no
     fixup_referencers in 5.8, so do what it does: load each referencer (which follows the redirector) and save
@@ -3887,6 +3977,122 @@ class TetherCore(_Base):
         registry = unreal.AssetRegistryHelpers.get_asset_registry()
         info["used_by"] = len(registry.get_referencers(sound.get_outermost().get_name(), _dependency_options()) or [])
         return json.dumps(info)
+
+    @_tool
+    @staticmethod
+    def sound_usage(targets: str, depth: int = 4, limit: int = 4000) -> str:
+        """Every SoundWave a data asset, Blueprint, cue or folder reaches through hard and soft references (through
+        cues, MetaSounds and data assets; maps, meshes, textures and materials are not followed), with the assets
+        that reference each one. Read from the asset registry: nothing is loaded.
+
+        Args:
+            targets: JSON list of asset paths or folders ('/Game/Audio', '/Game/SD/Audio/DA_SDSounds').
+            depth: How many references deep to follow.
+            limit: Most packages to visit.
+
+        Returns:
+            JSON {roots, waves: [{path, channels, duration, sample_rate, looping, users}], visited}.
+        """
+        registry = unreal.AssetRegistryHelpers.get_asset_registry()
+        roots = []
+        for target in json.loads(targets):
+            path = target.split(".")[0].rstrip("/")
+            if registry.get_assets_by_package_name(path):
+                roots.append(path)
+            else:
+                found = registry.get_assets_by_path(path, recursive=True) or []
+                if not found:
+                    raise RuntimeError(f"no asset or folder {path}")
+                roots += sorted({str(a.package_name) for a in found})
+        waves, seen = {}, set()
+        queue = [(root, 0, None) for root in roots]
+        while queue and len(seen) < limit:
+            package, level, user = queue.pop(0)
+            row = _wave_row(registry, package)
+            if row:
+                entry = waves.setdefault(package, dict(row, path=package, users=[]))
+                if user and user not in entry["users"]:
+                    entry["users"].append(user)
+                continue
+            if package in seen:
+                continue
+            seen.add(package)
+            classes = {str(a.asset_class_path.asset_name) for a in registry.get_assets_by_package_name(package) or []}
+            if classes & _SOUND_SKIP or level >= depth:
+                continue
+            for dep in registry.get_dependencies(package, _dependency_options()) or []:
+                dep = str(dep)
+                if dep.startswith("/Script/") or (dep.startswith("/Engine/") and not _wave_row(registry, dep)):
+                    continue
+                queue.append((dep, level + 1, package))
+        return json.dumps({"roots": roots, "waves": sorted(waves.values(), key=lambda w: w["path"]),
+                           "visited": len(seen)})
+
+    @_tool
+    @staticmethod
+    def export_waves(waves: str, folder: str) -> str:
+        """Export SoundWaves as .wav files (the engine's WAV exporter), for loudness analysis outside the editor.
+
+        Args:
+            waves: JSON {package path: file name} to write into folder.
+            folder: Output folder.
+
+        Returns:
+            JSON {package path: file path, or 'error: ...'}.
+        """
+        os.makedirs(folder, exist_ok=True)
+        out = {}
+        for package, file_name in json.loads(waves).items():
+            wave = unreal.load_asset(package)
+            if not isinstance(wave, unreal.SoundWave):
+                out[package] = "error: not a SoundWave"
+                continue
+            task = unreal.AssetExportTask()
+            task.object = wave
+            task.filename = os.path.join(folder, file_name)
+            task.automated = True
+            task.prompt = False
+            task.replace_identical = True
+            task.exporter = unreal.SoundExporterWAV()
+            ok = unreal.Exporter.run_asset_export_task(task)
+            out[package] = task.filename if ok and os.path.isfile(task.filename) else "error: export failed"
+        return json.dumps(out)
+
+    @_tool
+    @staticmethod
+    def audio_log(action: str = "status", every: float = 0.05) -> str:
+        """Record the sounds that start on audio components in PIE, with what the mixer resolves for each:
+        spatialized or not, effective attenuation (component override, then the component's asset, then the
+        sound's), effective sound class (SoundClassOverride, then the sound's), the waves and their channels,
+        owner and distance. Polled on the editor tick, so a sound shorter than `every` may be missed.
+
+        Args:
+            action: 'start' (replaces a running log), 'stop' (ends it and returns the starts), or 'status'.
+            every: Seconds between polls.
+
+        Returns:
+            JSON: status, or {starts: [...], seconds, ended}.
+        """
+        state = _AUDIO_LOG
+        if action == "start":
+            if state.get("handle") is not None:
+                unreal.unregister_slate_post_tick_callback(state["handle"])
+            game = _game_world()
+            if game is None:
+                raise RuntimeError("PIE is not running (ue pie start)")
+            state.clear()
+            state.update(world=game, start=time.time(), last=0.0, every=max(0.0, every), starts=[], playing={},
+                         ended=None)
+            state["handle"] = unreal.register_slate_post_tick_callback(_audio_log_tick)
+            return json.dumps({"recording": True})
+        if action == "stop":
+            if state.get("handle") is not None:
+                unreal.unregister_slate_post_tick_callback(state["handle"])
+                state["handle"] = None
+            return json.dumps({"starts": state.get("starts", []), "ended": state.get("ended"),
+                               "seconds": round(time.time() - state.get("start", time.time()), 1)})
+        return json.dumps({"recording": state.get("handle") is not None, "starts": len(state.get("starts", [])),
+                           "ended": state.get("ended")})
 
     @_tool
     @staticmethod

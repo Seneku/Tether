@@ -2087,3 +2087,38 @@ class Round14(unittest.TestCase):
         self.assertIn("Ambient_Wind_Loop_1 (100.0 s), volume 1.28\n", text)  # no drone owner or attenuation on the bed
         self.assertIn("Drone_Hum (loop) on SDRobot_0, 7064 cm away", text)
         self.assertEqual(text.count("(component only)"), 3)
+
+    def test_wave_stats_of_a_known_sine(self):
+        import math
+        import struct
+        import wave
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "sine.wav")
+            amp = int(32767 * 10 ** (-6 / 20))
+            with wave.open(path, "wb") as f:
+                f.setnchannels(2)
+                f.setsampwidth(2)
+                f.setframerate(8000)
+                silence = b"\0\0\0\0" * 800  # 0.1 s before the tone
+                tone = b"".join(struct.pack("<hh", *(2 * [int(amp * math.sin(2 * math.pi * 500 * i / 8000))])) for i in range(8000))
+                f.writeframes(silence + tone)
+            stats = ue.wave_stats(path)
+        self.assertEqual((stats["peak_db"], stats["loud50_db"], stats["channels"]), (-6.0, -9.0, 2))
+        self.assertAlmostEqual(stats["bright_hz"], 455, delta=60)  # 500 Hz over 1.1 s, the silence included
+        self.assertLessEqual(stats["attack_ms"], 5)
+
+    def test_audio_log_flags_what_played(self):
+        starts = [{"sound": "Shot", "sound_path": "/Game/S/Shot.Shot", "spatialized": True, "attenuated": True,
+                   "attenuation": "ATT_Range", "falloff_m": 36.0, "stereo_spread": 200.0, "sound_class": "SFX",
+                   "waves": [{"wave": "Shot", "channels": 2}], "owner": "Robot_1", "attached": True},
+                  {"sound": "Hum", "sound_path": "/Game/S/Hum.Hum", "spatialized": False, "attenuated": False,
+                   "attenuation": None, "sound_class": None, "waves": [{"wave": "Hum", "channels": 1}],
+                   "owner": "Robot_2", "attached": True}]
+        replies = iter([{"recording": True}, {"starts": starts, "seconds": 1.0, "ended": None}])
+        ctx = types.SimpleNamespace(beacon={"pie": True}, data=None, tether=lambda *a, **k: next(replies))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), unittest.mock.patch("time.sleep"):
+            ue.audio_log(ctx, argparse.Namespace(log=1, do=None, limit=20))
+        text = out.getvalue()
+        self.assertIn("! stereo positioned in 3D (stereo spread 200)", text)
+        self.assertIn("Hum (mono)  2D, class none, on Robot_2  ! attached to an actor but not attenuated", text)

@@ -501,6 +501,9 @@ def active_sounds(ctx):
 def cmd_audio(ctx, args):
     if getattr(args, "match", None) == "mix":
         return audio_mix(ctx, args)
+    if getattr(args, "log", None) or getattr(args, "do", None):
+        args.log = args.log or 10
+        return audio_log(ctx, args)
     """Sounds playing in PIE: what, from where, how loud."""
     if not (ctx.beacon or {}).get("pie"):
         raise CliError("PIE is not running (ue pie start)")
@@ -1563,8 +1566,17 @@ def tree_lines(rows, describe):
 
 
 def cmd_sound(ctx, args):
-    """`ue sound <asset>`: a sound in a few lines; `ue audio mix` is the class/submix tree (see cmd_audio)."""
-    info = ctx.tether("sound_info", target=args.asset)
+    """`ue sound <asset>`: a sound in a few lines; data assets, Blueprints and folders: the waves they use
+    (sound_usage); --stats: loudness. `ue audio mix` is the class/submix tree (see cmd_audio)."""
+    info = None
+    if len(args.assets) == 1 and not args.stats:
+        try:
+            info = ctx.tether("sound_info", target=args.assets[0])
+        except CliError as exc:
+            if "is not a sound" not in str(exc) and "None" not in str(exc):
+                raise
+    if info is None:
+        return sound_usage(ctx, args)
     info = json.loads(info) if isinstance(info, str) else info
     duration = info.get("duration")
     head = f"{info['sound']} ({info['class']})" + (f": {duration:.2f} s" if isinstance(duration, (int, float)) and 0 < duration < 1e5 else "")
@@ -1594,6 +1606,183 @@ def cmd_sound(ctx, args):
         print(f"  plays {wave}")
     print(f"  used by {info['used_by']} asset(s)")
     ctx.data = info
+    return 0
+
+
+def channels_text(n):
+    return {1: "mono", 2: "stereo"}.get(n, f"{n} ch" if n else "?")
+
+
+def sound_usage(ctx, args):
+    """Every wave the given assets or folders reach, with who uses it; stereo ones called out as 'if played 3D'."""
+    data = ctx.tether("sound_usage", targets=json.dumps(args.assets))
+    data = json.loads(data) if isinstance(data, str) else data
+    waves = data["waves"]
+    names = ", ".join(a.rsplit("/", 1)[-1] for a in args.assets)
+    if not waves:
+        print(f"{names}: no sound waves reached ({data['visited']} package(s) followed)")
+        ctx.data = data
+        return 0
+    stereo = [w for w in waves if (w.get("channels") or 1) > 1]
+    rates = {}
+    for w in waves:
+        rates[w.get("sample_rate")] = rates.get(w.get("sample_rate"), 0) + 1
+    total = sum(w.get("duration") or 0 for w in waves if (w.get("duration") or 0) < 1e5)
+    print(f"{names}: {len(waves)} sound wave(s) through {data['visited']} package(s) (hard and soft references); "
+          f"{len(waves) - len(stereo)} mono, {len(stereo)} stereo or more; "
+          + (f"{total / 60:.1f} min" if total >= 90 else f"{total:.1f} s") + " in all; rates "
+          + ", ".join(f"{r or '?'} Hz x{n}" for r, n in sorted(rates.items(), key=lambda kv: -kv[1])))
+    if args.stats:
+        return sound_stats(ctx, args, waves)
+    if stereo:
+        print(f"{len(stereo)} stereo wave(s): if played 3D (spatialized), stereo is not positioned per channel "
+              "(make them mono, or give them a StereoSpread / play them 2D):")
+    shown = stereo + [w for w in waves if w not in stereo] if args.all else stereo[: args.top]
+    for w in shown:
+        users = ", ".join(u.rsplit("/", 1)[-1] for u in w["users"][:3]) + (f" +{len(w['users']) - 3}" if len(w["users"]) > 3 else "")
+        length = "loop" if w.get("looping") or (w.get("duration") or 0) > 1e5 else f"{w.get('duration') or 0:.1f} s"
+        print(f"  {channels_text(w.get('channels')):<7} {length:>7}  {w['path']}" + (f"  <- {users}" if users else ""))
+    if not args.all and len(stereo) > args.top:
+        print(f"  ... +{len(stereo) - args.top} more stereo (--all lists every wave)")
+    print("  --stats adds loudness; ue audio --log 10 in PIE shows how each actually played")
+    ctx.data = data
+    return 0
+
+
+def wave_stats(path, limit_seconds=30.0):
+    """Loudness and character of a 16-bit PCM .wav (stdlib only): peak, RMS, loudest 50 ms (dBFS), attack (ms from
+    the first sound to 90 % of its loudest 5 ms), brightness (a zero-crossing estimate of where its energy sits, Hz).
+    Long files: the first `limit_seconds`."""
+    import array
+    import math
+    import wave
+    with wave.open(path, "rb") as f:
+        channels, width, rate, frames = f.getnchannels(), f.getsampwidth(), f.getframerate(), f.getnframes()
+        if width != 2:
+            raise CliError(f"{path}: {8 * width}-bit samples (16-bit only)")
+        raw = f.readframes(min(frames, int(rate * limit_seconds)))
+    samples = array.array("h")
+    samples.frombytes(raw)
+    if channels > 1:  # mix down: the mean of the channels
+        samples = array.array("h", (sum(samples[i:i + channels]) // channels for i in range(0, len(samples), channels)))
+    n = len(samples)
+    if not n:
+        return {"seconds": frames / rate if rate else 0, "channels": channels, "peak_db": None, "rms_db": None,
+                "loud50_db": None, "attack_ms": None, "bright_hz": None}
+
+    def db(value):
+        return round(20 * math.log10(value / 32768), 1) if value > 0 else -96.0
+    peak = max(max(samples), -min(samples))
+    rms = math.sqrt(sum(map(lambda v: v * v, samples)) / n)
+    step = max(1, int(rate * 0.005))  # 5 ms windows
+    windows = [math.sqrt(sum(v * v for v in samples[i:i + step]) / len(samples[i:i + step])) for i in range(0, n, step)]
+    per50 = 10
+    loud50 = max((math.sqrt(sum(w * w for w in windows[i:i + per50]) / len(windows[i:i + per50]))
+                  for i in range(0, len(windows), per50)), default=0)
+    top = max(windows, default=0)
+    first = next((i for i, w in enumerate(windows) if w > top * 0.03), 0)  # about -30 dB under the loudest
+    reach = next((i for i, w in enumerate(windows) if w >= top * 0.9), first)
+    crossings = sum(1 for a, b in zip(samples, samples[1:]) if (a < 0) != (b < 0))
+    return {"seconds": round(frames / rate, 2), "channels": channels, "peak_db": db(peak), "rms_db": db(rms),
+            "loud50_db": db(loud50), "attack_ms": round((reach - first) * 5), "bright_hz": round(crossings * rate / (2 * n))}
+
+
+def sound_stats(ctx, args, waves):
+    """Export the waves once (cached by package file), analyse them, and print a table plus levels per pack."""
+    import hashlib
+    from .assets import package_file
+    folder = os.path.join(state_dir(ctx.project), "audio")
+    os.makedirs(folder, exist_ok=True)
+    wanted, files = {}, {}
+    for w in waves:
+        source = package_file(ctx.project, w["path"]) if w["path"].startswith("/Game/") else None
+        stamp = f"{w['path']}|{os.path.getmtime(source) if source and os.path.isfile(source) else 0}"
+        name = f"{w['path'].rsplit('/', 1)[-1]}-{hashlib.sha1(stamp.encode()).hexdigest()[:8]}.wav"
+        files[w["path"]] = os.path.join(folder, name)
+        if not os.path.isfile(files[w["path"]]):
+            wanted[w["path"]] = name
+    for start in range(0, len(wanted), 40):  # in batches: each export loads the wave
+        batch = dict(list(wanted.items())[start:start + 40])
+        ctx.tether("export_waves", waves=json.dumps(batch), folder=folder)
+    rows = []
+    for w in waves:
+        try:
+            stats = wave_stats(files[w["path"]])
+        except (OSError, EOFError, CliError) as exc:
+            stats = {"error": str(exc)[:80]}
+        rows.append(dict(w, **stats))
+    good = [r for r in rows if r.get("rms_db") is not None]
+    key = {"loud": lambda r: -(r.get("loud50_db") or -96), "quiet": lambda r: r.get("loud50_db") or -96,
+           "length": lambda r: -(r.get("seconds") or 0), "name": lambda r: r["path"]}[args.sort]
+    good.sort(key=key)
+    print("dBFS (0 = full scale); loudest 50 ms is what a listener notices; brightness from zero crossings")
+    print(f"  {'peak':>6} {'rms':>6} {'50ms':>6} {'attack':>7} {'bright':>7} {'len':>6}  ch  wave")
+    for r in (good if args.all else good[: args.top]):
+        print(f"  {r['peak_db']:>6} {r['rms_db']:>6} {r['loud50_db']:>6} {r['attack_ms']:>5}ms {r['bright_hz'] / 1000:>6.1f}k "
+              f"{r['seconds']:>5.1f}s  {r['channels']}   {r['path'].rsplit('/', 1)[-1]}")
+    if len(good) > args.top and not args.all:
+        print(f"  ... +{len(good) - args.top} more (--all)")
+    packs = {}
+    for r in good:
+        parts = r["path"].split("/")
+        packs.setdefault("/".join(parts[:3]), []).append(r["loud50_db"])
+    if len(packs) > 1:
+        print("by folder (median loudest 50 ms; level packs toward one another):")
+        for pack, values in sorted(packs.items(), key=lambda kv: -sorted(kv[1])[len(kv[1]) // 2]):
+            values = sorted(values)
+            print(f"  {values[len(values) // 2]:>6} dB  {pack}  ({len(values)} wave(s), {values[0]} to {values[-1]})")
+    failed = [r for r in rows if r.get("error")]
+    if failed:
+        print(f"{len(failed)} wave(s) not analysed: " + "; ".join(f"{r['path'].rsplit('/', 1)[-1]}: {r['error']}" for r in failed[:3]))
+    ctx.data = rows
+    return 0
+
+
+def audio_log(ctx, args):
+    """`ue audio --log N`: the sounds that started on audio components over N seconds of PIE, as the mixer
+    resolved them, and the problems that shows (stereo positioned in 3D, attached sounds with no attenuation)."""
+    if not (ctx.beacon or {}).get("pie"):
+        raise CliError("PIE is not running (ue pie start)")
+    ctx.tether("audio_log", action="start")
+    try:
+        if args.do:
+            pie_do(ctx, argparse.Namespace(script=[], file=args.do, reject=None, warmup=0, keep=True,
+                                           keep_going=False, quiet=False))
+        else:
+            time.sleep(args.log)
+    finally:
+        data = ctx.tether("audio_log", action="stop")
+    data = json.loads(data) if isinstance(data, str) else data
+    starts = data["starts"]
+    groups = {}
+    for s in starts:
+        key = (s.get("sound_path") or s.get("sound"), s.get("spatialized"), s.get("attenuation"), bool(s.get("attached")))
+        groups.setdefault(key, []).append(s)  # one row per way a sound was played
+    print(f"audio log, {data['seconds']} s: {len(starts)} sound start(s) on components, {len(groups)} sound/way-played pair(s)"
+          + (f" ({data['ended']})" if data.get("ended") else ""))
+    stereo_3d, unattenuated = [], []
+    for key, items in sorted(groups.items(), key=lambda kv: -len(kv[1])):
+        s = items[0]
+        chans = max((w.get("channels") or 1 for w in s.get("waves", [])), default=None)
+        mode = (f"3D, attenuation {s.get('attenuation')}" + (f" ({s['falloff_m']} m)" if s.get("falloff_m") else "")
+                if s.get("spatialized") else ("2D" + (f", attenuated by {s.get('attenuation')}" if s.get("attenuated") else "")))
+        owners = sorted({i.get("owner") or "?" for i in items if i.get("attached")}) or ["no actor (2D)"]
+        line = (f"  x{len(items):<3} {s.get('sound')} ({channels_text(chans)})  {mode}, class {s.get('sound_class') or 'none'}"
+                f", on {', '.join(owners[:3])}" + (f" +{len(owners) - 3}" if len(owners) > 3 else ""))
+        if s.get("spatialized") and chans and chans > 1:
+            stereo_3d.append(s.get("sound"))
+            line += "  ! stereo positioned in 3D" + (f" (stereo spread {s['stereo_spread']:g})" if s.get("stereo_spread") is not None else "")
+        if not s.get("attenuated") and s.get("attached"):
+            unattenuated.append(s.get("sound"))
+            line += "  ! attached to an actor but not attenuated (as loud everywhere)"
+        print(line)
+    if stereo_3d:
+        print(f"{len(stereo_3d)} stereo sound(s) played spatialized: make the waves mono, or set the attenuation's "
+              "StereoSpread / play them 2D")
+    if unattenuated:
+        print(f"{len(unattenuated)} attached sound(s) with no attenuation: intended (UI, music)? otherwise give them one")
+    print("fire-and-forget sounds (PlaySoundAtLocation, no component) are not in this log: ue audio lists them while they play")
+    ctx.data = data
     return 0
 
 

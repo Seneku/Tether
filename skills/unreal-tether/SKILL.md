@@ -77,7 +77,9 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
   the wrong unit (x100), a mesh lying on its side, an off pivot, missing lightmap UVs or collision, and faces
   pointing inward. `ue skel <SK_ or skeleton>` shows a character's bone tree, sockets, physics bodies and rigs:
   read it before naming a socket or bone in code. `ue sound <S_asset>` says whether a sound is stereo (no 3D
-  position), attenuated, in a sound class; `ue audio mix` shows the class tree and mixes.
+  position), attenuated, in a sound class; `ue audio mix` shows the class tree and mixes. When sounds are driven
+  from data or code, `ue sound <DA_Sounds|/Game/Audio>` lists every wave they use (stereo ones first) and
+  `--stats` adds loudness (peak, RMS, loudest 50 ms, per-folder medians) for levelling and picking sounds.
 - Data-driven content (enemy stats, weapon tuning): `ue data <ClassName|/Game/Folder>` compares every DataAsset
   or Blueprint subclass of a class side by side, only the properties that differ. To retune many at once:
   `--csv tuning.csv`, edit, `--import tuning.csv --dry-run`, then `--import tuning.csv --save`.
@@ -317,7 +319,9 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
 - Animation in PIE: `ue anim <actor|player>` (anim BP and its variables, montage, curves, movement mode and
   speed). Python cannot read state machine states; the variables the transitions use usually tell you.
 - Audio in PIE: `ue audio` lists what is playing (needs `ue open --headless --sound`, which stays silent);
-  `expect-sound <regex>` as a `ue pie do` step checks a sound fires.
+  `expect-sound <regex>` as a `ue pie do` step checks a sound fires. `ue audio --log 10` (or `--do steps.txt`)
+  records how each sound that started was actually played (3D or 2D, attenuation, class) and flags stereo sounds
+  played in 3D: trust it over asset settings when code builds attenuation at runtime.
 - Character animation logic: `ue anim graph /Game/.../ABP_Hero` (state machines, what each state plays,
   transition rules and blend times); `ue anim player` shows the live anim instance in PIE.
 - AI built on StateTree: `ue statetree /Game/AI/ST_Enemy` prints the whole tree as text (states, enter conditions,
