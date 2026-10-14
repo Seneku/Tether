@@ -1852,3 +1852,96 @@ class LodNames(unittest.TestCase):
         self.assertEqual(ue.lod_named_meshes(path), {"Robot": [0, 1, 2]})
         self.assertEqual(ue.lod_named_meshes(os.path.join(tmp.name, "t.png")), {})
         tmp.cleanup()
+
+
+class NoiseForms(unittest.TestCase):
+    def test_pattern_with_the_level_matches(self):
+        import re as _re
+        known = [_re.compile("^LogAutomationTest: Error: Condition failed")]
+        self.assertTrue(ue.noise_match(known, "LogAutomationTest", "Error", "Condition failed"))
+        self.assertFalse(ue.noise_match(known, "LogAutomationTest", "Warning", "Condition failed"))
+        self.assertTrue(ue.noise_match([_re.compile("^LogFoo: bar")], "LogFoo", "Error", "bar baz"))
+
+
+class WatchShapes(unittest.TestCase):
+    def test_position_rotation_and_other_vectors(self):
+        self.assertTrue(ue.is_position("player"))
+        self.assertTrue(ue.is_position("Door.RelativeLocation"))
+        self.assertFalse(ue.is_position("player.CharMoveComp.Velocity"))
+        self.assertTrue(ue.is_rotation("player.control"))
+        result = {"targets": ["player.GetVelocity()", "player.control"],
+                  "samples": [[0.0, 0.0, [0, 0, 0], [0, 10, 0]], [0.5, 0.5, [600, 0, 0], [0, 40, 0]],
+                              [1.0, 1.0, [300, 400, 0], [0, 40, 0]]]}
+        lines, summary = ue.watch_summary(result)
+        self.assertIn("max 600", lines[0])
+        self.assertNotIn("moved", lines[0])
+        self.assertEqual(summary["player.GetVelocity()"]["last_size"], 500.0)
+        self.assertIn("yaw range 30.0", lines[1])
+
+    def test_shot_args_cover_the_shot_parser(self):
+        parser = ue.build_parser()
+        sub = next(a for a in parser._actions if a.dest == "cmd").choices["shot"]
+        wanted = {a.dest for a in sub._actions if a.dest not in ("help", "project", "pid", "port", "timeout", "json",
+                                                                 "limit", "time")}
+        self.assertLessEqual(wanted, set(vars(ue.shot_args())))
+
+
+class LiveCodingErrors(unittest.TestCase):
+    def test_link_errors_and_hint(self):
+        lines = ['[2026.10.14-05.03.45:001]X.cpp.obj : error LNK2019: unresolved external symbol "__declspec(dllimport) '
+                 'public: static class IThing & __cdecl IThing::Get(void)" (__imp_?Get@IThing@@SAAEAV1@XZ) referenced in '
+                 'function "void __cdecl Foo(void)" (?Foo@@YAXXZ)',
+                 "Game.patch_0.exe : fatal error LNK1120: 1 unresolved externals", "Building patch...",
+                 "Y.cpp(12): error C2065: 'Z': undeclared identifier"]
+        errors, hints = ue.live_coding_errors(lines + lines[:1])
+        self.assertEqual(len(errors), 3)
+        self.assertIn("IThing::Get(void)", errors[0])
+        self.assertNotIn("__imp_", errors[0])
+        self.assertTrue(hints and "Build.cs" in hints[0])
+
+
+class CppCollisions(unittest.TestCase):
+    def test_file_scope_names(self):
+        src = ('#include "x.h"\nnamespace { const float CapsuleHalfHeight = 88.f; struct FLocal { int A; };\n'
+               'void Helper(int X) { if (X) {} } }\nstatic FString Settings = TEXT("a;b"); // ; {\n'
+               'namespace Game { int Shared = 1; }\nvoid APawn::Tick(float D) { static int Counter = 0; }\n')
+        self.assertEqual(ue.file_scope_names(src), ["CapsuleHalfHeight", "FLocal", "Helper", "Settings"])
+
+    def test_module_clashes(self):
+        project = Project()
+        project.write("Source/Game/Game.Build.cs", "")
+        project.write("Source/Game/A.cpp", "namespace { float Settings = 1; }\nstatic void OnlyHere() {}\n")
+        project.write("Source/Game/Sub/B.cpp", "static int Settings = 2;\n")
+        self.assertEqual(ue.cpp_collisions(project.uproject), {"Game": {"Settings": ["A.cpp", os.path.join("Sub", "B.cpp")]}})
+        project.close()
+
+
+class ContentRules(unittest.TestCase):
+    def test_missing_refs_and_empty_meshes(self):
+        rows = [["/Game/SM_A", "StaticMesh", {"_missing": ["/Game/M_Gone"], "_materials": 0}],
+                ["/Game/SM_B", "StaticMesh", {"_materials": 2}], ["/Game/T_C", "Texture2D", {}]]
+        found = {(r, p) for r, p, _ in ue.lint_rules(rows)}
+        self.assertIn(("missing-ref", "/Game/SM_A"), found)
+        self.assertIn(("mesh-no-material", "/Game/SM_A"), found)
+        self.assertNotIn(("mesh-no-material", "/Game/SM_B"), found)
+
+
+class UiWindows(unittest.TestCase):
+    SNAP = '''window "Game - Unreal Editor" [pos=0,0 size=1280,720] [ref=w1]
+  splitter [pos=7,105 size=795,576] [ref=sp3]
+    button "SETTINGS" [pos=300,400 size=200,40] [ref=b1]
+window "Message Log" [pos=200,300 size=400,200] [ref=w2]
+  text "Asset Check" [pos=210,310 size=580,280] [ref=x1]'''
+
+    def test_parse_two_keys_in_one_bracket(self):
+        nodes = ue.parse_snapshot(self.SNAP)
+        self.assertEqual((nodes[0]["pos"], nodes[0]["size"]), ("0,0", "1280,720"))
+
+    def test_windows_scaled_to_their_widgets_and_cover(self):
+        nodes = ue.parse_snapshot(self.SNAP)
+        wins = ue.windows(nodes)
+        self.assertEqual(wins[1][2], (200.0, 300.0, 600.0, 300.0))  # 150 %: the text reaches x 790
+        button = next(n for n in nodes if n["label"] == "SETTINGS")
+        self.assertEqual(ue.covering_window(nodes, button), "Message Log")
+        far = dict(button, pos="900,600")
+        self.assertIsNone(ue.covering_window(nodes + [far], far))

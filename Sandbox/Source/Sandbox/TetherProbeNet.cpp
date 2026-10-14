@@ -17,6 +17,7 @@ namespace
 void ATetherProbeNetController::TetherPing(int32 Nonce)
 {
 	UE_LOG(LogTemp, Display, TEXT("TetherProbe: ping %d sent from %s on the %s"), Nonce, *GetName(), NetModeName(GetWorld()));
+	++PingsSent;
 	ServerTetherPing(Nonce);
 }
 

@@ -65,9 +65,17 @@ def cmd_build(ctx, args):
     running = bool(beacon and editor_process(beacon.get("pid")))
     changes = classify_changes(ctx.project)
     has_csharp = csharp_layout(ctx.project) is not None
+    pending_file = os.path.join(state_dir(ctx.project), "pending-reopen.json")
     if not running:
-        code = ubt_build(ctx, args)
-        return code or (uat_user_solution(ctx, args.limit) if has_csharp else 0)
+        code = ubt_build(ctx, args) or (uat_user_solution(ctx, args.limit) if has_csharp else 0)
+        pending = read_json(pending_file)
+        if pending and args.restart and not code:  # the editor a failed `--restart` closed: reopen it now
+            os.remove(pending_file)
+            return reopen_editor(ctx, args, pending)
+        if pending and not code:
+            print("note: the editor is still closed from a `ue build --restart` whose build failed: "
+                  "ue build --restart (or ue open) reopens it")
+        return code
     if not args.restart:
         if changes and changes[1]:
             names = ", ".join(os.path.basename(p) for p in changes[1])
@@ -93,18 +101,32 @@ def cmd_build(ctx, args):
             print("nothing to build: no C++ or C# changes since the last green build")
         return 0
     launch = read_json(os.path.join(state_dir(ctx.project), "launch.json")) or {}
-    reopen_map = beacon.get("map") if beacon.get("map") and not beacon["map"].startswith("/Temp") else None
-    started = time.time()
+    reopen = {"map": beacon.get("map") if beacon.get("map") and not beacon["map"].startswith("/Temp") else None,
+              "started": time.time()}
+    if "nullrhi" in beacon:  # how this editor ran (a hand-opened one is windowed), from its beacon
+        reopen.update(headless=bool(beacon.get("headless")), render=not beacon.get("nullrhi"),
+                      sound=bool(beacon.get("sound")), unattended=launch.get("unattended"))
+    else:
+        reopen.update(headless=launch.get("headless", False), render=launch.get("render", False),
+                      sound=launch.get("sound", False), unattended=launch.get("unattended"))
     cmd_close(ctx, argparse.Namespace(save=args.save, discard=args.discard, force=False))
+    os.environ.pop("UE_EDITOR_PID", None)  # --pid named the editor to close; it is gone now
     code = ubt_build(ctx, args) or (uat_user_solution(ctx, args.limit) if has_csharp else 0)
     if code:
-        print("  editor left closed because the build failed")
+        write_json(pending_file, reopen)
+        print("  editor left closed because the build failed; fix the errors and run `ue build --restart` again "
+              "(it reopens the editor)")
         return code
-    code = cmd_open(ctx, argparse.Namespace(map=reopen_map, headless=launch.get("headless", False),
-                                            render=launch.get("render", False), sound=launch.get("sound", False),
-                                            unattended=launch.get("unattended"), no_build=True,
+    return reopen_editor(ctx, args, reopen)
+
+
+def reopen_editor(ctx, args, how):
+    """Open the editor again after a restart build, as it ran before (map, headless or windowed, rendering)."""
+    code = cmd_open(ctx, argparse.Namespace(map=how.get("map"), headless=how.get("headless", False),
+                                            render=how.get("render", False), sound=how.get("sound", False),
+                                            unattended=how.get("unattended"), no_build=True,
                                             limit=args.limit, wait=600, no_wait=False))
-    print(f"restart cycle: {time.time() - started:.1f}s total")
+    print(f"restart cycle: {time.time() - how.get('started', time.time()):.1f}s total")
     return code
 
 

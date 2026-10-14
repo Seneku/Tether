@@ -21,6 +21,14 @@ public:
 	/** Logs "TetherProbe: server got ping <n> from <controller>" with the world's net mode. */
 	UFUNCTION(Server, Reliable)
 	void ServerTetherPing(int32 Nonce);
+
+	/** Pings this controller sent: a plain UPROPERTY, invisible to Blueprints and Python (ue props reads it anyway). */
+	UPROPERTY()
+	int32 PingsSent = 0;
+
+	/** A struct the same way, for the fallback's struct text. */
+	UPROPERTY()
+	FVector LastPingSpot = FVector(1.f, 2.f, 3.f);
 };
 
 /** Game mode that uses ATetherProbeNetController; PIE runs it with ?game=/Script/Sandbox.TetherProbeNetGameMode. */

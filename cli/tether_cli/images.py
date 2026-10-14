@@ -200,6 +200,15 @@ def cmd_look(ctx, args):
     return 0
 
 
+def shot_args(**given):
+    """Arguments for calling cmd_shot from other commands: every option at its default, then `given`. A unit
+    test keeps these in step with the `shot` parser, so a new option cannot break the callers again."""
+    defaults = dict(actor=None, at=None, look_at=None, rot=None, annotate=False, grid_z=0, ui=False, hud=False,
+                    output=None, baseline=None, compare=None, tolerance=0.5, threshold=32)
+    import argparse
+    return argparse.Namespace(**dict(defaults, **given))
+
+
 def cmd_shot(ctx, args):
     """Capture the viewport (or the player's view during PIE) to a PNG and print its path."""
     launch = editor_mode(ctx.project, ctx.beacon)

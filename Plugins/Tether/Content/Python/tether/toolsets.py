@@ -56,6 +56,7 @@ sys._tether_undo = _UNDO
 # Persistent REPL namespace for `py`; stashed on sys so it survives hot reloads.
 _NAMESPACE = getattr(sys, "_tether_ns", None) or {"unreal": unreal, "__name__": "__tether_py__"}
 sys._tether_ns = _NAMESPACE
+_NAMESPACE["tether"] = sys.modules.get("tether")  # tether.world(), player(), console() without an import
 
 
 _PY_OUTPUT = "<<printed before the error>>"
@@ -769,6 +770,8 @@ def _watch_value(value):
     """A sampled value as JSON: numbers and booleans as is, vectors/rotators as lists, the rest as short text."""
     if isinstance(value, (bool, int, float)) or value is None:
         return value
+    if isinstance(value, list) and all(isinstance(v, (int, float)) for v in value):
+        return value
     if isinstance(value, unreal.Vector):
         return [round(value.x, 1), round(value.y, 1), round(value.z, 1)]
     if isinstance(value, unreal.Rotator):
@@ -784,8 +787,60 @@ def _watch_value(value):
     return _short(_compact(value) if isinstance(value, (dict, list, tuple)) else str(value), 80)
 
 
+def _dump_props(obj):
+    """[(class, name, value text)] for every UPROPERTY of an object, Blueprint-visible or not, as the engine
+    exports them (`obj dump`): Python and Epic's reflection only reach the visible ones."""
+    rows, owner = [], ""
+    for line in _console_output(None, [f"obj dump {obj.get_path_name()}"]):
+        head = re.match(r"^=== (\w+) properties ===", line)
+        if head:
+            owner = head.group(1)
+            continue
+        m = re.match(r"^  (\w+)=(.*)$", line)
+        if m and owner:
+            rows.append((owner, m.group(1), m.group(2)))
+    return rows
+
+
+def _text_value(text):
+    """A number from exported text when it is one ('3', '0.500000'), else the text."""
+    nums = _numbers(text) if text is not None else None
+    if nums and len(nums) == 1 and re.fullmatch(r"-?[\d.]+(?:[eE][-+]?\d+)?", text.strip()):
+        return nums[0]
+    return text
+
+
+def _hidden_reader(obj, name, every=0.5):
+    """Read a UPROPERTY Python cannot see through the engine's `getall Class Prop name=Obj` (one log line), at
+    most every `every` seconds: it goes through the log."""
+    cls, world, cache = obj.get_class().get_name(), obj.get_world(), {"t": 0.0, "v": None}
+    pattern = re.compile(r"\." + re.escape(name) + r" = (.*)$")
+
+    def read():
+        if time.time() - cache["t"] >= every:
+            cache["t"] = time.time()
+            for line in _console_output(world, [f"getall {cls} {name} name={obj.get_name()}"]):
+                m = pattern.search(line)
+                if m:
+                    cache["v"] = _text_value(m.group(1).strip())
+        return cache["v"]
+    return read
+
+
+def _snake(name):
+    """'GetControlRotation' -> 'get_control_rotation' (how Python names Unreal functions)."""
+    return re.sub(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])", "_", name).lower()
+
+
 def _watch_reader(spec, pawn, controller):
-    """A function reading one watched value: 'Actor' (its location), 'Actor.Prop', 'player.Comp.Prop'."""
+    """A function reading one watched value: 'Actor' (its location), 'Actor.Prop', 'player.Comp.Prop', or an
+    input action ('IA_Look': its value, worked out from the keys behind it)."""
+    if "." not in spec and spec.upper().startswith("IA_"):
+        action = _action_reader(spec, controller)
+        if action is None:
+            raise RuntimeError(f"no input action {spec} (ue input)")
+        size = {"boolean": 1, "axis1d": 1, "axis2d": 2}.get(action.value_type.lower(), 3)
+        return lambda: (lambda v: v[0][0] if size == 1 else v[0][:size])(action())
     target, _, prop = spec.rpartition(".")
     if not target:
         target, prop = spec, "location"
@@ -794,18 +849,34 @@ def _watch_reader(spec, pawn, controller):
     if key in ("location", "rotation"):
         actor = obj if isinstance(obj, unreal.Actor) else obj.get_owner()
         return lambda: actor.get_actor_location() if key == "location" else actor.get_actor_rotation()
+    if key in ("control", "controlrotation"):  # protected on AController: through its getter
+        ctrl = obj if isinstance(obj, unreal.Controller) else _try(lambda: obj.get_controller())
+        if ctrl is None:
+            raise RuntimeError(f"{_label(obj)} has no controller (watch player.control or a controller)")
+        return lambda: ctrl.get_control_rotation()
+    if prop.endswith("()"):  # a getter: player.GetVelocity(), Comp.GetCurrentHealth()
+        method = _try(lambda: getattr(obj, _snake(prop[:-2])))
+        if not callable(method):
+            raise RuntimeError(f"{_label(obj)} has no function {prop[:-2]} Python can call (ue api {obj.get_class().get_name()})")
+        return method
     library = getattr(unreal, "ToolsetLibrary", None)
     name = prop
     if library:
-        schema = _reflect(library.list_struct_properties(obj.get_class()), obj)
+        schema = _reflect(library.list_struct_properties(obj.get_class(), False), obj)  # every UPROPERTY, hidden too
         name = {n.lower(): n for n in schema}.get(key)
         if name is None:
-            raise RuntimeError(f"{_label(obj)} has no property '{prop}'")
+            getter = _try(lambda: getattr(obj, "get_" + _snake(prop)))
+            if callable(getter):  # e.g. a protected property with a public getter
+                return getter
+            raise RuntimeError(f"{_label(obj)} has no property '{prop}' (a getter works too: {prop}() calls get_...)")
     if _try(lambda: obj.get_editor_property(name), _WATCH) is not _WATCH:
         return lambda: obj.get_editor_property(name)
-    if library:  # a plain UPROPERTY() Python cannot see: Epic's reflection reads it
+    # Epic's reflection reads the visible ones (asking it for a hidden one logs a script error that fails the call).
+    visible = {n.lower() for n in _reflect(library.list_struct_properties(obj.get_class()), obj)} if library else set()
+    if library and name.lower() in visible:
         return lambda: _reflect(library.get_object_properties(obj, [name]), obj).get(name)
-    raise RuntimeError(f"{_label(obj)}.{prop} is not readable from Python")
+    # Not Blueprint-visible: neither Python nor Epic's reflection reads it, the engine's own export does.
+    return _hidden_reader(obj, name[:1].upper() + name[1:])
 
 
 def _watch_tick(_delta):
@@ -864,6 +935,78 @@ def _modifier_text(modifier):
         s = _try(lambda: modifier.get_editor_property("scalar"))
         return f"scalar:{s.x:g},{s.y:g},{s.z:g}" if s else "scalar"
     return kind
+
+
+def _apply_input_modifiers(value, modifiers):
+    """A key's raw (x, y, z) through Enhanced Input modifiers: negate, swizzle, scalar and dead zone are applied;
+    others (smoothing, response curves, FOV scaling) are listed by the caller but not modelled."""
+    x = list(value)
+    for mod in modifiers:
+        kind = mod.get_class().get_name().replace("InputModifier", "").lower()
+        get = lambda name, default=None: _try(lambda: mod.get_editor_property(name), default)  # noqa: E731
+        if kind == "negate":
+            x = [-v if get(a, True) else v for v, a in zip(x, "xyz")]
+        elif kind == "swizzleaxis":
+            order = str(get("order", "YXZ")).split(".")[-1].split(":")[0].upper()
+            x = [x["XYZ".index(c)] for c in order]
+        elif kind == "scalar":
+            sc = get("scalar")
+            x = [v * f for v, f in zip(x, (sc.x, sc.y, sc.z))] if sc else x
+        elif kind == "deadzone":
+            low, high = float(get("lower_threshold", 0.2)), float(get("upper_threshold", 1.0))
+            radial = "radial" in str(get("type", "")).lower()
+
+            def remap(v):
+                return 0.0 if abs(v) < low else (1 if v > 0 else -1) * min(1.0, (abs(v) - low) / max(1e-6, high - low))
+            if radial:
+                size = (x[0] ** 2 + x[1] ** 2 + x[2] ** 2) ** 0.5
+                x = [v / size * remap(size) for v in x] if size else x
+            else:
+                x = [remap(v) for v in x]
+    return x
+
+
+def _action_reader(name, controller):
+    """A function giving an input action's value as Enhanced Input combines it, worked out from the live state of
+    its mapped keys through each mapping's modifiers (Python cannot read action values themselves; triggers are
+    not modelled). Returns ([x, y, z], [(key, raw)]) per call."""
+    registry = unreal.AssetRegistryHelpers.get_asset_registry()
+    found = [d for d in registry.get_assets_by_class(unreal.TopLevelAssetPath("/Script/EnhancedInput", "InputAction"))
+             if str(d.asset_name).lower() == name.lower()]
+    if not found:
+        return None
+    action = found[0].get_asset()
+    action_mods = list(_try(lambda: action.get_editor_property("modifiers"), []) or [])
+    mappings = []
+    for data in registry.get_assets_by_class(unreal.TopLevelAssetPath("/Script/EnhancedInput", "InputMappingContext")):
+        imc = _try(lambda: data.get_asset())
+        for row in (_mapping_rows(imc) or []) if imc else []:
+            if _try(lambda: row.get_editor_property("action")) == action:
+                key = row.get_editor_property("key")
+                kind = "2d" if _try(lambda: unreal.InputLibrary.key_is_axis2d(key), False) else \
+                    "1d" if _try(lambda: unreal.InputLibrary.key_is_analog(key), False) else "button"
+                mappings.append((key, str(key.get_editor_property("key_name")), kind,
+                                 list(_try(lambda: row.get_editor_property("modifiers"), []) or [])))
+
+    def read():
+        combined, sources = [0.0, 0.0, 0.0], []
+        for key, key_name, kind, mods in mappings:
+            if kind == "2d":
+                v = _try(lambda: controller.get_input_vector_key_state(key))
+                raw = [v.x, v.y, v.z] if v else [0.0, 0.0, 0.0]
+            elif kind == "1d":
+                raw = [float(_try(lambda: controller.get_input_analog_key_state(key), 0.0)), 0.0, 0.0]
+            else:
+                raw = [1.0 if _try(lambda: controller.is_input_key_down(key), False) else 0.0, 0.0, 0.0]
+            if any(raw):
+                sources.append((key_name, [round(r, 3) for r in raw if r] or [0]))
+            out = _apply_input_modifiers(_apply_input_modifiers(raw, mods), action_mods)
+            combined = [c if abs(c) >= abs(o) else o for c, o in zip(combined, out)]  # highest absolute value
+        return [round(c, 4) for c in combined], sources
+    read.value_type = str(_try(lambda: action.get_editor_property("value_type"), "")).split(".")[-1].split(":")[0]
+    read.mappings = [(k, kind, [m.get_class().get_name().replace("InputModifier", "") for m in mods])
+                     for _, k, kind, mods in mappings]
+    return read
 
 
 def _rec_tick(_delta):
@@ -2022,9 +2165,9 @@ def _networked(world):
     return bool(world) and not _try(lambda: unreal.SystemLibrary.is_standalone(world), True)
 
 
-def _queue_command(world, command):
-    """Run a console command in a PIE world on its next tick, as that world's player typed it (see
-    _deferred_exec_class). Returns at once; the command's output reaches the log a frame later."""
+def _queue_command(world, command, delay=0.0):
+    """Run a console command in a PIE world on its next tick (or `delay` seconds of game time later), as that
+    world's player typed it (see _deferred_exec_class). Returns at once; its output reaches the log later."""
     controller = unreal.GameplayStatics.get_player_controller(world, 0)
     if controller is None:
         raise RuntimeError(f"{world.get_name()} has no player controller to run '{command}' for")
@@ -2033,7 +2176,75 @@ def _queue_command(world, command):
     runner.set_editor_property("Target", controller)
     pending = getattr(sys, "_tether_deferred", None) or []  # keep it alive until its timer has fired
     sys._tether_deferred = pending[-20:] + [runner]
-    unreal.SystemLibrary.set_timer_for_next_tick(runner, "Run")
+    if delay > 0:
+        unreal.SystemLibrary.set_timer(runner, "Run", delay, False)
+    else:
+        unreal.SystemLibrary.set_timer_for_next_tick(runner, "Run")
+
+
+def _mapped_keys():
+    """Every key some input mapping context in the project maps (cached per session)."""
+    keys = getattr(sys, "_tether_mapped_keys", None)
+    if keys is None:
+        keys = set()
+        registry = unreal.AssetRegistryHelpers.get_asset_registry()
+        for data in registry.get_assets_by_class(unreal.TopLevelAssetPath("/Script/EnhancedInput", "InputMappingContext")):
+            imc = _try(lambda: data.get_asset())
+            for row in (_mapping_rows(imc) or []) if imc else []:
+                key = _try(lambda: row.get_editor_property("key"))
+                name = _try(lambda: str(key.get_editor_property("key_name"))) if key else None
+                if name:
+                    keys.add(name)
+        sys._tether_mapped_keys = keys
+    return keys
+
+
+def _raw_input(world, verb, rest):
+    """`pie do` raw input: keys go in as if pressed (Enhanced Input's forced keys), so key mappings, triggers and
+    modifiers (dead zones, scalars, swizzles) apply, unlike `hold IA_x`, which injects the action's value.
+      key <Key> down [value] | up | tap      mouse <dx> <dy>      stick <Key> x,y [seconds]"""
+    def force(key, value=""):
+        unreal.SystemLibrary.execute_console_command(world, f"Input.+key {key} {value}".strip())
+
+    def release(key, delay=0.0):
+        _queue_command(world, f"Input.-key {key}", delay)
+    parts = rest.split()
+    if verb == "key":
+        if len(parts) < 2 or parts[1].lower() not in ("down", "up", "tap"):
+            raise RuntimeError("key <Key> down [value] | up | tap   (Key as Unreal names it: SpaceBar, LeftShift, E)")
+        key, action = parts[0], parts[1].lower()
+        if action == "up":
+            unreal.SystemLibrary.execute_console_command(world, f"Input.-key {key}")
+        else:
+            force(key, " ".join(parts[2:]))
+            if action == "tap":
+                release(key)  # pressed for one frame
+        return f"{key} {action}"
+    if verb == "mouse":
+        nums = _numbers(",".join(parts))
+        if not nums or len(nums) != 2:
+            raise RuntimeError("mouse <dx> <dy>: mouse movement in counts, for one frame")
+        dx, dy = nums
+        if "Mouse2D" in _mapped_keys() or not ({"MouseX", "MouseY"} & _mapped_keys()):
+            force("Mouse2D", f"X={dx:g} Y={dy:g}")
+            release("Mouse2D")
+            return f"Mouse2D ({dx:g}, {dy:g}) for one frame"
+        for key, value in (("MouseX", dx), ("MouseY", dy)):
+            if value:
+                force(key, f"{value:g}")
+                release(key)
+        return f"MouseX {dx:g}, MouseY {dy:g} for one frame"
+    if verb == "stick":
+        if len(parts) < 2:
+            raise RuntimeError("stick <Key> x,y [seconds]   e.g. stick Gamepad_Right2D 0.25,0 1")
+        key, nums = parts[0], _numbers(parts[1]) or []
+        value = f"X={nums[0]:g} Y={nums[1]:g}" if len(nums) == 2 else f"{nums[0]:g}" if nums else ""
+        force(key, value)
+        seconds = float(parts[2]) if len(parts) > 2 else 0.0
+        if seconds:
+            release(key, seconds)
+        return f"{key} at {parts[1]}" + (f" for {seconds:g}s" if seconds else " until `key {key} up`")
+    raise RuntimeError(verb)
 
 
 _Base = getattr(unreal, "ToolsetDefinition", object)
@@ -2123,8 +2334,19 @@ class TetherCore(_Base):
             rx = re.compile(match, re.I)
             names = [n for n in names if rx.search(n) or rx.search(_type_name(schema[n]))]
         values = _reflect(unreal.ToolsetLibrary.get_object_properties(obj, names), obj) if names else {}
-        head = f"{_label(obj)} ({cls.get_name()}, {len(schema)} props" + (f", {len(names)} match" if match else "") + ")"
         rows = [f"{n}: {_type_name(schema[n])} = {_short(_round(values.get(n)))}" for n in names]
+        hidden = []
+        if not isinstance(obj, unreal.Struct):  # UPROPERTYs that are not Blueprint-visible: the engine's export
+            seen = {n.lower() for n in schema}
+            rx = re.compile(match, re.I) if match else None
+            hidden = [(owner, name, value) for owner, name, value in _try(lambda: _dump_props(obj), []) or []
+                      if name.lower() not in seen and (not rx or rx.search(name))]
+            if hidden:
+                rows.append(f"not Blueprint-visible ({len(hidden)}, read through the engine's export; "
+                            "pie watch reads them too):")
+                rows += [f"  {name} = {_short(value)}  ({owner})" for owner, name, value in hidden]
+        head = (f"{_label(obj)} ({cls.get_name()}, {len(schema)} props" + (f" + {len(hidden)} hidden" if hidden else "")
+                + (f", {len(names) + len(hidden)} match" if match else "") + ")")
         return _capped(head, rows, limit)
 
     @_tool
@@ -5099,6 +5321,8 @@ class TetherCore(_Base):
             found = _match_actors(rest, pie=True)
             ok = bool(found) == (verb == "exists")
             detail = f"{len(found)} match(es)"
+        elif verb in ("key", "mouse", "stick"):
+            detail = _raw_input(game, verb, rest)
         elif verb == "exec":
             if _networked(game):  # RPCs would run locally from Python (see _deferred_exec_class)
                 _queue_command(game, rest)
@@ -5107,8 +5331,8 @@ class TetherCore(_Base):
                 unreal.SystemLibrary.execute_console_command(game, rest)
                 detail = "ran"
         else:
-            raise RuntimeError(f"unknown step '{verb}' (at, look, move, near, tap, hold, release, call, expect, "
-                               "exists, gone, exec; the CLI adds wait, until, press, log, shot)")
+            raise RuntimeError(f"unknown step '{verb}' (at, look, move, near, tap, hold, release, key, mouse, stick, call, "
+                               "expect, exists, gone, exec; the CLI adds wait, until, press, log, shot)")
         return json.dumps({"ok": ok, "detail": detail})
 
     @_tool
@@ -5921,14 +6145,29 @@ class TetherCore(_Base):
         wanted = {"Texture2D": texture, "TextureCube": texture, "Texture2DArray": texture, "VolumeTexture": texture,
                   "StaticMesh": ("Triangles", "LODs", "CollisionPrims", "CollisionComplexity", "NaniteEnabled",
                                  "DefaultCollision")}
-        rows, seen = [], set()
+        rows, seen, classes = [], set(), {}
+        options = _dependency_options()
+
+        def class_of(package):  # the asset class in a package, or None when no such package exists
+            if package not in classes:
+                found = registry.get_assets_by_package_name(package) or []
+                classes[package] = str(found[0].asset_class_path.asset_name) if found else None
+            return classes[package]
         for data in registry.get_assets_by_path(path.rstrip("/") or "/Game", recursive=True):
             package, cls = str(data.package_name), str(data.asset_class_path.asset_name)
             if package in seen or "/__External" in package:
                 continue
             seen.add(package)
             tags = {t: data.get_tag_value(t) for t in wanted.get(cls, ())}
-            rows.append([package, cls, {k: v for k, v in tags.items() if v is not None}])
+            tags = {k: v for k, v in tags.items() if v is not None}
+            deps = [str(d) for d in registry.get_dependencies(package, options) or []]
+            deps = [d for d in deps if d.startswith("/") and not d.startswith(("/Script/", "/Temp/", "/Memory/"))]
+            missing = [d for d in deps if class_of(d) is None]
+            if missing:  # e.g. a material slot pointing at a deleted asset: it loads as None
+                tags["_missing"] = missing[:10]
+            if cls in ("StaticMesh", "SkeletalMesh"):
+                tags["_materials"] = sum(1 for d in deps if "Material" in (class_of(d) or ""))
+            rows.append([package, cls, tags])
         return json.dumps(rows)
 
     @_tool

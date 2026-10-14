@@ -397,6 +397,13 @@ def load_log_ignore(project):
             print(f"warning: log-ignore.json: bad regex {pattern!r}: {exc}", file=sys.stderr)
 
 
+def noise_match(patterns, category, level, message):
+    """Whether a known-noise pattern matches the line, written either as 'Category: message' or with its level,
+    'Category: Error: message', as the log shows it."""
+    forms = (f"{category}: {message}", f"{category}: {level}: {message}")
+    return any(rx.search(form) for rx in patterns for form in forms)
+
+
 class LogLines(list):
     """filter_log's result; `hidden` counts the entries the project's known-noise list left out."""
     hidden = 0
@@ -436,7 +443,7 @@ def filter_log(lines, level="Warning", category=None, pattern=None, ignore=True)
             continue
         if rx and not rx.search(line):
             continue
-        if known and any(k.search(f"{cat}: {msg}") for k in known):
+        if known and noise_match(known, cat, lvl, msg):
             hidden += 1
             continue
         key = (lvl[0], cat, msg.strip())
@@ -477,7 +484,7 @@ def summarize_log(lines, level="Warning", ignore=True):
         cat, lvl, msg = m.group(1), m.group(2) or "Log", m.group(3).strip()
         if LEVELS[lvl] > max_level or cat in NOISE or (cat == "LogJson" and NOISE_MESSAGE.match(msg)):
             continue
-        if known and any(k.search(f"{cat}: {msg}") for k in known):
+        if known and noise_match(known, cat, lvl, msg):
             hidden += 1
             continue
         key = (lvl, cat, log_shape(msg))

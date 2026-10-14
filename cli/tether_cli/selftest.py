@@ -10,12 +10,7 @@ from .core import (
 from .transport import catalog
 from .images import png_write
 from .assets import package_file
-from .setup import tether_plugins_dir
-
-
-def tether_version():
-    plugin = read_json(os.path.join(tether_plugins_dir(), "Tether", "Tether.uplugin")) or {}
-    return plugin.get("VersionName", "?")
+from .setup import tether_plugins_dir, tether_version
 
 
 FIRST_ASSET = """
@@ -122,6 +117,11 @@ def cmd_selftest(ctx, args):
     check("log", ["log", "--level", "Error"])
     check("log --summary", ["log", "--summary"], ok=lambda c, o: c == 0 and "group(s)" in o)
     check("help", ["help", "log"], ok=lambda c, o: c == 0 and "--since" in o)
+    check("log --tail", ["log", "--tail", "3"], ok=lambda c, o: c == 0 and "this session" in o)
+    check("lint --cpp", ["lint", "--cpp"], ok=lambda c, o: c == 0 and "file-private name(s)" in o)
+    has_net = (ue("py", "hasattr(unreal, 'TetherProbeNetController')")[1].splitlines() or [""])[-1] == "True"
+    check("props (not Blueprint-visible)", ["props", "/Script/Sandbox.Default__TetherProbeNetController", "PingsSent"],
+          skip=None if has_net else "no Sandbox net fixture", ok=lambda c, o: c == 0 and "PingsSent = 0" in o)
     check("net (class)", ["net", "Character"], ok=lambda c, o: c == 0 and "Character : Pawn" in o and "replicates" in o)
     check("cvar", ["cvar", "r.Shadow.MaxResolution"], ok=lambda c, o: c == 0 and "r.Shadow.MaxResolution = " in o)
     check("cvar --for", ["cvar", "r.Shadow.MaxResolution=777", "--for", "cvar r.Shadow.MaxResolution"],
@@ -304,6 +304,22 @@ def cmd_selftest(ctx, args):
     check("pie record", ["pie", "record", "--seconds", "1", "-o", os.path.join(tempfile.gettempdir(), "tether-selftest-rec.txt")],
           ok=lambda c, o: (c == 0 and "recorded" in o) or "no keys to record" in o)
     check("tree (player)", ["tree", "player"], ok=lambda c, o: c == 0 and "component(s)" in o)
+    check("pie status (frame rate)", ["pie", "status"], ok=lambda c, o: c == 0 and "fps" in o)
+    check("pie do wait (game time)", ["pie", "do", "wait 0.5 game"], ok=lambda c, o: c == 0 and "of game time" in o)
+    check("py (engine's own message)", ["py", "print(unreal.EditorAssetLibrary.load_asset('/Engine/BasicShapes/Cube'))"],
+          ok=lambda c, o: c == 0 and "engine:" in o and "play mode" in o)
+    imc = "/Game/TetherFixtures/Input/IMC_TetherProbe"
+    # unreal.load_asset: EditorAssetLibrary refuses to run while PIE is up
+    has_imc = (ue("py", f"unreal.load_asset('{imc}') is not None")[1].splitlines() or [""])[-1] == "True"
+    if has_imc:
+        ue("py", f"from tether import toolsets as t\nt._input_subsystem(tether.world()).add_mapping_context("
+                 f"unreal.load_asset('{imc}'), 0, unreal.ModifyContextOptions())")
+    check("pie do raw keys -> action value", ["pie", "do", "key W down", "wait 0.5", "key W up", "wait 0.3",
+                                               "--watch", "IA_TetherMove"],
+          skip=None if has_imc else "no input fixture (Sandbox's IMC_TetherProbe)",
+          ok=lambda c, o: c == 0 and "(0, 1)" in o)
+    check("ui at", ["ui", "at", "5,5"], skip=None if "SlateInspectorToolset.SlateInspectorToolset" in toolsets
+          else "no Epic Slate inspector", ok=lambda c, o: c == 0 and "window" in o)
     check("log --since pie", ["log", "--since", "pie", "--level", "Display"],
           ok=lambda c, o: c == 0 and "since the last PIE start" in o)
     check("gpu", ["gpu", "--frames", "1"], timeout=300, skip="needs 5.8" if remote else None if rendering else

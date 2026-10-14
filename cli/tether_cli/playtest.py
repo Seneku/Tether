@@ -8,13 +8,14 @@ import math
 import os
 import re
 import shutil
+import sys
 import time
 
 from .core import CliError, editor_mode, log_end, log_path, read_json, state_dir
 from .calls import flush_editor_log, scoped_cvars
 from .assets import cmd_bp, cmd_size, code_usages, folder_packages, package_bytes
 from .content import cmd_tex
-from .images import cmd_shot
+from .images import cmd_shot, shot_args
 from .play import cmd_mem, cmd_perf, cmd_pie, insights_exe, insights_export, pie_do, unthrottled
 
 
@@ -58,7 +59,40 @@ def _short(package):
     return package.rsplit("/", 1)[-1]
 
 
+def input_live(ctx, args):
+    """`ue input --live <Action>`: the action's value over time while PIE runs (the user playing, or a step file),
+    worked out from the keys behind it through their mappings' modifiers."""
+    action = args.live
+    was_running = ctx.tether("pie", action="status") == "running"
+    if not was_running:
+        raise CliError("start PIE first (ue pie start), then play while this watches")
+    seconds = args.seconds or 10
+    with unthrottled(ctx):
+        print(ctx.tether("pie_watch", action="start", targets=json.dumps([action]), every=0.05))
+        print(f"watching {action} for {seconds:g}s: play now")
+        sys.stdout.flush()
+        time.sleep(seconds)
+        result = ctx.tether("pie_watch", action="stop")
+    result = json.loads(result) if isinstance(result, str) else result
+    changes, last = [], object()
+    for row in result["samples"]:
+        if row[2] != last:
+            changes.append((row[0], row[2]))
+            last = row[2]
+    for t, value in changes[: args.limit]:
+        print(f"  {t:6.2f}s  {_fmt(value)}")
+    if len(changes) > args.limit:
+        print(f"  ... +{len(changes) - args.limit} more changes (--limit N)")
+    print(f"{len(changes) - 1} change(s) in {len(result['samples'])} samples. The value is worked out from the mapped "
+          "keys through negate, swizzle, scalar and dead zone modifiers (triggers and other modifiers not modelled; "
+          "see ue input " + action + ")")
+    ctx.data = {"changes": changes}
+    return 0
+
+
 def cmd_input(ctx, args):
+    if getattr(args, "live", None):
+        return input_live(ctx, args)
     data = ctx.tether("input_map")
     if not data["actions"] and not data["contexts"]:
         print("no Enhanced Input actions or mapping contexts in this project")
@@ -90,6 +124,16 @@ def _fmt(value):
     return str(value)
 
 
+def is_position(spec):
+    """A watched value that is a place: an actor alone (its location) or a property named like one."""
+    prop = spec.rpartition(".")[2] if "." in spec else "location"
+    return bool(re.search(r"location|position|(^|_)pos$|^loc$", prop, re.I))
+
+
+def is_rotation(spec):
+    return bool(re.search(r"rotation|^control$|rotator|orientation", spec.rpartition(".")[2], re.I))
+
+
 def watch_summary(result, max_changes=10):
     """One line per watched value: numbers' range, positions' travel, and every change of anything else."""
     lines, summary = [], {}
@@ -116,6 +160,18 @@ def watch_summary(result, max_changes=10):
                     f"{at(high):.1f}s, {changes} change{'' if changes == 1 else 's'})" if low != high
                     else f"{_fmt(first)} throughout")
             summary[spec] = {"first": first, "last": last, "min": low, "max": high, "changes": changes}
+        elif all(isinstance(v, list) and len(v) == 3 for v in values) and not is_position(spec):
+            sizes = [sum(x * x for x in v) ** 0.5 for v in values]
+            kind = "rotation" if is_rotation(spec) else "size"
+            if kind == "rotation":  # pitch, yaw, roll: how far each turned
+                spans = [max(v[k] for v in values) - min(v[k] for v in values) for k in range(3)]
+                text = (f"{_fmt(first)} -> {_fmt(last)}" + (f"  (yaw range {spans[1]:.1f}, pitch range {spans[0]:.1f})"
+                                                            if any(spans) else "  throughout"))
+            else:  # a velocity, an acceleration, a direction: its length
+                peak = max(range(len(sizes)), key=sizes.__getitem__)
+                text = (f"{_fmt(first)} -> {_fmt(last)}  (size {sizes[0]:.0f} -> {sizes[-1]:.0f}, max {sizes[peak]:.0f} "
+                        f"at {seen[peak][0]:.1f}s)" if len(set(map(tuple, values))) > 1 else f"{_fmt(first)} throughout")
+            summary[spec] = {"first": first, "last": last, "max_size": round(max(sizes), 1), "last_size": round(sizes[-1], 1)}
         elif all(isinstance(v, list) and len(v) == 3 for v in values):
             travelled, top = 0.0, 0.0
             for (t0, a), (t1, b) in zip(seen, seen[1:]):
@@ -738,9 +794,7 @@ def perf_scalability(ctx, args):
                     raise CliError(f"the capture at {level} failed")
                 if args.shots:
                     shot = os.path.join(state_dir(ctx.project), "shots", f"scalability-{level.strip().lower()}.png")
-                    _quietly(cmd_shot, ctx, argparse.Namespace(
-                        actor=None, at=None, look_at=None, rot=None, annotate=False, grid_z=0, ui=False, output=shot,
-                        baseline=None, compare=None, tolerance=0.5, threshold=32))
+                    _quietly(cmd_shot, ctx, shot_args(output=shot))
                     data["shot"] = shot
             results.append((level.strip().lower(), data))
             print(f"{level.strip().lower()}: frame {data['FrameTime']['avg']:.1f} ms", flush=True)
@@ -758,15 +812,28 @@ def pie_command(ctx, args):
     """`ue pie`: watch and record live here; everything else is play.cmd_pie."""
     if args.action == "watch":
         return pie_watch(ctx, args)
-    if args.action == "do" and args.file and (args.watch or watch_header(args.file)):
-        # A step file that watches values is a regression test: compare with its baseline, or record it first.
-        name = args.compare or args.baseline or os.path.splitext(os.path.basename(args.file))[0]
-        recorded = os.path.isfile(baseline_path(ctx.project, name))
+    if args.action == "do" and (args.watch or (args.file and watch_header(args.file))):
         watch_args = argparse.Namespace(**vars(args))
         watch_args.script = args.watch or watch_header(args.file)
         watch_args.seconds = None
-        watch_args.baseline = None if recorded and not args.baseline else name
-        watch_args.compare = name if recorded and not args.baseline else None
+        if not args.file:  # inline steps: play them from a file like any step file
+            folder = os.path.join(state_dir(ctx.project), "watch")
+            os.makedirs(folder, exist_ok=True)
+            watch_args.file = os.path.join(folder, "inline-steps.txt")
+            with open(watch_args.file, "w", encoding="utf-8") as f:
+                f.write("\n".join(args.script) + "\n")
+        # A step file under tests/play that watches values is a regression test: compare with its baseline, or
+        # record one. Anywhere else, only --baseline records and --compare compares.
+        plays = os.path.join(os.path.dirname(ctx.project), "tests", "play")
+        in_tests = bool(args.file) and os.path.normcase(os.path.abspath(args.file)).startswith(os.path.normcase(plays))
+        if args.baseline or args.compare:
+            watch_args.baseline, watch_args.compare = args.baseline, args.compare
+        elif in_tests:
+            name = os.path.splitext(os.path.basename(args.file))[0]
+            recorded = os.path.isfile(baseline_path(ctx.project, name))
+            watch_args.baseline, watch_args.compare = (None, name) if recorded else (name, None)
+        else:
+            watch_args.baseline = watch_args.compare = None
         return pie_watch(ctx, watch_args)
     if args.action == "record":
         return pie_record(ctx, args)

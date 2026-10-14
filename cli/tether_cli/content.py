@@ -312,6 +312,12 @@ def lint_rules(rows, config=None):
                                                      f"{tags.get('CompressionSettings') or 'TC_Default'})")
             if tags.get("NeverStream") == "True" and max(w, h) >= 1024 and tags.get("VirtualTextureStreaming") != "True":
                 add("texture-never-stream", package, f"{w}x{h} never streams: all its mips stay in memory")
+        if tags.get("_missing"):
+            add("missing-ref", package, f"references {len(tags['_missing'])} package(s) that do not exist: "
+                                        + ", ".join(tags["_missing"][:3]) + " (they load as None)")
+        if cls in ("StaticMesh", "SkeletalMesh") and tags.get("_materials") == 0:
+            add("mesh-no-material", package, "depends on no material: its slots are empty (renders with the default "
+                                             "material) or point at assets that are gone")
         if cls == "StaticMesh" and tags.get("Triangles"):
             tris = int(tags["Triangles"])
             if tags.get("CollisionPrims") == "0" and tags.get("CollisionComplexity") != "CTF_UseComplexAsSimple" \
@@ -343,6 +349,91 @@ def lint_plan(found, rules=None):
         elif rule in LINT_FIXES:
             plan.append({"rule": rule, "package": package, "fix": LINT_FIXES[rule]})
     return plan
+
+
+CPP_NOISE = re.compile(r'//[^\n]*|/\*.*?\*/|"(?:\\.|[^"\\\n])*"|\'(?:\\.|[^\'\\\n])*\'', re.S)
+CPP_TYPE_DECL = re.compile(r"^(?:template\s*<[^>]*>\s*)?(?:struct|class|enum(?:\s+class)?|union)\s+(?:\w+_API\s+)?(\w+)")
+CPP_NAME = re.compile(r"\b(\w+)\s*(?:\(|=|\[|$|\{)")
+
+
+def file_scope_names(source):
+    """Names a .cpp declares that are private to it: in an anonymous namespace, `static` at file scope, or types
+    defined at file scope. A unity build (or Live Coding regrouping files) compiles several .cpp files as one, and
+    then two of these with the same name collide."""
+    text = CPP_NOISE.sub(lambda m: " " if m.group(0).startswith(("/", '"', "'")) else m.group(0), source)
+    text = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
+    names, depth, anon, stmt = [], 0, [], ""
+    for ch in text:
+        if ch in "{;":
+            head = re.sub(r"\s+", " ", stmt).strip()
+            stmt = ""
+            private = bool(anon and depth == anon[-1])
+            if ch == "{" and re.fullmatch(r"(?:inline\s+)?namespace", head):
+                anon.append(depth + 1)
+            elif ch == "{" and head.startswith("namespace"):
+                pass  # a named namespace: its contents are not file-private
+            elif head and (private or depth == 0) and not head.startswith(("using ", "extern ", "friend ")):
+                decl = CPP_TYPE_DECL.match(head)
+                if decl and ch == "{":
+                    names.append(decl.group(1))
+                elif (private or head.startswith(("static ", "static\t"))) and not decl:
+                    body = re.split(r"[=(\[{]", head, 1)
+                    m = re.search(r"(\w+)\s*$", body[0])
+                    if m and m.group(1) not in ("operator", "const", "constexpr", "static", "auto"):
+                        names.append(m.group(1))
+            if ch == "{":
+                depth += 1
+        elif ch == "}":
+            if anon and depth == anon[-1]:
+                anon.pop()
+            depth = max(0, depth - 1)
+            stmt = ""
+        elif depth == 0 or (anon and depth == anon[-1]):
+            stmt += ch
+    return names
+
+
+def cpp_collisions(project):
+    """{module: {name: [files]}} for file-private names declared in more than one .cpp of the same module."""
+    found = {}
+    for root in project_code_roots(project):
+        if os.path.basename(root) != "Source":
+            continue
+        for dirpath, dirs, files in os.walk(root):
+            dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+            build = [f for f in files if f.endswith(".Build.cs")]
+            if not build:
+                continue
+            module = build[0][: -len(".Build.cs")]
+            seen = {}
+            for here, subdirs, names in os.walk(dirpath):
+                subdirs[:] = [d for d in subdirs if d not in SKIP_DIRS]
+                for f in names:
+                    if f.endswith(".cpp"):
+                        path = os.path.join(here, f)
+                        with open(path, encoding="utf-8", errors="replace") as fh:
+                            for name in set(file_scope_names(fh.read())):
+                                seen.setdefault(name, []).append(os.path.relpath(path, dirpath))
+            clashes = {n: sorted(p) for n, p in seen.items() if len(p) > 1}
+            if clashes:
+                found[module] = clashes
+            dirs[:] = []  # a module's own subfolders were walked above
+    return found
+
+
+def lint_cpp(ctx, args):
+    """`ue lint --cpp`: unity-build collisions waiting to happen, from the sources alone."""
+    found = cpp_collisions(ctx.project)
+    total = sum(len(v) for v in found.values())
+    print(f"{total} file-private name(s) declared in more than one .cpp of a module" + (
+        ": a unity build (or Live Coding regrouping changed files) compiles them as one file and they collide; "
+        "rename one, or move it into a named namespace" if total else ""))
+    for module, clashes in found.items():
+        print(f"{module}:")
+        for name, files in sorted(clashes.items())[: args.limit]:
+            print(f"  {name}: {', '.join(files[:4])}" + (f" +{len(files) - 4} more" if len(files) > 4 else ""))
+    ctx.data = found
+    return 1 if total and args.strict else 0
 
 
 def lint_config(ctx):
@@ -462,6 +553,8 @@ def cmd_tex(ctx, args):
 
 def cmd_lint(ctx, args):
     """Content rules beyond Epic's validators, from asset registry tags (nothing is loaded)."""
+    if getattr(args, "cpp", False):
+        return lint_cpp(ctx, args)
     config_path, config = lint_config(ctx)
     if args.ignore:
         config["ignore"] = config.get("ignore", []) + args.ignore

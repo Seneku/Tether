@@ -237,12 +237,45 @@ def ubt_build(ctx, args):
     return 0 if ok else 1
 
 
+LC_ERROR = re.compile(r"(?:error|fatal error) (?:LNK|C)\d+\s*:")
+
+
+def live_coding_console_log(project):
+    """The Live Coding console's own log: compile and link errors of a patch land there, not in the editor log."""
+    try:
+        root = engine_root(project)
+    except CliError:
+        return None
+    return os.path.join(root, "Engine", "Programs", "LiveCodingConsole", "Saved", "Logs", "LiveCodingConsole.log")
+
+
+def live_coding_errors(lines):
+    """The compile/link errors in Live Coding console log lines, de-duplicated, mangled names dropped; plus a hint
+    for unresolved externals (usually a module missing from the Build.cs dependencies)."""
+    errors = []
+    for line in lines:
+        text = re.sub(r"^\[[^\]]*\]\[[^\]]*\]", "", line).strip()
+        if not LC_ERROR.search(text):
+            continue
+        text = re.sub(r"\s*\((?:__imp_)?\?[^)]*\)", "", text)  # (?Get@IPlatformInputDeviceMapper@@...) mangled names
+        text = re.sub(r"\b__declspec\(dllimport\)\s*", "", text)
+        if text not in errors:
+            errors.append(text)
+    hints = []
+    if any("LNK2019" in e or "LNK2001" in e for e in errors):
+        hints.append("unresolved external: the module that defines it is probably missing from your Build.cs "
+                     "dependencies (the type's header tells which module; add it, then ue build --restart)")
+    return errors, hints
+
+
 UNITY_COMPILE = re.compile(r"\] Compile \[\w+\] (Module\.[\w.]+\.cpp)")
 
 
 def live_coding_build(ctx, args, changes):
     log, ubt_log = log_path(ctx.project), ubt_log_path()
     start, ubt_mtime = log_end(ctx.project), os.path.getmtime(ubt_log) if os.path.exists(ubt_log) else 0
+    lc_log = live_coding_console_log(ctx.project)
+    lc_start = os.path.getsize(lc_log) if lc_log and os.path.isfile(lc_log) else 0
     started = time.time()
     ctx.tether("console", command="LiveCoding.Compile")
     result = None
@@ -262,9 +295,20 @@ def live_coding_build(ctx, args, changes):
             ubt_lines = f.read().splitlines()
         errors, warnings, _ = compact_diagnostics(ubt_lines, os.path.dirname(ctx.project))
         unity = sorted(set(UNITY_COMPILE.findall("\n".join(ubt_lines))))
+    link_errors, hints = [], []
+    if not ok and not errors and lc_log and os.path.isfile(lc_log):  # a patch that failed to link: only its console knows
+        with open(lc_log, "rb") as f:
+            f.seek(lc_start if os.path.getsize(lc_log) >= lc_start else 0)
+            link_errors, hints = live_coding_errors(f.read().decode("utf-8", "replace").splitlines())
     print(f"live coding: {'OK' if ok else 'FAILED'} in {time.time() - started:.1f}s"
-          + ("" if ok else f" ({len(errors)} errors)"))
+          + ("" if ok else f" ({len(errors) + len(link_errors)} errors)"))
     print_diagnostics(errors, warnings, args.limit)
+    for line in link_errors[: args.limit]:
+        print(f"  {line}")
+    for hint in hints:
+        print(f"  hint: {hint}")
+    if not ok and not errors and not link_errors:
+        print(f"  (no compiler or linker errors found; the Live Coding console log is {lc_log})")
     if unity and time.time() - started > 15:
         print(f"  note: Live Coding recompiled whole-module unity file(s) ({', '.join(unity)}). Setting "
               "`bUseUnity = false;` in those modules' Build.cs makes it compile only the changed files "

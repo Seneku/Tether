@@ -109,6 +109,17 @@ def _headless():
     return bool(re.search(r"(^|\s)-(nullrhi|RenderOffscreen)\b", _command_line(), re.I))
 
 
+def _plugin_version():
+    if "version" not in _state:
+        try:
+            here = os.path.dirname(os.path.abspath(__file__))  # Plugins/Tether/Content/Python/tether
+            with open(os.path.join(here, "..", "..", "..", "Tether.uplugin"), encoding="utf-8") as f:
+                _state["version"] = json.load(f).get("VersionName")
+        except (OSError, ValueError):
+            _state["version"] = None
+    return _state["version"]
+
+
 def _snapshot():
     editor = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem)
     # get_editor_world() logs "The Editor is currently in a play mode" during PIE, so check PIE first.
@@ -151,6 +162,7 @@ def _snapshot():
         "nullrhi": _state["nullrhi"],  # no rendering at all: no ue shot
         "sound": _state["sound"],
         "launched_by_tether": _state["launched"],  # `ue open` marks its editors; the rest are the user's
+        "tether": _plugin_version(),  # the plugin version this editor loaded (ue doctor compares it with the CLI)
         "started": _state["started"],
         "log": _state.get("log"),
         "heartbeat": time.time(),

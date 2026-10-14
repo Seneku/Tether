@@ -287,6 +287,7 @@ def build_parser():
     s.add_argument("--since", choices=["last", "start", "pie"], default="last",
                    help="last: new since the previous ue log (default); start: this editor session; pie: the last PIE")
     s.add_argument("--summary", action="store_true", help="the whole session's warnings/errors grouped by message shape")
+    s.add_argument("--tail", type=int, metavar="N", help="the session's last N entries (--since start --limit N)")
     s.add_argument("--ignore", metavar="REGEX", help="add known noise to Config/Tether/log-ignore.json (hidden from log, pie, ci)")
     s.add_argument("--why", help="with --ignore: a note kept next to the pattern")
     s.add_argument("--all", action="store_true", help="show known noise too")
@@ -400,6 +401,7 @@ def build_parser():
     s.add_argument("rest", nargs="*")
     s.add_argument("--all", action="store_true", help="also images and zero-size widgets")
     s.add_argument("--submit", action="store_true", help="with type: press Enter afterwards")
+    s.add_argument("--event", action="store_true", help="with click: fire a UMG button's OnClicked instead of clicking")
     s = add("anim", cmd_anim, "animation state in PIE: anim BP, montage, curves, its variables, movement; "
                               "`anim graph <ABP>`: its state machines as text")
     s.add_argument("target", help="actor, 'player', or Actor.Component; or `graph`")
@@ -440,6 +442,8 @@ def build_parser():
     s.add_argument("--keep-going", action="store_true", help="keep looping after a failing iteration")
     s = add("input", cmd_input, "Enhanced Input: actions and their keys by mapping context; in PIE, what is active")
     s.add_argument("action", nargs="?", help="regex: only these actions")
+    s.add_argument("--live", metavar="ACTION", help="while PIE runs: the action's value over time, from the keys behind it")
+    s.add_argument("--seconds", type=float, help="with --live: how long to watch (10)")
     s = add("savegame", cmd_savegame, "save slots: list, show one (regex filter), or Name=value to edit and save (.bak kept)")
     s.add_argument("slot", nargs="?", help="slot name (default: list the slots)")
     s.add_argument("rest", nargs="*", metavar="regex|Name=value")
@@ -468,6 +472,8 @@ def build_parser():
     s.add_argument("--rule", help="regex: only these rules (naming, characters, texture-*, mesh-*)")
     s.add_argument("--ignore", action="append", metavar="GLOB", help="skip packages matching, e.g. '/Game/Fab/*' (repeatable)")
     s.add_argument("--strict", action="store_true", help="exit 1 when anything is reported")
+    s.add_argument("--cpp", action="store_true", help="C++: file-private names in several .cpp files of a module "
+                                                     "(unity-build collisions)")
     s.add_argument("--fix", action="store_true", help="fix what has a safe fix (renames only with --rule naming|characters)")
     s.add_argument("--dry-run", action="store_true", help="with --fix: show the fixes only")
     s.add_argument("--save", action="store_true", help="with --fix: save the changed assets")

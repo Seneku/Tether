@@ -234,3 +234,42 @@ class Cvars(unittest.TestCase):
 
     def test_fmt3(self):
         self.assertEqual(toolsets._fmt3((1.0, -0.004, 250.126)), "(1, 0, 250.13)")
+
+
+class FakeModifier:
+    def __init__(self, cls, **props):
+        self._cls, self._props = cls, props
+
+    def get_class(self):
+        return types.SimpleNamespace(get_name=lambda: self._cls)
+
+    def get_editor_property(self, name):
+        if name not in self._props:
+            raise AttributeError(name)
+        return self._props[name]
+
+
+class InputModifiers(unittest.TestCase):
+    def test_swizzle_negate_scalar(self):
+        apply = toolsets._apply_input_modifiers
+        self.assertEqual(apply([1, 0, 0], [FakeModifier("InputModifierSwizzleAxis", order="YXZ")]), [0, 1, 0])
+        self.assertEqual(apply([1, 0, 0], [FakeModifier("InputModifierNegate", x=True, y=True, z=True)]), [-1, 0, 0])
+        scalar = types.SimpleNamespace(x=0.07, y=0.07, z=1)
+        self.assertEqual(apply([100, 0, 0], [FakeModifier("InputModifierScalar", scalar=scalar)]), [7.000000000000001, 0, 0])
+
+    def test_dead_zone(self):
+        apply = toolsets._apply_input_modifiers
+        axial = FakeModifier("InputModifierDeadZone", lower_threshold=0.2, upper_threshold=1.0, type="Axial")
+        self.assertEqual(apply([0.1, 0.0, 0.0], [axial]), [0.0, 0.0, 0.0])
+        self.assertAlmostEqual(apply([0.6, 0.0, 0.0], [axial])[0], 0.5)
+        radial = FakeModifier("InputModifierDeadZone", lower_threshold=0.2, upper_threshold=1.0, type="Radial")
+        self.assertAlmostEqual(apply([0.25, 0.0, 0.0], [radial])[0], 0.0625)
+
+
+class SmallHelpers(unittest.TestCase):
+    def test_snake_and_text_values(self):
+        self.assertEqual(toolsets._snake("GetControlRotation"), "get_control_rotation")
+        self.assertEqual(toolsets._snake("GetHUDClass"), "get_hud_class")
+        self.assertEqual(toolsets._text_value("3"), 3)
+        self.assertEqual(toolsets._text_value("0.500000"), 0.5)
+        self.assertEqual(toolsets._text_value("(X=1.0,Y=2.0,Z=3.0)"), "(X=1.0,Y=2.0,Z=3.0)")

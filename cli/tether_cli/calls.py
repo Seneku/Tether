@@ -107,17 +107,41 @@ def cmd_py(ctx, args):
         code = " ".join(args.code)
     for note in py_pitfalls(code):
         print(f"note: {note}", file=sys.stderr)
+    start = log_end(ctx.project)
     try:
         out = ctx.tether("py", code=code.lstrip("﻿"))  # PowerShell pipes a BOM
     except CliError as exc:
         error, marker, printed = str(exc).partition(f"\n{PY_OUTPUT}\n")
         if marker:  # what the script printed before it raised, with its newlines, then the error
             print(printed.rstrip("\n"))
+        for line in engine_complaints(ctx, start):
+            print(f"engine: {line}", file=sys.stderr)
+        if marker:
             raise CliError(error, exc.code) from None
         raise
     if out not in ("", None):  # output that is itself JSON comes back decoded
         print(out.rstrip("\n") if isinstance(out, str) else json.dumps(out))
+    for line in engine_complaints(ctx, start):  # why a call returned None, said only in the log
+        print(f"engine: {line}", file=sys.stderr)
     return 0
+
+
+SCRIPTING_LOGS = {"LogEditorScripting", "LogUtils", "LogPython", "LogBlueprintEditorLib", "LogEditorAssetSubsystem",
+                  "LogAssetTools", "LogUObjectGlobals"}
+
+
+def engine_complaints(ctx, start):
+    """Warnings and errors the editor's scripting libraries logged while a `ue py` call ran: Editor Scripting
+    Utilities and friends often return None and say why only in the log (e.g. refusing to run during PIE)."""
+    try:
+        flush_editor_log(ctx)
+        with open(log_path(ctx.project), "rb") as f:
+            f.seek(start)
+            lines = f.read().decode("utf-8", "replace").splitlines()
+    except (OSError, CliError):
+        return []
+    return [line for line in filter_log(lines, level="Warning", ignore=False)
+            if line.split(" ", 2)[1].rstrip(":") in SCRIPTING_LOGS][:10]
 
 
 def cmd_props(ctx, args):
@@ -482,6 +506,8 @@ def cmd_log(ctx, args):
             print(f"... +{len(rows) - args.limit} more group(s) (--limit)")
         ctx.data = {"groups": rows, "hidden": hidden}
         return 0
+    if args.tail:  # the last N entries of the session: what `tail` would show
+        args.since, args.limit = "start", args.tail
     if args.since == "pie":
         lines = since_pie(read_new_log(ctx.project, from_start=True, advance=False))
         where = "since the last PIE start"

@@ -230,6 +230,14 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
   Settings behind it: `ue cvar r.Shadow` lists console variables with who set them; `ue cvar --changed` shows
   everything the project and device profile changed; to try a value, `ue cvar r.X=1 --for "gpu"` sets it only
   for that one command.
+- Input: `hold IA_Move 1,0` in `pie do` injects the action's value (mapping modifiers like dead zones are
+  skipped); `key W down`/`key W up`, `mouse 100 0` and `stick Gamepad_Right2D 0.25,0 1` go in as real key
+  presses through the mappings. `ue input --live IA_Look` (PIE running) shows the action's value while you or a
+  step file play; `pie watch IA_Look` puts it in a column. A background editor runs PIE at a few fps: `ue pie
+  start` lifts that for its sessions, and `wait 2.5 game` waits on game time.
+- Reading state: `ue props` also lists UPROPERTYs that are not Blueprint-visible; `pie watch` reads them, plus
+  `player.control` and getters like `player.GetVelocity()`.
+- When `ue py` prints `engine: ...` lines, that is why a call returned None (e.g. Editor Scripting refusing in PIE).
 - UI checks: `ue shot --hud` in PIE captures the game view with its UMG HUD (plain `ue shot` has the 3D view only).
 - Engine traps worth knowing (`ue py` warns about the first two):
   - `StaticMesh.build_from_static_mesh_descriptions` on a mesh that already has render data crashes the editor;

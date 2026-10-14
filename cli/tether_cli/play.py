@@ -13,7 +13,7 @@ from .core import (
 from .transport import catalog, py_json, resolve_toolset
 from .build import csharp_changes, csharp_layout, csharp_reload_build
 from .calls import flush_editor_log, scoped_cvars
-from .images import cmd_shot, image_diff, png_read, png_write
+from .images import cmd_shot, image_diff, png_read, png_write, shot_args
 from .assets import mcp_tool
 from .jobs import cmd_job, jobs_dir
 
@@ -139,10 +139,11 @@ def parse_snapshot(text):
         if not m:
             continue
         attrs = re.findall(r"\[([^\]]*)\]", m.group("attrs") or "")
-        fields = dict(a.split("=", 1) for a in attrs if "=" in a)
+        # One bracket can hold several keys: [pos=0,0 size=1280,720]
+        fields = dict(token.split("=", 1) for a in attrs for token in a.split() if "=" in token)
         nodes.append({"indent": len(m.group("indent")), "role": m.group("role"),
                       "label": (m.group("label") or "").replace('\\"', '"'), "ref": fields.get("ref", ""),
-                      "src": fields.get("src", ""), "size": fields.get("size", ""),
+                      "src": fields.get("src", ""), "size": fields.get("size", ""), "pos": fields.get("pos", ""),
                       "flags": [a for a in attrs if "=" not in a]})
     return nodes
 
@@ -189,8 +190,60 @@ def ui_nodes(ctx):
         return None, False
     text = mcp_tool(ctx, "SlateInspectorToolset", "Snapshot", {"ref": "", "maxDepth": 120, "bIncludeSourceLocations": True})
     target = re.search(r"^\* (\d+):", pie_net(ctx, "status"), re.M)  # `ue pie target` picks a client's window
-    return game_ui(parse_snapshot(text if isinstance(text, str) else json.dumps(text)),
-                   int(target.group(1)) if target else 0), True
+    nodes = parse_snapshot(text if isinstance(text, str) else json.dumps(text))
+    ctx.ui_all = nodes  # every window, for hit tests
+    return game_ui(nodes, int(target.group(1)) if target else 0), True
+
+
+def box(node):
+    """(x, y, w, h) of a snapshot node, or None."""
+    try:
+        x, y = (float(v) for v in node["pos"].split(","))
+        w, h = (float(v) for v in node["size"].split(","))
+        return x, y, w, h
+    except (KeyError, ValueError):
+        return None
+
+
+def windows(nodes):
+    """[(index, title, (x, y, w, h))] of the top-level windows, in absolute pixels. A window's own size is in
+    DPI-independent units while everything inside it is in pixels, so it is scaled to fit its widgets."""
+    out = []
+    top = min((n["indent"] for n in nodes), default=0)
+    for i, node in enumerate(nodes):
+        if node["role"] != "window" or node["indent"] != top or not box(node):
+            continue
+        x, y, w, h = box(node)
+        scale = 1.0
+        for child in subtree(nodes, i):
+            b = box(child)
+            if b and b[2] and b[3] and w and h:
+                scale = max(scale, (b[0] + b[2] - x) / w, (b[1] + b[3] - y) / h)
+        scale = min(3.0, round(scale * 4) / 4)  # DPI scales come in quarters (125 %, 150 %, ...)
+        out.append((i, node["label"], (x, y, w * scale, h * scale)))
+    return out
+
+
+def inside(point, rect):
+    return rect[0] <= point[0] < rect[0] + rect[2] and rect[1] <= point[1] < rect[1] + rect[3]
+
+
+def covering_window(nodes, node):
+    """The title of another top-level window over the centre of `node`, where a synthesized click would land
+    instead (a floating Message Log over the PIE viewport did exactly that), or None."""
+    b = box(node)
+    if not b:
+        return None
+    point = (b[0] + b[2] / 2, b[1] + b[3] / 2)
+    index = next(i for i, n in enumerate(nodes) if n is node) if any(n is node for n in nodes) else None
+    own = None
+    for i, title, rect in windows(nodes):
+        if index is not None and i < index <= i + len(subtree(nodes, i)):
+            own = i
+    for i, title, rect in windows(nodes):
+        if i != own and not title.endswith("Unreal Editor") and inside(point, rect):
+            return title or "an untitled window"
+    return None
 
 
 def ui_lines(nodes, show_all=False, match=None):
@@ -225,11 +278,22 @@ def find_ui(nodes, target, roles=INTERACTIVE):
     return hit[0]
 
 
-def ui_click(ctx, target):
+def ui_click(ctx, target, event=False):
     nodes, slate = ui_nodes(ctx)
-    if not slate:
+    if not slate or event:  # a UMG button's OnClicked, fired directly
         return ctx.tether("umg", click=target)
     node = find_ui(nodes, target)
+    # Epic's Click synthesizes a mouse press at the widget's centre on screen: whatever window is on top there gets
+    # it. Check first, and for a UMG button fire its OnClicked instead of clicking another window.
+    cover = covering_window(getattr(ctx, "ui_all", nodes), node)
+    if cover:
+        try:
+            fired = ctx.tether("umg", click=node["label"] or target)
+            return fired + f' (window "{cover}" covers it on screen, so its OnClicked was fired instead of a click)'
+        except CliError:
+            raise CliError(f'{node["role"]} "{node["label"]}" is covered by window "{cover}": a click would land '
+                           f"there. Close it (ue call SlateInspectorToolset.Windows action=list, then action=close "
+                           f"index=N) and retry") from None
     mcp_tool(ctx, "SlateInspectorToolset", "Click", {"ref": node["ref"]})
     return f'clicked {node["role"]} "{node["label"]}"'
 
@@ -246,7 +310,29 @@ def cmd_ui(ctx, args):
         raise CliError("PIE is not running (ue pie start)")
     action = args.action or "show"
     if action == "click":
-        print(ui_click(ctx, " ".join(args.rest)))
+        print(ui_click(ctx, " ".join(args.rest), getattr(args, "event", False)))
+        return 0
+    if action == "at":  # what is on screen at a point, every window included
+        try:
+            point = tuple(float(v) for v in " ".join(args.rest).replace(" ", "").split(","))
+            assert len(point) == 2
+        except (ValueError, AssertionError):
+            raise CliError("ue ui at <x,y> (absolute screen pixels, as ue ui shows positions)") from None
+        _, slate = ui_nodes(ctx)
+        if not slate:
+            raise CliError("ue ui at needs Epic's SlateInspectorToolset (ue init enables it)")
+        nodes = ctx.ui_all
+        hits = []
+        for i, title, rect in windows(nodes):
+            if inside(point, rect):
+                hits.append(f'window "{title}" at {rect[0]:.0f},{rect[1]:.0f} size {rect[2]:.0f}x{rect[3]:.0f}')
+                for n in subtree(nodes, i):
+                    b = box(n)
+                    if b and b[2] and b[3] and inside(point, b) and (n["label"] or n["role"] in INTERACTIVE):
+                        hits.append(f'  {n["role"]}' + (f' "{n["label"]}"' if n["label"] else "") + f"  ({n['ref']})")
+        print("\n".join(hits) if hits else f"nothing at {point[0]:.0f},{point[1]:.0f}")
+        if sum(1 for h in hits if h.startswith("window")) > 1:
+            print("note: several windows overlap here; a click goes to the one on top")
         return 0
     if action in ("type", "key"):
         nodes, slate = ui_nodes(ctx)
@@ -1091,7 +1177,10 @@ def pie_do(ctx, args):
         seconds = float(within.group(1)) if within else None
         rest = rest[: within.start()].strip() if within else rest
         if verb == "wait":
-            time.sleep(float(rest or 1))
+            amount, _, clock = (rest or "1").partition(" ")
+            if clock.strip().lower() == "game":  # game time, whatever the frame rate
+                return wait_game_seconds(ctx, float(amount))
+            time.sleep(float(amount))
             return True, ""
         if verb == "until":
             return poll(lambda: tool("expect " + rest), seconds or 5)
@@ -1132,6 +1221,8 @@ def pie_do(ctx, args):
                 ok = ui_has_text(ctx, rest) == want
                 return ok, "" if ok else ("still on screen" if not want else "not on screen")
             return poll(check, seconds or 3)
+        if verb == "key" and re.search(r"\s(down|up|tap)\b", rest, re.I):
+            return tool(step)  # raw key input through the key mappings (the toolset's forced keys)
         if verb in ("type", "key"):
             import shlex
             parts = shlex.split(rest)
@@ -1200,8 +1291,7 @@ def shot_check(ctx, rest):
     baseline = os.path.join(os.path.dirname(ctx.project), "tests", "play", "shots", name + ".png")
     path = os.path.join(state_dir(ctx.project), "shots", time.strftime(f"check-{name}-%H%M%S.png"))
     with redirect_stdout(io.StringIO()):
-        cmd_shot(ctx, argparse.Namespace(actor=None, at=None, look_at=None, rot=None, annotate=False, grid_z=0, ui=False,
-                                         output=path, baseline=None, compare=None, tolerance=tolerance, threshold=32))
+        cmd_shot(ctx, shot_args(output=path, tolerance=tolerance))
     if not os.path.isfile(baseline):
         os.makedirs(os.path.dirname(baseline), exist_ok=True)
         shutil.copyfile(path, baseline)
@@ -1260,6 +1350,7 @@ def cmd_pie(ctx, args):
     elif args.action == "start":
         options = {"bSimulate": args.simulate, "playMode": "PlayMode_InViewPort", "warmupSeconds": args.warmup}
         text, is_error = ctx.mcp.call(toolset, "StartPIE", {"options": options})
+        pie_throttle(ctx, "lift")  # a background editor runs PIE at ~3 fps, so game time crawls
         if is_error and unwrap(ctx.mcp.call(toolset, "IsPIERunning", {})[0]) is True:
             # Epic fails the call when anything logged a script error during startup (e.g. a Blueprint
             # drawing to a render target under -nullrhi), although PIE is running. Report, don't fail.
@@ -1276,12 +1367,16 @@ def cmd_pie(ctx, args):
             raise CliError(compact_error(text) + "".join("\n  " + l for l in fatal[:3]) + hint)
     elif args.action == "stop":
         text, is_error = ctx.mcp.call(toolset, "StopPIE", {})
+        pie_throttle(ctx, "restore")
     else:
         text, is_error = ctx.mcp.call(toolset, "IsPIERunning", {})
         if is_error:
             raise CliError(compact_error(text))
         if unwrap(text) is True:
-            print("pie: running")
+            fps, throttled = pie_rate(ctx)
+            print("pie: running" + (f" (~{fps:.0f} fps" + (": the editor is in the background and throttled, so game time "
+                                                           "runs slow; ue pie start lifts that for its sessions"
+                                                           if throttled and fps < 15 else "") + ")" if fps else ""))
             net = pie_net(ctx, "status")
             if net.count(": ") > 1:  # several PIE worlds: multiplayer
                 print(net)
@@ -1310,6 +1405,58 @@ def cmd_pie(ctx, args):
     elif args.action == "start" and getattr(args, "clients", None):
         print(pie_net(ctx, "status"))
     return 0
+
+
+THROTTLE = """import sys
+s = unreal.find_object(None, '/Script/UnrealEd.Default__EditorPerformanceSettings')
+key = 'bThrottleCPUWhenNotForeground'
+if '{action}' == 'lift' and s.get_editor_property(key):
+    s.set_editor_property(key, False)
+    sys._tether_throttle = True
+elif '{action}' == 'restore' and getattr(sys, '_tether_throttle', False):
+    s.set_editor_property(key, True)
+    sys._tether_throttle = False
+"""
+
+
+GAME_TIME = "unreal.GameplayStatics.get_time_seconds(unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_game_world())"
+
+
+def wait_game_seconds(ctx, seconds):
+    """Wait until N seconds of game time have passed in PIE (a throttled or slow editor runs game time slower)."""
+    start_game, start_real = float(ctx.tether("py", code=GAME_TIME)), time.time()
+    while True:
+        now = float(ctx.tether("py", code=GAME_TIME))
+        if now - start_game >= seconds:
+            return True, f"{now - start_game:.2f} s of game time took {time.time() - start_real:.1f} s"
+        if time.time() - start_real > seconds * 30 + 10:
+            return False, f"only {now - start_game:.2f} s of game time passed in {time.time() - start_real:.0f} s"
+        time.sleep(0.1)
+
+
+def pie_throttle(ctx, action):
+    """Lift "Use Less CPU when in Background" for a PIE session Tether starts (put back on stop): throttled, a
+    background editor runs PIE at a few frames per second and game time with it, so timed steps fall short.
+    Set directly, not as a transaction (an editor setting is not level work)."""
+    try:
+        ctx.tether("py", code=THROTTLE.format(action=action))
+    except CliError:
+        pass
+
+
+def pie_rate(ctx):
+    """(frames per second of the PIE world now, whether the editor's background throttle is on)."""
+    try:
+        out = str(ctx.tether("py", code=(
+            "w = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_game_world()\n"
+            "d = unreal.GameplayStatics.get_world_delta_seconds(w) if w else 0\n"
+            "t = unreal.find_object(None, '/Script/UnrealEd.Default__EditorPerformanceSettings')"
+            ".get_editor_property('bThrottleCPUWhenNotForeground')\n"
+            "f'{(1 / d) if d else 0:.1f} {t}'"))).strip().strip("'")
+        rate, throttled = out.split()
+        return float(rate), throttled == "True"
+    except (CliError, ValueError):
+        return 0.0, False
 
 
 def pie_net(ctx, action, clients=1, net="", target=-1, game="-"):

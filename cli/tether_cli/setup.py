@@ -58,6 +58,13 @@ def cmd_doctor(ctx, args):
                    "ue init")
     except (CliError, OSError, ValueError) as exc:
         report("WARN", f"could not check the project setup: {exc}", "")
+    beacon = editor_live(ctx.project)
+    loaded, mine = (beacon or {}).get("tether"), tether_version()
+    if beacon and loaded and loaded != mine:
+        report("WARN", f"the running editor (pid {beacon.get('pid')}) loaded Tether {loaded}; this CLI is {mine}",
+               "after ue init, restart the editor to load it (ue build --restart, or close and reopen it)")
+    elif beacon and loaded:
+        report("ok", f"the running editor loaded Tether {loaded}, the same as this CLI")
     beacon = ctx.beacon or {}
     pid = beacon.get("pid")
     if pid and pid_alive(pid):
@@ -138,6 +145,12 @@ ALL_TOOLSETS = {"EditorToolset", "AutomationTestToolset", "SlateInspectorToolset
 
 def tether_plugins_dir():
     return os.path.join(os.path.dirname(CLI_DIR), "Plugins")
+
+
+def tether_version(plugin_dir=None):
+    """VersionName of a Tether plugin folder (default: the one next to this CLI)."""
+    plugin = read_json(os.path.join(plugin_dir or os.path.join(tether_plugins_dir(), "Tether"), "Tether.uplugin")) or {}
+    return plugin.get("VersionName", "?")
 
 
 def plugin_reachable(project, data, name):
@@ -225,8 +238,10 @@ def cmd_init(ctx, args):
     for line in changes:
         print(("would " if args.dry_run else "") + line)
     for name, source, target, exists in copies:
+        versions = (f" (the project has {tether_version(target)}, this CLI {tether_version(source)})"
+                    if exists and name == "Tether" else "")
         print(("would " if args.dry_run else "") + ("update" if exists else "copy") + f" {name} -> "
-              + os.path.relpath(target, os.path.dirname(project)))
+              + os.path.relpath(target, os.path.dirname(project)) + versions)
     if args.dry_run:
         return 0
     if ini:
