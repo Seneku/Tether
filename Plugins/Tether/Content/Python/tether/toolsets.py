@@ -814,12 +814,16 @@ def _hidden_reader(obj, name, every=0.5):
     """Read a UPROPERTY Python cannot see through the engine's `getall Class Prop name=Obj` (one log line), at
     most every `every` seconds: it goes through the log."""
     cls, world, cache = obj.get_class().get_name(), obj.get_world(), {"t": 0.0, "v": None}
-    pattern = re.compile(r"\." + re.escape(name) + r" = (.*)$")
+    # Components share names across actors (every robot has a "Health"), so filter on the outer too and only take
+    # the line with this object's own path.
+    pattern = re.compile(re.escape(obj.get_path_name()) + r"\." + re.escape(name) + r" = (.*)$", re.I)
+    outer = obj.get_outer()
+    where = f"name={obj.get_name()}" + (f" outer={outer.get_name()}" if outer and not isinstance(obj, unreal.Actor) else "")
 
     def read():
         if time.time() - cache["t"] >= every:
             cache["t"] = time.time()
-            for line in _console_output(world, [f"getall {cls} {name} name={obj.get_name()}"]):
+            for line in _console_output(world, [f"getall {cls} {name} {where}"]):
                 m = pattern.search(line)
                 if m:
                     cache["v"] = _text_value(m.group(1).strip())
@@ -876,7 +880,13 @@ def _watch_reader(spec, pawn, controller):
     if library and name.lower() in visible:
         return lambda: _reflect(library.get_object_properties(obj, [name]), obj).get(name)
     # Not Blueprint-visible: neither Python nor Epic's reflection reads it, the engine's own export does.
-    return _hidden_reader(obj, name[:1].upper() + name[1:])
+    return _hidden_reader(obj, _cpp_property_name(name))
+
+
+def _cpp_property_name(name):
+    """The C++ name of a property from reflection's camelCase one: 'currentHealth' -> 'CurrentHealth', but bools
+    keep their b ('bTelegraphing')."""
+    return name if re.match(r"b[A-Z]", name) else name[:1].upper() + name[1:]
 
 
 def _watch_tick(_delta):

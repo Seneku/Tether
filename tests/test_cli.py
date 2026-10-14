@@ -2042,3 +2042,29 @@ class Round14(unittest.TestCase):
             held.close()
         self.assertEqual(ue.listening_port(["LogNet: Name:GameNetDriver IpNetDriver listening on port 17778"]), 17778)
         self.assertIsNone(ue.listening_port(["LogNet: nothing"]))
+
+    def test_hud_rect_at_150_percent_dpi(self):
+        # Epic's inspector: absolute pixel positions, DPI-independent sizes (ShooterDomination, 3840x2088 at 150 %)
+        snap = ('window "SD" [pos=0,0 size=2560,1392] [ref=w1]\n'
+                '  splitter [pos=6,153 size=2552,1254] [ref=sp2]\n'
+                '    splitter [pos=6,153 size=1606,1254] [ref=sp5]\n'
+                '    splitter [pos=2422,153 size=941,1254] [ref=sp6]')
+        self.assertEqual(ue.hud_rect(snap, 2409, 1830, 1.5), (6.0, 204.0, 2409, 1830))
+        moved = snap.replace("pos=0,0", "pos=100,50").replace("pos=6,153", "pos=106,203")
+        self.assertEqual(ue.hud_rect(moved, 2409, 1830, 1.5), (6.0, 204.0, 2409, 1830))
+
+    def test_package_staleness(self):
+        project = Project()
+        root = os.path.dirname(project.uproject)
+        exe_dir = os.path.join(root, "pkg")
+        os.makedirs(exe_dir)
+        exe = os.path.join(exe_dir, "Game.exe")
+        open(exe, "w").close()
+        os.makedirs(os.path.join(root, "Content"), exist_ok=True)
+        asset = os.path.join(root, "Content", "Map.umap")
+        open(asset, "w").close()
+        os.utime(exe, (time.time() - 3600, time.time() - 3600))
+        self.assertIn("Map.umap", ue.package_staleness(project.uproject, exe))
+        os.utime(exe, None)
+        self.assertIsNone(ue.package_staleness(project.uproject, exe))
+        project.close()

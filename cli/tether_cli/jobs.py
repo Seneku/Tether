@@ -160,6 +160,44 @@ def packaged_executable(project, platform):
     return min(found, key=len) if found else None
 
 
+def newest_file(folder, skip=("Saved", "Intermediate", "Binaries", "DerivedDataCache", ".git", "obj", "bin")):
+    """(mtime, path) of the most recently changed file under a folder, build output skipped."""
+    best = (0.0, None)
+    for dirpath, dirs, files in os.walk(folder):
+        dirs[:] = [d for d in dirs if d not in skip]
+        for f in files:
+            path = os.path.join(dirpath, f)
+            try:
+                mtime = os.path.getmtime(path)
+            except OSError:
+                continue
+            if mtime > best[0]:
+                best = (mtime, path)
+    return best
+
+
+def package_staleness(project, exe):
+    """A warning when the project's sources changed after the package was made (a packaged run then tests old
+    code or content), else None."""
+    built = 0.0
+    for dirpath, _, files in os.walk(os.path.dirname(exe)):
+        for f in files:
+            if f.lower().endswith((".exe", ".pak", ".utoc", ".ucas", ".dll", ".so", ".sh")) or "." not in f:
+                try:
+                    built = max(built, os.path.getmtime(os.path.join(dirpath, f)))
+                except OSError:
+                    pass
+    root = os.path.dirname(project)
+    newest = max((newest_file(os.path.join(root, d)) for d in ("Source", "Content", "Config", "Script")
+                  if os.path.isdir(os.path.join(root, d))), default=(0.0, None))
+    if not built or newest[0] <= built + 1:
+        return None
+    stamp = time.strftime("%H:%M", time.localtime(built)) if time.time() - built < 86400 else \
+        time.strftime("%Y-%m-%d %H:%M", time.localtime(built))
+    return (f"the package is from {stamp}, older than your changes ({os.path.relpath(newest[1], root)} at "
+            f"{time.strftime('%H:%M', time.localtime(newest[0]))}): this runs the old build; ue package first")
+
+
 def boot_test(ctx, exe, seconds, nullrhi=False, strict=False):
     """Run a packaged game headless for a while and report crashes, fatal errors and logged errors."""
     project_name = os.path.splitext(os.path.basename(ctx.project))[0]
@@ -247,10 +285,6 @@ def cmd_package(ctx, args):
         for pid in leftovers:
             kill_tree(pid)
         print(f"stopped {len(leftovers)} process(es) still running from the last package (they lock its files)")
-    if getattr(args, "play", None):
-        return cmd_game(ctx, argparse.Namespace(action="start", packaged=True, clients=args.play, server="listen", map=None,
-                                                game=None, windowed=False, game_port=None, server_args="", client_args="",
-                                                wait=120, server_delay=3, platform=platform, limit=args.limit))
     if not args.boot_only:
         cmd_job(ctx, argparse.Namespace(action="package", platform=platform, config=args.config, id=None,
                                         name=None, limit=args.limit, project=args.project, job_command=[]))
@@ -264,9 +298,18 @@ def cmd_package(ctx, args):
     exe = packaged_executable(ctx.project, platform)
     if not exe:
         raise CliError(f"no packaged game under {package_dir(ctx.project, platform)} (ue package first)")
+    if args.boot_only:
+        stale = package_staleness(ctx.project, exe)
+        if stale:
+            print(f"warning: {stale}")
     if args.no_boot:
         print(f"packaged: {exe}")
         return 0
+    if getattr(args, "play", None):  # instead of the boot test: a listen server and clients from this build
+        return cmd_game(ctx, argparse.Namespace(action="start", packaged=True, clients=args.play, server="listen", map=None,
+                                                game=None, windowed=False, game_port=None, server_args="", client_args="",
+                                                wait=120, server_delay=3, platform=platform, limit=args.limit,
+                                                checked=True))
     return boot_test(ctx, exe, args.seconds, args.nullrhi, args.strict)
 
 
@@ -397,6 +440,11 @@ def cmd_game(ctx, args):
         if state.get("instances") and any(pid_alive(i["pid"]) for i in state["instances"]):
             raise CliError("a game session is running (ue game status; ue game stop first)")
         os.makedirs(folder, exist_ok=True)
+        if args.packaged and not getattr(args, "checked", False):
+            exe = packaged_executable(ctx.project, args.platform or host_platform())
+            stale = exe and package_staleness(ctx.project, exe)
+            if stale:
+                print(f"warning: {stale}")
         asked = getattr(args, "game_port", None)
         port = asked or free_udp_port(17777)
         roles = ([args.server] if args.server != "none" else []) + ["client"] * args.clients

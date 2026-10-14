@@ -4,6 +4,7 @@ import contextlib
 import json
 import os
 import re
+import sys
 import time
 
 from .core import (
@@ -829,6 +830,7 @@ def cmd_gpu(ctx, args):
 def read_profile_csv(path):
     """{column: [floats per frame]} from a CsvProfiler capture (the header repeats at the end)."""
     import csv
+    csv.field_size_limit(min(sys.maxsize, 2 ** 31 - 1))  # the EVENTS column can hold more than the 128 KB default
     with open(path, encoding="utf-8", errors="replace", newline="") as f:
         rows = list(csv.reader(f))
     header, columns = rows[0], {}

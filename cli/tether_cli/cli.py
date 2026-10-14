@@ -551,13 +551,13 @@ def build_parser():
     s.add_argument("--wait", type=float, default=7200, help="seconds to allow the packaging job (7200)")
     s.add_argument("--no-wait", action="store_true", help="start the packaging job and return")
     s.add_argument("--no-boot", action="store_true", help="package only")
-    s.add_argument("--boot-only", action="store_true", help="boot-test the last package without rebuilding")
+    s.add_argument("--boot-only", action="store_true", help="use the last package without rebuilding (warns when it is older than your changes)")
     s.add_argument("--nullrhi", action="store_true", help="boot without rendering (-nullrhi)")
     s.add_argument("--strict", action="store_true", help="fail on logged errors too")
     s.add_argument("--play", type=int, metavar="CLIENTS", help="instead of the boot test: a listen server and N clients "
-                                                               "from the packaged build (ue game start --packaged)")
+                                                               "from the new package (--boot-only: the last one)")
     s.add_argument("--perf", type=float, metavar="SECONDS", help="instead of the boot test: frame times in the packaged "
-                                                                 "game for about N seconds (after ue package)")
+                                                                 "game for about N seconds (--boot-only: the last package)")
     s.add_argument("--map", help="with --perf: the map to measure (default: the game's start map)")
     s = add("ci", cmd_ci, "project checks in one pass/fail: open if needed, tests, Blueprint compile, validation, cook, close")
     s.add_argument("--tests", help="test filter (default ^<Project>.)")

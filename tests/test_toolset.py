@@ -30,6 +30,8 @@ OBJECT = {"title": "Class@/Script/Engine.Actor", "type": "object", "properties":
 
 class Numbers(unittest.TestCase):
     def test_numbers(self):
+        self.assertEqual(toolsets._cpp_property_name("bTelegraphing"), "bTelegraphing")  # bools keep their b
+        self.assertEqual(toolsets._cpp_property_name("currentHealth"), "CurrentHealth")
         self.assertEqual(toolsets._numbers("1,2.5,-3"), [1, 2.5, -3])
         self.assertEqual(toolsets._numbers("(0, 0, 1e2)"), [0, 0, 100.0])
         self.assertEqual(toolsets._numbers("7"), [7])

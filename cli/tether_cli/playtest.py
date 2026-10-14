@@ -16,7 +16,7 @@ from .calls import flush_editor_log, scoped_cvars
 from .assets import cmd_bp, cmd_size, code_usages, folder_packages, package_bytes
 from .content import cmd_tex
 from .images import cmd_shot, shot_args
-from .jobs import cmd_package, packaged_executable
+from .jobs import cmd_package, package_staleness, packaged_executable
 from .play import frame_stats, read_profile_csv
 from .play import cmd_mem, cmd_perf, cmd_pie, insights_exe, insights_export, pie_do, unthrottled
 
@@ -946,8 +946,37 @@ def cmd_budget(ctx, args):
 def package_command(ctx, args):
     """`ue package`: --perf lives here (it reads profiler captures like ue perf); the rest is jobs.cmd_package."""
     if getattr(args, "perf", None):
+        if not args.boot_only:  # package first, like the boot test; --boot-only measures the last package
+            code = cmd_package(ctx, argparse.Namespace(**dict(vars(args), no_boot=True, play=None)))
+            if code:
+                return code
         return package_perf(ctx, args)
     return cmd_package(ctx, args)
+
+
+CAPTURE_WRITTEN = re.compile(r"Capture Ended\. Writing CSV to file\s*:\s*(.+\.csv)")
+
+
+def wait_for_capture(proc, log, log_start, root, name, platform, timeout):
+    """The CSV path once the packaged game's log says its capture ended and the file stops growing; None when the
+    game exits first or the time runs out. The log names it relative to the game's Binaries/<Platform> folder."""
+    deadline, path, size = time.time() + timeout, None, -1
+    binaries = os.path.join(root, name, "Binaries", platform)
+    while time.time() < deadline:
+        if path is None and os.path.isfile(log) and os.path.getmtime(log) >= log_start:
+            with open(log, encoding="utf-8", errors="replace") as f:
+                m = CAPTURE_WRITTEN.search(f.read())
+            if m:
+                path = os.path.normpath(os.path.join(binaries, m.group(1).strip()))
+        if path and os.path.isfile(path):
+            now = os.path.getsize(path)
+            if now and now == size:
+                return path
+            size = now
+        if proc.poll() is not None:
+            return path
+        time.sleep(1)
+    return None
 
 
 def package_perf(ctx, args):
@@ -958,8 +987,13 @@ def package_perf(ctx, args):
     exe = packaged_executable(ctx.project, platform)
     if not exe:
         raise CliError("no packaged game (ue package first)")
+    stale = args.boot_only and package_staleness(ctx.project, exe)
+    if stale:
+        print(f"warning: {stale}")
     name = os.path.splitext(os.path.basename(ctx.project))[0]
     csv_dir = os.path.join(os.path.dirname(exe), name, "Saved", "Profiling", "CSV")
+    game_log = os.path.join(os.path.dirname(exe), name, "Saved", "Logs", f"{name}.log")
+    log_start = os.path.getmtime(game_log) if os.path.isfile(game_log) else 0.0
     before = set(os.listdir(csv_dir)) if os.path.isdir(csv_dir) else set()
     warmup = 90  # loading and shader warm-up frames, left out of the numbers
     frames = int(args.perf * 60) + warmup
@@ -968,15 +1002,19 @@ def package_perf(ctx, args):
         f"-csvCaptureFrames={frames}", "-csvExitOnCompletion"]
     started = time.time()
     proc = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
-    try:
-        proc.wait(timeout=max(180.0, args.perf * 20))
-    except subprocess.TimeoutExpired:
-        from .jobs import kill_tree
-        kill_tree(proc.pid)
-        raise CliError(f"the packaged game did not finish {frames} frames in time (stuck at a menu? pass a map)", 4)
+    # -csvExitOnCompletion does not always quit the game: wait for the capture to be written, then end it.
+    written = wait_for_capture(proc, game_log, log_start, os.path.dirname(exe), name, platform, max(180.0, args.perf * 20))
+    exited = proc.poll() is not None
+    from .jobs import kill_tree
+    kill_tree(proc.pid)
+    if written is None and not exited:
+        raise CliError(f"the packaged game did not finish {frames} frames in time (stuck at a menu? pass a map; "
+                       f"its log: {game_log})", 4)
     new = [f for f in (os.listdir(csv_dir) if os.path.isdir(csv_dir) else []) if f.endswith(".csv") and f not in before]
+    if written and os.path.isfile(written) and os.path.basename(written) not in new:
+        csv_dir, new = os.path.dirname(written), [os.path.basename(written)]
     if not new:
-        raise CliError(f"the packaged game wrote no profiler capture (exit code {proc.returncode}); is it a Shipping build? "
+        raise CliError(f"the packaged game wrote no profiler capture (exit code {proc.poll()}); is it a Shipping build? "
                        "CSV profiling needs Development")
     path = os.path.join(csv_dir, max(new, key=lambda f: os.path.getmtime(os.path.join(csv_dir, f))))
     try:
@@ -985,7 +1023,7 @@ def package_perf(ctx, args):
         columns = {}
     if not columns.get("FrameTime"):
         log = os.path.join(os.path.dirname(exe), name, "Saved", "Logs", name + ".log")
-        raise CliError(f"the capture is empty: the game exited (code {proc.returncode}) before profiling any frames; "
+        raise CliError(f"the capture is empty: the game exited (code {proc.poll()}) before profiling any frames; "
                        f"its log: {log} (ue package --boot-only shows why)")
     stats = {k: frame_stats(v[warmup:] or v) for k, v in columns.items()
              if k in ("FrameTime", "GameThreadTime", "RenderThreadTime", "GPUTime") and v}

@@ -44,17 +44,24 @@ def pie_screenshot(ctx, args):
 SNAPSHOT_BOX = re.compile(r"^(\s*)(\w+).*?\[pos=(-?\d+),(-?\d+) size=(\d+),(\d+)\]")
 
 
-def hud_rect(snapshot, view_w, view_h):
-    """(x, y, w, h) of the game viewport inside the editor window, in window units, from a Slate inspector
+def hud_rect(snapshot, view_w, view_h, dpi=1.0):
+    """(x, y, w, h) of the game viewport inside the editor window, in screenshot pixels, from a Slate inspector
     snapshot: the smallest panel as wide as the viewport and at least as tall (the viewport tab's area), with
-    the viewport at its bottom, below the tab's toolbar. None when no panel fits (PIE in its own window)."""
+    the viewport at its bottom, below the tab's toolbar. None when no panel fits (PIE in its own window).
+    The inspector prints absolute (desktop pixel) positions but DPI-independent sizes: positions are taken
+    relative to the window, sizes times the DPI scale."""
     boxes = []
     for line in snapshot.splitlines():
         m = SNAPSHOT_BOX.match(line)
         if m:
             boxes.append(tuple(int(v) for v in m.groups()[2:]))
+    if not boxes:
+        return None
+    wx, wy = boxes[0][:2]  # the window
+    boxes = [(x - wx, y - wy, w * dpi, h * dpi) for x, y, w, h in boxes[1:]]
     # The viewport's panel: as wide as the viewport (give or take a border), taller by its tab and toolbar.
-    fits = [b for b in boxes if abs(b[2] - view_w) <= 4 and view_h - 4 <= b[3] < view_h + 600]
+    slack = 4 * dpi + 1
+    fits = [b for b in boxes if abs(b[2] - view_w) <= slack and view_h - slack <= b[3] < view_h + 600 * dpi]
     if not fits:
         return None
     x, y, w, h = min(fits, key=lambda b: b[3])
@@ -101,24 +108,23 @@ def hud_screenshot(ctx, cache=None):
         raw = f.read()
     os.remove(path)  # it moves to Saved/Tether/shots (or -o)
     if cache and cache.get("rect"):  # a film: the viewport stays put, so locate it once
-        image_w = int.from_bytes(raw[16:20], "big")
-        return png_crop(raw, cache["rect"], image_w / cache["window_w"])
+        return png_crop(raw, cache["rect"])
     text, is_error = ctx.mcp.call("SlateInspectorToolset.SlateInspectorToolset", "Snapshot",
                                   {"ref": "", "maxDepth": 60, "bIncludeSourceLocations": False})
     snapshot = unwrap(text) if not is_error else ""
     snapshot = snapshot if isinstance(snapshot, str) else json.dumps(snapshot)
     window = SNAPSHOT_BOX.match(snapshot.splitlines()[0]) if snapshot else None
-    rect = hud_rect(snapshot, view_w, view_h) if snapshot else None
-    if rect is None:
-        print("note: could not place the game viewport in the window (Slate inspector unavailable, or PIE runs in "
-              "its own window): this is the whole window")
-        return raw
     image_w = int.from_bytes(raw[16:20], "big")
     window_w = int(window.group(5)) if window and int(window.group(5)) else image_w
-    scale = image_w / window_w  # DPI scaling
+    dpi = image_w / window_w  # the window's size is in DPI-independent units, the screenshot in pixels
+    rect = hud_rect(snapshot, view_w, view_h, dpi) if snapshot else None
+    if rect is None:
+        print(f"note: could not place the {view_w}x{view_h} game viewport in the window (DPI scale {dpi:g}; Slate "
+              "inspector unavailable, or PIE runs in its own window): this is the whole window")
+        return raw
     if cache is not None:
-        cache.update(rect=rect, window_w=window_w)
-    return png_crop(raw, rect, scale)
+        cache.update(rect=rect)
+    return png_crop(raw, rect)
 
 
 def capture_viewport(ctx, pose, annotations=None, ui=False):

@@ -180,9 +180,13 @@ def _tick(_delta):
         tmp = path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(_snapshot(), f)
-        os.replace(tmp, path)
+        _replace(tmp, path)
+        _state["failures"] = 0
     except Exception as exc:  # never let the beacon break or spam the tick
-        if not _state["warned"]:
+        # A reader (ue status) holding the file makes a replace fail now and then on Windows: the next tick
+        # writes it again, so only a lasting failure is worth a warning.
+        _state["failures"] = _state.get("failures", 0) + 1
+        if _state["failures"] >= 5 and not _state["warned"]:
             _state["warned"] = True
             unreal.log_warning(f"Tether beacon: {exc}")
 
@@ -206,7 +210,18 @@ def _write_session():
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump({"pid": os.getpid(), "token": session_token()}, f)
-    os.replace(tmp, path)
+    _replace(tmp, path)
+
+
+def _replace(tmp, path, tries=5):
+    """os.replace, retried: on Windows it fails while another process has the target open."""
+    for attempt in range(tries):
+        try:
+            return os.replace(tmp, path)
+        except PermissionError:
+            if attempt == tries - 1:
+                raise
+            time.sleep(0.01 * (attempt + 1))
 
 
 def _others():
