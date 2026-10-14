@@ -270,6 +270,11 @@ def schema(ctx, toolset):
     return tools
 
 
+TOOLSET_PLUGINS = {"niagara": "NiagaraToolsets", "pcg": "PCGToolset", "slateinspector": "SlateInspectorToolset",
+                   "configsettings": "ConfigSettingsToolset", "automationtest": "AutomationTestToolset",
+                   "statetree": "StateTreeToolset", "blueprinttools": "EditorToolset", "editorapp": "EditorToolset"}
+
+
 def resolve_toolset(ctx, query):
     names = list(catalog(ctx))
     q = query.lower()
@@ -281,7 +286,9 @@ def resolve_toolset(ctx, query):
     if len(exact) == 1:
         return exact[0]
     if not exact:
-        raise CliError(f"no toolset matches '{query}' (try: ue tools)")
+        plugin = next((p for key, p in TOOLSET_PLUGINS.items() if key in q), None)
+        raise CliError(f"no toolset matches '{query}'" + (f": enable Epic's {plugin} plugin (ue init does), then restart "
+                                                           "the editor" if plugin else " (try: ue tools)"))
     raise CliError(f"'{query}' is ambiguous: " + ", ".join(n.rsplit(".", 1)[-1] for n in exact[:10]))
 
 

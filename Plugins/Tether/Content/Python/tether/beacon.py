@@ -247,3 +247,8 @@ def _remove_files(folder, pid):
             os.remove(os.path.join(folder, name))
         except OSError:
             pass
+    try:  # a clean exit: older beacons left by crashed or killed editors are stale from now on (the CLI prunes them)
+        with open(os.path.join(os.path.dirname(folder), "last-exit.json"), "w", encoding="utf-8") as f:
+            json.dump({"pid": pid, "time": time.time()}, f)
+    except OSError:
+        pass

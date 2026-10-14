@@ -16,7 +16,7 @@ from .calls import (
 )
 from .images import cmd_look, cmd_shot
 from .testing import cmd_test
-from .assets import cmd_diff, cmd_fx, cmd_overview, cmd_pcg, cmd_size, cmd_table, cmd_usages, cmd_validate
+from .assets import cmd_diff, cmd_fx, cmd_net, cmd_overview, cmd_pcg, cmd_size, cmd_table, cmd_usages, cmd_validate
 from .content import cmd_import, cmd_landscape, cmd_lint, cmd_tex, cmd_unused
 from .jobs import cmd_job, cmd_package
 from .play import cmd_audio, cmd_gpu, cmd_mem, cmd_soak, cmd_ui, cmd_world
@@ -45,6 +45,15 @@ def undo_msys_paths(argv):
     return [rx.sub("", a) for a in argv]
 
 
+def cmd_help(ctx, args):
+    """`ue help [command]`: argparse's own help for a command, or the list of commands."""
+    try:
+        build_parser().parse_args([args.topic, "-h"] if args.topic else ["-h"])
+    except SystemExit as exc:
+        return 2 if exc.code else 0
+    return 0
+
+
 def build_parser():
     # Global options are accepted before or after the subcommand (agents write both).
     common = argparse.ArgumentParser(add_help=False)
@@ -67,6 +76,8 @@ def build_parser():
         s.set_defaults(fn=fn)
         return s
 
+    s = add("help", cmd_help, "help on a command: ue help pie (same as ue pie -h)")
+    s.add_argument("topic", nargs="?", help="a command name")
     add("status", cmd_status, "editor state from the beacon (no HTTP needed)")
     add("doctor", cmd_doctor, "check the setup (engine, plugins, editor, ports, Live Coding lock, .NET, git/LFS, disk)")
     s = add("open", cmd_open, "launch the editor with the MCP server on a per-project port and wait until ready")
@@ -187,6 +198,12 @@ def build_parser():
     s.add_argument("target", nargs="?", help="with generate/cleanup/status: the actor; with list: a name regex")
     s.add_argument("--seed", type=int, help="with generate: use this seed (undoable)")
     s.add_argument("--wait", type=float, default=60, help="with generate: seconds to wait for it to finish (60)")
+    s = add("net", cmd_net, "replication: what a class replicates (properties, RPCs), an actor's role/owner/relevancy per "
+                            "PIE world; `net compare Actor.Prop`: server vs clients")
+    s.add_argument("target", help="an actor (or player), a class, a Blueprint path, or 'compare'")
+    s.add_argument("prop", nargs="?", help="with compare: Actor.Property (or player.Health, Actor.location)")
+    s.add_argument("--pie", action="store_true", help="look the actor up in PIE (the world ue pie target picked)")
+    s.add_argument("--all", action="store_true", help="every parent class in full, not just counts")
     s = add("tree", cmd_tree, "an actor's or Blueprint's components as a tree: sockets, transforms, mobility, meshes, flags")
     s.add_argument("target", help="actor label, 'player' (PIE pawn), or a Blueprint /Game/... path")
     s.add_argument("--pie", action="store_true", help="the PIE world's actor")
@@ -245,6 +262,7 @@ def build_parser():
     s.add_argument("--annotate", action="store_true", help="overlay Epic's world grid and actor labels")
     s.add_argument("--grid-z", type=float, default=0, help="with --annotate: grid height (0)")
     s.add_argument("--ui", action="store_true", help="include gizmos and selection outlines")
+    s.add_argument("--hud", action="store_true", help="in PIE: the player's view with the game's UMG HUD on it")
     s.add_argument("-o", "--output", help="PNG path (default Saved/Tether/shots/shot-<time>.png)")
     s.add_argument("--baseline", metavar="NAME", help="also save this shot and its camera as a named baseline")
     s.add_argument("--compare", metavar="NAME", help="re-shoot a baseline's camera and report what changed (exit 1)")
@@ -266,12 +284,13 @@ def build_parser():
     s.add_argument("command", nargs="+")
     s.add_argument("--pie", action="store_true", help="run in the PIE world")
     s = add("log", cmd_log, "new log entries since the last call; --summary: the session grouped; --ignore: known noise")
-    s.add_argument("--since", choices=["last", "start"], default="last")
+    s.add_argument("--since", choices=["last", "start", "pie"], default="last",
+                   help="last: new since the previous ue log (default); start: this editor session; pie: the last PIE")
     s.add_argument("--summary", action="store_true", help="the whole session's warnings/errors grouped by message shape")
     s.add_argument("--ignore", metavar="REGEX", help="add known noise to Config/Tether/log-ignore.json (hidden from log, pie, ci)")
     s.add_argument("--why", help="with --ignore: a note kept next to the pattern")
     s.add_argument("--all", action="store_true", help="show known noise too")
-    s.add_argument("--level", default="Warning", help="Error, Warning, Display, Log, Verbose")
+    s.add_argument("--level", help="Error, Warning (default), Display, Log, Verbose; with --grep: Log")
     s.add_argument("--cat", help="only this log category")
     s.add_argument("--grep", help="regex filter")
     s = add("pie", pie_command, "Play-In-Editor: start | stop | status | run <script> | do <steps...> | watch <props> | record")
@@ -281,6 +300,8 @@ def build_parser():
     s.add_argument("-f", "--file", help="with do: a file of steps, one per line (# comments); with watch: run it while sampling")
     s.add_argument("--keep-going", action="store_true", help="with do: run every step even after a failure")
     s.add_argument("--clients", type=int, help="with start: multiplayer PIE with this many clients")
+    s.add_argument("--game", metavar="CLASS", help="with start: play with this game mode (/Script/Module.Class or "
+                                                  "/Game/BP_X.BP_X_C) instead of the project default; put back on stop")
     s.add_argument("--net", choices=["listen", "client", "standalone"],
                    help="with --clients: listen server (default), client (dedicated server), or standalone")
     s.add_argument("--expect", action="append", help="with run: log regex that must appear (repeatable)")

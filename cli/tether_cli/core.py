@@ -258,9 +258,14 @@ def unwrap(text):
     return value
 
 
+PY_OUTPUT = "<<printed before the error>>"  # toolsets._PY_OUTPUT: what a failing `ue py` script printed follows
+
+
 def compact_error(text):
     text = text.split("\nFunction schema Json", 1)[0]
-    return re.sub(r"\s+", " ", text).strip()[:600]
+    text, marker, printed = text.partition(PY_OUTPUT)
+    head = re.sub(r"\s+", " ", text).strip()[:600]
+    return head + (f"\n{PY_OUTPUT}\n{printed.strip(chr(10))}" if marker else "")
 
 
 def strip_common(paths):
@@ -417,6 +422,8 @@ def filter_log(lines, level="Warning", category=None, pattern=None, ignore=True)
         if cat in NOISE or (cat == "Cmd" and msg.strip() == "FLUSHLOG") or (cat == "LogJson" and NOISE_MESSAGE.match(msg)):
             continue
         if cat == "LogConsoleManager" and "FindConsoleObject() for 'FLUSHLOG'" in msg:  # our own log flushes
+            continue
+        if "BP_TetherDeferredExec" in msg:  # building Tether's helper for commands in multiplayer PIE
             continue
         if copy_frames and (TETHER_COPY.search(line) or (cat in ("BlueprintLog", "LogBlueprint", "LogK2Compiler")
                                                           and frame(line) in copy_frames)):
@@ -666,9 +673,50 @@ def running_editors():
     return rows
 
 
+def process_name(pid):
+    """The executable name of a running process, or None when it cannot be told."""
+    try:
+        if os.name == "nt":
+            import ctypes
+            from ctypes import wintypes
+            kernel32 = ctypes.windll.kernel32
+            kernel32.OpenProcess.restype = ctypes.c_void_p
+            kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
+            kernel32.QueryFullProcessImageNameW.argtypes = (ctypes.c_void_p, wintypes.DWORD, wintypes.LPWSTR,
+                                                            ctypes.POINTER(wintypes.DWORD))
+            handle = kernel32.OpenProcess(0x1000, False, int(pid))  # PROCESS_QUERY_LIMITED_INFORMATION
+            if not handle:
+                return None
+            try:
+                buf, size = ctypes.create_unicode_buffer(1024), wintypes.DWORD(1024)
+                ok = kernel32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size))
+                return os.path.basename(buf.value) if ok else None
+            finally:
+                kernel32.CloseHandle(handle)
+        if os.path.exists(f"/proc/{int(pid)}/comm"):
+            with open(f"/proc/{int(pid)}/comm", encoding="utf-8", errors="replace") as f:
+                return f.read().strip()
+        out = subprocess.run(["ps", "-p", str(int(pid)), "-o", "comm="], capture_output=True, text=True).stdout.strip()
+        return os.path.basename(out) or None
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def editor_process(pid):
+    """True while pid is a running Unreal Editor; a dead editor's pid that a later process reused is not."""
+    if not pid_alive(pid):
+        return False
+    name = process_name(pid)
+    return name is None or "editor" in name.lower()
+
+
 def editor_beacons(project):
     """Every editor beacon this project has, newest heartbeat first: one file per editor process
-    (Saved/Tether/editors/<pid>.json), plus the single editor.json that Tether before 0.11 wrote."""
+    (Saved/Tether/editors/<pid>.json), plus the single editor.json that Tether before 0.11 wrote.
+
+    An editor that was killed or crashed leaves its files behind (they are removed on a clean exit). Of those,
+    only the newest is kept, for status and crash reports, and only if it is newer than the last clean exit
+    (Saved/Tether/last-exit.json); the rest are deleted."""
     folder = os.path.join(state_dir(project), "editors")
     found = {}
     for name in os.listdir(folder) if os.path.isdir(folder) else []:
@@ -679,12 +727,36 @@ def editor_beacons(project):
     legacy = read_json(os.path.join(state_dir(project), "editor.json"))
     if legacy and legacy.get("pid") and legacy["pid"] not in found:
         found[legacy["pid"]] = dict(legacy, legacy=True)
-    return sorted(found.values(), key=lambda b: -b.get("heartbeat", 0))
+    ordered = sorted(found.values(), key=lambda b: -b.get("heartbeat", 0))
+    clean_exit = (read_json(os.path.join(state_dir(project), "last-exit.json")) or {}).get("time", 0)
+    kept, dead_kept = [], False
+    for beacon in ordered:
+        if editor_process(beacon.get("pid")):
+            kept.append(beacon)
+        elif not dead_kept and beacon.get("heartbeat", 0) > clean_exit:
+            kept.append(beacon)
+            dead_kept = True
+        else:
+            forget_beacon(project, beacon)
+    return kept
+
+
+def forget_beacon(project, beacon):
+    """Delete a dead editor's beacon and token files."""
+    if beacon.get("legacy"):
+        paths = [os.path.join(state_dir(project), n) for n in ("editor.json", "session.json")]
+    else:
+        paths = [os.path.join(state_dir(project), "editors", f"{beacon['pid']}{ext}") for ext in (".json", ".token")]
+    for path in paths:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
 
 
 def live_editors(project):
     """Beacons of the project's editors whose process is still running (ticking or hung)."""
-    return [b for b in editor_beacons(project) if pid_alive(b.get("pid"))]
+    return [b for b in editor_beacons(project) if editor_process(b.get("pid"))]
 
 
 def chosen_editor(project):
@@ -693,7 +765,7 @@ def chosen_editor(project):
     than one `ue open` launched, else the most recently started."""
     wanted = os.environ.get("UE_EDITOR_PID")
     beacons = editor_beacons(project)
-    live = [b for b in beacons if pid_alive(b.get("pid"))]
+    live = [b for b in beacons if editor_process(b.get("pid"))]
     if wanted:
         match = next((b for b in beacons if str(b.get("pid")) == wanted), None)
         if match is None or match not in live:
@@ -740,7 +812,7 @@ def editor_mode(project, beacon):
 def editor_live(project):
     """The chosen editor's beacon if it is running and ticking, else None."""
     beacon = chosen_editor(project) or {}
-    alive = pid_alive(beacon.get("pid")) and time.time() - beacon.get("heartbeat", 0) < 15
+    alive = editor_process(beacon.get("pid")) and time.time() - beacon.get("heartbeat", 0) < 15
     return beacon if alive else None
 
 

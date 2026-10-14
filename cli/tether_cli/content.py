@@ -18,6 +18,25 @@ IMPORT_EXTS = {
 IMPORTABLE = tuple(ext for exts in IMPORT_EXTS.values() for ext in exts)
 
 
+LOD_NODE = re.compile(rb"([A-Za-z0-9_]+?)_LOD(\d+)(?=\x00\x01Model|::|\"|\x00)")
+
+
+def lod_named_meshes(path, limit=64 << 20):
+    """{base name: sorted LOD numbers} for meshes inside an FBX/glTF named Name_LOD0, Name_LOD1... (Unity's
+    convention). Interchange does not read those as LODs: it stacks them into one LOD of one mesh."""
+    if not path.lower().endswith((".fbx", ".gltf", ".glb")):
+        return {}
+    try:
+        with open(path, "rb") as f:
+            data = f.read(limit)
+    except OSError:
+        return {}
+    found = {}
+    for m in LOD_NODE.finditer(data):
+        found.setdefault(m.group(1).decode("utf-8", "replace"), set()).add(int(m.group(2)))
+    return {base: sorted(lods) for base, lods in found.items() if len(lods) > 1}
+
+
 def import_plan(sources, dest):
     """{content folder: [files]} for files and folders; a folder's subfolders become subfolders of dest."""
     plan = {}
@@ -78,6 +97,12 @@ def cmd_import(ctx, args):
         plan = import_plan(sources, dest)
         if args.name and sum(len(files) for files in plan.values()) > 1:
             raise CliError("--name works with a single file")
+        for files in plan.values():
+            for path in files:
+                for base, lods in lod_named_meshes(path).items():
+                    print(f"warning: {os.path.basename(path)} has meshes {base}_LOD{lods[0]}..{lods[-1]} (Unity's LOD naming): "
+                          f"Interchange imports them stacked into a single LOD. Rename them LOD{lods[0]}_{base}... or put "
+                          "them in an FBX LOD group to get one mesh with LODs")
         options = {"name": args.name, "collision": args.collision, "lods": args.lods, "nanite": args.nanite,
                    "texture_group": args.texture_group, "replace": not args.no_replace, "save": args.save}
         results, code = [], 0

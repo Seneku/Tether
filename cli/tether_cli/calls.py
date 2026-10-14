@@ -7,8 +7,8 @@ import sys
 import time
 
 from .core import (
-    CliError, GATED, TETHER, UE_SCRIPT, compact_error, editor_token, emit, filter_log, human_bytes, log_end, log_ignore_entries,
-    log_ignore_path, log_path, pid_alive, summarize_log, write_json,
+    CliError, GATED, TETHER, UE_SCRIPT, compact_error, editor_process, editor_token, emit, filter_log, human_bytes, log_end, log_ignore_entries,
+    log_ignore_path, log_path, pid_alive, PY_OUTPUT, summarize_log, write_json,
     port_open,
     read_json, read_new_log, short, state_dir, unwrap,
 )
@@ -77,6 +77,26 @@ def cmd_call(ctx, args):
     return 0
 
 
+PY_PITFALLS = [  # (pattern in `ue py` code, what goes wrong): engine behaviour that cost real sessions time
+    (re.compile(r"build_from_static_mesh_descriptions\s*\("),
+     "StaticMesh.build_from_static_mesh_descriptions on a mesh that already has render data crashes the editor "
+     "(\"FRenderResource was deleted without being released first\"); building into a new mesh is fine"),
+]
+STRUCT_LOOP = re.compile(r"for\s+(\w+)\s+in\s+[^\n]*get_editor_property\([^\n]*:\s*\n((?:[ \t]+[^\n]*\n?)+)")
+
+
+def py_pitfalls(code):
+    """Warnings for known engine traps in code about to run in the editor."""
+    notes = [message for rx, message in PY_PITFALLS if rx.search(code)]
+    for m in STRUCT_LOOP.finditer(code):
+        if re.search(r"\b" + re.escape(m.group(1)) + r"\.set_editor_property\(", m.group(2)):
+            notes.append(f"'{m.group(1)}' comes from iterating an unreal.Array: elements of struct arrays are copies, "
+                         "so set_editor_property on them changes nothing; set the edited element back by index "
+                         "(arr[i] = item) and write the array back")
+            break
+    return notes
+
+
 def cmd_py(ctx, args):
     if args.file:
         with open(args.file, encoding="utf-8") as f:
@@ -85,7 +105,16 @@ def cmd_py(ctx, args):
         code = sys.stdin.read()
     else:
         code = " ".join(args.code)
-    out = ctx.tether("py", code=code.lstrip("﻿"))  # PowerShell pipes a BOM
+    for note in py_pitfalls(code):
+        print(f"note: {note}", file=sys.stderr)
+    try:
+        out = ctx.tether("py", code=code.lstrip("﻿"))  # PowerShell pipes a BOM
+    except CliError as exc:
+        error, marker, printed = str(exc).partition(f"\n{PY_OUTPUT}\n")
+        if marker:  # what the script printed before it raised, with its newlines, then the error
+            print(printed.rstrip("\n"))
+            raise CliError(error, exc.code) from None
+        raise
     if out not in ("", None):  # output that is itself JSON comes back decoded
         print(out.rstrip("\n") if isinstance(out, str) else json.dumps(out))
     return 0
@@ -387,11 +416,23 @@ def cmd_actors(ctx, args):
 
 def cmd_exec(ctx, args):
     start = log_end(ctx.project)
-    world = ctx.tether("console", command=" ".join(args.command), pie=args.pie)
-    flush_editor_log(ctx)
-    with open(log_path(ctx.project), "rb") as f:
-        f.seek(start)
-        lines = f.read().decode("utf-8", "replace").splitlines()
+    command = " ".join(args.command)
+    world = ctx.tether("console", command=command, pie=args.pie)
+    # In multiplayer PIE the command runs on the world's next tick (so RPCs replicate), and what it causes on the
+    # other side lands a frame or two later: wait for it to run, then a little longer.
+    deadline = time.time() + (8 if "queued" in str(world) else 0)
+    ran_at = None
+    while True:
+        flush_editor_log(ctx)
+        with open(log_path(ctx.project), "rb") as f:
+            f.seek(start)
+            lines = f.read().decode("utf-8", "replace").splitlines()
+        if ran_at is None and any(l.rstrip().endswith(f"Cmd: {command}") for l in lines):
+            ran_at = time.time()  # then a second more for the other side's reply (PIE ticks slowly in the background)
+        if time.time() >= deadline or ran_at and time.time() - ran_at >= 1.0:
+            break
+        time.sleep(0.25)
+    world = str(world).replace(" (queued for its next tick)", ", from its next tick")
     shown = filter_log(lines, level="Log")
     print(f"ran in {world}" + ("" if shown else " (no log output)"))
     for line in shown[: args.limit]:
@@ -405,7 +446,7 @@ def flush_editor_log(ctx):
     if getattr(ctx, "transport", "mcp") == "remote":
         reachable = ctx._rex is not None  # a fresh remote connection costs ~1 s of discovery; skip it
     else:
-        reachable = beacon and pid_alive(beacon.get("pid")) and beacon.get("mcp_port") and port_open(beacon["mcp_port"])
+        reachable = beacon and editor_process(beacon.get("pid")) and beacon.get("mcp_port") and port_open(beacon["mcp_port"])
     if reachable:
         try:
             ctx.tether("console", command="FLUSHLOG")
@@ -413,15 +454,27 @@ def flush_editor_log(ctx):
             pass  # hung or busy editor: read whatever is on disk
 
 
+PIE_START = re.compile(r"LogPlayLevel: Creating play world package: \S*UEDPIE_0_")  # each PIE session's first world
+
+
+def since_pie(lines):
+    """The lines from the start of the last PIE session on (all of them when there was none)."""
+    starts = [i for i, line in enumerate(lines) if PIE_START.search(line)]
+    return lines[starts[-1]:] if starts else lines
+
+
 def cmd_log(ctx, args):
     if args.ignore:
         return add_log_ignore(ctx, args.ignore, args.why)
     flush_editor_log(ctx)
+    level = args.level or ("Log" if args.grep else "Warning")  # a search looks at every line unless told otherwise
     if args.summary:
         lines = read_new_log(ctx.project, from_start=True, advance=False)
-        rows, hidden = summarize_log(lines, args.level, ignore=not args.all)
+        lines = since_pie(lines) if args.since == "pie" else lines
+        rows, hidden = summarize_log(lines, level, ignore=not args.all)
         total = sum(r["count"] for r in rows)
-        print(f"{total} entries (>= {args.level}) in {len(rows)} group(s) from {len(lines)} lines this session"
+        print(f"{total} entries (>= {level}) in {len(rows)} group(s) from {len(lines)} lines "
+              + ("since the last PIE start" if args.since == "pie" else "this session")
               + (f"; {hidden} known noise hidden (--all)" if hidden else ""))
         for row in rows[: args.limit]:
             print(f"{row['count']:>5}x {row['level'][0]} {row['category']}: {short(row['first'], 160)}")
@@ -429,11 +482,18 @@ def cmd_log(ctx, args):
             print(f"... +{len(rows) - args.limit} more group(s) (--limit)")
         ctx.data = {"groups": rows, "hidden": hidden}
         return 0
-    lines = read_new_log(ctx.project, from_start=args.since == "start")
-    shown = filter_log(lines, args.level, args.cat, args.grep, ignore=not args.all)
-    print(f"{len(shown)} entries (>= {args.level}) from {len(lines)} new lines"
-          + (f"; {shown.hidden} known noise hidden (--all)" if shown.hidden else ""))
-    for line in shown[-args.limit:] if args.since == "start" else shown[: args.limit]:
+    if args.since == "pie":
+        lines = since_pie(read_new_log(ctx.project, from_start=True, advance=False))
+        where = "since the last PIE start"
+    else:
+        lines = read_new_log(ctx.project, from_start=args.since == "start")
+        where = "this session" if args.since == "start" else "new since the last ue log"
+    shown = filter_log(lines, level, args.cat, args.grep, ignore=not args.all)
+    filters = [f">= {level}"] + ([f"category {args.cat}"] if args.cat else []) + ([f"matching /{args.grep}/"] if args.grep else [])
+    print(f"{len(shown)} entries ({', '.join(filters)}) of {len(lines)} lines {where}"
+          + (f"; {shown.hidden} known noise hidden (--all)" if shown.hidden else "")
+          + ("" if shown or level in ("Log", "Verbose", "VeryVerbose") else f" (--level Log shows info lines too)"))
+    for line in shown[-args.limit:] if args.since in ("start", "pie") else shown[: args.limit]:
         print(line)
     if len(shown) > args.limit:
         print(f"... +{len(shown) - args.limit} more (--limit)")

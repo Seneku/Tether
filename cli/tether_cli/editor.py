@@ -4,7 +4,8 @@ import os
 import time
 
 from .core import (
-    CliError, blocking_dialogs, crash_reports, crash_summary, describe_crash, editor_beacons, editor_executable,
+    CliError, blocking_dialogs, crash_reports, crash_summary, describe_crash, editor_beacons, editor_executable, forget_beacon,
+    editor_process,
     editor_label, engine_root, filter_log, live_coding_available, live_editors, logged_dialogs, modal_dialogs,
     pick_port, pid_alive, port_open, read_json, read_new_log, recent_crash, state_dir, subprocess, write_json,
 )
@@ -23,7 +24,7 @@ def cmd_status(ctx, args):
         print(f"{name}: editor not running (ue open starts one; an editor you open yourself works too, once it "
               "has loaded)")
         return 2
-    alive = pid_alive(beacon.get("pid"))
+    alive = editor_process(beacon.get("pid"))
     age = time.time() - beacon.get("heartbeat", 0)
     port = beacon.get("mcp_port")
     if not alive:
@@ -61,7 +62,7 @@ def cmd_status(ctx, args):
 
 def cmd_build(ctx, args):
     beacon = ctx.beacon
-    running = bool(beacon and pid_alive(beacon.get("pid")))
+    running = bool(beacon and editor_process(beacon.get("pid")))
     changes = classify_changes(ctx.project)
     has_csharp = csharp_layout(ctx.project) is not None
     if not running:
@@ -109,7 +110,7 @@ def cmd_build(ctx, args):
 
 def cmd_open(ctx, args):
     beacon = ctx.beacon
-    if beacon and pid_alive(beacon.get("pid")):  # attach to the open editor, the user's own included
+    if beacon and editor_process(beacon.get("pid")):  # attach to the open editor, the user's own included
         print(f"already open ({editor_label(beacon)}); using it")
         return cmd_status(ctx, args)
     has_csharp = csharp_layout(ctx.project) is not None
@@ -237,6 +238,10 @@ def close_editor(ctx, args, explicit):
             raise CliError("editor did not exit within 30s (modal dialog open?); retry with --force", 4)
         subprocess.run(["taskkill", "/PID", str(pid), "/F"] if os.name == "nt" else ["kill", "-9", str(pid)],
                        capture_output=True)
+        # Not a crash: forget its beacon (its own exit cleanup never ran) and note the exit like a clean one.
+        forget_beacon(ctx.project, beacon)
+        write_json(os.path.join(state_dir(ctx.project), "last-exit.json"), {"pid": pid, "time": time.time(),
+                                                                            "terminated": True})
         print("terminated")
     else:
         print("closed")

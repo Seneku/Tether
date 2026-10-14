@@ -6,7 +6,7 @@ import sys
 import time
 
 from .core import (
-    CliError, chosen_editor, editor_label, editor_live, live_editors, find_project, pid_alive, project_of, read_json, stall_report, state_dir,
+    CliError, chosen_editor, editor_label, editor_live, editor_process, live_editors, find_project, pid_alive, project_of, read_json, stall_report, state_dir,
     write_json,
 )
 from .build import classify_changes, csharp_changes, csharp_layout
@@ -73,7 +73,7 @@ def hook_session_start(payload):
     except Exception:  # a hook must never fail
         brief = ""
     beacon = chosen_editor(project) or {}
-    if not pid_alive(beacon.get("pid")):
+    if not editor_process(beacon.get("pid")):
         head = (f"Unreal project {name}: editor not running. Use the `ue` CLI (unreal-tether skill); "
                 "start it with `ue open --headless` (`--render` if you need `ue shot`).")
     else:

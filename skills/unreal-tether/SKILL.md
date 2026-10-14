@@ -80,6 +80,13 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
 - Terrain: `ue landscape` (size, layers), `ue landscape at x,y` (height, slope, layer weights: use it before placing
   things), `ue landscape map` (a PNG of the shape). `ue landscape flatten x,y,r [--height z]` (a pad for a
   building), `raise x,y,r --by cm`, `smooth x,y,r`; each prints a backup for `ue landscape restore --backup`.
+- Multiplayer: `ue pie start --clients 2` (add `--game /Script/MyGame.MyGameMode` to try another game mode), then
+  `ue pie target 1` to act on the first client. `ue exec --pie` and `pie do` exec steps run on that world's next
+  tick, so RPCs replicate; a `call` step or your own Python calling a function directly runs any RPC locally
+  (editor Python makes every RPC local). `ue pie run` scripts: `import tether`, then `tether.world()`, `player()`,
+  `console("cmd")` follow the targeted world. `ue net MyCharacter` lists replicated properties and RPCs;
+  `ue net player --pie` shows role, owner and relevancy per world; `ue net compare player.Health` checks the
+  server and clients agree.
 - Component layout: `ue tree BP_Door` (or an actor label, or `player` in PIE) shows the component hierarchy
   with sockets, transforms, meshes and collision/visibility flags.
 - Effects: `ue fx /Game/FX/NS_Fire` reads a Niagara system (emitters, modules per stage, user parameters);
@@ -114,6 +121,8 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
   `fill_data_table_from_json_string`, which wipes every row).
 - `ue log [--level Warning|Display|Log] [--cat X] [--grep re]`: only entries that are new since the last
   `ue log`, de-duplicated. Run it after anything that might have warned or errored.
+- `ue log --since pie` reads from the last PIE start; `--grep` searches every line (Log and up) unless `--level`
+  is given.
 - `ue log --summary`: the whole session's warnings and errors grouped by message shape with counts. Noise the
   project knows about goes in Config/Tether/log-ignore.json (`ue log --ignore '^LogX: known thing' --why ...`);
   ue log, pie and ci then hide it and say how many lines they hid (`--all` shows them). Add an entry only for
@@ -221,6 +230,18 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
   Settings behind it: `ue cvar r.Shadow` lists console variables with who set them; `ue cvar --changed` shows
   everything the project and device profile changed; to try a value, `ue cvar r.X=1 --for "gpu"` sets it only
   for that one command.
+- UI checks: `ue shot --hud` in PIE captures the game view with its UMG HUD (plain `ue shot` has the 3D view only).
+- Engine traps worth knowing (`ue py` warns about the first two):
+  - `StaticMesh.build_from_static_mesh_descriptions` on a mesh that already has render data crashes the editor;
+    build into a new mesh instead.
+  - Iterating an `unreal.Array` of structs gives copies: edit `arr[i]`, assign it back, then write the array back
+    (a skeletal mesh's material slots silently stay None otherwise).
+  - Interchange stacks Unity-style `Name_LOD0..2` meshes into one LOD (`ue import` warns); it wants `LODxx_Name`
+    or an FBX LOD group.
+  - `UMovementComponent::bTickBeforeOwner` (on by default) plus `AddTickPrerequisiteActor(owner)` makes a tick
+    cycle warning.
+  - A `UDeveloperSettings` subclass without `BlueprintType` has no Python type, but
+    `unreal.find_object(None, '/Script/Module.Default__X')` still reaches its defaults.
 - Texture memory: `ue tex /Game/Folder` (largest textures, estimated memory, oversized/uncompressed/never
   streaming ones) and `ue tex --streaming` (what is resident now, pool use, textures held back).
   `ue perf --trace` adds which scopes (functions, Blueprint events, render passes) take the time per thread.

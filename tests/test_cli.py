@@ -15,6 +15,19 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "cli"))
 import tether_cli as ue  # noqa: E402
 
 
+_NAME_PATCH = unittest.mock.patch("tether_cli.core.process_name", return_value=None)
+
+
+def setUpModule():
+    # Tests stand in for editors with real pids (this process, its parent); don't let the image-name check
+    # (python.exe is not an editor) call them dead. Beacons.test_* exercises that check itself.
+    _NAME_PATCH.start()
+
+
+def tearDownModule():
+    _NAME_PATCH.stop()
+
+
 def stamped(text):
     return f"[2026.10.12-10.13.00:858][398]{text}"
 
@@ -362,7 +375,7 @@ class Init(unittest.TestCase):
 
     def test_enables_plugins_copies_tether_keeps_crlf_and_is_idempotent(self):
         self.run_init()
-        self.assertEqual(self.plugins(), dict.fromkeys(ue.REQUIRED_PLUGINS, True))
+        self.assertEqual(self.plugins(), dict.fromkeys(ue.REQUIRED_PLUGINS + ["NiagaraToolsets"], True))  # Niagara is on by default
         self.assertTrue(os.path.isfile(os.path.join(self.project.root, "Plugins", "Tether", "Tether.uplugin")))
         self.assertFalse(os.path.exists(os.path.join(self.project.root, "Plugins", "TetherUnrealSharp")))
         self.assertIn(b"\r\n\t\"FileVersion\": 3", self.raw())
@@ -1714,3 +1727,128 @@ class GpuProfile(unittest.TestCase):
         self.assertEqual(summary["kinds"]["post processing"], 0.2)
         self.assertEqual(summary["passes"][:2], [("RenderGraphExecute - Slate", 0.9), ("BasePass", 0.7)])
         self.assertNotIn("SceneRender - ViewFamilies", dict(summary["passes"]))
+
+
+class Beacons(unittest.TestCase):
+    def test_dead_and_reused_pids_are_pruned(self):
+        project = Project()
+        folder = os.path.join(ue.state_dir(project.uproject), "editors")
+        now = time.time()
+        for pid, heartbeat in ((111, now - 50), (222, now - 500), (333, now - 900), (os.getpid(), now - 700)):
+            ue.write_json(os.path.join(folder, f"{pid}.json"), {"pid": pid, "heartbeat": heartbeat})
+            ue.write_json(os.path.join(folder, f"{pid}.token"), {"token": "t"})
+        names = {os.getpid(): "python.exe"}  # a live pid that is no editor: reused
+        alive = {os.getpid(), 222}
+        with unittest.mock.patch("tether_cli.core.pid_alive", side_effect=lambda pid: pid in alive),                 unittest.mock.patch("tether_cli.core.process_name", side_effect=lambda pid: names.get(pid, "UnrealEditor.exe")):
+            beacons = ue.editor_beacons(project.uproject)
+        # 222 runs an editor; 111 is the newest dead one (kept for crash reports); 333 and the reused pid go.
+        self.assertEqual([b["pid"] for b in beacons], [111, 222])
+        self.assertEqual(sorted(os.listdir(folder)), ["111.json", "111.token", "222.json", "222.token"])
+        project.close()
+
+    def test_clean_exit_retires_older_dead_beacons(self):
+        project = Project()
+        folder = os.path.join(ue.state_dir(project.uproject), "editors")
+        ue.write_json(os.path.join(folder, "111.json"), {"pid": 111, "heartbeat": 1000})
+        ue.write_json(os.path.join(ue.state_dir(project.uproject), "last-exit.json"), {"pid": 5, "time": 2000})
+        with unittest.mock.patch("tether_cli.core.pid_alive", return_value=False):
+            self.assertEqual(ue.editor_beacons(project.uproject), [])
+            self.assertIsNone(ue.chosen_editor(project.uproject))
+        project.close()
+
+
+class PyErrors(unittest.TestCase):
+    def test_printed_output_keeps_its_lines(self):
+        text = "RuntimeError: x (line 1)\n<<printed before the error>>\na\nb\n"
+        self.assertEqual(ue.compact_error(text), "RuntimeError: x (line 1)\n<<printed before the error>>\na\nb")
+        self.assertEqual(ue.compact_error("Some   error\n  spread out"), "Some error spread out")
+
+    def test_pitfalls(self):
+        notes = ue.py_pitfalls("mesh.build_from_static_mesh_descriptions([d])\n")
+        self.assertTrue(notes and "crashes the editor" in notes[0])
+        loop = "for slot in mesh.get_editor_property('static_materials'):\n    slot.set_editor_property('x', m)\n"
+        self.assertTrue(any("copies" in n for n in ue.py_pitfalls(loop)))
+        self.assertEqual(ue.py_pitfalls("for a in actors():\n    print(a)\n"), [])
+
+
+class LogSincePie(unittest.TestCase):
+    def test_since_last_pie_start(self):
+        lines = ["a", stamped("LogPlayLevel: Creating play world package: /Game/UEDPIE_0_L"), "b",
+                 stamped("LogPlayLevel: Creating play world package: /Game/UEDPIE_1_L"), "c",
+                 stamped("LogPlayLevel: Creating play world package: /Game/UEDPIE_0_L"), "d"]
+        self.assertEqual(ue.since_pie(lines)[1:], ["d"])
+        self.assertEqual(ue.since_pie(["x", "y"]), ["x", "y"])
+
+    def test_help_command(self):
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(ue.cmd_help(None, argparse.Namespace(topic="log")), 0)
+        self.assertIn("--since", out.getvalue())
+
+
+class HudCrop(unittest.TestCase):
+    SNAPSHOT = """window "Sandbox - Unreal Editor" [pos=0,0 size=1280,720] [ref=w1]
+  splitter [pos=3,3 size=1274,714] [ref=sp1]
+      splitter [pos=7,105 size=795,576] [ref=sp3]
+          tab "Viewport 1" [pos=7,105 size=160,25] [ref=t3]
+            text "UMG probe widget" [pos=26,181 size=260,37] [ref=x13]"""
+
+    def test_rect_is_bottom_of_the_viewport_panel(self):
+        self.assertEqual(ue.hud_rect(self.SNAPSHOT, 795, 519), (7, 162, 795, 519))
+        self.assertIsNone(ue.hud_rect(self.SNAPSHOT, 1920, 1080))
+
+    def test_crop(self):
+        width, height = 6, 4
+        rgb = bytes((x * 10, y * 10, 0) [c] for y in range(height) for x in range(width) for c in range(3))
+        out = ue.png_read(ue.png_crop(ue.png_bytes(width, height, rgb), (2, 1, 3, 2)))
+        self.assertEqual(out[:3], (3, 2, 3))
+        self.assertEqual(out[3][:3], bytes((20, 10, 0)))
+
+
+class NetSource(unittest.TestCase):
+    HEADER = """
+UCLASS()
+class GAME_API ARobot : public ACharacter
+{
+	GENERATED_BODY()
+	UPROPERTY(ReplicatedUsing = OnRep_Health, BlueprintReadOnly)
+	float Health = 100.f;
+	UPROPERTY(replicated)
+	uint8 bArmed : 1;
+	UPROPERTY(EditAnywhere)
+	float NotNet;
+	UFUNCTION(Server, Reliable, WithValidation)
+	void ServerFire(FVector Aim);
+	UFUNCTION(NetMulticast, Unreliable)
+	void MulticastSpark();
+	UFUNCTION(reliable, client)
+	void ClientHit(int32 Damage);
+};
+class OTHER_API AOther : public AActor { UPROPERTY(Replicated) int32 X; };
+"""
+
+    def test_header(self):
+        rep = ue.replication_in_header(self.HEADER, "ARobot")
+        self.assertEqual(rep["properties"], [("Health", "OnRep_Health"), ("bArmed", None)])
+        self.assertEqual(rep["rpcs"], [("ServerFire", "server", True, True), ("MulticastSpark", "multicast", False, False),
+                                       ("ClientHit", "client", True, False)])
+        self.assertIsNone(ue.replication_in_header(self.HEADER, "ANope"))
+
+    def test_conditions(self):
+        cpp = ("DOREPLIFETIME_CONDITION(ARobot, Health, COND_OwnerOnly);\nFDoRepLifetimeParams P;\n"
+               "P.Condition = COND_SkipOwner;\nDOREPLIFETIME_WITH_PARAMS_FAST(ARobot, bArmed, P);")
+        self.assertEqual(ue.replication_conditions(cpp, "ARobot"), {"Health": "OwnerOnly", "bArmed": "SkipOwner"})
+
+    def test_words(self):
+        self.assertEqual(ue.net_word("roleautonomousproxy", "role"), "autonomous proxy")
+        self.assertEqual(ue.net_word("DORM_Awake", "dorm"), "awake")
+
+
+class LodNames(unittest.TestCase):
+    def test_unity_lod_meshes_in_fbx(self):
+        tmp = tempfile.TemporaryDirectory()
+        path = os.path.join(tmp.name, "robot.fbx")
+        with open(path, "wb") as f:
+            f.write(b"Robot_LOD0\x00\x01Model Robot_LOD1\x00\x01Model Robot_LOD2\x00\x01Model Arm_LOD0\x00\x01Model")
+        self.assertEqual(ue.lod_named_meshes(path), {"Robot": [0, 1, 2]})
+        self.assertEqual(ue.lod_named_meshes(os.path.join(tmp.name, "t.png")), {})
+        tmp.cleanup()

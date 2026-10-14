@@ -58,6 +58,9 @@ _NAMESPACE = getattr(sys, "_tether_ns", None) or {"unreal": unreal, "__name__": 
 sys._tether_ns = _NAMESPACE
 
 
+_PY_OUTPUT = "<<printed before the error>>"
+
+
 def _run_python(code):
     tree = ast.parse(code, "<ue py>", "exec")
     tail = None
@@ -72,7 +75,8 @@ def _run_python(code):
         frames = traceback.extract_tb(exc.__traceback__)
         line = next((f.lineno for f in reversed(frames) if f.filename == "<ue py>"), None)
         where = f" (line {line})" if line else ""
-        raise RuntimeError(f"{buf.getvalue()}{type(exc).__name__}: {exc}{where}") from None
+        printed = buf.getvalue()  # after a marker, so the CLI can show it with its newlines (errors get compacted)
+        raise RuntimeError(f"{type(exc).__name__}: {exc}{where}" + (f"\n{_PY_OUTPUT}\n{printed}" if printed else "")) from None
     out = buf.getvalue()
     if value is not None:
         out += value if isinstance(value, str) else repr(value)
@@ -172,13 +176,22 @@ def _short_path(path):
     return path.split(":PersistentLevel.", 1)[-1]
 
 
+def _actor_label(actor):
+    """An actor's label, except in PIE when it is the automatic one (SDRobotCharacter3 for SDRobotCharacter_3, as
+    actors spawned at runtime get): then its object name, which Python, logs and the game's own code use."""
+    label, name = actor.get_actor_label(), actor.get_name()
+    if label != name and label == re.sub(r"_(\d+)$", r"\1", name) and "UEDPIE_" in actor.get_outermost().get_name():
+        return name
+    return label
+
+
 def _label(obj):
     if obj.get_name().startswith("Default__"):  # a class default object: its "actor label" is meaningless
         return _short_path(obj.get_path_name())
     if isinstance(obj, unreal.Actor):
-        return obj.get_actor_label()
+        return _actor_label(obj)
     if isinstance(obj, unreal.ActorComponent) and obj.get_owner():
-        return f"{obj.get_owner().get_actor_label()}.{obj.get_name()}"
+        return f"{_actor_label(obj.get_owner())}.{obj.get_name()}"
     return _short_path(obj.get_path_name())
 
 
@@ -413,7 +426,7 @@ def snapshot_level(level=None):
     if world is None:
         return
     level = level or world.get_path_name().split(".")[0]
-    _LEVELS[level] = {a.get_path_name(): (a.get_actor_label(), a.get_class().get_name(), _pose_key(a))
+    _LEVELS[level] = {a.get_path_name(): (_actor_label(a), a.get_class().get_name(), _pose_key(a))
                       for a in _authored_actors()}
 
 
@@ -946,6 +959,16 @@ def _fixup_redirector(package, vcs):
     return saved, problems
 
 
+def _texture_dims(texture):
+    """'2048 x 2048' as built for this platform. GetSizeX/Y read the platform data, which is a 32 x 32 placeholder
+    while the texture still compiles in the background (right after an import); the built size is worked out
+    from the source and settings without waiting."""
+    size = _try(lambda: texture.blueprint_get_built_texture_size())
+    if size is not None and size.x:
+        return f"{size.x:.0f} x {size.y:.0f}"
+    return f"{texture.blueprint_get_size_x()} x {texture.blueprint_get_size_y()}"
+
+
 _IMPORT_TAG = "TetherImport"  # asset metadata: the options `ue import` applied, re-applied on reimport
 
 
@@ -1010,7 +1033,7 @@ def _after_import(asset, opts):
             asset.set_editor_property("compression_settings", unreal.TextureCompressionSettings.TC_MASKS)
         compression = str(asset.get_editor_property("compression_settings")).split(".")[-1].split(":")[0]
         lod_group = str(asset.get_editor_property("lod_group")).split(".")[-1].split(":")[0].replace("TEXTUREGROUP_", "")
-        return (f"{asset.blueprint_get_size_x()} x {asset.blueprint_get_size_y()}, {compression}, sRGB "
+        return (f"{_texture_dims(asset)}, {compression}, sRGB "
                 f"{asset.get_editor_property('srgb')}, group {lod_group}" + (" (mask: set linear)" if mask else ""))
     if isinstance(asset, unreal.SoundWave):
         return f"{asset.get_editor_property('duration'):.2f} s, {asset.get_editor_property('num_channels')} channel(s)"
@@ -1087,7 +1110,7 @@ def _settings(method, *args):
     """Call Epic's ConfigSettingsToolset (the editor's Project/Editor Settings registry) and decode its JSON."""
     tool = getattr(unreal, "ConfigSettingsToolset", None)
     if tool is None:
-        raise RuntimeError("needs Epic's ConfigSettingsToolset (UE 5.8+)")
+        raise RuntimeError("needs Epic's ConfigSettingsToolset plugin (UE 5.8+; ue init enables it, then restart the editor)")
     result = unreal.get_default_object(tool).call_method(method, args)
     if isinstance(result, str):
         try:
@@ -1131,6 +1154,27 @@ def _package_file(package, is_map=False):
         if base and os.path.isfile(base + ext):
             return base + ext
     return base + (".umap" if is_map else ".uasset") if base else ""
+
+
+def _clean_copy(asset):
+    """A /Temp copy of a saved asset, loaded from its file, for work that marks an asset modified (recompiling a
+    material does). An asset with unsaved changes is returned as is: its file is not what the editor has."""
+    package = asset.get_outermost().get_name()
+    dirty = {p.get_name() for p in unreal.EditorLoadingAndSavingUtils.get_dirty_content_packages()}
+    path = _package_file(package)
+    if package in dirty or not package.startswith("/Game/") or not os.path.isfile(path):
+        return asset
+    import hashlib
+    with open(path, "rb") as f:
+        data = f.read()
+    tag, name = hashlib.sha1(data).hexdigest()[:12], package.rsplit("/", 1)[-1]
+    folder = os.path.join(unreal.Paths.convert_relative_path_to_full(unreal.Paths.project_saved_dir()),
+                          "Tether", "diff", tag)  # /Temp is mounted on Saved/
+    if not os.path.isfile(os.path.join(folder, name + ".uasset")):
+        os.makedirs(folder, exist_ok=True)
+        with open(os.path.join(folder, name + ".uasset"), "wb") as f:
+            f.write(data)
+    return unreal.load_asset(f"/Temp/Tether/diff/{tag}/{name}.{name}") or asset
 
 
 class _Vcs:
@@ -1228,7 +1272,7 @@ def _ground_actor(actor, align=False):
     # above, for an actor sunk below the surface.
     hit = trace(origin.z + extent.z + 1) or trace(origin.z + 200000)
     if hit is None:
-        raise RuntimeError(f"no ground below {actor.get_actor_label()} (nothing with collision under it)")
+        raise RuntimeError(f"no ground below {_actor_label(actor)} (nothing with collision under it)")
     loc = actor.get_actor_location()
     old_z = loc.z
     loc.z += hit["impact_point"].z - bottom
@@ -1239,7 +1283,7 @@ def _ground_actor(actor, align=False):
         aligned = unreal.MathLibrary.make_rot_from_zx(normal, unreal.MathLibrary.get_forward_vector(rot))
         actor.set_actor_rotation(aligned, True)
     landed = hit.get("hit_actor")
-    return old_z, loc.z, (landed.get_actor_label() if landed else "?")
+    return old_z, loc.z, (_actor_label(landed) if landed else "?")
 
 
 def _trace_down(world, x, y, ignore=(), top=200000.0):
@@ -1772,7 +1816,7 @@ def _legacy_set(obj, requested):
                 for comp in obj.get_components_by_class(unreal.ActorComponent):
                     names = {_legacy_key(n) for n in dict(_DOC_PROPERTY.findall(type(comp).__doc__ or ""))}
                     if _legacy_key(base) in names:
-                        owners.append(f"{obj.get_actor_label()}.{comp.get_name()}")
+                        owners.append(f"{_actor_label(obj)}.{comp.get_name()}")
             raise RuntimeError(f"{_label(obj)} has no property '{base}'"
                                + (f"; it is on {', '.join(owners[:3])}" if owners else "")
                                + (f" (did you mean: {', '.join(by_key[c] for c in close)})" if close and not owners else ""))
@@ -1920,6 +1964,78 @@ def _cvar_dump(prefix=""):
     return rows
 
 
+_DEFER_PATH = "/Temp/Tether/BP_TetherDeferredExec"
+
+
+def _deferred_exec_class():
+    """A transient Blueprint class (in /Temp, never saved) whose Run function executes one console command.
+
+    Editor Python calls every UFunction inside FEditorScriptExecutionGuard, which makes each RPC run locally
+    (AActor::GetFunctionCallspace): a client's Server RPC never reaches the server. Run is called by a timer on the
+    target world's own tick, in the Blueprint VM, outside that guard, so commands sent through it replicate. Built
+    with the native graph API: Epic's Blueprint tools resolve their arguments by path, which /Temp assets lack."""
+    cls = getattr(sys, "_tether_defer_cls2", None)  # once per editor session (stashed on sys: survives reloads)
+    if cls is not None and _try(lambda: cls.get_name()):
+        return cls
+    lib = unreal.BlueprintEditorLibrary
+    bp, attempt = None, 0
+    while bp is None and attempt < 20:  # a failed earlier build can leave its package name taken
+        bp = lib.create_blueprint_asset_with_parent(_DEFER_PATH + (f"_{attempt}" if attempt else ""), unreal.Object)
+        attempt += 1
+    if bp is None:
+        raise RuntimeError("could not create the deferred-command helper Blueprint in /Temp")
+    lib.add_member_variable(bp, "Command", lib.get_basic_type_by_name("string"))
+    lib.add_member_variable(bp, "Target", lib.get_object_reference_type(unreal.PlayerController.static_class()))
+    for name in ("Command", "Target"):  # set from Python per command
+        lib.set_blueprint_variable_instance_editable(bp, name, True)
+    graph = unreal.BlueprintGraphEditor.create_and_edit_function_graph(bp, "Run")
+
+    def pin(node, name, direction):
+        found = [p for p in node.list_all_pins() if p.get_pin_direction() == direction
+                 and str(p.get_pin_name()).lower() == name.lower()]
+        if not found:
+            raise RuntimeError(f"{node.get_node_title()} has no {name} pin "
+                               f"({', '.join(str(p.get_pin_name()) for p in node.list_all_pins())})")
+        return found[0]
+    out, inp = unreal.EdGraphPinDirection.EGPD_OUTPUT, unreal.EdGraphPinDirection.EGPD_INPUT
+    run = graph.create_node_from_name("Development|ExecuteConsoleCommand", unreal.Vector2D(300, 0), [])
+    get_cmd = graph.add_get_member_variable_node("Command")
+    get_target = graph.add_get_member_variable_node("Target")
+    target = pin(get_target, "Target", out)
+    links = [(graph.find_graph_entry_pin(), pin(run, "execute", inp)), (pin(get_cmd, "Command", out), pin(run, "Command", inp)),
+             (target, pin(run, "SpecificPlayer", inp))]
+    world_pin = [p for p in run.list_all_pins() if str(p.get_pin_name()) == "WorldContextObject"]
+    links += [(target, world_pin[0])] if world_pin else []  # shown on a plain Object, which has no world of its own
+    for a, b in links:
+        if not a.try_create_connection(b):
+            raise RuntimeError(f"could not connect {a.get_pin_name()} -> {b.get_pin_name()}")
+    lib.compile_blueprint(bp)
+    cls = lib.generated_class(bp)
+    if cls is None:
+        raise RuntimeError("could not build the deferred-command helper Blueprint")
+    sys._tether_defer_cls2 = cls
+    return cls
+
+
+def _networked(world):
+    """True for a client or server PIE world (multiplayer PIE), where RPCs matter."""
+    return bool(world) and not _try(lambda: unreal.SystemLibrary.is_standalone(world), True)
+
+
+def _queue_command(world, command):
+    """Run a console command in a PIE world on its next tick, as that world's player typed it (see
+    _deferred_exec_class). Returns at once; the command's output reaches the log a frame later."""
+    controller = unreal.GameplayStatics.get_player_controller(world, 0)
+    if controller is None:
+        raise RuntimeError(f"{world.get_name()} has no player controller to run '{command}' for")
+    runner = unreal.new_object(_deferred_exec_class(), outer=controller)  # its world: the controller's
+    runner.set_editor_property("Command", command)
+    runner.set_editor_property("Target", controller)
+    pending = getattr(sys, "_tether_deferred", None) or []  # keep it alive until its timer has fired
+    sys._tether_deferred = pending[-20:] + [runner]
+    unreal.SystemLibrary.set_timer_for_next_tick(runner, "Run")
+
+
 _Base = getattr(unreal, "ToolsetDefinition", object)
 
 
@@ -1975,6 +2091,9 @@ class TetherCore(_Base):
         world = game if game is not None else editor.get_editor_world()
         if world is None:
             raise RuntimeError("no editor world")
+        if _networked(game):  # from Python every RPC would run locally; run it from the world's own tick
+            _queue_command(game, command)
+            return f"PIE world {world.get_name()} (queued for its next tick)"
         unreal.SystemLibrary.execute_console_command(world, command)
         return ("PIE world " if game is not None else "editor world ") + world.get_name()
 
@@ -2068,7 +2187,7 @@ class TetherCore(_Base):
                     for comp in obj.get_components_by_class(unreal.ActorComponent):
                         names = json.loads(unreal.ToolsetLibrary.list_struct_properties(comp.get_class()))
                         if base.lower() in (n.lower() for n in names):
-                            owners.append(f"{obj.get_actor_label()}.{comp.get_name()}")
+                            owners.append(f"{_actor_label(obj)}.{comp.get_name()}")
                 raise RuntimeError(f"{_label(obj)} has no property '{base}'"
                                    + (f"; it is on {', '.join(owners[:3])}" if owners else "")
                                    + (f" (did you mean: {', '.join(by_lower[c] for c in close)})" if close and not owners else ""))
@@ -2213,7 +2332,7 @@ class TetherCore(_Base):
         rx = re.compile(match, re.I) if match else None
         rows = []
         for actor in _actors(pie):
-            label, cls = actor.get_actor_label(), actor.get_class().get_name()
+            label, cls = _actor_label(actor), actor.get_class().get_name()
             if rx and not (rx.search(label) or rx.search(cls)):
                 continue
             loc = actor.get_actor_location()
@@ -2345,9 +2464,9 @@ class TetherCore(_Base):
                     landed = f"not grounded: {exc}"
         if actor is None:
             raise RuntimeError(f"could not spawn {what} (see ue log)")
-        _record_undo(before, f"spawn {actor.get_actor_label()}")
+        _record_undo(before, f"spawn {_actor_label(actor)}")
         loc = actor.get_actor_location()
-        return f"spawned {actor.get_actor_label()} ({actor.get_class().get_name()}) at ({loc.x:g}, {loc.y:g}, {loc.z:.6g})" + \
+        return f"spawned {_actor_label(actor)} ({actor.get_class().get_name()}) at ({loc.x:g}, {loc.y:g}, {loc.z:.6g})" + \
             (f" on {landed}" if landed and not landed.startswith("not grounded") else f" ({landed})" if landed else "")
 
     @_tool
@@ -2380,10 +2499,10 @@ class TetherCore(_Base):
                     actor.root_component.modify()
                 try:
                     old_z, new_z, landed = _ground_actor(actor, align)
-                    rows.append(f"{actor.get_actor_label()}: z {old_z:.6g} -> {new_z:.6g} (on {landed})")
+                    rows.append(f"{_actor_label(actor)}: z {old_z:.6g} -> {new_z:.6g} (on {landed})")
                 except RuntimeError as exc:
-                    rows.append(f"{actor.get_actor_label()}: {exc}")
-        _record_undo(before, "drop " + ", ".join(a.get_actor_label() for a in actors))
+                    rows.append(f"{_actor_label(actor)}: {exc}")
+        _record_undo(before, "drop " + ", ".join(_actor_label(a) for a in actors))
         return "\n".join(rows)
 
     @_tool
@@ -3089,6 +3208,153 @@ class TetherCore(_Base):
         else:
             raise RuntimeError("action must be list, status, generate or cleanup")
         return json.dumps([row(comp)])
+
+    @_tool
+    @staticmethod
+    def net_info(target: str, pie: bool = False) -> str:
+        """Replication facts the editor knows about a class, Blueprint or actor: the class chain (C++ classes with
+        their module, so the CLI can read their headers), each Blueprint's replicated variables, and for an actor
+        its live network state in every PIE world it is found in (role, owner, update rate, relevancy, dormancy).
+
+        Args:
+            target: An actor label or name ('player' for the PIE pawn), a class name, or a Blueprint path.
+            pie: Look the actor up in the PIE world (the one `ue pie target` picked).
+
+        Returns:
+            JSON: {name, chain: [{name, native, module, blueprint}], bp_vars: [{blueprint, name, replication}],
+            actors: [{world, index, net_mode, ...}]}.
+        """
+        get = lambda obj, prop, default=None: _try(lambda: obj.get_editor_property(prop), default)  # noqa: E731
+        actor, bp, cls = None, None, None
+        if target.lower() in ("player", "pawn"):
+            actor = _pie_player()[1]
+        elif "/" in target:
+            bp = unreal.load_asset(target.split(".")[0])
+            if not isinstance(bp, unreal.Blueprint):
+                raise RuntimeError(f"{target} is not a Blueprint")
+        else:
+            found = _try(lambda: _resolve(target, pie))
+            if isinstance(found, unreal.Actor):
+                actor = found
+            elif found is not None and isinstance(found, unreal.ActorComponent):
+                actor = found.get_owner()
+            else:
+                py_type = getattr(unreal, target, None) or getattr(unreal, target[1:], None)
+                cls = py_type.static_class() if py_type and hasattr(py_type, "static_class") else None
+                if cls is None:
+                    raise RuntimeError(f"no actor, class or Blueprint '{target}'")
+        if actor is not None:
+            cls = actor.get_class()
+        chain, bp_vars = [], []
+        current = bp or (unreal.load_asset(cls.get_path_name().rsplit("_C", 1)[0].split(".")[0])
+                         if cls is not None and not cls.get_path_name().startswith("/Script/") else None)
+        if current is not None and not isinstance(current, unreal.Blueprint):
+            current = None
+        from editor_toolset.toolsets import blueprint as epic
+        while current is not None:  # Blueprint parents first
+            chain.append({"name": current.get_name(), "native": False, "blueprint": current.get_path_name().split(".")[0]})
+            for name in _try(lambda: unreal.BlueprintEditorLibrary.list_member_variable_names(current), []) or []:
+                if "/" in str(name) or "." in str(name):  # inherited native members come as paths
+                    continue
+                mode = _try(lambda: epic.BlueprintTools.get_variable_replication(current, str(name)))
+                if mode is not None and "none" not in str(mode).lower():
+                    bp_vars.append({"blueprint": current.get_name(), "name": str(name),
+                                    "replication": str(mode).split(".")[-1].split(":")[0].lower()})
+            parent = unreal.BlueprintEditorLibrary.get_blueprint_parent_class(current)
+            if parent is None:
+                current = None
+                break
+            if parent.get_path_name().startswith("/Script/"):
+                cls = parent
+                current = None
+            else:
+                current = unreal.load_asset(parent.get_path_name().split(".")[0])
+        native = getattr(unreal, cls.get_name(), None) if cls is not None else None
+        for t in ([native] + list(native.__mro__[1:]) if native else []):
+            name = t.__name__
+            if name in ("_ObjectBase", "_WrapperBase", "object", "Object"):
+                continue
+            uclass = _try(lambda: t.static_class())
+            module = uclass.get_path_name().split(".")[0].replace("/Script/", "") if uclass else ""
+            chain.append({"name": name, "native": True, "module": module})
+        rows = []
+        if actor is not None:  # this actor in each PIE world: the same name, else the nearest of its class
+            loc = actor.get_actor_location()
+            worlds = _pie_worlds() if _game_world() is not None else {}
+            for index, world in sorted(worlds.items()) or [(-1, actor.get_world())]:
+                same = [a for a in unreal.GameplayStatics.get_all_actors_of_class(world, actor.get_class())]
+                match = next((a for a in same if a.get_name() == actor.get_name()), None) if world == actor.get_world() \
+                    else min(same, key=lambda a: (a.get_actor_location() - loc).length(), default=None)
+                if match is None:
+                    rows.append({"world": world.get_name(), "index": index, "missing": True})
+                    continue
+                lib = unreal.SystemLibrary
+                mode = "standalone" if _try(lambda: lib.is_standalone(world), True) else \
+                    "dedicated server" if _try(lambda: lib.is_dedicated_server(world), False) else \
+                    "listen server" if _try(lambda: lib.is_server(world), False) else "client"
+                owner = _try(lambda: match.get_owner())
+                rows.append({"world": world.get_name(), "index": index, "net_mode": mode, "name": match.get_name(),
+                             "distance": round((match.get_actor_location() - loc).length(), 1),
+                             "role": _enum_name(_try(lambda: match.get_local_role(), "")),
+                             "remote_role": _enum_name(_try(lambda: match.get_remote_role(), "")),
+                             "owner": _label(owner) if owner else None,
+                             "replicates": bool(get(match, "replicates", False)),
+                             "replicate_movement": bool(get(match, "replicate_movement", False)),
+                             "update_hz": get(match, "net_update_frequency"),
+                             "min_update_hz": get(match, "min_net_update_frequency"),
+                             "priority": get(match, "net_priority"),
+                             "cull_m": round((get(match, "net_cull_distance_squared", 0) or 0) ** 0.5 / 100, 1),
+                             "always_relevant": bool(get(match, "always_relevant", False)),
+                             "only_owner": bool(get(match, "only_relevant_to_owner", False)),
+                             "dormancy": _enum_name(get(match, "net_dormancy", ""))})
+        return json.dumps({"name": (actor and _label(actor)) or (bp and bp.get_name()) or (cls and cls.get_name()),
+                           "actor": actor is not None, "chain": chain, "bp_vars": bp_vars, "actors": rows})
+
+    @_tool
+    @staticmethod
+    def net_compare(target: str, prop: str) -> str:
+        """One property of a replicated actor in every PIE world: the actor of the same name in the world it was
+        named in (the one `ue pie target` picked), and the nearest actor of its class in the others.
+
+        Args:
+            target: Actor label or name, or 'player' (the targeted world's pawn).
+            prop: Property name (as `ue props` lists it), or location/rotation.
+
+        Returns:
+            JSON list of {world, index, net_mode, name, value, distance}.
+        """
+        worlds = _pie_worlds()
+        if not worlds:
+            raise RuntimeError("PIE is not running (ue pie start --clients 2)")
+        base = _pie_player()[1] if target.lower() in ("player", "pawn") else _resolve(target, True)
+        if isinstance(base, unreal.ActorComponent):
+            base = base.get_owner()
+        loc = base.get_actor_location()
+
+        def value(obj):
+            if prop.lower() == "location":
+                return _fmt3(_vec_tuple(obj.get_actor_location()))
+            if prop.lower() == "rotation":
+                return _fmt3(_rot_tuple(obj.get_actor_rotation()))
+            text = unreal.ToolsetLibrary.get_object_properties(obj, [prop])
+            data = json.loads(text) if isinstance(text, str) else text
+            if isinstance(data, dict) and data:
+                return _short(_round(next(iter(data.values()))), 120)
+            raise RuntimeError(f"{_label(obj)} has no property '{prop}' (ue props {_label(obj)} --pie)")
+        rows = []
+        for index, world in sorted(worlds.items()):
+            same = list(unreal.GameplayStatics.get_all_actors_of_class(world, base.get_class()))
+            match = base if world == base.get_world() else \
+                min(same, key=lambda a: (a.get_actor_location() - loc).length(), default=None)
+            lib = unreal.SystemLibrary
+            mode = "dedicated server" if _try(lambda: lib.is_dedicated_server(world), False) else \
+                "listen server" if _try(lambda: lib.is_server(world), False) and not _try(lambda: lib.is_standalone(world), False) \
+                else "standalone" if _try(lambda: lib.is_standalone(world), False) else "client"
+            rows.append({"world": world.get_name(), "index": index, "net_mode": mode,
+                         "name": _label(match) if match else None,
+                         "value": value(match) if match else None,
+                         "distance": round((match.get_actor_location() - loc).length(), 1) if match else None})
+        return json.dumps(rows)
 
     @_tool
     @staticmethod
@@ -4073,7 +4339,7 @@ class TetherCore(_Base):
             if not isinstance(obj, unreal.Actor):
                 raise RuntimeError(f"'{ref}' is not an actor")
             actors.append(obj)
-        labels = [a.get_actor_label() for a in actors]
+        labels = [_actor_label(a) for a in actors]
         before = unreal.ToolsetLibrary.get_active_undo_count() if not _LEGACY else 0
         with unreal.ScopedEditorTransaction("ue delete"):
             ok = unreal.get_editor_subsystem(unreal.EditorActorSubsystem).destroy_actors(actors)
@@ -4105,7 +4371,7 @@ class TetherCore(_Base):
         subsystem = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
         before = unreal.ToolsetLibrary.get_active_undo_count() if not _LEGACY else 0
         copies, previous = [], source
-        with unreal.ScopedEditorTransaction(f"ue duplicate {source.get_actor_label()}"):  # all copies, one undo step
+        with unreal.ScopedEditorTransaction(f"ue duplicate {_actor_label(source)}"):  # all copies, one undo step
             for _ in range(max(1, count)):
                 copy = subsystem.duplicate_actor(previous, None, step)
                 if copy is None:
@@ -4114,8 +4380,8 @@ class TetherCore(_Base):
                 previous = copy
         if not copies:
             raise RuntimeError("the editor refused to duplicate it")
-        _record_undo(before, f"duplicate {source.get_actor_label()} x{len(copies)}")
-        return "\n".join(f"{c.get_actor_label()} at ({c.get_actor_location().x:g}, {c.get_actor_location().y:g}, "
+        _record_undo(before, f"duplicate {_actor_label(source)} x{len(copies)}")
+        return "\n".join(f"{_actor_label(c)} at ({c.get_actor_location().x:g}, {c.get_actor_location().y:g}, "
                          f"{c.get_actor_location().z:g})" for c in copies)
 
     @_tool
@@ -4230,11 +4496,11 @@ class TetherCore(_Base):
         base = _LEVELS.get(level)
         if level and base is not None and (maps or actor_packages):
             now = {a.get_path_name(): a for a in _authored_actors()}
-            added = [now[p].get_actor_label() for p in now if p not in base]
+            added = [_actor_label(now[p]) for p in now if p not in base]
             removed = [base[p][0] for p in base if p not in now]
-            moved = [now[p].get_actor_label() for p in now if p in base and _pose_key(now[p]) != base[p][2]]
+            moved = [_actor_label(now[p]) for p in now if p in base and _pose_key(now[p]) != base[p][2]]
             dirty_actor = {p.rsplit("/", 1)[-1] for p in actor_packages}
-            changed = [now[p].get_actor_label() for p in now if p in base and now[p].get_actor_label() not in moved
+            changed = [_actor_label(now[p]) for p in now if p in base and _actor_label(now[p]) not in moved
                        and now[p].get_outermost().get_name().rsplit("/", 1)[-1] in dirty_actor]
             parts = [f"{n} {kind} ({cap(names)})" for kind, names in
                      (("added", added), ("removed", removed), ("moved", moved), ("changed", changed)) for n in [len(names)] if n]
@@ -4405,7 +4671,7 @@ class TetherCore(_Base):
             mats = prop(asset, "materials", []) or []
             out.append("  materials: " + ", ".join(f"{m.material_slot_name}={short(m.material_interface)}" for m in mats[:8]))
         elif isinstance(asset, unreal.Texture2D):
-            out.append(f"  {asset.blueprint_get_size_x()} x {asset.blueprint_get_size_y()}, "
+            out.append(f"  {_texture_dims(asset)}, "
                        f"{str(prop(asset, 'compression_settings')).split('.')[-1].split(':')[0]}, "
                        f"sRGB {prop(asset, 'srgb')}, LOD group {str(prop(asset, 'lod_group')).split('.')[-1].split(':')[0]}")
             memory = asset.blueprint_get_memory_size()  # 0 when no render resource exists (-nullrhi)
@@ -4592,15 +4858,15 @@ class TetherCore(_Base):
 
             for name in [n for n in new_actors if n not in old_actors and (saved is None or n in saved)]:
                 actor = new_actors[name]
-                out.append(f"+ {actor.get_actor_label()} ({actor.get_class().get_name()}){where(actor)}")
+                out.append(f"+ {_actor_label(actor)} ({actor.get_class().get_name()}){where(actor)}")
             for name in [n for n in old_actors if n not in new_actors]:
                 actor = old_actors[name]
-                out.append(f"- {actor.get_actor_label()} ({actor.get_class().get_name()})")
+                out.append(f"- {_actor_label(actor)} ({actor.get_class().get_name()})")
             for name in [n for n in new_actors if n in old_actors]:
                 lines = []
                 _diff_parts(_actor_parts(old_actors[name]), _actor_parts(new_actors[name]), roots, lines)
                 if lines:
-                    out.append(f"~ {new_actors[name].get_actor_label()} ({new_actors[name].get_class().get_name()})")
+                    out.append(f"~ {_actor_label(new_actors[name])} ({new_actors[name].get_class().get_name()})")
                     out.extend("  " + line for line in lines)
         else:
             _diff_props("properties", a, b, roots, out, limit)
@@ -4668,7 +4934,9 @@ class TetherCore(_Base):
             base = material
             while isinstance(base, unreal.MaterialInstance) and _try(lambda: base.get_editor_property("parent")):
                 base = base.get_editor_property("parent")
-            errors = [str(e) for e in lib.recompile_material(base)] if isinstance(base, unreal.Material) else []
+            # Recompiling marks the material modified; compile a copy of a saved one so it stays clean.
+            target = _clean_copy(base) if isinstance(base, unreal.Material) else base
+            errors = [str(e) for e in lib.recompile_material(target)] if isinstance(target, unreal.Material) else []
             out += f"\ncompiled {_short_path(base.get_path_name())}: " + \
                 (f"{len(errors)} error(s)\n" + "\n".join("  " + e for e in errors) if errors else "no errors")
         return out
@@ -4832,8 +5100,12 @@ class TetherCore(_Base):
             ok = bool(found) == (verb == "exists")
             detail = f"{len(found)} match(es)"
         elif verb == "exec":
-            unreal.SystemLibrary.execute_console_command(game, rest)
-            detail = "ran"
+            if _networked(game):  # RPCs would run locally from Python (see _deferred_exec_class)
+                _queue_command(game, rest)
+                detail = "queued for the next tick"
+            else:
+                unreal.SystemLibrary.execute_console_command(game, rest)
+                detail = "ran"
         else:
             raise RuntimeError(f"unknown step '{verb}' (at, look, move, near, tap, hold, release, call, expect, "
                                "exists, gone, exec; the CLI adds wait, until, press, log, shot)")
@@ -4874,7 +5146,7 @@ class TetherCore(_Base):
                 generation = str(prop("runtime_generation", "?")).split(".")[-1].split(":")[0].title()
                 agent = f", agent radius {prop('agent_radius', 0):g} height {prop('agent_height', 0):g}" \
                     if isinstance(nav_data, unreal.RecastNavMesh) else ""
-                out.append(f"  nav data {nav_data.get_actor_label()} ({nav_data.get_class().get_name()}, "
+                out.append(f"  nav data {_actor_label(nav_data)} ({nav_data.get_class().get_name()}, "
                            f"runtime generation {generation}{agent})")
             if not data:
                 out.append("  no navigation data actor (a NavMeshBoundsVolume creates RecastNavMesh-Default)")
@@ -4884,7 +5156,7 @@ class TetherCore(_Base):
                 centre, extent = volume.get_actor_bounds(False)
                 found = navsys.get_random_point_in_navigable_radius(world, centre, max(extent.x, extent.y))
                 empty += found is None
-                out.append(f"  bounds {volume.get_actor_label()}: {extent.x * 2 / 100:.0f} x {extent.y * 2 / 100:.0f} x "
+                out.append(f"  bounds {_actor_label(volume)}: {extent.x * 2 / 100:.0f} x {extent.y * 2 / 100:.0f} x "
                            f"{extent.z * 2 / 100:.0f} m, " + ("navmesh present" if found is not None else "NO navmesh inside"))
             if not volumes:
                 out.append("  no NavMeshBoundsVolume: no navmesh is generated")
@@ -4916,7 +5188,7 @@ class TetherCore(_Base):
             rx = re.compile(match or r"PlayerStart|Spawn|Patrol|Waypoint|TargetPoint", re.I)
             rows, off = [], 0
             for actor in actors(world, unreal.Actor):
-                label = actor.get_actor_label()
+                label = _actor_label(actor)
                 if not (rx.search(label) or rx.search(actor.get_class().get_name())):
                     continue
                 loc = actor.get_actor_location()
@@ -5219,7 +5491,7 @@ class TetherCore(_Base):
         pawn_of = lambda c: _try(lambda: c.k2_get_pawn()) or _try(lambda: c.get_controlled_pawn())
         if target:
             key = target.lower()
-            controllers = [c for c in controllers if key in (c.get_actor_label().lower(), c.get_name().lower())
+            controllers = [c for c in controllers if key in (_actor_label(c).lower(), c.get_name().lower())
                            or (pawn_of(c) and key in (pawn_of(c).get_actor_label().lower(), pawn_of(c).get_name().lower()))] \
                 or [c for c in controllers if pawn_of(c) and key in pawn_of(c).get_actor_label().lower()]
             if not controllers:
@@ -5254,7 +5526,7 @@ class TetherCore(_Base):
                 f = facts(controller)
                 pawn = f["pawn"]
                 where = vec(pawn.get_actor_location()) if pawn else "(no pawn)"
-                rows.append(f"{_label(pawn) if pawn else controller.get_actor_label()} at {where}: {f['move']}"
+                rows.append(f"{_label(pawn) if pawn else _actor_label(controller)} at {where}: {f['move']}"
                             + (f", focus {f['focus']}" if f["focus"] else "")
                             + (f", perceives {', '.join(f['perceives'][:3])}" if f["perceives"] else "")
                             + (f", {f['brain']}" if f["brain"] else ""))
@@ -5266,7 +5538,7 @@ class TetherCore(_Base):
             pawn = f["pawn"]
             lines = [f"{_label(pawn) if pawn else '(no pawn)'} ({pawn.get_class().get_name() if pawn else '-'})"
                      + (f" at {vec(pawn.get_actor_location())}, speed {pawn.get_velocity().length():.0f} cm/s" if pawn else "")]
-            lines.append(f"  controller {controller.get_actor_label()} ({controller.get_class().get_name()})")
+            lines.append(f"  controller {_actor_label(controller)} ({controller.get_class().get_name()})")
             lines.append(f"  move: {f['move']}")
             lines.append(f"  focus: {f['focus'] or 'none'}")
             lines.append(f"  perceives: {', '.join(f['perceives']) or 'nothing'}")
@@ -6117,15 +6389,17 @@ class TetherCore(_Base):
 
     @_tool
     @staticmethod
-    def pie_net(action: str = "status", clients: int = 1, net: str = "listen", target: int = -1, token: str = "") -> str:
+    def pie_net(action: str = "status", clients: int = 1, net: str = "listen", target: int = -1, game: str = "-",
+                token: str = "") -> str:
         """Multiplayer PIE: configure the next session's clients and net mode (restorable), pick which PIE world
         the other tools act on, or list the running PIE worlds with their net mode and players.
 
         Args:
-            action: status, configure, restore or target.
+            action: status, configure, restore, target, or game (the next PIE's game mode, in memory only).
             clients: With configure: number of clients.
             net: With configure: standalone, listen (listen server + clients) or client (dedicated server + clients).
             target: With target: the PIE instance index to act on (0 = the first world), or -1 for the default.
+            game: With game: a game mode class path (/Script/Module.Class or a Blueprint's _C) for the next PIE.
             token: Session token from Saved/Tether/editors/<pid>.token (the ue CLI sends it).
 
         Returns:
@@ -6150,9 +6424,29 @@ class TetherCore(_Base):
             unreal.ToolsetLibrary.set_object_properties(settings, json.dumps(
                 {"playNumberOfClients": max(1, clients), "playNetMode": mode, "runUnderOneProcess": True}))
             return f"next PIE: {clients} client(s), {mode}"
+        if action == "game":
+            _authorize(token)
+            maps = unreal.find_object(None, "/Script/EngineSettings.Default__GameMapsSettings")
+            cls = unreal.load_class(None, game) if game.startswith("/") else None
+            if cls is None:
+                raise RuntimeError(f"no game mode class '{game}' (/Script/Module.Class, or /Game/BP_X.BP_X_C)")
+            if getattr(sys, "_tether_game_mode", None) is None:  # the project's own default, put back by restore
+                sys._tether_game_mode = str(maps.get_editor_property("global_default_game_mode").export_text())
+            maps.set_editor_property("global_default_game_mode", unreal.SoftClassPath(cls.get_path_name()))
+            world = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_editor_world()
+            override = _try(lambda: world.get_world_settings().get_editor_property("default_game_mode"))
+            return f"next PIE: game mode {cls.get_name()}" + (
+                f" (but this map's World Settings override it with {override.get_name()})" if override else "")
         if action == "restore":
             _authorize(token)
             sys._tether_pie_target = None
+            saved_mode = getattr(sys, "_tether_game_mode", None)
+            if saved_mode is not None:
+                maps = unreal.find_object(None, "/Script/EngineSettings.Default__GameMapsSettings")
+                maps.set_editor_property("global_default_game_mode", unreal.SoftClassPath(saved_mode.strip('"')))
+                sys._tether_game_mode = None
+                if not os.path.exists(_play_saved()):
+                    return "game mode restored"
             if not os.path.exists(_play_saved()):
                 return "nothing to restore"
             with open(_play_saved(), encoding="utf-8") as f:
@@ -6206,9 +6500,12 @@ class TetherCore(_Base):
         subsystem = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
         world = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_editor_world()
         staged = [a for a in unreal.GameplayStatics.get_all_actors_of_class(world, unreal.Actor)
-                  if a.get_actor_label().startswith("TetherLook_")]
+                  if _actor_label(a).startswith("TetherLook_")]
         if staged:
             subsystem.destroy_actors(staged)
+        for comp in getattr(sys, "_tether_look_hidden", None) or []:  # the level's fog, hidden while staging
+            _try(lambda: comp.set_visibility(True))
+        sys._tether_look_hidden = []
         if action == "remove":
             return json.dumps({"removed": len(staged)})
         obj = unreal.load_asset(asset.split(".")[0])
@@ -6229,16 +6526,26 @@ class TetherCore(_Base):
         actor.set_actor_label("TetherLook_Subject")
         center, extent = actor.get_actor_bounds(False)
         radius = max(extent.length(), 10.0)
-        light = subsystem.spawn_actor_from_class(unreal.PointLight, center + unreal.Vector(-radius * 2, -radius * 2,
-                                                                                            radius * 2),
-                                                 unreal.Rotator(), transient=True)
-        light.set_actor_label("TetherLook_Light")
-        comp = light.get_component_by_class(unreal.PointLightComponent)
-        comp.set_editor_property("attenuation_radius", radius * 20)
-        comp.set_editor_property("intensity", 150.0 * max(1.0, (radius / 100.0) ** 2))  # a fill, not a spotlight
-        for sprite in light.get_components_by_class(unreal.BillboardComponent):  # the editor's light icon
-            sprite.set_visibility(False)
-        return json.dumps({"center": [center.x, center.y, center.z], "radius": radius,
+        # A key light and a weaker one from the opposite side, so no view (front, back, sides) is left black.
+        for label, offset, share in (("TetherLook_Light", (-2, -2, 2), 1.0), ("TetherLook_Fill", (2, 2, 1), 0.5)):
+            light = subsystem.spawn_actor_from_class(
+                unreal.PointLight, center + unreal.Vector(*(radius * o for o in offset)), unreal.Rotator(), transient=True)
+            light.set_actor_label(label)
+            comp = light.get_component_by_class(unreal.PointLightComponent)
+            comp.set_editor_property("attenuation_radius", radius * 20)
+            comp.set_editor_property("intensity", share * 150.0 * max(1.0, (radius / 100.0) ** 2))  # a fill, not a spot
+            for sprite in light.get_components_by_class(unreal.BillboardComponent):  # the editor's light icon
+                sprite.set_visibility(False)
+        # The subject is seen inside the user's level, and dense height fog washed it out: hide the fog until
+        # `remove` (not a transaction: nothing for undo, nothing saved).
+        hidden = []
+        for fog in unreal.GameplayStatics.get_all_actors_of_class(world, unreal.ExponentialHeightFog):
+            for comp in fog.get_components_by_class(unreal.ExponentialHeightFogComponent):
+                if comp.is_visible():
+                    comp.set_visibility(False)
+                    hidden.append(comp)
+        sys._tether_look_hidden = hidden
+        return json.dumps({"center": [center.x, center.y, center.z], "radius": radius, "fog_hidden": len(hidden),
                            "class": obj.get_class().get_name()})
 
     @_tool
@@ -6544,6 +6851,16 @@ class TetherCore(_Base):
         Returns:
             Confirmation that the reload was scheduled.
         """
+        # Compile first: a reload of a broken file fails on the next tick, where nobody sees it, and leaves the
+        # old code running. Report the error now instead and keep the current code.
+        folder = os.path.dirname(os.path.abspath(__file__))
+        for name in sorted(os.listdir(folder)):
+            if name.endswith(".py"):
+                with open(os.path.join(folder, name), encoding="utf-8") as f:
+                    try:
+                        compile(f.read(), name, "exec")
+                    except SyntaxError as exc:
+                        raise RuntimeError(f"not reloaded: {name}:{exc.lineno}: {exc.msg}") from None
         _schedule_reload()
         return "reload scheduled"
 

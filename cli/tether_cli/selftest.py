@@ -121,6 +121,8 @@ def cmd_selftest(ctx, args):
     check("asset", ["asset", "/Engine/BasicShapes/Cube"], ok=lambda c, o: c == 0 and "triangles" in o)
     check("log", ["log", "--level", "Error"])
     check("log --summary", ["log", "--summary"], ok=lambda c, o: c == 0 and "group(s)" in o)
+    check("help", ["help", "log"], ok=lambda c, o: c == 0 and "--since" in o)
+    check("net (class)", ["net", "Character"], ok=lambda c, o: c == 0 and "Character : Pawn" in o and "replicates" in o)
     check("cvar", ["cvar", "r.Shadow.MaxResolution"], ok=lambda c, o: c == 0 and "r.Shadow.MaxResolution = " in o)
     check("cvar --for", ["cvar", "r.Shadow.MaxResolution=777", "--for", "cvar r.Shadow.MaxResolution"],
           skip="needs UE 5.8+" if remote else None,
@@ -302,6 +304,8 @@ def cmd_selftest(ctx, args):
     check("pie record", ["pie", "record", "--seconds", "1", "-o", os.path.join(tempfile.gettempdir(), "tether-selftest-rec.txt")],
           ok=lambda c, o: (c == 0 and "recorded" in o) or "no keys to record" in o)
     check("tree (player)", ["tree", "player"], ok=lambda c, o: c == 0 and "component(s)" in o)
+    check("log --since pie", ["log", "--since", "pie", "--level", "Display"],
+          ok=lambda c, o: c == 0 and "since the last PIE start" in o)
     check("gpu", ["gpu", "--frames", "1"], timeout=300, skip="needs 5.8" if remote else None if rendering else
           "headless with -nullrhi (nothing renders)", ok=lambda c, o: c == 0 and "GPU " in o and "by kind:" in o)
     check("trace (player view)", ["trace", "--distance", "2000"], ok=lambda c, o: c == 0 and "trace on Visibility" in o)
@@ -315,13 +319,23 @@ def cmd_selftest(ctx, args):
     check("ui click (Sandbox fixture)", ["pie", "do", "call /Script/Sandbox.Default__TetherProbeUILibrary ShowProbeUI",
                                          "expect-ui Tether probe panel", "click UMG Probe Button", "expect-ui UMG clicks: "],
           skip=None if fixture else "no UI fixture (Sandbox's TetherProbeUILibrary)", ok=lambda c, o: c == 0 and "PASS" in o)
+    check("shot --hud", ["shot", "--hud", "-o", os.path.join(tempfile.gettempdir(), "tether-selftest-hud.png")],
+          skip="needs 5.8" if remote else None if rendering else "headless with -nullrhi",
+          ok=lambda c, o: c == 0 and "(PIE, with HUD)" in o)
     check("bp trace", ["bp", "trace", "--seconds", "1", "--keep"], timeout=600, skip="needs 5.8" if remote else None,
           ok=lambda c, o: c == 0 and "Blueprint function(s)/event(s) ran" in o)
     check("pie stop", ["pie", "stop"], ok=lambda c, o: c == 0 and "OK" in o)
-    clients = check("pie --clients 2", ["pie", "start", "--clients", "2"], timeout=300, skip="needs UE 5.8+" if remote else None,
-                    ok=lambda c, o: c == 0 and "1: client" in o)
+    net_fixture = (ue("py", "hasattr(unreal, 'TetherProbeNetGameMode')")[1].splitlines() or [""])[-1] == "True"
+    clients = check("pie --clients 2", ["pie", "start", "--clients", "2"]
+                    + (["--game", "/Script/Sandbox.TetherProbeNetGameMode"] if net_fixture else []),
+                    timeout=300, skip="needs UE 5.8+" if remote else None, ok=lambda c, o: c == 0 and "1: client" in o)
     check("pie target 1", ["pie", "target", "1"], skip=None if clients else "no multiplayer session",
           ok=lambda c, o: c == 0 and "PIE world 1" in o)
+    check("exec --pie: client RPC reaches the server", ["exec", "--pie", "TetherPing 42"],
+          skip=None if clients and net_fixture else "no net fixture (Sandbox's TetherProbeNetGameMode)",
+          ok=lambda c, o: c == 0 and "server got ping 42" in o and "on the listen server" in o)
+    check("net compare", ["net", "compare", "player.location"], skip=None if clients else "no multiplayer session",
+          ok=lambda c, o: c in (0, 1) and "2 PIE world(s)" in o)
     check("pie stop (restores)", ["pie", "stop"], skip=None if clients else "no multiplayer session",
           ok=lambda c, o: c == 0 and "restored" in o)
     if args.reload:

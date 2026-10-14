@@ -19,7 +19,9 @@ def pie_screenshot(ctx, args):
     PIE (from whatever pose it is given), so take a HighResShot in the PIE world and collect the file."""
     if args.actor or args.at or args.look_at or args.rot or args.annotate:
         raise CliError("during PIE, ue shot shows the player's view; --actor/--at/--look-at/--rot/--annotate "
-                       "only work outside PIE")
+                       "only work outside PIE, or in Simulate (ue pie start --simulate), which has a free camera")
+    if getattr(args, "hud", False):
+        return hud_screenshot(ctx)
     start = log_end(ctx.project)
     ctx.tether("console", command="HighResShot 1", pie=True)
     saved = re.compile(r"High resolution screenshot saved as (.+\.png)")
@@ -37,6 +39,79 @@ def pie_screenshot(ctx, args):
             return raw
         time.sleep(0.2)
     raise CliError("the PIE screenshot did not appear within 15 s (ue log --level Warning)", 4)
+
+
+SNAPSHOT_BOX = re.compile(r"^(\s*)(\w+).*?\[pos=(-?\d+),(-?\d+) size=(\d+),(\d+)\]")
+
+
+def hud_rect(snapshot, view_w, view_h):
+    """(x, y, w, h) of the game viewport inside the editor window, in window units, from a Slate inspector
+    snapshot: the smallest panel as wide as the viewport and at least as tall (the viewport tab's area), with
+    the viewport at its bottom, below the tab's toolbar. None when no panel fits (PIE in its own window)."""
+    boxes = []
+    for line in snapshot.splitlines():
+        m = SNAPSHOT_BOX.match(line)
+        if m:
+            boxes.append(tuple(int(v) for v in m.groups()[2:]))
+    fits = [b for b in boxes if abs(b[2] - view_w) <= 2 and view_h - 2 <= b[3] < view_h + 200]
+    if not fits:
+        return None
+    x, y, w, h = min(fits, key=lambda b: b[3])
+    return x, y + h - view_h, view_w, view_h
+
+
+def png_crop(raw, rect, scale=1.0):
+    """PNG bytes of a rectangle (window units, times scale for pixels) of a PNG."""
+    width, height, channels, pixels = png_read(raw)
+    x0, y0 = max(0, round(rect[0] * scale)), max(0, round(rect[1] * scale))
+    x1, y1 = min(width, round((rect[0] + rect[2]) * scale)), min(height, round((rect[1] + rect[3]) * scale))
+    rows = []
+    for y in range(y0, y1):
+        line = pixels[(y * width + x0) * channels:(y * width + x1) * channels]
+        rows.append(line if channels == 3 else bytes(b for i, b in enumerate(line) if i % channels < 3))
+    return png_bytes(x1 - x0, y1 - y0, b"".join(rows))
+
+
+def hud_screenshot(ctx):
+    """The PIE viewport as the player sees it, UMG HUD included. HighResShot renders the scene only; `shot showui`
+    grabs the whole editor window (UI and all), so take that and crop it to the game viewport, located through
+    Epic's Slate inspector."""
+    size = str(ctx.tether("py", code="s = unreal.WidgetLayoutLibrary.get_viewport_size(unreal.get_editor_subsystem("
+                                     "unreal.UnrealEditorSubsystem).get_game_world())\nf'{s.x:.0f} {s.y:.0f}'"))
+    view_w, view_h = (int(v) for v in size.strip().strip("'").split())
+    start = log_end(ctx.project)
+    ctx.tether("console", command="shot showui", pie=True)
+    taken = re.compile(r'Screenshot "([^"]+)" taken with size: (\d+) x (\d+)')
+    folder = os.path.join(os.path.dirname(ctx.project), "Saved", "Screenshots")
+    deadline, path = time.time() + 15, None
+    while time.time() < deadline and not path:
+        flush_editor_log(ctx)
+        with open(log_path(ctx.project), "rb") as f:
+            f.seek(start)
+            match = taken.search(f.read().decode("utf-8", "replace"))
+        if match:
+            names = [os.path.join(d, n) for d, _, files in os.walk(folder) for n in files if n == f"{match.group(1)}.png"]
+            path = max(names, key=os.path.getmtime) if names else None
+        time.sleep(0.2)
+    if not path:
+        raise CliError("the window screenshot did not appear within 15 s (ue log --level Warning)", 4)
+    time.sleep(0.3)  # the file is written after the log line
+    with open(path, "rb") as f:
+        raw = f.read()
+    os.remove(path)  # it moves to Saved/Tether/shots (or -o)
+    text, is_error = ctx.mcp.call("SlateInspectorToolset.SlateInspectorToolset", "Snapshot",
+                                  {"ref": "", "maxDepth": 60, "bIncludeSourceLocations": False})
+    snapshot = unwrap(text) if not is_error else ""
+    snapshot = snapshot if isinstance(snapshot, str) else json.dumps(snapshot)
+    window = SNAPSHOT_BOX.match(snapshot.splitlines()[0]) if snapshot else None
+    rect = hud_rect(snapshot, view_w, view_h) if snapshot else None
+    if rect is None:
+        print("note: could not place the game viewport in the window (Slate inspector unavailable, or PIE runs in "
+              "its own window): this is the whole window")
+        return raw
+    image_w = int.from_bytes(raw[16:20], "big")
+    scale = image_w / int(window.group(5)) if window and int(window.group(5)) else 1.0  # DPI scaling
+    return png_crop(raw, rect, scale)
 
 
 def capture_viewport(ctx, pose, annotations=None, ui=False):
@@ -144,6 +219,8 @@ def cmd_shot(ctx, args):
     pose = ctx.tether("shot_pose", actor=args.actor or "", at=args.at or "", look_at=args.look_at or "",
                       rot=args.rot or "")
     pie, simulate = pose.pop("pie", False), pose.pop("simulate", False)
+    if getattr(args, "hud", False) and not (pie and not simulate):
+        raise CliError("--hud needs PIE (ue pie start): it shows the game's UMG HUD over the player's view")
     if pie and not simulate:  # Play: CaptureViewport would render the editor world, so HighResShot the game
         raw = pie_screenshot(ctx, args)
     else:  # editor, or Simulate-In-Editor, whose simulation the level viewport shows
@@ -163,7 +240,8 @@ def cmd_shot(ctx, args):
     with open(path, "wb") as f:
         f.write(raw)
     loc, rot = pose["location"], pose["rotation"]
-    print(f"{path}  {width}x{height}  {len(raw) // 1024} KB" + ("  (Simulate)" if simulate else "  (PIE)" if pie else ""))
+    print(f"{path}  {width}x{height}  {len(raw) // 1024} KB" + ("  (Simulate)" if simulate else
+                                                              "  (PIE, with HUD)" if pie and getattr(args, "hud", False) else "  (PIE)" if pie else ""))
     print(f"camera at ({loc['x']:.0f}, {loc['y']:.0f}, {loc['z']:.0f}) "
           f"rot ({rot['pitch']:.0f}, {rot['yaw']:.0f}, {rot['roll']:.0f})")
     if args.baseline:
@@ -234,8 +312,8 @@ def png_read(data):
     return width, height, channels, bytes(out)
 
 
-def png_write(path, width, height, rgb):
-    """Write 8-bit RGB pixels as a PNG."""
+def png_bytes(width, height, rgb):
+    """8-bit RGB pixels as PNG bytes."""
     import struct
 
     def chunk(kind, body):
@@ -243,9 +321,14 @@ def png_write(path, width, height, rgb):
 
     stride = width * 3
     raw = b"".join(b"\x00" + rgb[y * stride:(y + 1) * stride] for y in range(height))
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(raw, 6)) + chunk(b"IEND", b""))
+
+
+def png_write(path, width, height, rgb):
+    """Write 8-bit RGB pixels as a PNG."""
     with open(path, "wb") as f:
-        f.write(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
-                + chunk(b"IDAT", zlib.compress(raw, 6)) + chunk(b"IEND", b""))
+        f.write(png_bytes(width, height, rgb))
 
 
 def image_diff(before, after, threshold=32):

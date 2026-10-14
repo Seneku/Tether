@@ -285,6 +285,9 @@ LIGHTING_DONE = re.compile(r"LogStaticLightingSystem: (?:Warning: )?(Illuminatio
 
 DIRTY_PACKAGES = ("import json\nU = unreal.EditorLoadingAndSavingUtils\n"
                   "print(json.dumps([p.get_name() for p in U.get_dirty_map_packages() + U.get_dirty_content_packages()]))")
+NAV_DATA_PACKAGES = ("import json\nw = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_editor_world()\n"
+                     "print(json.dumps(sorted({a.get_package().get_name() for a in "
+                     "unreal.GameplayStatics.get_all_actors_of_class(w, unreal.NavigationData)})))")
 
 
 def new_log_lines(ctx, start):
@@ -312,6 +315,13 @@ def cmd_world(ctx, args):
         print(ctx.tether("nav", action="status", start="", end="", match="", pie=False, limit=args.limit))
         dirty_after = py_json(ctx, DIRTY_PACKAGES)
         changed = [p for p in dirty_after if p not in dirty_before and not p.startswith("/Temp/")]
+        # The navmesh lives in the map (or its nav-data actor's package). A map that was already unsaved before the
+        # build, e.g. because a nav agent change replaced RecastNavMesh-Default, holds it too: save it as well.
+        nav_maps = py_json(ctx, NAV_DATA_PACKAGES) if args.save else []
+        held = [p for p in nav_maps if p in dirty_after and p not in changed]
+        if held and args.save:
+            print(f"also saving {', '.join(held)}: it holds the navmesh and had unsaved changes from before the build")
+            changed += held
         if changed and args.save:
             print(ctx.tether("save", paths=",".join(changed)))
         elif changed:
@@ -1087,7 +1097,11 @@ def pie_do(ctx, args):
             return poll(lambda: tool("expect " + rest), seconds or 5)
         if verb == "log":
             rx = re.compile(rest, re.I)
-            return poll(lambda: (any(rx.search(l) for l in log_lines()), "no matching log line"), seconds or 5)
+
+            def matched():
+                hit = next((l for l in log_lines() if rx.search(l)), None)
+                return bool(hit), short(re.sub(r"^\[[^\]]*\]\[[^\]]*\]", "", hit), 120) if hit else "no matching log line"
+            return poll(matched, seconds or 5)
         if verb == "move":
             tool("move " + rest)
             return poll(lambda: tool(f"near {rest} 120"), seconds or 15)
@@ -1213,6 +1227,8 @@ def cmd_pie(ctx, args):
         index = int(args.script[0]) if args.script else -1
         print(pie_net(ctx, "target", target=index))
         return 0
+    if args.action == "start" and getattr(args, "game", None):
+        print(pie_net(ctx, "game", game=args.game))
     if args.action == "start" and getattr(args, "clients", None):
         print(pie_net(ctx, "configure", clients=args.clients, net=args.net or "listen"))
     elif args.action == "start" and os.path.exists(os.path.join(state_dir(ctx.project), "play-settings.json")):
@@ -1296,6 +1312,6 @@ def cmd_pie(ctx, args):
     return 0
 
 
-def pie_net(ctx, action, clients=1, net="", target=-1):
+def pie_net(ctx, action, clients=1, net="", target=-1, game="-"):
     # Epic's MCP layer treats a string parameter with an empty default as required, so pass them all.
-    return ctx.tether("pie_net", action=action, clients=clients, net=net or "-", target=target)
+    return ctx.tether("pie_net", action=action, clients=clients, net=net or "-", target=target, game=game)

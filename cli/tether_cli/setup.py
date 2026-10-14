@@ -7,7 +7,8 @@ import sys
 import time
 
 from .core import (
-    CLI_DIR, CliError, crash_summary, editor_executable, editor_live, engine_root, pick_port, pid_alive, port_open,
+    CLI_DIR, CliError, crash_summary, editor_executable, editor_live, engine_root, filter_log, log_end, log_path,
+    pick_port, pid_alive, port_open,
     read_json, recent_crash, run_git, running_editors, stall_report, state_dir, subprocess,
 )
 from .build import csharp_layout
@@ -126,7 +127,13 @@ def doctor_print(results):
 
 
 REQUIRED_PLUGINS = ["PythonScriptPlugin", "ModelContextProtocol", "EditorToolset", "AutomationTestToolset", "SlateInspectorToolset",
-                    "Tether"]
+                    "ConfigSettingsToolset", "Tether"]
+# Epic's toolsets for engine features, enabled when the project uses the feature: (toolset plugin, feature plugin,
+# whether the feature is on unless the .uproject turns it off).
+FEATURE_TOOLSETS = [("NiagaraToolsets", "Niagara", True), ("PCGToolset", "PCG", False),
+                    ("StateTreeToolset", "StateTree", False)]
+ALL_TOOLSETS = {"EditorToolset", "AutomationTestToolset", "SlateInspectorToolset", "ConfigSettingsToolset",
+                "NiagaraToolsets", "PCGToolset", "StateTreeToolset"}  # what Epic's AllToolsets plugin brings
 
 
 def tether_plugins_dir():
@@ -174,8 +181,11 @@ def cmd_init(ctx, args):
     base = ["PythonScriptPlugin", "Tether"] if remote else REQUIRED_PLUGINS  # MCP and toolsets are 5.8+
     wanted = base + (["TetherUnrealSharp"] if args.unrealsharp or csharp_layout(project) else [])
     entries = data.setdefault("Plugins", [])
-    if any(e.get("Name") == "AllToolsets" and e.get("Enabled") for e in entries):
-        wanted = [n for n in wanted if n not in ("EditorToolset", "AutomationTestToolset")]  # AllToolsets has them
+    enabled = {e.get("Name"): e.get("Enabled", False) for e in entries}
+    if not remote:
+        wanted += [toolset for toolset, feature, default_on in FEATURE_TOOLSETS if enabled.get(feature, default_on)]
+    if enabled.get("AllToolsets"):
+        wanted = [n for n in wanted if n not in ALL_TOOLSETS]  # AllToolsets has them
     changes = []
     for name in wanted:
         entry = next((e for e in entries if e.get("Name") == name), None)
@@ -245,7 +255,22 @@ def cmd_init(ctx, args):
 
 
 def cmd_reload(ctx, args):
-    print(ctx.tether("reload"))
+    start = log_end(ctx.project)
+    ctx.tether("reload")
+    deadline, done = time.time() + 15, None
+    while time.time() < deadline and done is None:  # the reload runs on the next editor tick
+        time.sleep(0.3)
+        with open(log_path(ctx.project), "rb") as f:
+            f.seek(start)
+            text = f.read().decode("utf-8", "replace")
+        if "Tether: reloaded" in text:
+            done = True
+        elif re.search(r"LogPython: Error: .*(tether|Traceback)", text):
+            done = False
+    if done is False:
+        errors = [l for l in filter_log(text.splitlines(), level="Error") if "LogPython" in l]
+        raise CliError("reload failed: " + (" | ".join(errors[:3]) or "see ue log"))
+    print("reloaded" if done else "reload scheduled (not confirmed within 15 s; ue log)")
     cache = os.path.join(state_dir(ctx.project), "cache")
     for name in os.listdir(cache) if os.path.isdir(cache) else []:
         os.remove(os.path.join(cache, name))  # tool schemas may have changed

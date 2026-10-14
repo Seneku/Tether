@@ -6,7 +6,8 @@ import sys
 import time
 
 from .core import (
-    CliError, LEVELS, LOG_LINE, NOISE, NOISE_MESSAGE, compact_error, editor_live, human_bytes, log_end, log_path,
+    CliError, LEVELS, LOG_LINE, NOISE, NOISE_MESSAGE, compact_error, editor_live, engine_root, human_bytes, log_end,
+    log_path,
     read_json, run_git, short, state_dir, unwrap, write_json,
 )
 from .transport import py_json, resolve_toolset
@@ -1253,4 +1254,234 @@ def cmd_pcg(ctx, args):
     for row in rows:
         print("  " + pcg_row_line(row))
     ctx.data = rows
+    return 0
+
+
+UE_MACRO = re.compile(r"\b(UPROPERTY|UFUNCTION)\s*\(")
+CLASS_PREFIXES = ("A", "U", "F", "I")
+
+
+def _balanced(text, start):
+    """The text between the parenthesis at text[start - 1] and its match, and the index after it."""
+    depth, i = 1, start
+    while i < len(text) and depth:
+        depth += {"(": 1, ")": -1}.get(text[i], 0)
+        i += 1
+    return text[start:i - 1], i
+
+
+def class_body(text, name):
+    """The body of `class [X_API] <name> ...{ ... };` in a header, or None."""
+    m = re.search(r"^\s*(?:class|struct)\s+(?:\w+_API\s+)?" + re.escape(name) + r"\b[^;{]*\{", text, re.M)
+    if not m:
+        return None
+    end = re.search(r"^\};", text[m.end():], re.M)
+    return text[m.end(): m.end() + end.start()] if end else text[m.end():]
+
+
+def replication_in_header(text, name):
+    """{properties: [(name, notify)], rpcs: [(name, kind, reliable, validated)]} declared by a class in a header."""
+    body = class_body(text, name)
+    out = {"properties": [], "rpcs": []}
+    if body is None:
+        return None
+    for m in UE_MACRO.finditer(body):
+        specs, after = _balanced(body, m.end())
+        decl = body[after: after + 400]
+        flat = re.sub(r"\s+", " ", specs)
+        if m.group(1) == "UPROPERTY":
+            if not re.search(r"\bReplicated(Using)?\b", flat, re.I):  # specifiers are case-insensitive
+                continue
+            decl = decl.split(";", 1)[0]
+            decl = re.split(r"[={\[:]", decl, 1)[0]  # initialisers, arrays, bitfields (uint8 bFlag : 1)
+            prop = re.findall(r"\b(\w+)\s*$", decl.strip())
+            notify = re.search(r"ReplicatedUsing\s*=\s*(\w+)", flat, re.I)
+            if prop:
+                out["properties"].append((prop[0], notify.group(1) if notify else None))
+        else:
+            kind = next((k for k in ("Server", "Client", "NetMulticast") if re.search(r"\b" + k + r"\b", flat, re.I)), None)
+            if not kind:
+                continue
+            fn = re.match(r"[^(]*?\b(\w+)\s*\(", decl.replace("\n", " "))
+            if fn:
+                out["rpcs"].append((fn.group(1), kind.replace("NetMulticast", "multicast").lower(),
+                                    not re.search(r"\bUnreliable\b", flat, re.I),
+                                    bool(re.search(r"\bWithValidation\b", flat, re.I))))
+    return out
+
+
+def replication_conditions(text, name):
+    """{property: condition} from DOREPLIFETIME_CONDITION(Class, Prop, COND_X) lines in a source file."""
+    found = {}
+    for m in re.finditer(r"DOREPLIFETIME_CONDITION(?:_NOTIFY)?\s*\(\s*" + re.escape(name) + r"\s*,\s*(\w+)\s*,\s*COND_(\w+)", text):
+        found[m.group(1)] = m.group(2)
+    for m in re.finditer(r"DOREPLIFETIME_WITH_PARAMS(?:_FAST)?\s*\(\s*" + re.escape(name) + r"\s*,\s*(\w+)\s*,\s*(\w+)", text):
+        cond = re.search(re.escape(m.group(2)) + r"\.Condition\s*=\s*COND_(\w+)", text)
+        if cond:
+            found[m.group(1)] = cond.group(1)
+    return found
+
+
+def header_index(project):
+    """{file name: [paths]} for the C++ headers and sources of the project, its plugins and the engine (cached)."""
+    cache = os.path.join(state_dir(project), "cache", "source-index.json")
+    engine = engine_root(project) or ""
+    data = read_json(cache) or {}
+    if data.get("engine") == engine and data.get("version") == 1:
+        index = data["files"]
+    else:
+        index = {}
+        roots = [os.path.join(engine, "Engine", "Source", "Runtime"), os.path.join(engine, "Engine", "Plugins")]
+        for root in roots:
+            for dirpath, dirs, files in os.walk(root) if os.path.isdir(root) else []:
+                dirs[:] = [d for d in dirs if d not in SKIP_DIRS and d not in ("Content", "Resources", "Shaders")]
+                for f in files:
+                    if f.endswith((".h", ".cpp")):
+                        index.setdefault(f, []).append(os.path.join(dirpath, f))
+        write_json(cache, {"engine": engine, "version": 1, "files": index})
+    for root in project_code_roots(project):  # never cached: these change
+        for dirpath, dirs, files in os.walk(root):
+            dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+            for f in files:
+                if f.endswith((".h", ".cpp")):
+                    index.setdefault(f, []).insert(0, os.path.join(dirpath, f))
+    return index
+
+
+def project_headers_declaring(project, name):
+    """Project headers that declare one of A<name>/U<name> (project headers need not be named after a class)."""
+    rx = re.compile(r"^\s*class\s+(?:\w+_API\s+)?[AU]" + re.escape(name) + r"\b", re.M)
+    found = []
+    for root in project_code_roots(project):
+        for dirpath, dirs, files in os.walk(root):
+            dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+            for f in files:
+                if f.endswith(".h"):
+                    path = os.path.join(dirpath, f)
+                    with open(path, encoding="utf-8", errors="replace") as fh:
+                        if rx.search(fh.read()):
+                            found.append(path)
+    return found
+
+
+def class_replication(project, name, index=None):
+    """Replicated properties (with conditions) and RPCs a C++ class declares, read from its header and source;
+    None when the header is not found. `name` without its A/U prefix, as Python names classes."""
+    index = index if index is not None else header_index(project)
+    headers = index.get(f"{name}.h", []) or project_headers_declaring(project, name)
+    for prefix in CLASS_PREFIXES:
+        for path in headers:
+            try:
+                with open(path, encoding="utf-8", errors="replace") as f:
+                    found = replication_in_header(f.read(), prefix + name)
+            except OSError:
+                continue
+            if found is None:
+                continue
+            conditions = {}
+            stem = os.path.splitext(os.path.basename(path))[0]
+            for cpp in index.get(f"{stem}.cpp", []):
+                with open(cpp, encoding="utf-8", errors="replace") as f:
+                    conditions.update(replication_conditions(f.read(), prefix + name))
+            found["conditions"] = conditions
+            found["header"] = path
+            found["project"] = os.path.normcase(os.path.abspath(path)).startswith(
+                os.path.normcase(os.path.dirname(os.path.abspath(project))))
+            return found
+    return None
+
+
+def net_class_lines(info, project, show_all=False):
+    """`ue net` text for the class chain: replicated properties and RPCs, own class in full, parents summarised."""
+    lines = [" : ".join(c["name"] for c in info["chain"])]
+    for var in info["bp_vars"]:
+        lines.append(f"  {var['blueprint']} (Blueprint) replicates {var['name']} ({var['replication'].replace('_', ' ')})")
+    index = header_index(project)
+    shown_native = 0
+    for c in info["chain"]:
+        if not c["native"]:
+            continue
+        rep = class_replication(project, c["name"], index)
+        if rep is None:
+            continue
+        props = [f"{p}" + (f" ({rep['conditions'][p]})" if p in rep["conditions"] else "") + (f" -> {n}" if n else "")
+                 for p, n in rep["properties"]]
+        rpcs = [f"{n} ({k}{'' if r else ', unreliable'}{', validated' if v else ''})" for n, k, r, v in rep["rpcs"]]
+        if not props and not rpcs:
+            continue
+        full = show_all or shown_native == 0 or rep["project"]  # the class itself and the project's own: in full
+        shown_native += 1
+
+        def capped(items):
+            return items if show_all or len(items) <= 12 else items[:12] + [f"+{len(items) - 12} more (--all)"]
+        counts = (len(props), len(rpcs))
+        props, rpcs = capped(props), capped(rpcs)
+        head = f"  {c['name']}:"
+        if full:
+            if props:
+                lines.append(f"{head} replicates " + ", ".join(props))
+                head = " " * len(head)
+            if rpcs:
+                lines.append(f"{head} RPCs " + ", ".join(rpcs))
+        else:
+            lines.append(f"{head} {counts[0]} replicated, {counts[1]} RPC(s) (--all)")
+    if len(lines) == 1:
+        lines.append("  nothing replicated found (no Replicated properties or RPCs in the class headers)")
+    return lines
+
+
+NET_WORDS = {"authority": "authority", "simulatedproxy": "simulated proxy", "autonomousproxy": "autonomous proxy",
+             "none": "none", "awake": "awake", "dormantall": "dormant", "dormantpartial": "partly dormant",
+             "initial": "dormant until woken", "never": "never dormant"}
+
+
+def net_word(value, prefix):
+    """'roleautonomousproxy' -> 'autonomous proxy', 'dormawake' -> 'awake' (enum names as the toolset gives them)."""
+    key = (value or "").lower().replace("_", "")
+    key = key[len(prefix):] if key.startswith(prefix) else key
+    return NET_WORDS.get(key, key or "?")
+
+
+def net_actor_lines(rows):
+    out = []
+    for r in rows:
+        if r.get("missing"):
+            out.append(f"  world {r['index']}: not there")
+            continue
+        relevancy = "always relevant" if r["always_relevant"] else "owner only" if r["only_owner"] else f"cull {r['cull_m']} m"
+        where = f"world {r['index']} ({r['net_mode']})" if r["index"] >= 0 else r["net_mode"]
+        out.append(f"  {where}: {r['name']}" + (f" ({r['distance']:.0f} cm away)" if r["distance"] else "")
+                   + f", role {net_word(r['role'], 'role')}, remote {net_word(r['remote_role'], 'role')}"
+                   + (f", owner {r['owner']}" if r["owner"] else "")
+                   + ("" if r["replicates"] else ", not replicated")
+                   + (f", {r['update_hz']:g} Hz" if r["update_hz"] else "") + f", {relevancy}, {net_word(r['dormancy'], 'dorm')}"
+                   + (", movement" if r["replicate_movement"] else ""))
+    return out
+
+
+def cmd_net(ctx, args):
+    """Replication: what a class replicates (from its C++ headers and Blueprint variables), an actor's live
+    network state in each PIE world, or one property compared across the server and clients."""
+    if args.target == "compare":
+        if not args.prop or "." not in args.prop:
+            raise CliError("ue net compare <Actor.Property> (or player.Health, Actor.location)")
+        actor, _, prop = args.prop.rpartition(".")
+        rows = ctx.tether("net_compare", target=actor, prop=prop)
+        rows = json.loads(rows) if isinstance(rows, str) else rows
+        values = {r["value"] for r in rows if r["name"]}
+        print(f"{actor}.{prop} in {len(rows)} PIE world(s): " + ("the same everywhere" if len(values) == 1 else "DIFFERENT"))
+        for r in rows:
+            print(f"  world {r['index']} ({r['net_mode']}): " + (f"{r['name']} = {r['value']}"
+                  + (f"  ({r['distance']:.0f} cm from the named one)" if r["distance"] else "") if r["name"] else "no match"))
+        ctx.data = rows
+        return 0 if len(values) <= 1 else 1
+    info = ctx.tether("net_info", target=args.target, pie=args.pie)
+    info = json.loads(info) if isinstance(info, str) else info
+    lines = net_class_lines(info, ctx.project, args.all)
+    if info["actors"]:
+        lines.append(f"{info['name']} live:")
+        lines += net_actor_lines(info["actors"])
+    for line in lines:
+        print(line)
+    ctx.data = info
     return 0
