@@ -83,6 +83,7 @@ another session's builder script, and a `build --restart` ran while another sess
 | 19d | **`ue audio --log` flags stereo spread 0 as a problem**: spread 0 collapses both channels onto the source (it is the fix). Flag only spread > 0 (the default is 200), and drop "set StereoSpread" from the advice when it is already 0 | [field] bug, 0.19 | S |
 | 19e | **`ue audio --log` says "3D ... on no actor (2D)"** for 3D sounds created with `CreateComponent(World)` plus SetLocation: say "no owner actor" and give the world position and distance instead | [field] bug, 0.19 | S |
 | 19c | **`ue py` warns about `set_editor_properties` (plural) on AnimSequences**: it posts a change event without a property, so marking an import additive keeps the non-additive compressed data until a restart (the skeleton flew about 250 m in game) | [field] engine gotcha | S |
+| 19f | **Project copies of the skill stay current**: `ue doctor` flags a project's `.claude/skills/unreal-tether/SKILL.md` older than the CLI's, and `ue init` updates it | [gap] IslandHorror's copy is at 0.19.0 (synced by hand each release until then) | S |
 
 ---
 
@@ -138,6 +139,22 @@ another session's builder script, and a `build --restart` ran while another sess
 | 42 | **`ue fix lods\|nanite <folder>`**: generate LODs or enable Nanite where `lint` flags them | [idea] | S |
 | 43 | **Localization**: `ue loc` (gather, compile, missing translations, FText in code not marked for localization, string length overflow per language) | [idea] | M |
 | 44 | **`ue move-pack <folder> /Game/ThirdParty/<name>`**: relocate a Fab or marketplace pack with redirectors fixed | [idea] packs land at the content root | S |
+
+### 2H. Terrain, foliage and water
+From IslandHorror's own scripts and C++ helpers (`docs/systems/terrain-water.md`): each one is something Tether
+could not do when it was written. Its open follow-ups are re-placing content on slopes, re-levelling huts, rebuilding
+nav, hero-placing cliffs, tuning scatter and turning scattered rocks into foliage for performance.
+
+| # | Addition | Why | Effort |
+|---|---|---|---|
+| 59 | **`ue foliage check [type\|folder]`**: per foliage type or scattered mesh: instance count, cull distances, LODs (and the Fab/Megascans **billboard last LOD**, ≤12 triangles with `MI_*_Billboard`, which renders huge and spidery at distance), Nanite, WPO without a WPO disable distance, collision and shadows on small plants. With `ue fix lods --billboard` (part of 42) to strip that LOD | [field] IslandHorror wrote `fix_foliage_lod.py` and `fix_foliage_wpo.py` for exactly these | M |
+| 60 | **`ue foliage convert <regex\|tag>`**: StaticMeshActors into foliage instances (a foliage type per mesh, transforms kept, undoable) | [field] "convert scatter to foliage/HISM for perf": ~180 rock actors; Python cannot build HISM actors, so IslandHorror wrapped it in C++ | M |
+| 61 | **`ue foliage add --mask <png> [--avoid <regex>:<radius>]`**: density from a greyscale mask over the landscape, with keep-out around actors (play area, paths) | [field] the forest is placed from `forest_mask.u8` by a custom script | M |
+| 62 | **`ue drop --group`**: ground several actors (or an actor and what is attached to it) as one unit, by the lowest contact, so a multi-piece hut does not warp on a slope | [field] "multi-piece structures get each piece grounded independently, so on a slope they warp" | S |
+| 63 | **`ue landscape export\|import <file.png\|.r16> [--flip-y]`** and **`ue landscape paint <layer> --mask <png>`**: heightmap and paint layers in and out of an existing landscape through render targets (`LandscapeExportHeightmapToRenderTarget`, `LandscapeImportHeightmapFromRenderTarget`, `LandscapeImportWeightmapFromRenderTarget`); needs a rendering editor (`--render` or windowed). Creating a new landscape needs C++ (`ALandscape::Import` is not script-callable): see 65 | [field] png support and north/east orientation are open IslandHorror follow-ups | M |
+| 64 | **`ue water`**: water bodies and zones as text, with checks: a water body that edits the landscape (`affects_landscape` flattens a hand-made island), shoreline resolution (zone extent / water-info texture size, local tessellation), materials on the near and distant LOD meshes | [field] IslandHorror's terrain RULES list each of these as a lesson learned | S |
+| 65 | **A small Tether C++ editor module** for what Python cannot do: create a landscape from a heightmap file, assemble HISM actors. Optional, so Blueprint-only projects are not forced to compile it | [field] IslandHorror carries its own `IslandTerrainTools` / `IslandFoliageTools` for these | L |
+| 66 | **`ue wait compile`**: wait until shader and asset compilation has finished (after opening a big level or editing a material), printing what remains; `ue open` reports the backlog | [field] Lvl_Island must be opened once for its landscape and water shaders; the nav lock (0.20) also waits on asset compilation | S |
 
 ### 2G. Code (C++ and C#)
 | # | Addition | Why | Effort |
