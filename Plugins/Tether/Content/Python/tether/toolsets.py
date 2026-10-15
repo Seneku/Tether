@@ -1617,6 +1617,45 @@ def _ground_actor(actor, align=False):
     return old_z, loc.z, (_actor_label(landed) if landed else "?")
 
 
+def _ground_group(actors, rest="lowest"):
+    """Move actors as one unit (a hut of separate wall pieces): sample the ground under every piece's footprint,
+    ignoring the group itself, and shift all of them by one offset so the group's lowest point rests on the lowest
+    (or highest, or mean) ground under it. Attached children move with their parents. Returns (dz, ground spread
+    in cm, samples)."""
+    world = actors[0].get_world()
+    members = set(actors)
+    bottom, grounds = None, []
+    for actor in actors:
+        origin, extent = actor.get_actor_bounds(False)
+        bottom = origin.z - extent.z if bottom is None else min(bottom, origin.z - extent.z)
+        for dx, dy in ((0, 0), (-1, -1), (-1, 1), (1, -1), (1, 1)):
+            hit = _trace_down(world, origin.x + dx * extent.x * 0.9, origin.y + dy * extent.y * 0.9, ignore=actors)
+            if hit is not None:
+                grounds.append(hit["impact_point"].z)
+    if not grounds:
+        raise RuntimeError("no ground below the group (nothing with collision under it)")
+    target = {"lowest": min(grounds), "highest": max(grounds), "mean": sum(grounds) / len(grounds)}[rest]
+    dz = target - bottom
+    for actor in actors:
+        parent = _try(lambda a=actor: a.get_attach_parent_actor())
+        if parent in members:
+            continue  # follows its parent
+        loc = actor.get_actor_location()
+        loc.z += dz
+        actor.set_actor_location(loc, False, True)
+    return dz, max(grounds) - min(grounds), len(grounds)
+
+
+def _with_attached(actors):
+    """The actors plus everything attached to them, recursively, without duplicates."""
+    out = []
+    for actor in actors:
+        for a in [actor] + list(_try(lambda: actor.get_attached_actors(True, True)) or []):
+            if a not in out:
+                out.append(a)
+    return out
+
+
 def _trace_down(world, x, y, ignore=(), top=200000.0):
     """The first blocking surface below (x, y) from high above, as a hit dict, or None."""
     hit = unreal.SystemLibrary.line_trace_single(
@@ -1631,13 +1670,25 @@ def _trace_down(world, x, y, ignore=(), top=200000.0):
 def _circle_points(rng, cx, cy, radius, count, spacing=0.0):
     """Up to count random points in a circle, at least spacing apart."""
     import math
+
+    def sample():
+        r, a = radius * math.sqrt(rng.random()), rng.random() * 2 * math.pi
+        return cx + r * math.cos(a), cy + r * math.sin(a)
+    return _spaced_points(sample, count, spacing)
+
+
+def _rect_points(rng, x0, y0, x1, y1, count, spacing=0.0):
+    """Up to count random points in a rectangle, at least spacing apart."""
+    return _spaced_points(lambda: (rng.uniform(x0, x1), rng.uniform(y0, y1)), count, spacing)
+
+
+def _spaced_points(sample, count, spacing):
     points, tries = [], 0
     cell = {}  # spacing grid, so dense fills stay fast
     size = spacing or 1.0
     while len(points) < count and tries < count * 30:
         tries += 1
-        r, a = radius * math.sqrt(rng.random()), rng.random() * 2 * math.pi
-        p = (cx + r * math.cos(a), cy + r * math.sin(a))
+        p = sample()
         if spacing:
             gx, gy = int(p[0] // size), int(p[1] // size)
             near = [q for dx in (-1, 0, 1) for dy in (-1, 0, 1) for q in cell.get((gx + dx, gy + dy), ())]
@@ -1646,6 +1697,226 @@ def _circle_points(rng, cx, cy, radius, count, spacing=0.0):
             cell.setdefault((gx, gy), []).append(p)
         points.append(p)
     return points
+
+
+def _landscape_rect(world):
+    """(x0, y0, x1, y1) covering the level's landscapes, or None without one."""
+    boxes = [p.get_actor_bounds(False) for p in unreal.GameplayStatics.get_all_actors_of_class(world, unreal.LandscapeProxy)]
+    if not boxes:
+        return None
+    return (min(o.x - e.x for o, e in boxes), min(o.y - e.y for o, e in boxes),
+            max(o.x + e.x for o, e in boxes), max(o.y + e.y for o, e in boxes))
+
+
+def _mask_sampler(world, mask):
+    """mask: JSON {w, h, data (base64, one byte per pixel, rows along +Y, columns along +X), rect?}: a function
+    (x, y) -> 0..1, and the rectangle it covers (default: the landscape's)."""
+    import base64
+    grid = json.loads(mask)
+    w, h, pixels = int(grid["w"]), int(grid["h"]), base64.b64decode(grid["data"])
+    rect = grid.get("rect") or _landscape_rect(world)
+    if rect is None:
+        raise RuntimeError("the mask needs an area: no landscape here, so pass --mask-area x0,y0,x1,y1")
+    x0, y0, x1, y1 = rect
+
+    def value(x, y):
+        col, row = int((x - x0) / (x1 - x0) * w), int((y - y0) / (y1 - y0) * h)
+        return pixels[row * w + col] / 255.0 if 0 <= col < w and 0 <= row < h else 0.0
+    return value, rect
+
+
+def _avoid_points(world, avoid):
+    """avoid: JSON [[regex, radius cm], ...] over actor labels, classes and tags: [(x, y, radius)]."""
+    rules = [(re.compile(rx, re.I), float(r)) for rx, r in json.loads(avoid)] if avoid else []
+    points = []
+    if not rules:
+        return points
+    for actor in unreal.GameplayStatics.get_all_actors_of_class(world, unreal.Actor):
+        names = [_actor_label(actor), actor.get_class().get_name()] + [str(t) for t in (actor.tags or [])]
+        for rx, radius in rules:
+            if any(rx.search(n) for n in names):
+                loc = actor.get_actor_location()
+                points.append((loc.x, loc.y, radius))
+                break
+    return points
+
+
+_FOLIAGE_SMALL = 60.0  # cm bounds radius under which shadows and collision on thousands of instances are flagged
+
+
+def _mesh_facts(mesh):
+    """LOD triangle counts, Nanite, bounds radius, whether a material moves vertices (WPO), billboard last LOD."""
+    lods = _try(lambda: mesh.get_num_lods(), 1) or 1
+    tris = [_try(lambda i=i: mesh.get_num_triangles(i), 0) for i in range(lods)]
+    nanite = bool(_try(lambda: mesh.get_editor_property("nanite_settings").enabled, False))
+    radius = _try(lambda: mesh.get_bounds().sphere_radius, 0.0) or 0.0
+    sizes = _try(lambda: unreal.get_editor_subsystem(unreal.StaticMeshEditorSubsystem).get_lod_screen_sizes(mesh), []) or []
+    wpo = None
+    for slot in _try(lambda: mesh.get_editor_property("static_materials"), []) or []:
+        material = _try(lambda: slot.material_interface.get_base_material())
+        if material is None:
+            continue
+        node = _try(lambda: unreal.MaterialEditingLibrary.get_material_property_input_node(
+            material, unreal.MaterialProperty.MP_WORLD_POSITION_OFFSET), "?")
+        if node == "?":
+            continue
+        wpo = bool(wpo) or node is not None
+    # Megascans/Fab plants end on a 4-12 triangle impostor card; a screen size of 0 means it is already hidden
+    billboard = lods > 1 and 0 < tris[-1] <= 12 and not nanite and not (len(sizes) == lods and sizes[-1] <= 0)
+    return {"lods": lods, "tris": tris, "nanite": nanite, "radius": radius, "wpo": wpo, "billboard": billboard}
+
+
+def _instanced_groups(world, match):
+    """{mesh path: group} for the level's instanced meshes (foliage and other ISM/HISM components) and its
+    StaticMeshActors, each group with its components, actor count and mesh."""
+    rx = re.compile(match, re.I) if match not in ("", "-") else None
+    groups = {}
+    for actor in unreal.GameplayStatics.get_all_actors_of_class(world, unreal.Actor):
+        foliage = isinstance(actor, unreal.InstancedFoliageActor)
+        for comp in actor.get_components_by_class(unreal.InstancedStaticMeshComponent):
+            mesh = comp.get_editor_property("static_mesh")
+            if mesh is None or (rx and not rx.search(mesh.get_name())):
+                continue
+            g = groups.setdefault(mesh.get_path_name(), {"mesh": mesh, "comps": [], "actors": [], "kinds": set()})
+            g["comps"].append(comp)
+            g["kinds"].add("foliage" if foliage else f"instanced in {_actor_label(actor)}")
+        if isinstance(actor, unreal.StaticMeshActor):
+            mesh = _try(lambda: actor.static_mesh_component.get_editor_property("static_mesh"))
+            if mesh is not None and not (rx and not rx.search(mesh.get_name())):
+                g = groups.setdefault(mesh.get_path_name(), {"mesh": mesh, "comps": [], "actors": [], "kinds": set()})
+                g["actors"].append(actor)
+    return groups
+
+
+def _foliage_check(world, match, limit):
+    """Per instanced or repeated mesh: count, culling, LODs (and the impostor billboard), Nanite, wind (WPO)
+    distance, shadows and collision on small instances, and meshes placed as many separate actors."""
+    rows, flagged = [], 0
+    groups = _instanced_groups(world, match)
+    for path, g in sorted(groups.items(), key=lambda kv: -(sum(c.get_instance_count() for c in kv[1]["comps"])
+                                                           + len(kv[1]["actors"]))):
+        instances = sum(c.get_instance_count() for c in g["comps"])
+        separate = len(g["actors"])
+        if not instances and separate < 20:
+            continue  # a few plain actors of a mesh are not scatter
+        facts = _mesh_facts(g["mesh"])
+        comps = g["comps"]
+        issues = []
+        if facts["billboard"]:
+            issues.append(f"last LOD is a {facts['tris'][-1]}-triangle billboard (renders oversized far away; "
+                          "ue foliage fix billboards)")
+        if comps and instances >= 200 and any(c.get_editor_property("instance_end_cull_distance") <= 0 for c in comps):
+            issues.append("never culled (no end cull distance; ue foliage fix cull --distance N)")
+        if comps and facts["wpo"] and instances >= 200 and any(
+                _try(lambda c=c: c.get_editor_property("world_position_offset_disable_distance"), 1) <= 0 for c in comps):
+            issues.append("wind (WPO) runs at every distance (ue foliage fix wpo --distance N)")
+        if facts["lods"] == 1 and not facts["nanite"] and facts["tris"][0] >= 2000 and instances + separate >= 100:
+            issues.append(f"one LOD of {facts['tris'][0]} triangles and not Nanite")
+        small = facts["radius"] < _FOLIAGE_SMALL
+        if small and instances >= 1000 and any(c.get_editor_property("cast_shadow") for c in comps):
+            issues.append(f"{instances} small instances cast shadows")
+        if small and instances >= 500 and any(c.get_collision_enabled() != unreal.CollisionEnabled.NO_COLLISION
+                                              for c in comps):
+            issues.append(f"collision on {instances} small instances")
+        if separate >= 20:
+            issues.append(f"{separate} separate actors (ue foliage convert {g['mesh'].get_name()} makes them instances)")
+        flagged += bool(issues)
+        cull = max((c.get_editor_property("instance_end_cull_distance") for c in comps), default=0)
+        where = ", ".join(sorted(g["kinds"])) or "actors"
+        rows.append(f"{'!' if issues else ' '} {g['mesh'].get_name()}: {instances} instance(s)"
+                    + (f" + {separate} actor(s)" if separate else "") + f" ({where}); LODs "
+                    + "/".join(str(t) for t in facts["tris"]) + (" Nanite" if facts["nanite"] else "")
+                    + (f"; cull {cull / 100:.0f} m" if cull > 0 else ""))
+        rows += [f"    - {i}" for i in issues]
+    head = f"{len(groups)} instanced or repeated mesh(es), {flagged} with issues"
+    return _capped(head, rows, limit)
+
+
+def _foliage_fix(world, kind, match, value, scope, by_mesh=None):
+    """`fix billboards`: hide the impostor last LOD (screen size 0, so it is never chosen; the authored LODs stay)
+    on the level's instanced meshes, or every mesh under scope. `fix cull|wpo --distance`: set the end cull or WPO
+    disable distance on the level's instanced components and their foliage types."""
+    if kind == "billboards":
+        if scope not in ("", "-"):
+            meshes = [unreal.load_asset(p.split(".")[0]) for p in unreal.EditorAssetLibrary.list_assets(scope, True, False)]
+            meshes = [m for m in meshes if isinstance(m, unreal.StaticMesh)]
+        else:
+            meshes = [g["mesh"] for g in _instanced_groups(world, match).values()]
+        subsystem = unreal.get_editor_subsystem(unreal.StaticMeshEditorSubsystem)
+        fixed = []
+        for mesh in meshes:
+            if not _mesh_facts(mesh)["billboard"]:
+                continue
+            sizes = list(subsystem.get_lod_screen_sizes(mesh))
+            mesh.modify()
+            subsystem.set_lod_screen_sizes(mesh, sizes[:-1] + [0.0])
+            fixed.append(mesh.get_name())
+        return (f"hid the billboard LOD of {len(fixed)} mesh(es): {', '.join(fixed[:12])}" + (" ..." if len(fixed) > 12 else "")
+                + "; unsaved (ue save, or ue changes)") if fixed else "no billboard last LODs found"
+    if kind not in ("cull", "wpo") or value <= 0:
+        raise RuntimeError("fix billboards | fix cull --distance <cm> | fix wpo --distance <cm>")
+    prop = "instance_end_cull_distance" if kind == "cull" else "world_position_offset_disable_distance"
+    comps = [c for g in _instanced_groups(world, match).values() for c in g["comps"]]
+    types = set()
+    for comp in comps:
+        comp.modify()
+        comp.set_editor_property(prop, int(value))
+        mesh = comp.get_editor_property("static_mesh")
+        types.update((by_mesh or {}).get(mesh.get_path_name(), []) if mesh else [])
+    for ft in types:  # so new instances painted later get it too
+        ft.modify()
+        if kind == "cull":
+            _try(lambda f=ft: f.set_editor_property("cull_distance", unreal.Int32Interval(0, int(value))))
+        else:
+            _try(lambda f=ft: f.set_editor_property("world_position_offset_disable_distance", int(value)))
+    return (f"set {prop} = {value:g} cm on {len(comps)} component(s)" + (f" and {len(types)} foliage type(s)" if types else "")
+            + "; unsaved")
+
+
+def _foliage_convert(world, match, folder, resolve):
+    """StaticMeshActors whose label, tag or mesh matches -> foliage instances of their mesh's foliage type (made in
+    folder when missing; actors with override materials get a foliage type with those materials), the actors
+    deleted. Actors with attached actors or several components are left alone."""
+    rx = re.compile(match, re.I)
+    by_mesh, skipped = {}, []
+    for actor in unreal.GameplayStatics.get_all_actors_of_class(world, unreal.StaticMeshActor):
+        comp = actor.static_mesh_component
+        mesh = comp.get_editor_property("static_mesh") if comp else None
+        names = [_actor_label(actor)] + [str(t) for t in (actor.tags or [])] + ([mesh.get_name()] if mesh else [])
+        if mesh is None or not any(rx.search(n) for n in names):
+            continue
+        if _try(lambda: actor.get_attached_actors(True, False)) or len(actor.get_components_by_class(unreal.PrimitiveComponent)) > 1:
+            skipped.append(f"{_actor_label(actor)} (attached actors or more components)")
+            continue
+        overrides = tuple(m.get_path_name() if m else "" for m in (comp.get_editor_property("override_materials") or []))
+        overrides = overrides if any(overrides) else ()
+        by_mesh.setdefault((mesh.get_path_name(), overrides), (mesh, []))[1].append(actor)
+    if not by_mesh:
+        return "nothing to convert" + (f"; skipped {', '.join(skipped[:8])}" if skipped else "")
+    notes, done = [], []
+    with unreal.ScopedEditorTransaction("ue foliage convert"):
+        for (_, overrides), (mesh, actors) in by_mesh.items():
+            ft, note = resolve(mesh.get_path_name(), True) if not overrides else (None, None)
+            if overrides:  # a foliage type of its own, carrying those materials
+                name = "FT_" + re.sub(r"^SM_", "", mesh.get_name()) + "_" + overrides[0].rsplit(".", 1)[-1]
+                path = f"{folder.rstrip('/')}/{name}"
+                ft = _try(lambda: unreal.load_asset(path)) if unreal.EditorAssetLibrary.does_asset_exist(path) else None
+                ft = ft or unreal.AssetToolsHelpers.get_asset_tools().create_asset(
+                    name, folder.rstrip("/"), unreal.FoliageType_InstancedStaticMesh,
+                    unreal.FoliageType_InstancedStaticMeshFactory())
+                if ft is None:
+                    raise RuntimeError(f"could not load or create {path}")
+                ft.set_editor_property("mesh", mesh)
+                ft.set_editor_property("override_materials", [unreal.load_asset(p) if p else None for p in overrides])
+                unreal.EditorAssetLibrary.save_loaded_asset(ft, False)
+                note = f"{_short_path(ft.get_path_name())} with {mesh.get_name()}'s override materials"
+            if note:
+                notes.append(note)
+            unreal.InstancedFoliageActor.add_instances(world, ft, [a.static_mesh_component.get_world_transform() for a in actors])
+            unreal.get_editor_subsystem(unreal.EditorActorSubsystem).destroy_actors(actors)
+            done.append(f"{len(actors)} {mesh.get_name()} -> {ft.get_name()}")
+    return ("converted " + ", ".join(done) + " (labels and tags are not kept by instances)"
+            + (f"; {'; '.join(notes)}" if notes else "") + (f"; skipped {len(skipped)}: {', '.join(skipped[:6])}" if skipped else ""))
 
 
 def _read_square(world, rt, width, height, x0, y0, x1, y1):
@@ -1658,6 +1929,34 @@ def _read_square(world, rt, width, height, x0, y0, x1, y1):
         if len(pixels) == cols * rows:
             return list(pixels)
     raise RuntimeError(f"could not read a {cols} x {rows} square of the render target exactly")
+
+
+def _read_all_heights(world, rt, width, height, band=64):
+    """Every 16-bit height of an exported heightmap render target, row by row, read in bands."""
+    values = []
+    for y0 in range(0, height, band):
+        values += _rg16(_read_square(world, rt, width, height, 0, y0, width - 1, min(height, y0 + band) - 1))
+    return values
+
+
+def _write_r16(path, values):
+    import array
+    data = array.array("H", values)
+    if sys.byteorder == "big":
+        data.byteswap()
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    with open(path, "wb") as f:
+        data.tofile(f)
+
+
+def _read_r16(path):
+    import array
+    data = array.array("H")
+    with open(path, "rb") as f:
+        data.frombytes(f.read())
+    if sys.byteorder == "big":
+        data.byteswap()
+    return list(data)
 
 
 def _rg16(pixels):
@@ -2930,17 +3229,20 @@ class TetherCore(_Base):
 
     @_tool
     @staticmethod
-    def drop(targets: str, align: bool = False, token: str = "") -> str:
+    def drop(targets: str, align: bool = False, group: bool = False, rest: str = "lowest", token: str = "") -> str:
         """Put actors on the ground: move each straight down (or up, if buried) so the bottom of its bounds rests
-        on the first blocking surface below it. One undoable step.
+        on the first blocking surface below it. With group, move them (and what is attached to them) as one unit,
+        so a structure built of separate pieces keeps its shape on a slope. One undoable step.
 
         Args:
             targets: Comma-separated actor labels or names.
-            align: Also tilt each to the surface normal.
+            align: Also tilt each to the surface normal (not with group).
+            group: Move all of them, and their attached actors, by one offset.
+            rest: With group: rest the group's lowest point on the lowest, highest or mean ground under it.
             token: Session token from Saved/Tether/editors/<pid>.token (the ue CLI sends it).
 
         Returns:
-            One line per actor: old -> new height and what it landed on.
+            One line per actor (or one for the group): the height change and what it landed on.
         """
         _authorize(token)
         actors = []
@@ -2951,6 +3253,23 @@ class TetherCore(_Base):
             actors.append(obj)
         before = unreal.ToolsetLibrary.get_active_undo_count() if not _LEGACY else 0
         rows = []
+        if group:
+            if rest not in ("lowest", "highest", "mean"):
+                raise RuntimeError("rest must be lowest, highest or mean")
+            members = _with_attached(actors)
+            with unreal.ScopedEditorTransaction("ue drop --group"):
+                for actor in members:
+                    actor.modify()
+                    if actor.root_component:
+                        actor.root_component.modify()
+                dz, spread, samples = _ground_group(members, rest)
+            _record_undo(before, "drop group " + ", ".join(_actor_label(a) for a in actors))
+            extra = len(members) - len(actors)
+            return (f"group of {len(members)} actor(s)" + (f" ({extra} attached)" if extra else "") +
+                    f" moved {dz:+.0f} cm as one, resting on the {rest} ground under it; the ground varies "
+                    f"{spread:.0f} cm over {samples} samples" +
+                    (" (on a slope: the uphill side sits that much into it, or try flatter ground)"
+                     if rest == "lowest" and spread > 50 else ""))
         with unreal.ScopedEditorTransaction("ue drop"):
             for actor in actors:
                 actor.modify()
@@ -4972,21 +5291,28 @@ class TetherCore(_Base):
     @_tool
     @staticmethod
     def landscape_edit(step: str, action: str = "-", x: float = 0.0, y: float = 0.0, radius: float = 0.0,
-                       value: float = 0.0, strength: float = 1.0, backup: str = "-", token: str = "") -> str:
+                       value: float = 0.0, strength: float = 1.0, backup: str = "-", file: str = "", layer: str = "",
+                       token: str = "") -> str:
         """Sculpt the landscape under a circle: flatten (to value, or the height at the centre), raise (by value cm,
         negative lowers), smooth, or restore a backup. Python cannot sculpt, so this goes through the heightmap:
         export it to a render target, rewrite just the circle's square, check it reads back exactly, then import.
-        GPU work lands a frame later, so the ue CLI calls the steps in turn: begin, apply, commit.
+        GPU work lands a frame later, so the ue CLI calls the steps in turn: begin, apply, commit. The same path
+        exports the whole heightmap to a .r16 file (export: begin, apply), imports one (import: begin, apply,
+        commit; the old heights go to a .r16 backup), and imports a paint layer's weights from a picture (paint:
+        begin, commit).
 
         Args:
             step: begin (export), apply (edit the square; writes a backup), commit (verify and import), or cancel.
-            action: With begin: flatten, raise, smooth or restore.
+            action: With begin: flatten, raise, smooth, restore, export, import or paint.
             x: Circle centre x.
             y: Circle centre y.
             radius: Circle radius, cm (the outer quarter fades out).
             value: flatten: target height (below -1e29: the centre's); raise: cm.
             strength: 0..1, how far toward the result (smooth: passes).
             backup: With restore: the backup file a previous edit wrote.
+            file: export: the .r16 to write; import: a .r16 of exactly the landscape's vertex grid; paint: a PNG
+                whose red channel is the layer's weight, stretched over the whole landscape.
+            layer: With paint: the paint (target) layer's name.
             token: Session token from Saved/Tether/editors/<pid>.token (the ue CLI sends it).
 
         Returns:
@@ -5019,20 +5345,64 @@ class TetherCore(_Base):
             w = int(round((max_x - min_x) / scale.x)) + 1
             h = int(round((max_y - min_y) / scale.y)) + 1
             rt = R.create_render_target2d(world, w, h, unreal.TextureRenderTargetFormat.RTF_RGBA8)
+            if action == "paint":
+                names = [str(n) for n in (_try(lambda: list(land.get_target_layer_names()), []) or [])]
+                if layer not in names:
+                    raise RuntimeError(f"no paint layer '{layer}' on {_actor_label(land)}"
+                                       + (f" (it has {', '.join(names)})" if names else " (it has no paint layers)"))
+                with open(file, "rb") as f:
+                    texture = R.import_buffer_as_texture2d(world, list(f.read()))
+                if texture is None:
+                    raise RuntimeError(f"could not read {file} as a texture")
+                texture.set_editor_property("srgb", False)
+                canvas, _, context = R.begin_draw_canvas_to_render_target(world, rt)
+                canvas.draw_texture(texture, unreal.Vector2D(0, 0), unreal.Vector2D(w, h), unreal.Vector2D(0, 0),
+                                    unreal.Vector2D(1, 1), unreal.LinearColor(1, 1, 1, 1), unreal.BlendMode.BLEND_OPAQUE)
+                R.end_draw_canvas_to_render_target(world, context)
+                # The layer's weights as they are, for a backup (the editor's undo does not always keep paint)
+                before_rt = R.create_render_target2d(world, w, h, unreal.TextureRenderTargetFormat.RTF_RGBA8)
+                saved = _try(lambda: land.render_weightmap(unreal.Transform(), unreal.Box2D(), layer, before_rt), False)
+                state.clear()
+                state.update(land=land, rt=rt, w=w, h=h, action="paint", layer=layer, texture=texture,
+                             scale=(scale.x, scale.y, scale.z), z0=land.get_actor_location().z,
+                             before_rt=before_rt if saved else None)
+                return json.dumps({"step": "begin", "vertices": [w, h]})
             if not land.landscape_export_heightmap_to_render_target(rt, True, True):
                 raise RuntimeError("the heightmap export failed")
             state.clear()
             state.update(land=land, rt=rt, w=w, h=h, min_x=min_x, min_y=min_y, scale=(scale.x, scale.y, scale.z),
-                         z0=land.get_actor_location().z, action=action, args=(x, y, radius, value, strength, backup))
+                         z0=land.get_actor_location().z, action=action, args=(x, y, radius, value, strength, backup),
+                         file=file)
             return json.dumps({"step": "begin", "vertices": [w, h]})
         if not state.get("rt"):
             raise RuntimeError("no landscape edit in progress (begin first)")
         w, h, sx, sy, sz = state["w"], state["h"], *state["scale"]
         to_raw = lambda z: 32768.0 + (z - state["z0"]) / sz * 128.0  # noqa: E731
         to_z = lambda raw: state["z0"] + (raw - 32768.0) / 128.0 * sz  # noqa: E731
+        if step == "apply" and state["action"] == "export":
+            values = _read_all_heights(world, state["rt"], w, h)
+            path = state["file"]
+            _write_r16(path, values)
+            result = {"step": "apply", "file": path, "vertices": [w, h],
+                      "z_min": round(to_z(min(values)), 1), "z_max": round(to_z(max(values)), 1)}
+            state.clear()
+            return json.dumps(result)
         if step == "apply":
             x, y, radius, value, strength, backup_file = state["args"]
-            if state["action"] == "restore":
+            if state["action"] == "import":
+                patch = _read_r16(state["file"])
+                if len(patch) != w * h:
+                    raise RuntimeError(f"the heightmap has {len(patch)} samples; the landscape is {w} x {h} vertices "
+                                       f"({w * h}): resample it to that size first")
+                old = _read_all_heights(world, state["rt"], w, h)
+                folder = os.path.join(unreal.Paths.convert_relative_path_to_full(unreal.Paths.project_saved_dir()),
+                                      "Tether", "landscape")
+                backup_file = os.path.normpath(os.path.join(folder, time.strftime("backup-%Y%m%d-%H%M%S.r16")))
+                _write_r16(backup_file, old)
+                x0, y0, x1, y1 = 0, 0, w - 1, h - 1
+                state["before"] = None
+                state["range"] = (to_z(min(patch)), to_z(max(patch)))
+            elif state["action"] == "restore":
                 with open(backup_file, encoding="utf-8") as f:
                     saved = json.load(f)
                 x0, y0, x1, y1 = saved["square"]
@@ -5081,10 +5451,10 @@ class TetherCore(_Base):
                     json.dump({"landscape": state["land"].get_path_name(), "square": [x0, y0, x1, y1], "raw": old}, f)
                 state["before"] = (to_z(centre), max(abs(a - b) for a, b in zip(old, raw)) / 128.0 * sz)
             cols, rows = x1 - x0 + 1, y1 - y0 + 1
-            rgba = []
-            for v in patch:
-                rgba += [v >> 8, v & 255, 0, 255]
-            texture = R.import_buffer_as_texture2d(world, list(_png_rgba8(cols, rows, rgba)))
+            rgba = bytearray(b"\x00\x00\x00\xff" * len(patch))  # height in R (high byte) and G (low byte)
+            rgba[0::4] = bytes(v >> 8 for v in patch)
+            rgba[1::4] = bytes(v & 255 for v in patch)
+            texture =R.import_buffer_as_texture2d(world, list(_png_rgba8(cols, rows, rgba)))
             if texture is None:
                 raise RuntimeError("could not make the patch texture")
             texture.set_editor_property("srgb", False)
@@ -5095,23 +5465,58 @@ class TetherCore(_Base):
             R.end_draw_canvas_to_render_target(world, context)
             state.update(square=(x0, y0, x1, y1), patch=patch, texture=texture, backup=backup_file)
             return json.dumps({"step": "apply", "square": [x0, y0, x1, y1], "backup": backup_file})
+        if step == "commit" and state["action"] == "paint":
+            backup_file = None
+            if state.get("before_rt"):
+                weights = bytearray()
+                for y0 in range(0, h, 64):
+                    pixels = _read_square(world, state["before_rt"], w, h, 0, y0, w - 1, min(h, y0 + 64) - 1)
+                    scale255 = 1.0 if any(p.r > 1.0 for p in pixels) else 255.0
+                    weights += bytes(int(round(min(255.0, p.r * scale255))) for p in pixels)
+                rgba = bytearray(b"\x00\x00\x00\xff" * len(weights))
+                rgba[0::4], rgba[1::4], rgba[2::4] = weights, weights, weights
+                folder = os.path.join(unreal.Paths.convert_relative_path_to_full(unreal.Paths.project_saved_dir()),
+                                      "Tether", "landscape")
+                os.makedirs(folder, exist_ok=True)
+                backup_file = os.path.normpath(os.path.join(folder, time.strftime(
+                    f"paint-{re.sub(r'[^A-Za-z0-9_-]', '_', state['layer'])}-%Y%m%d-%H%M%S.png")))
+                with open(backup_file, "wb") as f:
+                    f.write(_png_rgba8(w, h, rgba))
+            land = state["land"]
+            before = unreal.ToolsetLibrary.get_active_undo_count() if not _LEGACY else 0
+            with unreal.ScopedEditorTransaction(f"ue landscape paint {state['layer']}"):
+                land.modify()
+                ok = land.landscape_import_weightmap_from_render_target(state["rt"], state["layer"], 0)
+            _record_undo(before, f"landscape paint {state['layer']}")
+            result = {"step": "commit", "ok": bool(ok), "action": "paint", "layer": state["layer"], "vertices": w * h,
+                      "backup": backup_file}
+            state.clear()
+            return json.dumps(result)
         if step == "commit":
             x0, y0, x1, y1 = state["square"]
-            pixels = _read_square(world, state["rt"], w, h, x0, y0, x1, y1)
-            back = _rg16(pixels)
+            if state["action"] == "import":
+                back = _read_all_heights(world, state["rt"], w, h)
+            else:
+                back = _rg16(_read_square(world, state["rt"], w, h, x0, y0, x1, y1))
             wrong = sum(1 for a, b in zip(back, state["patch"]) if a != b)
             if wrong or len(back) != len(state["patch"]):
                 state.clear()
                 raise RuntimeError(f"the patch did not read back exactly ({wrong} of {len(back)} vertices differ); "
                                    "nothing was changed")
             land = state["land"]
+            before = unreal.ToolsetLibrary.get_active_undo_count() if not _LEGACY else 0
             with unreal.ScopedEditorTransaction(f"ue landscape {state['action']}"):
                 land.modify()
                 ok = land.landscape_import_heightmap_from_render_target(state["rt"], True, 0)
+            _record_undo(before, f"landscape {state['action']}")
             result = {"step": "commit", "ok": bool(ok), "action": state["action"], "backup": state.get("backup"),
                       "vertices": len(back)}
             if state.get("before"):
                 result.update(centre_before=round(state["before"][0], 1), max_change_cm=round(state["before"][1], 1))
+            if state.get("range"):
+                result.update(z_min=round(state["range"][0], 1), z_max=round(state["range"][1], 1),
+                              grid={"min_x": state["min_x"], "min_y": state["min_y"], "scale": list(state["scale"]),
+                                    "z0": state["z0"], "w": w, "h": h})
             state.clear()
             return json.dumps(result)
         raise RuntimeError("step: begin, apply, commit or cancel")
@@ -5120,13 +5525,16 @@ class TetherCore(_Base):
     @staticmethod
     def foliage(action: str = "list", what: str = "-", area: str = "-", density: float = -1.0, count: int = -1,
                 spacing: float = -1.0, slope: str = "-", height: str = "-", scale: str = "-", align: bool = False,
-                seed: int = 0, folder: str = "/Game/Foliage", token: str = "") -> str:
+                seed: int = 0, folder: str = "/Game/Foliage", mask: str = "", avoid: str = "", value: float = -1.0,
+                scope: str = "", token: str = "") -> str:
         """Foliage instances in the edited level: list them by type, add instances over an area (real instanced
         foliage, snapped to the ground), or remove them from an area. Unset options use the foliage type's own
-        settings (density, radius, ground slope, height range, scale, random yaw, align to normal).
+        settings (density, radius, ground slope, height range, scale, random yaw, align to normal). check reports
+        culling, LODs, billboards, wind and shadows per instanced mesh; convert turns StaticMeshActors into
+        instances; fix billboards|cull|wpo repairs what check finds.
 
         Args:
-            action: list, add or remove.
+            action: list, add, remove, check, convert or fix.
             what: A FoliageType asset, or a static mesh (its foliage type is found, or created in folder for add).
                 '-' for every type (list, remove).
             area: 'x,y,radius'; required for add and remove, optional for list.
@@ -5139,6 +5547,12 @@ class TetherCore(_Base):
             align: Tilt each instance to the ground normal.
             seed: Random seed (same seed, same layout).
             folder: Where a foliage type made for a mesh goes.
+            mask: With add: JSON {w, h, data (base64 bytes, rows along +Y), rect?}: density 0..1 per pixel over rect
+                (default: the landscape), which also becomes the area when none is given.
+            avoid: With add: JSON [[regex, radius cm], ...]: keep away from actors whose label, class or tag matches.
+            value: With fix cull|wpo: the distance in cm.
+            scope: With fix: a regex over mesh names, or a content folder (billboards only) to fix every mesh in
+                (default: all the level's instanced meshes).
             token: Session token from Saved/Tether/editors/<pid>.token (the ue CLI sends it; add and remove).
 
         Returns:
@@ -5227,17 +5641,40 @@ class TetherCore(_Base):
                 out.append(f"foliage types with no instances here: {', '.join(sorted(unused)[:12])}"
                            + (f" +{len(unused) - 12}" if len(unused) > 12 else ""))
             return _capped(head, out, 60)
+        if action == "check":
+            return _foliage_check(world, what, 80)
         _authorize(token)
-        if circle is None:
-            raise RuntimeError(f"{action} needs an area: 'x,y,radius'")
-        cx, cy, radius = circle
+        if action == "fix":
+            folder_scope = scope.startswith("/")  # a content folder; anything else is a regex over mesh names
+            before = unreal.ToolsetLibrary.get_active_undo_count() if not _LEGACY else 0
+            with unreal.ScopedEditorTransaction(f"ue foliage fix {what}"):
+                out = _foliage_fix(world, what, "-" if folder_scope or not scope else scope, value,
+                                   scope if folder_scope else "", by_mesh)
+            _record_undo(before, f"foliage fix {what}")
+            return out
+        if action == "convert":
+            if what in ("", "-"):
+                raise RuntimeError("convert what? a regex over actor labels, tags or mesh names")
+            before = unreal.ToolsetLibrary.get_active_undo_count() if not _LEGACY else 0
+            out = _foliage_convert(world, what, folder, resolve)
+            _record_undo(before, f"foliage convert {what}")
+            return out
+        sampler = _mask_sampler(world, mask) if mask and action == "add" else None
+        if circle is None and sampler is None:
+            raise RuntimeError(f"{action} needs an area: 'x,y,radius'" + (" (or a --mask)" if action == "add" else ""))
         if action == "add":
             if what in ("", "-"):
                 raise RuntimeError("add what? a FoliageType asset or a static mesh")
             ft, note = resolve(what, create=True)
             rng = random.Random(seed)
             per_100m2 = density if density >= 0 else float(_try(lambda: ft.get_editor_property("density"), 100.0))
-            wanted = count if count >= 0 else int(round(per_100m2 * math.pi * radius * radius / 1e6))
+            if circle is not None:
+                cx, cy, radius = circle
+                area_cm2 = math.pi * radius * radius
+            else:
+                rx0, ry0, rx1, ry1 = sampler[1]
+                area_cm2 = (rx1 - rx0) * (ry1 - ry0)
+            wanted = count if count >= 0 else int(round(per_100m2 * area_cm2 / 1e6))
             gap = spacing if spacing >= 0 else float(_try(lambda: ft.get_editor_property("radius"), 0.0))
             slope_range = _numbers(slope) if slope not in ("", "-") else None
             if slope_range is None:
@@ -5254,8 +5691,17 @@ class TetherCore(_Base):
             scale_range = (scale_range * 2)[:2]
             random_yaw = bool(_try(lambda: ft.get_editor_property("random_yaw"), True))
             tilt = align or bool(_try(lambda: ft.get_editor_property("align_to_normal"), False))
-            transforms, skipped = [], {"no ground": 0, "slope": 0, "height": 0}
-            for x, y in _circle_points(rng, cx, cy, radius, wanted, gap):
+            transforms, skipped = [], {"mask": 0, "keep-out": 0, "no ground": 0, "slope": 0, "height": 0}
+            keep_out = _avoid_points(world, avoid)
+            points = (_circle_points(rng, cx, cy, radius, wanted, gap) if circle is not None
+                      else _rect_points(rng, *sampler[1], wanted, gap))
+            for x, y in points:
+                if sampler is not None and rng.random() >= sampler[0](x, y):  # thinned by the mask, before tracing
+                    skipped["mask"] += 1
+                    continue
+                if any((x - ax) ** 2 + (y - ay) ** 2 < ar * ar for ax, ay, ar in keep_out):
+                    skipped["keep-out"] += 1
+                    continue
                 hit = _trace_down(world, x, y)
                 if hit is None:
                     skipped["no ground"] += 1
@@ -5274,8 +5720,10 @@ class TetherCore(_Base):
                 s = rng.uniform(*scale_range)
                 transforms.append(unreal.Transform(point, rotation, unreal.Vector(s, s, s)))
             if transforms:
+                before = unreal.ToolsetLibrary.get_active_undo_count() if not _LEGACY else 0
                 with unreal.ScopedEditorTransaction(f"ue foliage add {ft.get_name()} x{len(transforms)}"):
                     unreal.InstancedFoliageActor.add_instances(world, ft, transforms)
+                _record_undo(before, f"foliage add {ft.get_name()} x{len(transforms)}")
             notes = [f"{n} {why}" for why, n in skipped.items() if n]
             if len(transforms) + sum(skipped.values()) < wanted:
                 notes.append(f"{wanted - len(transforms) - sum(skipped.values())} did not fit with spacing {gap:g}")
@@ -5284,6 +5732,7 @@ class TetherCore(_Base):
         if action == "remove":
             targets = [resolve(what, create=False)[0]] if what not in ("", "-") else types
             removed, kept_total = [], 0
+            before = unreal.ToolsetLibrary.get_active_undo_count() if not _LEGACY else 0
             with unreal.ScopedEditorTransaction("ue foliage remove"):
                 for ft in targets:
                     mesh = _try(lambda: ft.get_editor_property("mesh"))
@@ -5301,6 +5750,7 @@ class TetherCore(_Base):
                         unreal.InstancedFoliageActor.add_instances(world, ft, keep)
                     removed.append(f"{sum(len(v) for v in inside.values())} {ft.get_name()}")
                     kept_total += len(keep)
+            _record_undo(before, "foliage remove")
             return ("removed " + ", ".join(removed) + f" ({kept_total} outside the area kept)") if removed else \
                 "no foliage instances of those types in the area"
         raise RuntimeError("action: list, add or remove")

@@ -2,6 +2,7 @@
 import json
 import os
 import re
+import sys
 import time
 
 from .core import CliError, compact_error, editor_mode, log_end, log_path, read_json, state_dir, unwrap, write_json, zlib
@@ -392,6 +393,15 @@ def cmd_shot(ctx, args):
 
 def png_read(data):
     """(width, height, channels, pixel bytes) from an 8-bit non-interlaced PNG (stdlib only)."""
+    width, height, channels, depth, pixels = png_decode(data)
+    if depth != 8:
+        raise CliError(f"unsupported PNG (bit depth {depth})")
+    return width, height, channels, pixels
+
+
+def png_decode(data):
+    """(width, height, channels, bit depth, raw bytes) from a non-interlaced 8- or 16-bit PNG (16-bit samples
+    are big-endian, as PNG stores them)."""
     import struct
     if data[:8] != b"\x89PNG\r\n\x1a\n":
         raise CliError("not a PNG")
@@ -402,7 +412,7 @@ def png_read(data):
         if kind == b"IHDR":
             width, height, depth, color, _, _, interlace = struct.unpack(">IIBBBBB", body)
             channels = {0: 1, 2: 3, 4: 2, 6: 4}.get(color)
-            if depth != 8 or channels is None or interlace:
+            if depth not in (8, 16) or channels is None or interlace:
                 raise CliError(f"unsupported PNG (bit depth {depth}, color type {color}, interlace {interlace})")
         elif kind == b"IDAT":
             idat.append(body)
@@ -410,31 +420,111 @@ def png_read(data):
             break
         pos += 12 + length
     raw = zlib.decompress(b"".join(idat))
-    stride = width * channels
+    bpp = channels * depth // 8  # bytes per pixel: the filters' "left" neighbour
+    stride = width * bpp
     out = bytearray(stride * height)
     prev = bytearray(stride)
     for y in range(height):
         start = y * (stride + 1)
         kind, line = raw[start], bytearray(raw[start + 1:start + 1 + stride])
         if kind == 1:
-            for i in range(channels, stride):
-                line[i] = (line[i] + line[i - channels]) & 0xFF
+            for i in range(bpp, stride):
+                line[i] = (line[i] + line[i - bpp]) & 0xFF
         elif kind == 2:
             line = bytearray((a + b) & 0xFF for a, b in zip(line, prev))
         elif kind == 3:
             for i in range(stride):
-                left = line[i - channels] if i >= channels else 0
+                left = line[i - bpp] if i >= bpp else 0
                 line[i] = (line[i] + ((left + prev[i]) >> 1)) & 0xFF
         elif kind == 4:
             for i in range(stride):
-                a = line[i - channels] if i >= channels else 0
-                b, c = prev[i], (prev[i - channels] if i >= channels else 0)
+                a = line[i - bpp] if i >= bpp else 0
+                b, c = prev[i], (prev[i - bpp] if i >= bpp else 0)
                 p = a + b - c
                 pa, pb, pc = abs(p - a), abs(p - b), abs(p - c)
                 line[i] = (line[i] + (a if pa <= pb and pa <= pc else b if pb <= pc else c)) & 0xFF
         out[y * stride:(y + 1) * stride] = line
         prev = line
-    return width, height, channels, bytes(out)
+    return width, height, channels, depth, bytes(out)
+
+
+def png_gray16_bytes(width, height, values):
+    """16-bit greyscale PNG bytes (samples big-endian, as PNG stores them)."""
+    import array
+    import struct
+
+    def chunk(kind, body):
+        return struct.pack(">I", len(body)) + kind + body + struct.pack(">I", zlib.crc32(kind + body) & 0xFFFFFFFF)
+    samples = array.array("H", values)
+    if sys.byteorder == "little":
+        samples.byteswap()
+    data, stride = samples.tobytes(), width * 2
+    raw = b"".join(b"\x00" + data[y * stride:(y + 1) * stride] for y in range(height))
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 16, 0, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(raw, 6)) + chunk(b"IEND", b""))
+
+
+def flip_rows(width, height, values):
+    return [v for y in range(height - 1, -1, -1) for v in values[y * width:(y + 1) * width]]
+
+
+def read_grid(path):
+    """(width, height, max value, values row by row) from a greyscale or colour PNG (8 or 16 bit; colour as its
+    luminance, alpha ignored), a raw little-endian .r16, or a raw .u8, the raw ones square."""
+    import array
+    import math
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except OSError as exc:
+        raise CliError(f"cannot read {path}: {exc.strerror}") from None
+    ext = os.path.splitext(path)[1].lower()
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        w, h, channels, depth, raw = png_decode(data)
+        if depth == 16:
+            samples = array.array("H", raw)
+            if sys.byteorder == "little":
+                samples.byteswap()  # PNG stores 16-bit samples big-endian
+        else:
+            samples = raw
+        if channels == 1:
+            values = list(samples)
+        elif channels == 2:
+            values = list(samples[0::2])
+        else:  # RGB(A): Rec. 709 luminance
+            r, g, b = samples[0::channels], samples[1::channels], samples[2::channels]
+            values = [int(0.2126 * a + 0.7152 * c + 0.0722 * d) for a, c, d in zip(r, g, b)]
+        return w, h, 65535 if depth == 16 else 255, values
+    if ext in (".r16", ".raw"):
+        values = array.array("H", data[: len(data) // 2 * 2])
+        if sys.byteorder == "big":
+            values.byteswap()
+        top = 65535
+    elif ext in (".u8", ".r8"):
+        values, top = data, 255
+    else:
+        raise CliError(f"{path}: a PNG, .r16/.raw (16-bit) or .u8 (8-bit) file")
+    side = int(math.isqrt(len(values)))
+    if side * side != len(values):
+        raise CliError(f"{path}: {len(values)} samples is not a square; raw files must be square")
+    return side, side, top, list(values)
+
+
+def grid_to_bytes(w, h, top, values, max_side=512, flip_y=False):
+    """A grid as (w, h, one byte per sample 0..255), shrunk by box averaging to at most max_side a side."""
+    step = max(1, -(-max(w, h) // max_side))
+    ow, oh = -(-w // step), -(-h // step)
+    out = bytearray(ow * oh)
+    for oy in range(oh):
+        for ox in range(ow):
+            total = count = 0
+            for y in range(oy * step, min(h, (oy + 1) * step)):
+                row = y * w
+                for x in range(ox * step, min(w, (ox + 1) * step)):
+                    total += values[row + x]
+                    count += 1
+            out[(oh - 1 - oy if flip_y else oy) * ow + ox] = int(round(total / count / top * 255))
+    return ow, oh, bytes(out)
 
 
 def png_bytes(width, height, rgb):

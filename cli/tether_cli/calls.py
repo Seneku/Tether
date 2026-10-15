@@ -263,7 +263,7 @@ def cmd_scatter(ctx, args):
 
 
 def cmd_drop(ctx, args):
-    print(ctx.tether("drop", targets=",".join(args.actors), align=args.align))
+    print(ctx.tether("drop", targets=",".join(args.actors), align=args.align, group=args.group, rest=args.rest))
     return 0
 
 
@@ -649,18 +649,6 @@ def add_log_ignore(ctx, pattern, why=None):
     write_json(path, data)
     print(f"ignoring {pattern!r} in ue log, pie and ci ({os.path.relpath(path, os.path.dirname(ctx.project))}, "
           f"{len(items)} pattern(s)); ue log --all shows everything")
-    return 0
-
-
-def cmd_foliage(ctx, args):
-    """Foliage instances: list by type, add over an area, remove from an area."""
-    def opt(value):
-        return "-" if value is None else value
-    print(ctx.tether("foliage", action=args.action, what=opt(args.what), area=opt(args.area),
-                     density=-1.0 if args.density is None else args.density, count=-1 if args.count is None else args.count,
-                     spacing=-1.0 if args.spacing is None else args.spacing, slope=opt(args.slope),
-                     height=opt(args.height), scale=opt(args.scale), align=args.align, seed=args.seed,
-                     folder=args.folder))
     return 0
 
 

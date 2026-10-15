@@ -182,6 +182,38 @@ def tree_digest(root):
     return digest.hexdigest()
 
 
+SKILL_REL = os.path.join(".claude", "skills", "unreal-tether", "SKILL.md")
+SKILL_PARTS = re.compile(r"\A(---.*?\n---[ \t]*\n.*?^# [^\n]*\n\s*\n)(.*?\n)(\s*\n.*)\Z", re.S | re.M)
+
+
+def split_skill(text):
+    """(head, intro, body) of a SKILL.md: the frontmatter and title, the first paragraph under the title (how `ue`
+    is reached, which a project's copy may say its own way), and everything after it."""
+    m = SKILL_PARTS.match(text)
+    return m.groups() if m else ("", "", text)
+
+
+def project_skill_update(project):
+    """The project's copy of the unreal-tether skill (.claude/skills/) when it differs from the CLI's: (path, new
+    text, which keeps the copy's own intro paragraph). None when there is no copy or it is current."""
+    path = os.path.join(os.path.dirname(project), SKILL_REL)
+    source = os.path.join(os.path.dirname(CLI_DIR), "skills", "unreal-tether", "SKILL.md")
+    try:
+        with open(path, encoding="utf-8", newline="") as f:
+            mine = f.read()
+        with open(source, encoding="utf-8") as f:
+            theirs = f.read()
+    except OSError:
+        return None
+    newline = "\r\n" if "\r\n" in mine else "\n"
+    head, intro, body = split_skill(theirs.replace("\r\n", "\n"))
+    own_head, own_intro, own_body = split_skill(mine.replace("\r\n", "\n"))
+    if (own_head, own_body) == (head, body):
+        return None
+    text = head + (own_intro or intro) + body
+    return path, text.replace("\n", newline)
+
+
 def cmd_init(ctx, args):
     """Set up a project for Tether: enable the engine plugins it needs in the .uproject and copy the Tether
     editor plugin(s) into the project's Plugins/ unless the project already reaches them."""
@@ -232,11 +264,15 @@ def cmd_init(ctx, args):
         changes.append("enable Python remote execution in Config/DefaultEngine.ini (how ue reaches UE < 5.8)")
     else:
         ini = None
-    if not changes and not copies:
+    skill = project_skill_update(project)
+    if not changes and not copies and not skill:
         print("already set up: plugins enabled, Tether reachable")
         return 0
     for line in changes:
         print(("would " if args.dry_run else "") + line)
+    if skill:
+        print(("would " if args.dry_run else "") + f"update {SKILL_REL.replace(os.sep, '/')} (the project's copy of "
+              f"the skill) to Tether {tether_version()}, keeping its own first paragraph")
     for name, source, target, exists in copies:
         versions = (f" (the project has {tether_version(target)}, this CLI {tether_version(source)})"
                     if exists and name == "Tether" else "")
@@ -244,6 +280,11 @@ def cmd_init(ctx, args):
               + os.path.relpath(target, os.path.dirname(project)) + versions)
     if args.dry_run:
         return 0
+    if skill:
+        with open(skill[0], "w", encoding="utf-8", newline="") as f:
+            f.write(skill[1])
+    if not changes and not copies:
+        return 0  # only the skill: nothing for the editor to load
     if ini:
         newline = "\r\n" if "\r\n" in ini_text else "\n"
         if ini_section in ini_text:

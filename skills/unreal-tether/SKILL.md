@@ -95,7 +95,9 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
 - Where things are in a level: `ue map` (or `ue map x,y,r`, `--pie` for the running game) draws it from above
   (works headless) with player starts, spawners, AI and triggers as numbered dots; read the PNG to plan placement.
 - On terrain, never guess heights: `ue spawn /Game/X/SM_Rock --at 1200,-300,0 --ground` (or `ue drop Rock1 Rock2`,
-  `--align` to follow the slope) puts things on the surface below.
+  `--align` to follow the slope) puts things on the surface below. A structure built of separate pieces (walls,
+  roof) goes down as one: `ue drop Wall1 Wall2 Roof --group` (attached actors come along); it says how much the
+  ground varies under it, so move it to flatter ground rather than letting a slope swallow one side.
 - Materials as text: `ue mat graph /Game/X/M_Rock` (outputs, nodes, wiring). Edit in small steps:
   `ue mat graph M add ScalarParameter Wetness 0.2`, `... connect Wetness Lerp.Alpha`, `... connect Lerp BaseColor`,
   `... set #3 value=0.5`, `... delete #7`; each recompiles. Instances: `ue mat MI Name=value`.
@@ -108,6 +110,14 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
 - Terrain: `ue landscape` (size, layers), `ue landscape at x,y` (height, slope, layer weights: use it before placing
   things), `ue landscape map` (a PNG of the shape). `ue landscape flatten x,y,r [--height z]` (a pad for a
   building), `raise x,y,r --by cm`, `smooth x,y,r`; each prints a backup for `ue landscape restore --backup`.
+  Whole heightmaps: `ue landscape export h.png` / `import h.png` (16-bit, the landscape's exact vertex grid;
+  `--flip-y` for north-up files) and paint layers: `ue landscape paint Rock --mask rock.png`. These need a
+  rendering editor (`ue open --headless --render`); each prints the file that undoes it. Python cannot create a
+  new landscape; if the project has its own C++ helper for that, use it.
+- After opening a big level or editing materials, `ue wait compile` waits until shaders and assets have
+  compiled, before screenshots, timings or a nav build.
+- Water: `ue water` lists zones and bodies and flags the usual mistakes (an ocean whose brush flattens the
+  terrain, a coarse shoreline, a stock material on the distant water mesh).
 - Multiplayer: `ue pie start --clients 2` (add `--game /Script/MyGame.MyGameMode` to try another game mode), then
   `ue pie target 1` to act on the first client. `ue exec --pie` and `pie do` exec steps run on that world's next
   tick, so RPCs replicate; a `call` step or your own Python calling a function directly runs any RPC locally
@@ -131,7 +141,12 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
   names each; `ue redo` puts them back. Plain `ue undo` only covers `ue set`.
 - Grass, bushes, trees: `ue foliage add /Game/Foliage/FT_Fern --area 1200,-300,2000 --density 40` (real foliage
   instances on the ground; a mesh path works too and gets a foliage type). `ue foliage` counts by type
-  (`--area` for one spot); `ue foliage remove FT_Fern --area x,y,r` clears an area.
+  (`--area` for one spot); `ue foliage remove FT_Fern --area x,y,r` clears an area. Over a whole landscape
+  from a density picture: `ue foliage add FT_Fern --mask forest.png --density 40 --avoid PlayerStart:2000`.
+- Foliage performance: `ue foliage check` flags, per mesh, missing cull distances, wind (WPO) at every distance,
+  Fab/Megascans billboard last LODs (oversized and spidery far away), heavy single LODs, shadows and collision on
+  thousands of small plants, and scatter left as separate actors. Fix with `ue foliage fix billboards`,
+  `fix cull --distance 15000`, `fix wpo --distance 4000`, and `ue foliage convert <regex>` (actors to instances).
 - Many props at once: `ue scatter /Game/X/SM_Rock --count 30 --area 1200,-300,2000 --spacing 250 --scale 0.7,1.4
   --align` (one undo step; same `--seed`, same layout).
 - Level edits: `ue spawn PointLight --at 0,0,300 --label Lamp` (or an asset path), `ue duplicate Lamp --count 3`,

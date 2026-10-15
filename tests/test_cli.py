@@ -2428,7 +2428,115 @@ class SharedEditor(unittest.TestCase):
         self.assertEqual(ue.metres_to_cm("1.5,-2,18"), "150,-200,1800")
         self.assertEqual(ue.metres_to_cm("Tower_2"), "Tower_2")
         with unittest.mock.patch.object(ue.play.time, "sleep") as slept, unittest.mock.patch("builtins.print"):
-            self.assertEqual(ue.cmd_wait(types.SimpleNamespace(beacon={}), argparse.Namespace(seconds=4, clock="real")), 0)
+            self.assertEqual(ue.cmd_wait(types.SimpleNamespace(beacon={}), argparse.Namespace(what="4", clock="real")), 0)
         slept.assert_called_once_with(4)
         with self.assertRaises(ue.CliError):
-            ue.cmd_wait(types.SimpleNamespace(beacon={}), argparse.Namespace(seconds=4, clock="game"))
+            ue.cmd_wait(types.SimpleNamespace(beacon={}), argparse.Namespace(what="4", clock="game"))
+
+
+class TerrainRound(unittest.TestCase):
+    """0.21: project skill copies, grids and heightmaps, foliage masks, water, wait compile."""
+
+    def setUp(self):
+        self.project = Project()
+
+    def tearDown(self):
+        self.project.close()
+
+    def test_project_skill_copy_keeps_its_intro(self):
+        head = "---\nname: unreal-tether\ndescription: x\n---\n\n# Unreal via `ue`\n\n"
+        mine = head + "In this project, ue means python D:/T/cli/ue.py.\n\nOld body.\n"
+        path = self.project.write(".claude/skills/unreal-tether/SKILL.md")
+        with open(path, "w", encoding="utf-8", newline="") as f:  # CRLF, as a Windows checkout has it
+            f.write(mine.replace("\n", "\r\n"))
+        source = os.path.join(os.path.dirname(ue.CLI_DIR), "skills", "unreal-tether", "SKILL.md")
+        with open(source, encoding="utf-8") as f:
+            theirs = f.read()
+        p, text = ue.project_skill_update(self.project.uproject)
+        self.assertEqual(os.path.normcase(p), os.path.normcase(path))
+        self.assertIn("In this project, ue means python D:/T/cli/ue.py.\r\n", text)  # its own intro, its line ends
+        self.assertTrue(text.replace("\r\n", "\n").endswith(ue.split_skill(theirs)[2]))
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            f.write(text)
+        self.assertIsNone(ue.project_skill_update(self.project.uproject))  # current now
+
+    def test_grids_png16_r16_u8_and_flip(self):
+        values = [0, 1000, 65535, 32768]
+        png = self.project.write("h.png")
+        with open(png, "wb") as f:
+            f.write(ue.png_gray16_bytes(2, 2, values))
+        self.assertEqual(ue.read_grid(png), (2, 2, 65535, values))
+        r16 = self.project.write("h.r16")
+        import array
+        with open(r16, "wb") as f:
+            array.array("H", values).tofile(f)
+        self.assertEqual(ue.read_grid(r16), (2, 2, 65535, values))
+        u8 = self.project.write("m.u8")
+        with open(u8, "wb") as f:
+            f.write(bytes([0, 255, 255, 0, 0, 0, 255, 255, 255]))
+        self.assertEqual(ue.read_grid(u8)[:3], (3, 3, 255))
+        self.assertEqual(ue.flip_rows(2, 2, values), [65535, 32768, 0, 1000])
+        self.assertEqual(ue.grid_to_bytes(2, 2, 65535, values, max_side=1), (1, 1, bytes([int(round(99303 / 4 / 65535 * 255))])))
+        with self.assertRaises(ue.CliError):
+            ue.read_grid(self.project.write("bad.r16", "abcdef"))  # 3 samples: not square
+
+    def test_foliage_mask_and_avoid_are_sent(self):
+        mask = self.project.write("mask.u8")
+        with open(mask, "wb") as f:
+            f.write(bytes([255, 0, 0, 255]))
+        ctx = FakeCtx("added 3")
+        args = argparse.Namespace(action="add", what="/Game/FT_Fern", area=None, density=5, count=None, spacing=None,
+                                  slope=None, height=None, scale=None, align=False, seed=0, folder="/Game/Foliage",
+                                  mask=mask, mask_area="0,0,100,100", flip_y=True, avoid=["Camp|Path:1500", "Hut"],
+                                  distance=None, scope=None)
+        with unittest.mock.patch("builtins.print"):
+            ue.cmd_foliage(ctx, args)
+        sent = ctx.calls[0][1]
+        grid = json.loads(sent["mask"])
+        import base64
+        self.assertEqual((grid["w"], grid["h"], grid["rect"]), (2, 2, [0.0, 0.0, 100.0, 100.0]))
+        self.assertEqual(base64.b64decode(grid["data"]), bytes([0, 255, 255, 0]))  # flipped rows
+        self.assertEqual(json.loads(sent["avoid"]), [["Camp|Path", 1500.0], ["Hut", 500.0]])
+        with self.assertRaises(ue.CliError):
+            ue.cmd_foliage(ctx, argparse.Namespace(**dict(vars(args), action="fix", what="leaves", mask=None, avoid=None)))
+
+    def test_water_checks(self):
+        data = {"plugin": True, "landscapes": 1,
+                "zones": [{"label": "Zone", "extent": [400000, 400000], "resolution": [1024, 1024], "local": False,
+                           "local_extent": None}],
+                "bodies": [{"label": "Ocean", "class": "WaterBodyOcean", "z": 0, "affects_landscape": True,
+                            "material": "/Game/Water/MI_Storm", "lod_material": "/Water/Materials/Water_Material_Ocean_LOD",
+                            "waves": True}]}
+        out = io.StringIO()
+        with unittest.mock.patch.object(ue.content, "py_json", return_value=data), contextlib.redirect_stdout(out):
+            code = ue.cmd_water(types.SimpleNamespace(data=None), argparse.Namespace())
+        text = out.getvalue()
+        self.assertEqual(code, 1)
+        self.assertIn("8000 x 8000 m, water-info 1024 x 1024 (7.81 m/texel)", text)
+        self.assertIn("shoreline fade is coarse", text)
+        self.assertIn("it edits the landscape", text)
+        self.assertIn("distant LOD mesh still uses the stock one", text)
+        self.assertIn("3 issue(s)", text)
+
+    def test_landscape_files_need_rendering(self):
+        ctx = types.SimpleNamespace(project=self.project.uproject, beacon={"nullrhi": True})
+        with self.assertRaises(ue.CliError) as caught:
+            ue.landscape_file(ctx, argparse.Namespace(action="export", where="x.png", flip_y=False, mask=None))
+        self.assertIn("--render", str(caught.exception))
+
+    def test_wait_compile_until_quiet(self):
+        samples = iter([(10, 0, 2), (12, 40, 2), (13, 80, 2), (13.5, 80, 1), (14, 80, 0), (14.5, 80, 0), (15, 80, 0)])
+        ctx = types.SimpleNamespace(beacon={"pid": 1})
+        out = io.StringIO()
+        with unittest.mock.patch.object(ue.play, "editor_process", return_value=True), \
+                unittest.mock.patch.object(ue.play, "compile_cpu", side_effect=lambda pid: next(samples)), \
+                unittest.mock.patch.object(ue.play, "COMPILE_QUIET", 0), \
+                unittest.mock.patch.object(ue.play.time, "sleep"), contextlib.redirect_stdout(out):
+            self.assertEqual(ue.cmd_wait(ctx, argparse.Namespace(what="compile", clock="real", max=600)), 0)
+        self.assertIn("shader workers 80 CPU-s", out.getvalue())
+
+    def test_drop_group_is_sent(self):
+        ctx = FakeCtx("group of 3 actor(s) moved -591 cm")
+        with unittest.mock.patch("builtins.print"):
+            ue.cmd_drop(ctx, argparse.Namespace(actors=["A", "B"], align=False, group=True, rest="mean"))
+        self.assertEqual(ctx.calls[0][1], {"targets": "A,B", "align": False, "group": True, "rest": "mean"})

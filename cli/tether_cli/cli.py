@@ -13,12 +13,12 @@ from .editor import cmd_build, cmd_close, cmd_crash, cmd_lease, cmd_open, cmd_st
 from .calls import (
     cmd_actors, cmd_ai, cmd_anim, cmd_api, cmd_asset, cmd_call, cmd_changes, cmd_config, cmd_delete, cmd_drop,
     cmd_duplicate, cmd_exec, cmd_find, cmd_log, cmd_mat, cmd_mv, cmd_nav, cmd_new, cmd_props, cmd_py, cmd_refs,
-    cmd_class, cmd_collision, cmd_cvar, cmd_tree, cmd_foliage, cmd_lights, cmd_wp, cmd_level, cmd_rm, cmd_statetree, cmd_trace, cmd_save, cmd_savegame, cmd_scatter, cmd_set, cmd_spawn, cmd_tools, cmd_undo, cmd_watch,
+    cmd_class, cmd_collision, cmd_cvar, cmd_tree, cmd_lights, cmd_wp, cmd_level, cmd_rm, cmd_statetree, cmd_trace, cmd_save, cmd_savegame, cmd_scatter, cmd_set, cmd_spawn, cmd_tools, cmd_undo, cmd_watch,
 )
 from .images import cmd_look, cmd_shot
 from .testing import cmd_test
 from .assets import cmd_data, cmd_diff, cmd_fx, cmd_net, cmd_overview, cmd_pcg, cmd_skel, cmd_size, cmd_table, cmd_usages, cmd_validate
-from .content import cmd_import, cmd_landscape, cmd_lint, cmd_map, cmd_mesh, cmd_tex, cmd_unused
+from .content import cmd_foliage, cmd_import, cmd_landscape, cmd_lint, cmd_map, cmd_mesh, cmd_tex, cmd_unused, cmd_water
 from .fab import cmd_fab
 from .jobs import cmd_game, cmd_job, cmd_package
 from .play import cmd_audio, cmd_gpu, cmd_mem, cmd_sound, cmd_soak, cmd_ui, cmd_wait, cmd_world
@@ -118,9 +118,11 @@ def build_parser():
                                                                          "take again to renew")
     s.add_argument("--as", dest="name", help="a name for this session that the others see (kept)")
     s.add_argument("--force", action="store_true", help="with release: release another session's lease")
-    s = add("wait", cmd_wait, "wait N seconds, or N seconds of game time in PIE: ue wait 4 game (as pie do \"wait 4 game\")")
-    s.add_argument("seconds", type=float)
+    s = add("wait", cmd_wait, "wait N seconds, N seconds of game time in PIE (ue wait 4 game), or until shaders and "
+                              "assets have compiled (ue wait compile)")
+    s.add_argument("what", help="seconds, or compile")
     s.add_argument("clock", nargs="?", choices=["game", "real"], default="real", help="game: PIE game time")
+    s.add_argument("--max", type=float, default=900, help="with compile: give up after this many seconds (900)")
     s = add("who", cmd_who, "sessions that used this editor recently, their last command, the lease, who started PIE")
     s.add_argument("--minutes", type=float, default=15, help="how far back (15)")
     s.add_argument("--as", dest="name", help="a name for this session that the others see (kept)")
@@ -172,15 +174,23 @@ def build_parser():
     s.add_argument("--seed", type=int, default=0, help="same seed, same layout")
     s.add_argument("--align", action="store_true", help="tilt each to the surface")
     s.add_argument("--label", help="label prefix (default: the asset name)")
-    s = add("landscape", cmd_landscape, "landscape: info, at x,y, map [x,y,size], flatten|raise|smooth x,y,r, restore")
-    s.add_argument("action", nargs="?", default="info", choices=["info", "at", "map", "flatten", "raise", "smooth", "restore"])
-    s.add_argument("where", nargs="?", help="at: x,y; map: x,y,size (default: all); flatten/raise/smooth: x,y,radius")
+    s = add("landscape", cmd_landscape, "landscape: info, at x,y, map [x,y,size], flatten|raise|smooth x,y,r, restore, "
+                                        "export|import <heightmap>, paint <layer> --mask <picture>")
+    s.add_argument("action", nargs="?", default="info", choices=["info", "at", "map", "flatten", "raise", "smooth", "restore",
+                                                                 "export", "import", "paint"])
+    s.add_argument("where", nargs="?", help="at: x,y; map: x,y,size (default: all); flatten/raise/smooth: x,y,radius; "
+                                            "export/import: a 16-bit PNG or .r16 file; paint: the layer name")
+    s.add_argument("--mask", help="paint: a greyscale picture (PNG, .r16, .u8), white = full weight, stretched over "
+                                  "the landscape")
+    s.add_argument("--flip-y", action="store_true", help="export/import/paint: the file's first row is +Y (north-up)")
     s.add_argument("--height", type=float, help="flatten: target z (default: the height at the centre)")
     s.add_argument("--by", type=float, help="raise: cm (negative lowers)")
     s.add_argument("--strength", type=float, help="0..1 toward the result (smooth: number of passes, 2)")
     s.add_argument("--px", type=int, default=128, help="map: pixels per side (128, max 256)")
     s.add_argument("-o", "--output", help="map: PNG path (default Saved/Tether/shots/)")
     s.add_argument("--backup", help="restore: the backup file an edit printed")
+    add("water", cmd_water, "water zones and bodies, with checks: a body editing the landscape, a coarse shoreline, "
+                            "a stock material left on the distant water mesh")
     s = add("wp", cmd_wp, "World Partition: info, actors [regex|x,y,r] (unloaded too), load|unload <x,y,r|regex>")
     s.add_argument("action", nargs="?", default="info", choices=["info", "actors", "load", "unload"])
     s.add_argument("where", nargs="?", help="a name/class regex, or an area x,y,radius")
@@ -245,10 +255,21 @@ def build_parser():
     s.add_argument("action", choices=["check"])
     s.add_argument("--gap", type=float, default=5, help="cm above the surface that counts as floating (5)")
     s.add_argument("--strict", action="store_true", help="exit 1 when anything is reported")
-    s = add("foliage", cmd_foliage, "foliage instances: list by type, add over an area (snapped to the ground), remove")
-    s.add_argument("action", nargs="?", default="list", choices=["list", "add", "remove"])
-    s.add_argument("what", nargs="?", help="a FoliageType asset or a static mesh (add: required; remove: default all)")
-    s.add_argument("--area", help="x,y,radius (required for add and remove)")
+    s = add("foliage", cmd_foliage, "foliage instances: list, add over an area or a mask, remove; check (culling, LODs, "
+                                    "billboards, wind, shadows), convert actors to instances, fix billboards|cull|wpo")
+    s.add_argument("action", nargs="?", default="list", choices=["list", "add", "remove", "check", "convert", "fix"])
+    s.add_argument("what", nargs="?", help="add: a FoliageType asset or a static mesh; remove: one (default all); "
+                                           "check: a mesh-name regex; convert: a regex over actor labels, tags or "
+                                           "mesh names; fix: billboards, cull or wpo")
+    s.add_argument("--area", help="x,y,radius (required for add, unless --mask, and for remove)")
+    s.add_argument("--mask", help="add: a greyscale PNG/.r16/.u8 density mask (white = full density) over the "
+                                  "landscape (or --mask-area); rows run along +Y, columns along +X, as a heightmap")
+    s.add_argument("--mask-area", help="add: x0,y0,x1,y1 the mask covers (default: the landscape's bounds)")
+    s.add_argument("--flip-y", action="store_true", help="add: the mask's first row is +Y (north-up pictures)")
+    s.add_argument("--avoid", action="append", metavar="REGEX:RADIUS",
+                   help="add: no instances within RADIUS cm of actors whose label, class or tag matches (repeatable)")
+    s.add_argument("--distance", type=float, help="fix cull|wpo: the distance in cm")
+    s.add_argument("--scope", help="fix: a mesh-name regex, or a content folder (billboards) to fix every mesh in")
     s.add_argument("--density", type=float, help="add: instances per 10 x 10 m (default: the foliage type's)")
     s.add_argument("--count", type=int, help="add: exactly this many instead")
     s.add_argument("--spacing", type=float, help="add: minimum distance, cm (default: the type's radius)")
@@ -261,6 +282,10 @@ def build_parser():
     s = add("drop", cmd_drop, "put actors on the ground below them (undoable)")
     s.add_argument("actors", nargs="+", help="actor labels or names")
     s.add_argument("--align", action="store_true", help="also tilt each to the surface normal")
+    s.add_argument("--group", action="store_true", help="move them, and what is attached to them, as one unit "
+                                                        "(a structure of separate pieces keeps its shape on a slope)")
+    s.add_argument("--rest", choices=["lowest", "highest", "mean"], default="lowest",
+                   help="with --group: rest on the lowest (default: nothing floats), highest or mean ground under it")
     s = add("delete", cmd_delete, "delete actors from the level (undoable)")
     s.add_argument("actors", nargs="+", help="actor labels or names")
     s = add("duplicate", cmd_duplicate, "duplicate an actor (undoable)")

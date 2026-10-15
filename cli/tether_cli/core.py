@@ -755,6 +755,54 @@ def process_name(pid):
         return None
 
 
+def compile_cpu(pid):
+    """(editor CPU seconds, shader-worker CPU seconds, worker count) for an editor and its ShaderCompileWorker
+    children, from the processes' own CPU times; Windows only (None elsewhere). Shader compiles run in those
+    workers and asset builds (textures, meshes, Nanite) on the editor's threads, and neither queue is visible to
+    editor Python, so their CPU use is what shows whether compilation is still going on."""
+    if os.name != "nt":
+        return None
+    import ctypes
+    from ctypes import wintypes
+
+    class Entry(ctypes.Structure):  # PROCESSENTRY32W
+        _fields_ = [("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD), ("th32ProcessID", wintypes.DWORD),
+                    ("th32DefaultHeapID", ctypes.c_size_t), ("th32ModuleID", wintypes.DWORD),
+                    ("cntThreads", wintypes.DWORD), ("th32ParentProcessID", wintypes.DWORD),
+                    ("pcPriClassBase", ctypes.c_long), ("dwFlags", wintypes.DWORD), ("szExeFile", ctypes.c_wchar * 260)]
+    kernel32 = ctypes.windll.kernel32
+    kernel32.CreateToolhelp32Snapshot.restype = ctypes.c_void_p
+    kernel32.Process32FirstW.argtypes = kernel32.Process32NextW.argtypes = (ctypes.c_void_p, ctypes.POINTER(Entry))
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    kernel32.GetProcessTimes.argtypes = (ctypes.c_void_p,) + (ctypes.POINTER(wintypes.FILETIME),) * 4
+    kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
+
+    def cpu(p):
+        handle = kernel32.OpenProcess(0x1000, False, int(p))  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            return 0.0
+        try:
+            times = [wintypes.FILETIME() for _ in range(4)]
+            if not kernel32.GetProcessTimes(handle, *[ctypes.byref(t) for t in times]):
+                return 0.0
+            return sum((t.dwHighDateTime << 32 | t.dwLowDateTime) for t in times[2:]) / 1e7  # kernel + user
+        finally:
+            kernel32.CloseHandle(handle)
+    snapshot = kernel32.CreateToolhelp32Snapshot(0x2, 0)  # TH32CS_SNAPPROCESS
+    workers = []
+    try:
+        entry = Entry()
+        entry.dwSize = ctypes.sizeof(Entry)
+        ok = kernel32.Process32FirstW(snapshot, ctypes.byref(entry))
+        while ok:
+            if entry.th32ParentProcessID == pid and entry.szExeFile.lower().startswith("shadercompileworker"):
+                workers.append(entry.th32ProcessID)
+            ok = kernel32.Process32NextW(snapshot, ctypes.byref(entry))
+    finally:
+        kernel32.CloseHandle(snapshot)
+    return cpu(pid), sum(cpu(w) for w in workers), len(workers)
+
+
 def editor_process(pid):
     """True while pid is a running Unreal Editor; a dead editor's pid that a later process reused is not."""
     if not pid_alive(pid):

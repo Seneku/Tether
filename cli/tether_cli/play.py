@@ -9,7 +9,8 @@ import sys
 import time
 
 from .core import (
-    CliError, compact_error, crash_summary, editor_executable, editor_live, engine_root, filter_log, host_platform,
+    CliError, compact_error, compile_cpu, crash_summary, editor_executable, editor_live, editor_process, engine_root,
+    filter_log, host_platform,
     human_bytes, log_end, log_path, read_json, recent_crash, short, state_dir, subprocess, unwrap, write_json,
 )
 from .transport import catalog, py_json, resolve_toolset
@@ -1670,9 +1671,48 @@ def wait_game_seconds(ctx, seconds):
         time.sleep(0.1)
 
 
+COMPILE_QUIET = 3        # seconds of no shader-worker CPU and a quiet editor that count as "compiled"
+EDITOR_BUSY_CORES = 1.5  # editor CPU above this many cores counts as asset builds still running
+
+
+def wait_compile(ctx, args):
+    """`ue wait compile`: until the editor's shader workers and its own threads have been quiet for a few seconds
+    (shader and asset compilation are not visible to editor Python; their CPU use is)."""
+    pid = (ctx.beacon or {}).get("pid")
+    if not pid or not editor_process(pid):
+        raise CliError("no editor running (ue open)", 2)
+    last = compile_cpu(pid)
+    if last is None:
+        raise CliError("ue wait compile reads process CPU times, which is Windows-only for now")
+    started, quiet_since, totals, peak = time.time(), None, [0.0, 0.0], 0
+    while True:
+        time.sleep(1)
+        now = compile_cpu(pid)
+        editor, workers = now[0] - last[0], max(0.0, now[1] - last[1])  # workers that exit drop out of the sum
+        totals[0] += editor
+        totals[1] += workers
+        peak = max(peak, now[2])
+        last = now
+        busy = workers > 0.05 or editor > EDITOR_BUSY_CORES
+        quiet_since = None if busy else (quiet_since or time.time())
+        if quiet_since and time.time() - quiet_since >= COMPILE_QUIET:
+            print(f"compiled: quiet after {time.time() - started - COMPILE_QUIET:.0f}s (shader workers "
+                  f"{totals[1]:.0f} CPU-s, the editor {totals[0]:.0f} CPU-s; measured as CPU use)")
+            return 0
+        if time.time() - started > args.max:
+            raise CliError(f"still compiling after {args.max:g}s (shader workers {workers:.1f} cores, editor "
+                           f"{editor:.1f} cores)", 4)
+
+
 def cmd_wait(ctx, args):
     """`ue wait N [game]`: N seconds, or N seconds of game time in the running PIE (`pie do "wait N game"`), for
-    the pauses between `ue exec` or `ue pie do` calls."""
+    the pauses between `ue exec` or `ue pie do` calls. `ue wait compile`: until shaders and assets have compiled."""
+    if args.what == "compile":
+        return wait_compile(ctx, args)
+    try:
+        args.seconds = float(args.what)
+    except ValueError:
+        raise CliError("ue wait <seconds> [game] | ue wait compile") from None
     if args.clock == "game":
         if not (ctx.beacon or {}).get("pie"):
             raise CliError("`ue wait N game` needs PIE running (ue pie start); `ue wait N` waits wall-clock seconds")

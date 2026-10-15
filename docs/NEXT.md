@@ -30,6 +30,12 @@ navigation system refused as locked and names the lock; build errors say who las
 [game]`; `ue nav path` takes several pairs and reports the highest point and where a partial path stops (part of
 27a; "search limit hit" and islands are still open); `ue world probe`.
 
+**Done in 0.21.0** (the terrain round, for IslandHorror): 19f, 59 (with `fix billboards` hiding the impostor LOD by a
+screen size of 0 instead of rebuilding LODs, plus `fix cull|wpo`), 60 (override materials kept in their own foliage
+type), 61, 62, 63 (`paint` backs up the layer by rendering it at the vertex resolution) and 64; 66 as `ue wait
+compile`, which watches shader-worker and editor CPU because neither compile queue is visible to Python (`ue open`
+does not report the backlog yet). 65 (a C++ module) is still open.
+
 ---
 
 ## Priority 1: asked for, or blocking real work
@@ -121,6 +127,7 @@ another session's builder script, and a `build --restart` ran while another sess
 | 32 | **`ue shot --view lit\|unlit\|wireframe\|shadercomplexity\|lightcomplexity\|nanite\|lumen`** | [idea] the agent can see why a frame is expensive | S |
 | 33 | **`ue lights check`**: unbuilt lighting, overlapping stationary lights (more than 4), shadow-casting counts, Lumen settings in effect | [idea] | S |
 | 34 | **`ue post`**: the post-process volumes in effect at a point, with merged settings | [idea] | S |
+| 35a | **`ue map --footprints --json`**: per-mesh top-down hulls (outline, top and bottom z) over the play area, for tools that lay out a minimap or deploy map | [field] 0.20 menu session: a cyberpunk deploy map and minimap built from the level | S |
 | 35 | **Rendered top-down `ue map --render`**: fix the offscreen scene-capture issue (or use a temporary orthographic viewport) | [gap] `ue map` is schematic only | M |
 
 ### 2E. Performance, deeper

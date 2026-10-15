@@ -3,11 +3,13 @@ import fnmatch
 import json
 import os
 import re
+import sys
 import time
 
 from .core import CliError, filter_log, human_bytes, log_end, log_path, state_dir
+from .transport import py_json
 from .calls import flush_editor_log
-from .images import png_write
+from .images import flip_rows, grid_to_bytes, png_gray16_bytes, png_write, read_grid
 from .assets import SKIP_DIRS, SOURCE_EXTS, package_bytes, project_code_roots
 
 IMPORT_EXTS = {
@@ -637,9 +639,257 @@ def landscape_png(grid, path):
     return lo, hi
 
 
+def cmd_foliage(ctx, args):
+    """Foliage instances: list by type, add over an area or a mask, remove; check, convert actors, fix."""
+    import base64
+
+    def opt(value):
+        return "-" if value is None else value
+    mask = ""
+    if args.mask:
+        w, h, top, values = read_grid(args.mask)
+        mw, mh, pixels = grid_to_bytes(w, h, top, values, flip_y=args.flip_y)
+        grid = {"w": mw, "h": mh, "data": base64.b64encode(pixels).decode("ascii")}
+        if args.mask_area:
+            rect = [float(v) for v in args.mask_area.split(",")]
+            if len(rect) != 4:
+                raise CliError("--mask-area x0,y0,x1,y1 (cm)")
+            grid["rect"] = rect
+        mask = json.dumps(grid)
+    avoid = []
+    for rule in args.avoid or []:
+        rx, _, radius = rule.rpartition(":")
+        try:
+            avoid.append([rx or radius, float(radius) if rx else 500.0])
+        except ValueError:
+            raise CliError(f"--avoid REGEX:RADIUS_CM (not '{rule}')") from None
+    if args.action == "fix" and args.what not in ("billboards", "cull", "wpo"):
+        raise CliError("ue foliage fix billboards | cull --distance N | wpo --distance N")
+    print(ctx.tether("foliage", action=args.action, what=opt(args.what), area=opt(args.area),
+                     density=-1.0 if args.density is None else args.density, count=-1 if args.count is None else args.count,
+                     spacing=-1.0 if args.spacing is None else args.spacing, slope=opt(args.slope),
+                     height=opt(args.height), scale=opt(args.scale), align=args.align, seed=args.seed,
+                     folder=args.folder, mask=mask, avoid=json.dumps(avoid) if avoid else "",
+                     value=-1.0 if args.distance is None else args.distance, scope=args.scope or ""))
+    return 0
+
+
+WATER = """
+import json
+w = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_editor_world()
+def get(obj, name, default=None):
+    try:
+        return obj.get_editor_property(name)
+    except Exception:
+        return default
+def path(obj):
+    return obj.get_path_name().split(".")[0] if obj else None
+actors = unreal.GameplayStatics.get_all_actors_of_class(w, unreal.Actor)
+zones, bodies = [], []
+WaterZone, WaterBody = getattr(unreal, "WaterZone", None), getattr(unreal, "WaterBody", None)
+for a in actors if WaterZone else []:  # no Water plugin: no water classes
+    if isinstance(a, WaterZone):
+        ext, res = get(a, "zone_extent"), get(a, "render_target_resolution")
+        local = get(a, "local_tessellation_extent")
+        zones.append({"label": a.get_actor_label(), "extent": [ext.x, ext.y] if ext else None,
+                      "resolution": [res.x, res.y] if res else None,
+                      "local": bool(get(a, "enable_local_only_tessellation", False)),
+                      "local_extent": [local.x, local.y] if local else None})
+    elif isinstance(a, WaterBody):
+        c = a.get_water_body_component() if hasattr(a, "get_water_body_component") else None
+        bodies.append({"label": a.get_actor_label(), "class": a.get_class().get_name(), "z": a.get_actor_location().z,
+                       "affects_landscape": bool(get(c, "affects_landscape", False)) if c else None,
+                       "material": path(get(c, "water_material")) if c else None,
+                       "lod_material": path(get(c, "water_static_mesh_material")) if c else None,
+                       "waves": bool(get(a, "water_waves"))})
+landscapes = len(unreal.GameplayStatics.get_all_actors_of_class(w, unreal.LandscapeProxy))
+print(json.dumps({"zones": zones, "bodies": bodies, "landscapes": landscapes, "plugin": WaterZone is not None}))
+"""
+WATER_SHORE_M = 0.5  # metres per water-info texel above which the shoreline fade shows as slivers
+
+
+def cmd_water(ctx, args):
+    """`ue water`: water zones and bodies as text, with the checks that cost IslandHorror time: a body that edits the
+    landscape, a coarse shoreline (zone extent / water-info texture), a stock material left on the distant LOD mesh."""
+    data = py_json(ctx, WATER)
+    ctx.data = data
+    zones, bodies = data["zones"], data["bodies"]
+    if not data.get("plugin", True):
+        print("the Water plugin is not enabled in this project")
+        return 0
+    if not zones and not bodies:
+        print("no water in the edited level (WaterZone, WaterBody actors)")
+        return 0
+    issues = 0
+    for z in zones:
+        line = f"zone {z['label']}"
+        if z["extent"]:
+            line += f": {z['extent'][0] * 2 / 100:.0f} x {z['extent'][1] * 2 / 100:.0f} m"
+        texel = None
+        if z["extent"] and z["resolution"] and z["resolution"][0]:
+            texel = z["extent"][0] * 2 / 100 / z["resolution"][0]
+            line += f", water-info {z['resolution'][0]} x {z['resolution'][1]} ({texel:.2f} m/texel)"
+        line += (f", local tessellation {z['local_extent'][0] / 100:.0f} m around the camera" if z["local"] and z["local_extent"]
+                 else ", local tessellation off")
+        print(line)
+        if texel and texel > WATER_SHORE_M and not z["local"]:
+            issues += 1
+            print(f"  ! the shoreline fade is coarse ({texel:.2f} m/texel) and shows as flickering slivers: set "
+                  "enable_local_only_tessellation and local_tessellation_extent (about 40000), or raise "
+                  "render_target_resolution")
+    for b in bodies:
+        print(f"{b['class']} {b['label']}: z {b['z']:.0f}" + (", waves" if b["waves"] else "")
+              + (f", material {b['material'].rsplit('/', 1)[-1]}" if b["material"] else "")
+              + (f", distant mesh {b['lod_material'].rsplit('/', 1)[-1]}" if b["lod_material"] else ""))
+        if b["affects_landscape"] and data["landscapes"]:
+            issues += 1
+            print("  ! it edits the landscape (affects_landscape): its brush flattens or carves the terrain under it. "
+                  "If the heightmap already has the shore, set affects_landscape False on its water body component")
+        if b["material"] and b["lod_material"] and not b["material"].startswith("/Water/") \
+                and b["lod_material"].startswith("/Water/"):
+            issues += 1
+            print("  ! the near water has its own material but the distant LOD mesh still uses the stock one "
+                  "(water_static_mesh_material): far water will not match")
+    if bodies and not zones:
+        issues += 1
+        print("! water bodies but no WaterZone: nothing renders them")
+    print(f"{len(zones)} zone(s), {len(bodies)} body(ies), {issues} issue(s)")
+    return 1 if issues else 0
+
+
+def landscape_file(ctx, args):
+    """`ue landscape export|import <file>` and `paint <layer> --mask <file>`: heights and paint-layer weights in
+    and out of the existing landscape, through a render target (so the editor must render). Heightmaps are the
+    landscape's own raw values (32768 = the actor's z), rows along +Y and columns along +X, as Unreal imports
+    them; --flip-y for files whose first row is +Y."""
+    import array
+    if (ctx.beacon or {}).get("nullrhi"):
+        raise CliError("this editor runs without rendering (-nullrhi), and heightmaps go through a render target: "
+                       "ue close, then ue open --headless --render (or use a windowed editor)")
+    work = os.path.join(state_dir(ctx.project), "landscape")
+    os.makedirs(work, exist_ok=True)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+
+    def tool(step, action, file="", layer=""):
+        out = ctx.tether("landscape_edit", step=step, action=action, x=0.0, y=0.0, radius=0.0, value=0.0,
+                         strength=1.0, backup="-", file=file, layer=layer)
+        return json.loads(out) if isinstance(out, str) else out
+
+    if args.action == "export":
+        if not args.where:
+            raise CliError("ue landscape export <file.png|.r16>")
+        target = os.path.abspath(args.where)
+        raw = target if target.lower().endswith(".r16") and not args.flip_y else os.path.join(work, f"export-{stamp}.r16")
+        tool("begin", "export", raw)
+        try:
+            time.sleep(0.3)  # the export renders on a later frame
+            result = tool("apply", "export")
+        except CliError:
+            tool("cancel", "export")
+            raise
+        w, h = result["vertices"]
+        if raw != target:
+            values = array.array("H")
+            with open(raw, "rb") as f:
+                values.frombytes(f.read())
+            if sys.byteorder == "big":
+                values.byteswap()
+            values = flip_rows(w, h, list(values)) if args.flip_y else list(values)
+            if target.lower().endswith(".png"):
+                data = png_gray16_bytes(w, h, values)
+            else:
+                out = array.array("H", values)
+                if sys.byteorder == "big":
+                    out.byteswap()
+                data = out.tobytes()
+            with open(target, "wb") as f:
+                f.write(data)
+            os.remove(raw)
+        print(f"{target}: {w} x {h} vertices, z {result['z_min']} to {result['z_max']} (16-bit, 32768 = the "
+              "landscape's z" + (", flipped: first row is +Y" if args.flip_y else ", first row is -Y") + ")")
+        ctx.data = dict(result, file=target)
+        return 0
+    if args.action == "import":
+        if not args.where:
+            raise CliError("ue landscape import <file.png|.r16>  (16-bit, exactly the landscape's vertex grid)")
+        w, h, top, values = read_grid(args.where)
+        if top != 65535:
+            raise CliError(f"{args.where} is 8-bit: a heightmap needs 16 bits (256 levels would terrace the terrain)")
+        if args.flip_y:
+            values = flip_rows(w, h, values)
+        raw = os.path.join(work, f"import-{stamp}.r16")
+        data = array.array("H", values)
+        if sys.byteorder == "big":
+            data.byteswap()
+        with open(raw, "wb") as f:
+            data.tofile(f)
+        tool("begin", "import", raw)
+        try:
+            time.sleep(0.3)
+            applied = tool("apply", "import")
+            time.sleep(0.3)  # the patch draws on a later frame
+            result = tool("commit", "import")
+        except CliError:
+            tool("cancel", "import")
+            raise
+        finally:
+            if os.path.exists(raw):
+                os.remove(raw)
+        if not result.get("ok"):
+            raise CliError("the landscape refused the heightmap import (ue log)")
+        change = ""
+        grid = result.get("grid")
+        try:
+            old = read_grid(applied["backup"])[3]
+        except CliError:
+            old, grid = None, None
+        if grid and old and len(old) == len(values):
+            k = max(range(len(values)), key=lambda i: abs(values[i] - old[i]))
+            cm = (values[k] - old[k]) / 128.0 * grid["scale"][2]
+            x, y = grid["min_x"] + (k % w) * grid["scale"][0], grid["min_y"] + (k // w) * grid["scale"][1]
+            goal = grid["z0"] + (values[k] - 32768) / 128.0 * grid["scale"][2]
+            deadline = time.time() + 5
+            while abs(cm) > 1 and time.time() < deadline:  # collision follows the heightmap a frame or two later
+                at = ctx.tether("landscape", action="at", x=x, y=y, size=0.0, px=2)
+                if abs((json.loads(at) if isinstance(at, str) else at)["z"] - goal) < 2:
+                    break
+                time.sleep(0.25)
+            change = f"; largest change {cm:+.0f} cm at ({x:.0f}, {y:.0f})" if abs(cm) >= 1 else "; no height changed"
+        print(f"imported {w} x {h} vertices, z {result['z_min']} to {result['z_max']}{change}; undo: ue undo, or "
+              f"ue landscape import {applied['backup']}")
+        ctx.data = result
+        return 0
+    if not args.where or not args.mask:
+        raise CliError("ue landscape paint <layer> --mask <picture>  (white = full weight)")
+    w, h, top, values = read_grid(args.mask)
+    if args.flip_y:
+        values = flip_rows(w, h, values)
+    grey = bytes(int(round(v / top * 255)) for v in values)
+    picture = os.path.join(work, f"paint-{stamp}.png")
+    png_write(picture, w, h, bytes(b for g in grey for b in (g, g, g)))
+    try:
+        tool("begin", "paint", picture, args.where)
+        time.sleep(0.3)  # the picture draws on a later frame
+        result = tool("commit", "paint", layer=args.where)
+    except CliError:
+        tool("cancel", "paint")
+        raise
+    finally:
+        os.remove(picture)
+    if not result.get("ok"):
+        raise CliError("the landscape refused the weightmap import (ue log)")
+    print(f"painted layer {args.where} from {args.mask} ({w} x {h}) over {result['vertices']} vertices; "
+          + (f"undo: ue landscape paint {args.where} --mask {result['backup']}" if result.get("backup")
+             else "undo: Edit > Undo in the editor"))
+    ctx.data = result
+    return 0
+
+
 def cmd_landscape(ctx, args):
     """Landscape: summary, the surface at a point, a height/layer picture, or sculpting a circle."""
     import math
+    if args.action in ("export", "import", "paint"):
+        return landscape_file(ctx, args)
     nums = [float(v) for v in (args.where or "").replace(" ", "").split(",") if v] if args.where else []
     if args.action == "info":
         print(ctx.tether("landscape", action="info", x=0.0, y=0.0, size=0.0, px=2))
@@ -679,7 +929,7 @@ def cmd_landscape(ctx, args):
     strength = args.strength if args.strength is not None else (2.0 if args.action == "smooth" else 1.0)
     tool = lambda step: ctx.tether("landscape_edit", step=step, action=args.action, x=x, y=y, radius=radius,  # noqa: E731
                                    value=value, strength=strength,
-                                   backup=os.path.abspath(args.backup) if args.backup else "-")
+                                   backup=os.path.abspath(args.backup) if args.backup else "-", file="", layer="")
     tool("begin")
     try:
         time.sleep(0.3)  # the export renders on a later frame
