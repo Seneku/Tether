@@ -1663,9 +1663,8 @@ def cmd_pie(ctx, args):
         check_shared(ctx.project, "pie start", destructive=False)
         if not (ctx.beacon or {}).get("pie"):  # PIE already running stays whoever's it was
             record_pie_start(ctx.project)
-        note = layout_patch_note(ctx.project, ctx.beacon)
-        if note:
-            print("note: " + note)
+    # Said last (below the OK line and any status), where an output filter or a quick read does not lose it
+    layout_note = layout_patch_note(ctx.project, ctx.beacon) if args.action == "start" else None
     if args.action == "start" and getattr(args, "game", None):
         print(pie_net(ctx, "game", game=args.game))
     if args.action == "start" and getattr(args, "clients", None):
@@ -1753,6 +1752,8 @@ def cmd_pie(ctx, args):
                 print(note)
     elif args.action == "start" and getattr(args, "clients", None):
         print(pie_net(ctx, "status"))
+    if layout_note:
+        print("WARNING: " + layout_note)
     return 0
 
 
