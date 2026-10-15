@@ -17,6 +17,13 @@ Effort: **S** = under half a day, **M** = about a day, **L** = several days or n
 **Done in 0.19.1** (after this list was written): 19a, 19b, 19c, 19d, 19e and 13a–13d. Their rows are kept below
 for reference.
 
+**Done in 0.19.2** (ShooterDomination Missions notes, not rows here): `world build nav --save` waits for tiles and
+never saves a map without its navmesh; `build --restart --discard` no longer reopens on a "Restore Packages" dialog,
+and `open`/`build`/`status` name a dialog that stops a boot; `build --restart` compiles the game target before it
+closes the editor, and `ue build --check` does that alone; Live Coding failures re-read the logs before saying
+"0 errors"; `ue exec` folds only repeats in a row and says so; `pie run` scripts get a fresh namespace; `ue py`
+suggests the Python property names closest to a missing one; the unsaved-work refusal points at `ue changes`/`ue diff`.
+
 ---
 
 ## Priority 1: asked for, or blocking real work
@@ -28,7 +35,7 @@ another session's builder script, and a `build --restart` ran while another sess
 | # | Addition | Why | Effort |
 |---|---|---|---|
 | 1 | **`ue lock <pie\|build\|edit> [--by NAME] [--for MIN]` / `ue unlock`**: an advisory lock in `Saved/Tether/locks/` that `pie start`, `build --restart`, `close`, `py -f` and `import` respect (they wait, or refuse with who holds it and since when) | [field] a builder ran into another session's PIE; a restart ran while another session waited | M |
-| 2 | **`ue who`**: which clients used the editor's MCP port in the last few minutes (session token use, last command, PIE owner) | [field] "a restart that warns when another client used the MCP port in the last few minutes" | S |
+| 2 | **`ue who`**: which clients used the editor's MCP port in the last few minutes (session token use, last command, PIE owner); plus `started by` (a session, or "user") on PIE in `ue status` / `ue pie status` | [field] "a restart that warns when another client used the MCP port in the last few minutes"; 0.19.1: three sessions on one editor had to message each other to learn PIE was the user's own run | S |
 | 3 | **`ue py` warns when PIE is running** before it runs (Editor Scripting refuses in PIE, and scripts then take the wrong branch) | [field] | S |
 | 4 | **Restart and close guards**: `build --restart` and `close` name the other sessions' recent activity and need `--force` | [field] | S |
 
@@ -42,6 +49,7 @@ another session's builder script, and a `build --restart` ran while another sess
 | 9 | **`ui click --at x,y` inside a widget** (offset from its top left), for widgets the inspector sees as one block | [field] | S |
 | 9a | **`ue shot --at ... --burst N --every S`**: a fixed spectator camera over time, with the debug camera turned on once instead of per shot (each spectator shot takes about 1.75 s now) | [field] 0.19 | S |
 | 9b | **Bone and socket sampling in `pie watch`** (`Actor.Mesh@Hips`, `player.Mesh@hand_r`): world location per sample | [field] 0.19: a ue py loop run 14 times instead | S |
+| 9c | **`ue shot --window "<title>"`**: an editor tab or tool window as a PNG, through `SlateInspectorToolset` (`Windows action=select`, then `Screenshot`, which returns base64) | [field] 0.19.1: the only way to see the Mission Board tool from the CLI; `ue shot` covers viewports only | S |
 
 ### 1C. Audio follow-ups (round 16 shipped the core)
 | # | Addition | Why | Effort |
@@ -89,6 +97,7 @@ another session's builder script, and a `build --restart` ran while another sess
 | 25 | **`ue vislog`**: record the Visual Logger over a PIE run and print a per-actor text timeline (AI decisions, EQS, perception) | [idea] best AI debugging view, text-friendly | M |
 | 26 | **`ue gdt <category>`**: Gameplay Debugger categories as text for a chosen actor | [idea] | M |
 | 27 | **`ue eqs <query> --at <pawn>`**: run an EQS query and print the scored items | [idea] | M |
+| 27a | **`ue nav reach <from> <to...>`** telling "no path" from "search limit hit" (A* stops at 2048 nodes by default, so long routes come back partial), and **`ue nav islands --from <point>`** listing navmesh pieces unreachable from it (e.g. floor sealed inside blocks, which Recast still rasterises) | [field] 0.19.1: two level problems in the Spire district came from navmesh connectivity | M |
 | 28 | **`ue anim seq <asset>`**: notifies, curves, root motion, length and rate; `ue anim montage` sections and slots | [idea] animation debugging after `ue skel` | S |
 | 28a | **`ue anim pose <asset> --at T [--bones Hips,...]`**: the pose as the runtime evaluates it (additive applied on its base, compressed data), not the raw source that `AnimationLibrary.get_bone_poses_for_time` reads; flags bones that move far from the reference pose | [field] 0.19: an additive slam sent the skeleton about 250 m; no check outside PIE could see it | M |
 

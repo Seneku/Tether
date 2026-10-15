@@ -6,11 +6,12 @@ import time
 from .core import (
     CliError, blocking_dialogs, crash_reports, crash_summary, describe_crash, editor_beacons, editor_executable, forget_beacon,
     editor_process,
-    editor_label, engine_root, filter_log, live_coding_available, live_editors, logged_dialogs, modal_dialogs,
-    pick_port, pid_alive, port_open, read_json, read_new_log, recent_crash, state_dir, subprocess, write_json,
+    decline_package_restore, editor_label, engine_root, filter_log, live_coding_available, live_editors, logged_dialogs,
+    pick_port, pid_alive, port_open, read_json, read_new_log, recent_crash, startup_dialogs, state_dir, subprocess,
+    write_json,
 )
 from .build import (
-    classify_changes, csharp_changes, csharp_layout, csharp_reload_build, editor_env, live_coding_build,
+    classify_changes, compile_check, csharp_changes, csharp_layout, csharp_reload_build, editor_env, live_coding_build,
     uat_user_solution, ubt_build,
 )
 
@@ -21,6 +22,12 @@ def cmd_status(ctx, args):
     beacon = ctx.beacon
     name = os.path.splitext(os.path.basename(ctx.project))[0]
     if not beacon:
+        launch = read_json(os.path.join(state_dir(ctx.project), "launch.json")) or {}
+        if launch.get("pid") and editor_process(launch["pid"]):  # started, but its beacon is not up yet
+            dialogs = startup_dialogs(launch["pid"])
+            print(f"{name}: editor starting (pid {launch['pid']}, {time.time() - launch.get('started', time.time()):.0f}s "
+                  "ago; not loaded yet)" + (f"; waiting on a dialog: \"{dialogs[0][:80]}\"" if dialogs else ""))
+            return 2
         print(f"{name}: editor not running (ue open starts one; an editor you open yourself works too, once it "
               "has loaded)")
         return 2
@@ -61,6 +68,12 @@ def cmd_status(ctx, args):
 
 
 def cmd_build(ctx, args):
+    if args.check:
+        code = compile_check(ctx, args.limit)
+        if code is None:
+            raise CliError("no game target (Source/<Project>.Target.cs) to check; `ue build` compiles the editor")
+        print("  (the game target: editor-only modules and WITH_EDITOR code are not compiled; the editor is untouched)")
+        return code
     beacon = ctx.beacon
     running = bool(beacon and editor_process(beacon.get("pid")))
     changes = classify_changes(ctx.project)
@@ -113,6 +126,13 @@ def cmd_build(ctx, args):
     else:
         reopen.update(headless=launch.get("headless", False), render=launch.get("render", False),
                       sound=launch.get("sound", False), unattended=launch.get("unattended"))
+    if changes is None or changes[0]:
+        # Compile before closing: a build that fails after the close leaves every session sharing the editor without one.
+        code = None if args.no_check else compile_check(ctx, args.limit)
+        if code:
+            print("  editor left open: the restart's build would fail (errors above). Fix them and run it again; "
+                  "--no-check skips this check")
+            return code
     cmd_close(ctx, argparse.Namespace(save=args.save, discard=args.discard, force=False))
     os.environ.pop("UE_EDITOR_PID", None)  # --pid named the editor to close; it is gone now
     code = ubt_build(ctx, args) or (uat_user_solution(ctx, args.limit) if has_csharp else 0)
@@ -184,18 +204,22 @@ def cmd_open(ctx, args):
         cmd += ["-ini:Engine:[/Script/PythonScriptPlugin.PythonScriptPluginSettings]:bRemoteExecution=True"]
     write_json(os.path.join(state_dir(ctx.project), "launch.json"),
                {"headless": bool(args.headless), "render": bool(args.render or not args.headless),
-                "sound": bool(getattr(args, "sound", False) or not args.headless), "unattended": unattended, "port": port})
+                "sound": bool(getattr(args, "sound", False) or not args.headless), "unattended": unattended, "port": port,
+                "pid": None})
     started = time.time()
     detach = ({"creationflags": subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt"
               else {"start_new_session": True})  # outlive this CLI process either way
     proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, env=env, stdout=subprocess.DEVNULL,
                             stderr=subprocess.DEVNULL, close_fds=True, **detach)
+    launch_file = os.path.join(state_dir(ctx.project), "launch.json")
+    write_json(launch_file, dict(read_json(launch_file) or {}, pid=proc.pid, started=started))  # `ue status` while it boots
     mode = ", ".join(m for m, on in (("headless", args.headless), ("offscreen render", args.headless and args.render),
                                      ("unattended", unattended)) if on)
     print(f"launched pid {proc.pid} " + ("(python remote execution)" if remote else f"on mcp :{port}")
           + (f" ({mode})" if mode else ""))
     if args.no_wait:
         return 0
+    first_seen = None
     while time.time() - started < args.wait:
         beacon = next((b for b in editor_beacons(ctx.project) if b.get("pid") == proc.pid), None)
         if beacon and beacon.get("pid") == proc.pid and beacon.get("heartbeat", 0) > started and (
@@ -213,8 +237,9 @@ def cmd_open(ctx, args):
             tail = filter_log(read_new_log(ctx.project, from_start=True), level="Error")[-5:]
             raise CliError(f"editor exited during startup (code {proc.returncode})"
                            + "".join("\n  " + l for l in tail))
-        dialogs = modal_dialogs(proc.pid)
-        if dialogs:
+        dialogs = startup_dialogs(proc.pid)
+        first_seen = (first_seen or time.time()) if dialogs else None
+        if dialogs and time.time() - first_seen >= 3:  # a window that stays: the boot waits on it
             # A modal dialog stalls the boot; a headless editor has nobody to answer it.
             if args.headless:
                 proc.kill()
@@ -252,7 +277,8 @@ def close_editor(ctx, args, explicit):
             "len(U.get_dirty_content_packages()) + len(U.get_dirty_map_packages())")).strip()
         dirty_count = 0 if dirty in ("", "0") else dirty
         if dirty_count and not (args.save or args.discard):
-            raise CliError(f"{dirty_count} unsaved packages: pass --save or --discard")
+            raise CliError(f"{dirty_count} unsaved packages: pass --save or --discard (`ue changes` lists them, "
+                           "`ue diff <asset>` shows what changed)")
         if args.save and dirty_count:
             ctx.tether("py", code="unreal.EditorLoadingAndSavingUtils.save_dirty_packages(True, True)")
         if args.discard and dirty_count:
@@ -273,6 +299,9 @@ def close_editor(ctx, args, explicit):
         write_json(os.path.join(state_dir(ctx.project), "last-exit.json"), {"pid": pid, "time": time.time(),
                                                                             "terminated": True})
         print("terminated")
+        if args.discard and decline_package_restore(ctx.project):
+            # Its autosaves would otherwise come back as a "Restore Packages" dialog at the next start.
+            print("declined the restore of the discarded packages' autosaves")
     else:
         print("closed")
     return 0

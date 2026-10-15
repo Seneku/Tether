@@ -96,6 +96,9 @@ def build_parser():
     s.add_argument("--restart", action="store_true", help="save/close editor, UBT build, reopen same map")
     s.add_argument("--save", action="store_true", help="with --restart: save dirty packages first")
     s.add_argument("--discard", action="store_true", help="with --restart: drop unsaved changes")
+    s.add_argument("--check", action="store_true", help="compile the game target only (UBT): the running editor and its "
+                                                         "Live Coding are untouched; misses editor-only code")
+    s.add_argument("--no-check", action="store_true", help="with --restart: skip the compile check made before closing")
     s.add_argument("--target", help="UBT target (default <Project>Editor)")
     s.add_argument("--config", default="Development")
     s.add_argument("--wait", type=float, default=300, help="seconds to wait for Live Coding (300)")
@@ -307,7 +310,9 @@ def build_parser():
     s.add_argument("--grep", help="regex filter")
     s = add("pie", pie_command, "Play-In-Editor: start | stop | status | run <script> | do <steps...> | watch <props> | record")
     s.add_argument("action", choices=["start", "stop", "status", "run", "do", "target", "watch", "record"])
-    s.add_argument("script", nargs="*", help="with run: Python file to execute in the PIE world; with do: steps; "
+    s.add_argument("script", nargs="*", help="with run: Python file to execute in the PIE world, in a fresh namespace "
+                                             "(tether.world() / tether.player(): the targeted PIE world and its pawn); "
+                                             "with do: steps; "
                                              "with watch: Actor.Property ... (an actor alone: its location)")
     s.add_argument("-f", "--file", help="with do: a file of steps, one per line (# comments); with watch: run it while sampling")
     s.add_argument("--keep-going", action="store_true", help="with do: run every step even after a failure")

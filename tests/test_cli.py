@@ -2149,3 +2149,130 @@ class Round14(unittest.TestCase):
         code = "a = unreal.load_asset('/Game/A/AS_Slam')\na.set_editor_properties({'additive_anim_type': t})"
         self.assertTrue(any("recompressed" in n for n in ue.py_pitfalls(code)))
         self.assertFalse(ue.py_pitfalls("m.set_editor_properties({'x': 1})"))
+
+
+class Fixes0192(unittest.TestCase):
+    """The ShooterDomination 0.19.1 field notes."""
+
+    def test_decline_package_restore_keeps_utf16(self):
+        project = Project()
+        try:
+            self.assertFalse(ue.decline_package_restore(project.uproject))  # no file
+            path = os.path.join(project.root, "Saved", "Autosaves", "PackageRestoreData.json")
+            os.makedirs(os.path.dirname(path))
+            with open(path, "wb") as f:  # as the editor writes it: UTF-16 LE, no BOM, CRLF and tabs
+                f.write('{\r\n\t"RestoreEnabled": true,\r\n\t"Packages": ["/Game/L"]\r\n}'.encode("utf-16-le"))
+            self.assertTrue(ue.decline_package_restore(project.uproject))
+            with open(path, "rb") as f:
+                raw = f.read()
+            self.assertEqual(raw[:2], b"{\x00")
+            self.assertEqual(json.loads(raw.decode("utf-16-le")), {"RestoreEnabled": False, "Packages": ["/Game/L"]})
+            self.assertFalse(ue.decline_package_restore(project.uproject))  # already off
+        finally:
+            project.close()
+
+    def nav_build(self, status, save=True):
+        replies = {"console": "", "py": "False", "nav": status, "save": "saved 1 package"}
+
+        class Ctx(FakeCtx):
+            def tether(self, tool, **kwargs):
+                self.calls.append((tool, kwargs))
+                return replies[tool]
+        ctx = Ctx()
+        dirty = iter([[], ["/Game/Maps/Spire"], ["/Game/Maps/Spire"]])
+        args = argparse.Namespace(what="nav", save=save, wait=0, limit=20)
+        with unittest.mock.patch.object(ue.play, "py_json", side_effect=lambda c, code: next(dirty)), \
+                unittest.mock.patch.object(ue.play.time, "sleep"), unittest.mock.patch("builtins.print"):
+            try:
+                return ue.cmd_world(ctx, args), ctx.calls
+            except ue.CliError as exc:
+                return exc, ctx.calls
+
+    def test_nav_build_never_saves_a_map_without_navmesh(self):
+        result, calls = self.nav_build("/Game/Maps/Spire\n  bounds NavBounds: 200 x 200 x 20 m, NO navmesh inside")
+        self.assertIsInstance(result, ue.CliError)
+        self.assertIn("not saved", str(result))
+        self.assertNotIn("save", [tool for tool, _ in calls])
+        result, calls = self.nav_build("/Game/Maps/Spire\n  bounds NavBounds: 200 x 200 x 20 m, navmesh present")
+        self.assertEqual(result, 0)
+        self.assertIn("save", [tool for tool, _ in calls])
+
+    def test_exec_folds_only_repeats_in_a_row_and_counts_them(self):
+        a, b = stamped("LogTemp: Display: objective types: 3"), stamped("LogTemp: Display: district 2")
+        shown = ue.filter_log([a, b, a], level="Log", consecutive=True)
+        self.assertEqual(len(shown), 3)
+        self.assertEqual(shown.folded, 0)
+        shown = ue.filter_log([a, a, b], level="Log", consecutive=True)
+        self.assertEqual(shown, ["D LogTemp: objective types: 3  x2", "D LogTemp: district 2"])
+        self.assertEqual(shown.folded, 1)
+        self.assertEqual(ue.filter_log([a, b, a], level="Log").folded, 1)
+
+    def test_property_name_hint_lists_python_names(self):
+        error = ("Exception: SDMissionDef: Failed to find property 'in_order' for attribute 'in_order' on "
+                 "'SDMissionDef'")
+        hint = ue.property_name_hint(FakeCtx(json.dumps(["order", "objectives", "district"])), error)
+        self.assertIn("closest to 'in_order': order", hint)
+        self.assertIsNone(ue.property_name_hint(FakeCtx("[]"), "NameError: name 'x' is not defined"))
+
+    def test_compile_check_builds_the_game_target_without_marking_green(self):
+        project = Project()
+        try:
+            ctx = types.SimpleNamespace(project=project.uproject)
+            self.assertIsNone(ue.compile_check(ctx, 20))  # no game target
+            project.write("Source/Game.Target.cs")
+            seen = []
+
+            def fake_run(argv, **kw):
+                seen.append(argv)
+                return types.SimpleNamespace(returncode=0, stdout="Result: Succeeded", stderr="")
+            with unittest.mock.patch.object(ue.build, "engine_root", return_value="E"), \
+                    unittest.mock.patch.object(ue.build, "ubt_command", return_value=["ubt"]), \
+                    unittest.mock.patch.object(ue.build, "live_editors", return_value=[{"pid": 1}]), \
+                    unittest.mock.patch.object(ue.subprocess, "run", side_effect=fake_run), \
+                    unittest.mock.patch("builtins.print"):
+                self.assertEqual(ue.compile_check(ctx, 20), 0)
+            self.assertEqual(seen[0][1], "Game")
+            self.assertIn("-NoHotReloadFromIDE", seen[0])  # with an editor up: its Live Coding is left alone
+            self.assertFalse(os.path.exists(os.path.join(ue.state_dir(project.uproject), "last-build.json")))
+        finally:
+            project.close()
+
+    def test_restart_keeps_the_editor_open_when_the_check_fails(self):
+        project = Project()
+        try:
+            ctx = types.SimpleNamespace(project=project.uproject, beacon={"pid": 1, "map": "/Game/M"})
+            args = argparse.Namespace(check=False, no_check=False, restart=True, save=True, discard=False, limit=20)
+            with unittest.mock.patch.object(ue.editor, "editor_process", return_value=True), \
+                    unittest.mock.patch.object(ue.editor, "classify_changes", return_value=(["A.h"], [], ["A.h"])), \
+                    unittest.mock.patch.object(ue.editor, "compile_check", return_value=1), \
+                    unittest.mock.patch.object(ue.editor, "cmd_close") as close, \
+                    unittest.mock.patch("builtins.print"):
+                self.assertEqual(ue.cmd_build(ctx, args), 1)
+            close.assert_not_called()
+        finally:
+            project.close()
+
+    def test_pie_run_uses_a_fresh_namespace(self):
+        project = Project()
+        try:
+            project.write("Saved/Logs/Game.log")
+            script = project.write("check.py", "print('world' in globals(), tether is not None, __name__)")
+            sent = []
+            persistent = {"world": "stale", "tether": object(), "unreal": None}
+
+            def tether(tool, **kwargs):
+                if tool != "py":
+                    return "running"
+                sent.append(kwargs["code"])
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    exec(kwargs["code"], persistent)
+                return out.getvalue()
+            ctx = types.SimpleNamespace(project=project.uproject, transport="remote", tether=tether, beacon=None)
+            args = argparse.Namespace(script=[script], expect=None, reject=None, seconds=0.1, keep=True)
+            out = io.StringIO()
+            with unittest.mock.patch.object(ue.play, "flush_editor_log"), contextlib.redirect_stdout(out):
+                ue.pie_run(ctx, args)
+            self.assertIn("script: False True __pie_run__", out.getvalue())
+        finally:
+            project.close()

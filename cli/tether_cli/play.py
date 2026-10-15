@@ -387,6 +387,18 @@ def new_log_lines(ctx, start):
         return f.read().decode("utf-8", "replace").splitlines()
 
 
+NAV_SETTLE = 30  # seconds `world build nav` waits for tiles after the build flag drops
+
+
+def nav_status(ctx, args):
+    return str(ctx.tether("nav", action="status", start="", end="", match="", pie=False, limit=args.limit))
+
+
+def nav_incomplete(status):
+    """True while `nav status` says a bounds volume has no navmesh yet, or the build is still running."""
+    return "NO navmesh inside" in status or "being built right now" in status
+
+
 def cmd_world(ctx, args):
     """World builds: navmesh and lighting in the live editor; HLODs and other World Partition builders as jobs."""
     what = args.what.lower()
@@ -401,8 +413,21 @@ def cmd_world(ctx, args):
             if time.time() - started > args.wait:
                 raise CliError(f"navigation still building after {args.wait:g}s", 4)
             time.sleep(0.5)
+        # The build flag can be down before the (dynamic) generation has started, so wait for tiles inside every
+        # bounds volume too: saving any earlier writes the map without its navmesh.
+        status = nav_status(ctx, args)
+        settle = time.time()
+        if nav_incomplete(status) and args.wait > 0:
+            print(f"waiting up to {min(args.wait, NAV_SETTLE):g}s for navmesh tiles in every bounds volume")
+        while nav_incomplete(status) and time.time() - settle < min(args.wait, NAV_SETTLE):
+            time.sleep(1)
+            status = nav_status(ctx, args)
         print(f"navigation rebuilt in {time.time() - started:.1f}s")
-        print(ctx.tether("nav", action="status", start="", end="", match="", pie=False, limit=args.limit))
+        print(status)
+        if nav_incomplete(status) and args.save:
+            raise CliError(f"not saved: a bounds volume still has no navmesh after {min(args.wait, NAV_SETTLE):g}s "
+                           "(still generating, or the volume misses the floor). Run it again, or `ue save` to keep "
+                           "the map as it is", 4)
         dirty_after = py_json(ctx, DIRTY_PACKAGES)
         changed = [p for p in dirty_after if p not in dirty_before and not p.startswith("/Temp/")]
         # The navmesh lives in the map (or its nav-data actor's package). A map that was already unsaved before the
@@ -1101,6 +1126,11 @@ def pie_run(ctx, args):
         if code_start:
             return code_start
     failures = []
+    # A fresh namespace per run: `ue py`'s persistent one keeps globals such as a `world` from an earlier PIE
+    # session, which is dead now. tether.world() / tether.player() give the targeted PIE world and its pawn.
+    path = os.path.abspath(args.script[0])
+    code = (f"exec(compile({code!r}, '<ue py>', 'exec'), "
+            f"{{'unreal': unreal, 'tether': globals().get('tether'), '__name__': '__pie_run__', '__file__': {path!r}}})")
     try:
         out = ctx.tether("py", code=code)
         if out:

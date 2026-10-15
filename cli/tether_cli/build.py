@@ -1,4 +1,5 @@
 """Compiling: UBT, Live Coding, the UnrealSharp C# build, and compiler diagnostics."""
+import argparse
 import os
 import re
 import time
@@ -209,13 +210,29 @@ def csharp_reload_build(ctx, args):
     return 1
 
 
-def ubt_build(ctx, args):
+def game_target(project):
+    """The project's game target name, if it has one (Source/<Project>.Target.cs)."""
+    name = os.path.splitext(os.path.basename(project))[0]
+    return name if os.path.isfile(os.path.join(os.path.dirname(project), "Source", f"{name}.Target.cs")) else None
+
+
+def compile_check(ctx, limit):
+    """Compile the game target with UBT: its intermediates and binaries are separate from the editor's, so a
+    running editor and its Live Coding are left alone (a `-Module=` build of the editor target breaks Live Coding
+    until a restart). Misses WITH_EDITOR code and editor-only modules. None when there is no game target."""
+    target = game_target(ctx.project)
+    if not target:
+        return None
+    return ubt_build(ctx, argparse.Namespace(target=target, config="Development", limit=limit), check=True)
+
+
+def ubt_build(ctx, args, check=False):
     root = engine_root(ctx.project)
     name = os.path.splitext(os.path.basename(ctx.project))[0]
     target = args.target or f"{name}Editor"
     started = time.time()
     extra = []
-    if not live_editors(ctx.project):
+    if check or not live_editors(ctx.project):
         # UBT refuses to build while any editor on this engine has Live Coding on: its mutex is named after the
         # shared UnrealEditor.exe, so another project's editor blocks this one. The check protects a running
         # editor of this target from having its object files rewritten, and none is running.
@@ -226,13 +243,14 @@ def ubt_build(ctx, args):
     errors, warnings, hidden = compact_diagnostics(lines, os.path.dirname(ctx.project))
     result = next((l.strip() for l in reversed(lines) if l.strip().startswith("Result:")), f"exit {proc.returncode}")
     ok = proc.returncode == 0
-    print(f"ubt {target}: {'OK' if ok else 'FAILED'} in {time.time() - started:.1f}s ({result})"
+    print(("compile check, game target " if check else "ubt ")
+          + f"{target}: {'OK' if ok else 'FAILED'} in {time.time() - started:.1f}s ({result})"
           + (f", {hidden} engine-header warnings hidden" if hidden else ""))
     if any("Unable to build while Live Coding is active" in l for l in lines):
         print("  Live Coding is active in an editor on this engine (the mutex is per engine, not per project):"
               " build through that editor with `ue build`, or close it")
     print_diagnostics(errors, warnings, args.limit)
-    if ok:
+    if ok and not check:  # a check builds the game, not the editor this marker is about
         mark_green(ctx.project)
     return 0 if ok else 1
 
@@ -289,17 +307,25 @@ def live_coding_build(ctx, args, changes):
     if result is None:
         raise CliError(f"no Live Coding result within {args.wait:.0f}s (ue log --cat LogLiveCoding)", 4)
     ok = not result.startswith("Live coding failed")
-    errors, warnings, unity = [], [], []
-    if os.path.exists(ubt_log) and os.path.getmtime(ubt_log) > ubt_mtime:
-        with open(ubt_log, encoding="utf-8", errors="replace") as f:
-            ubt_lines = f.read().splitlines()
-        errors, warnings, _ = compact_diagnostics(ubt_lines, os.path.dirname(ctx.project))
-        unity = sorted(set(UNITY_COMPILE.findall("\n".join(ubt_lines))))
-    link_errors, hints = [], []
-    if not ok and not errors and lc_log and os.path.isfile(lc_log):  # a patch that failed to link: only its console knows
-        with open(lc_log, "rb") as f:
-            f.seek(lc_start if os.path.getsize(lc_log) >= lc_start else 0)
-            link_errors, hints = live_coding_errors(f.read().decode("utf-8", "replace").splitlines())
+    # The result reaches the editor log before the UBT and Live Coding console logs are on disk: a failure with
+    # no errors found yet gets a few more reads.
+    retry_until = time.time() + (5 if not ok else 0)
+    while True:
+        errors, warnings, unity, lc_lines = [], [], [], []
+        if os.path.exists(ubt_log) and os.path.getmtime(ubt_log) > ubt_mtime:
+            with open(ubt_log, encoding="utf-8", errors="replace") as f:
+                ubt_lines = f.read().splitlines()
+            errors, warnings, _ = compact_diagnostics(ubt_lines, os.path.dirname(ctx.project))
+            unity = sorted(set(UNITY_COMPILE.findall("\n".join(ubt_lines))))
+        link_errors, hints = [], []
+        if not ok and not errors and lc_log and os.path.isfile(lc_log):  # a failed link: only its console knows
+            with open(lc_log, "rb") as f:
+                f.seek(lc_start if os.path.getsize(lc_log) >= lc_start else 0)
+                lc_lines = f.read().decode("utf-8", "replace").splitlines()
+            link_errors, hints = live_coding_errors(lc_lines)
+        if ok or errors or link_errors or time.time() > retry_until:
+            break
+        time.sleep(0.5)
     print(f"live coding: {'OK' if ok else 'FAILED'} in {time.time() - started:.1f}s"
           + ("" if ok else f" ({len(errors) + len(link_errors)} errors)"))
     print_diagnostics(errors, warnings, args.limit)
@@ -308,7 +334,11 @@ def live_coding_build(ctx, args, changes):
     for hint in hints:
         print(f"  hint: {hint}")
     if not ok and not errors and not link_errors:
-        print(f"  (no compiler or linker errors found; the Live Coding console log is {lc_log})")
+        first = next((l for l in lc_lines if re.search(r"\berror\b", l, re.I)), None)
+        if first:
+            print("  first error line in the Live Coding console log: "
+                  + re.sub(r"^\[[^\]]*\]\[[^\]]*\]", "", first).strip())
+        print(f"  (no compiler or linker errors parsed; the Live Coding console log is {lc_log})")
     if unity and time.time() - started > 15:
         print(f"  note: Live Coding recompiled whole-module unity file(s) ({', '.join(unity)}). Setting "
               "`bUseUnity = false;` in those modules' Build.cs makes it compile only the changed files "

@@ -1,5 +1,6 @@
 """Thin commands over one editor tool each: tools, call, py, props, set, spawn and friends."""
 import contextlib
+import difflib
 import json
 import os
 import re
@@ -13,7 +14,7 @@ from .core import (
     read_json, read_new_log, short, state_dir, unwrap,
 )
 from .fabfiles import fab_origin, listing_url, project_fab
-from .transport import catalog, fill_args, resolve_toolset, schema, signature
+from .transport import catalog, fill_args, py_json, resolve_toolset, schema, signature
 
 
 def cmd_tools(ctx, args):
@@ -127,6 +128,9 @@ def cmd_py(ctx, args):
             print(printed.rstrip("\n"))
         for line in engine_complaints(ctx, start):
             print(f"engine: {line}", file=sys.stderr)
+        hint = property_name_hint(ctx, error)
+        if hint:
+            print(f"hint: {hint}", file=sys.stderr)
         if marker:
             raise CliError(error, exc.code) from None
         raise
@@ -135,6 +139,31 @@ def cmd_py(ctx, args):
     for line in engine_complaints(ctx, start):  # why a call returned None, said only in the log
         print(f"engine: {line}", file=sys.stderr)
     return 0
+
+
+MISSING_PROPERTY = re.compile(r"Failed to find property '[^']*' for attribute '(\w+)' on '(\w+)'")
+# The class's docstring lists its editor properties by their Python names: "- ``order`` (bool): ..."
+PYTHON_PROPERTY_NAMES = ("import re as _r, json as _j\n"
+                         "_t = getattr(unreal, {cls!r}, None)\n"
+                         "_j.dumps(_r.findall(r'^- ``(\\w+)`` \\(', (_t.__doc__ or '') if _t else '', _r.M))")
+
+
+def property_name_hint(ctx, error):
+    """For "Failed to find property": the class's Python property names closest to the one asked for. The
+    pythonizer drops a bool's b prefix, then an In prefix (bInOrder is `order`), so the C++ name is no guide."""
+    m = MISSING_PROPERTY.search(error)
+    if not m:
+        return None
+    attr, cls = m.groups()
+    try:
+        names = py_json(ctx, PYTHON_PROPERTY_NAMES.format(cls=cls))
+    except (CliError, ValueError, IndexError):
+        return None
+    close = difflib.get_close_matches(attr, names or [], n=3, cutoff=0.6)
+    if not close:
+        return None
+    return (f"{cls}'s Python property names closest to '{attr}': {', '.join(close)} (Python names drop a bool's "
+            "b prefix and then an In prefix: bInOrder is `order`)")
 
 
 SCRIPTING_LOGS = {"LogEditorScripting", "LogUtils", "LogPython", "LogBlueprintEditorLib", "LogEditorAssetSubsystem",
@@ -475,10 +504,13 @@ def cmd_exec(ctx, args):
             break
         time.sleep(0.25)
     world = str(world).replace(" (queued for its next tick)", ", from its next tick")
-    shown = filter_log(lines, level="Log")
+    # A command's output in its own order: only repeats in a row are folded, and the output says so.
+    shown = filter_log(lines, level="Log", consecutive=True)
     print(f"ran in {world}" + ("" if shown else " (no log output)"))
     for line in shown[: args.limit]:
         print(line)
+    if shown.folded:
+        print(f"({shown.folded} repeated line(s) in a row folded into \"xN\")")
     return 0
 
 

@@ -405,8 +405,10 @@ def noise_match(patterns, category, level, message):
 
 
 class LogLines(list):
-    """filter_log's result; `hidden` counts the entries the project's known-noise list left out."""
+    """filter_log's result; `hidden` counts the entries the project's known-noise list left out, `folded` the
+    repeats shown as "xN" on another line."""
     hidden = 0
+    folded = 0
 
 
 def filter_log(lines, level="Warning", category=None, pattern=None, ignore=True, consecutive=False):
@@ -458,10 +460,10 @@ def filter_log(lines, level="Warning", category=None, pattern=None, ignore=True,
         counts[key] = counts.get(key, 0) + 1
     if consecutive:
         result = LogLines(f"{k[0]} {k[1]}: {k[2]}" + (f"  x{n}" if n > 1 else "") for k, n in order)
-        result.hidden = hidden
+        result.hidden, result.folded = hidden, sum(n - 1 for _, n in order)
         return result
     result = LogLines(f"{l} {c}: {m}" + (f"  x{counts[(l, c, m)]}" if counts[(l, c, m)] > 1 else "") for l, c, m in order)
-    result.hidden = hidden
+    result.hidden, result.folded = hidden, sum(counts.values()) - len(order)
     return result
 
 
@@ -568,6 +570,40 @@ def blocking_dialogs(pid):
     if main_disabled:
         found += [t for c, t, e in windows if c == "UnrealWindow" and e and t and not t.endswith(" - Unreal Editor")]
     return found
+
+
+def startup_dialogs(pid):
+    """Titles of the dialogs a booting editor waits on: native message boxes, plus any titled Slate window shown
+    before the main frame exists (e.g. "Restore Packages" after an editor was terminated)."""
+    found = modal_dialogs(pid)
+    windows = editor_windows(pid)
+    if not any(c == "UnrealWindow" and t.endswith(" - Unreal Editor") for c, t, e in windows):
+        found += [t for c, t, e in windows if c == "UnrealWindow" and t]
+    return found
+
+
+def decline_package_restore(project):
+    """Turn off the "Restore Packages" offer a terminated editor leaves in Saved/Autosaves/PackageRestoreData.json
+    (it is offered at the next start, before anything loads). True if it held packages to offer. The file is UTF-16
+    without a BOM."""
+    path = os.path.join(os.path.dirname(project), "Saved", "Autosaves", "PackageRestoreData.json")
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+    except OSError:
+        return False
+    encoding = "utf-16" if raw[:2] in (b"\xff\xfe", b"\xfe\xff") else "utf-16-le" if b"\x00" in raw[:4] else "utf-8-sig"
+    try:
+        data = json.loads(raw.decode(encoding))
+    except (UnicodeDecodeError, ValueError):
+        return False
+    if not isinstance(data, dict) or not data.get("RestoreEnabled"):
+        return False
+    data["RestoreEnabled"] = False
+    text = json.dumps(data, indent="\t").replace("\n", "\r\n")
+    with open(path, "wb") as f:
+        f.write(text.encode("utf-8" if encoding == "utf-8-sig" else encoding))
+    return bool(data.get("Packages"))
 
 
 def stall_report(project):

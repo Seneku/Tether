@@ -102,7 +102,7 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
 - Multiplayer: `ue pie start --clients 2` (add `--game /Script/MyGame.MyGameMode` to try another game mode), then
   `ue pie target 1` to act on the first client. `ue exec --pie` and `pie do` exec steps run on that world's next
   tick, so RPCs replicate; a `call` step or your own Python calling a function directly runs any RPC locally
-  (editor Python makes every RPC local). `ue pie run` scripts: `import tether`, then `tether.world()`, `player()`,
+  (editor Python makes every RPC local). `ue pie run` scripts run in a fresh namespace each time: `tether.world()`, `player()`,
   `console("cmd")` follow the targeted world. `ue net MyCharacter` lists replicated properties and RPCs;
   `ue net player --pie` shows role, owner and relevancy per world; `ue net compare player.Health` checks the
   server and clients agree.
@@ -158,8 +158,12 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
 - New UPROPERTYs, class layout or constructor defaults, Build.cs/.uproject changes, or Blueprint/Python
   wrappers that need the new API: run `ue build --restart`. It closes the editor, builds, reopens the
   same map and waits until ready. It refuses if there is unsaved work unless you pass `--save` or
-  `--discard`; ask the user before discarding. Exit code 3 from `ue build` means a restart is required.
-  Batch reflection changes so you restart once.
+  `--discard`; ask the user before discarding (`ue changes` and `ue diff <asset>` show what would go).
+  Exit code 3 from `ue build` means a restart is required. Batch reflection changes so you restart once.
+- Before closing, `--restart` compiles the game target (UBT, ~20 s): if that fails, the editor stays open
+  for everyone sharing it. `ue build --check` runs the same check alone, with the editor up and Live
+  Coding untouched (it misses editor-only modules and WITH_EDITOR code). Do not compile the editor
+  target with UBT `-Module=` while the editor runs: Live Coding breaks until a restart.
 
 ## C# changes (UnrealSharp projects: a `Script/` folder plus `Plugins/UnrealSharp`)
 - Edit `.cs` files under `Script/`, then run `ue build`. It hot-reloads in ~1 s, covering function
