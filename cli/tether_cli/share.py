@@ -194,6 +194,22 @@ def record_edit(project, path, sid, now=None):
     write_json(edits_path(project), edits)
 
 
+def others_edits(project, paths, minutes=10, now=None):
+    """[(path, session, edit time)] of the files another session wrote (through Claude Code's Edit/Write, as the
+    post-edit hook saw) in the last `minutes`, and that nothing wrote since."""
+    now = time.time() if now is None else now
+    edits, me, found = read_json(edits_path(project)) or {}, session_id(), []
+    for path in paths:
+        record = edits.get(edit_key(project, path))
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            continue
+        if record and record["session"] != me and record["time"] >= mtime - 2 and now - record["time"] <= minutes * 60:
+            found.append((path, record["session"], record["time"]))
+    return found
+
+
 def file_owner(project, path, now=None):
     """'edited by menu (aaea8357) 3 min ago (not you)' / '... (you)' for a file the hook saw, else the file's own
     state: 'uncommitted, written 07:12' from git and its modification time. None if it cannot tell."""

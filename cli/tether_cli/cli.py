@@ -24,7 +24,7 @@ from .jobs import cmd_game, cmd_job, cmd_package
 from .play import cmd_audio, cmd_gpu, cmd_mem, cmd_sound, cmd_soak, cmd_ui, cmd_wait, cmd_world
 from .playtest import bp_command, cmd_budget, cmd_input, package_command, perf_command, pie_command
 from .hooks import cmd_hook
-from .setup import cmd_doctor, cmd_init, cmd_reload
+from .setup import cmd_doctor, cmd_init, cmd_reload, tether_version
 from .selftest import cmd_ci, cmd_selftest
 
 
@@ -71,6 +71,7 @@ def build_parser():
     common.add_argument("--time", action="store_true", default=argparse.SUPPRESS, help="elapsed time to stderr")
 
     p = argparse.ArgumentParser(prog="ue", description=sys.modules[__package__].__doc__.split("\n\n")[0], parents=[common])
+    p.add_argument("--version", action="version", version=f"ue (Tether) {tether_version()}")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     def add(name, fn, help_text):
@@ -100,6 +101,8 @@ def build_parser():
     s.add_argument("--check", action="store_true", help="compile the game target only (UBT): the running editor and its "
                                                          "Live Coding are untouched; misses editor-only code")
     s.add_argument("--no-check", action="store_true", help="with --restart: skip the compile check made before closing")
+    s.add_argument("--include-others", action="store_true", help="Live Coding: compile even files another session edited "
+                                                                 "in the last 15 min (it refuses otherwise)")
     s.add_argument("--ignore-lease", action="store_true", help="with --restart: go ahead although another session holds "
                                                                "the lease or used the editor in the last few minutes")
     s.add_argument("--target", help="UBT target (default <Project>Editor)")
@@ -113,7 +116,7 @@ def build_parser():
                                                                "used the editor in the last few minutes")
     s = add("lease", cmd_lease, "share the editor between sessions: take --for WHAT [--minutes N] | release | (show)")
     s.add_argument("action", nargs="?", choices=["take", "release"])
-    s.add_argument("--for", dest="what", help="with take: what the editor is for, as the other sessions will see it")
+    s.add_argument("--for", "--reason", dest="what", help="with take: what the editor is for, as the other sessions will see it")
     s.add_argument("--minutes", type=float, default=LEASE_MINUTES, help=f"with take: how long ({LEASE_MINUTES}); "
                                                                          "take again to renew")
     s.add_argument("--as", dest="name", help="a name for this session that the others see (kept)")
@@ -209,8 +212,14 @@ def build_parser():
     s.add_argument("--top", type=int, default=10, help="how many of the largest to list (10)")
     s.add_argument("--max", type=int, help="flag textures over this many pixels a side (lint.json max_texture_size, 4096)")
     s.add_argument("--strict", action="store_true", help="exit 1 when any issue is found")
-    s = add("map", cmd_map, "the level from above as a picture: mesh footprints, landscape height, gameplay actors by class")
-    s.add_argument("area", nargs="?", help="x,y,radius (default: the whole level)")
+    s = add("map", cmd_map, "the level from above as a picture: mesh footprints, landscape height, gameplay actors by "
+                            "class; `map open <path>` loads another map into the editor")
+    s.add_argument("area", nargs="?", help="x,y,radius (default: the whole level), or open")
+    s.add_argument("path", nargs="?", help="with open: the map to load")
+    s.add_argument("--save", action="store_true", help="with open: save the current map's unsaved edits first")
+    s.add_argument("--discard", action="store_true", help="with open: drop the current map's unsaved edits")
+    s.add_argument("--footprints", action="store_true", help="the collidable geometry as data (outline, top, bottom per "
+                                                             "mesh) in a JSON file, instead of a picture")
     s.add_argument("--match", help="only markers whose label or class matches this regex")
     s.add_argument("--pie", action="store_true", help="the PIE world (spawned actors where they are now)")
     s.add_argument("--px", type=int, default=800, help="picture size (800)")
@@ -358,6 +367,7 @@ def build_parser():
     s.add_argument("--grep", help="regex filter")
     s = add("pie", pie_command, "Play-In-Editor: start | stop | status | run <script> | do <steps...> | watch <props> | record")
     s.add_argument("action", choices=["start", "stop", "status", "run", "do", "target", "watch", "record"])
+    s.add_argument("-c", "--code", help="with run: inline Python instead of a script file")
     s.add_argument("script", nargs="*", help="with run: Python file to execute in the PIE world, in a fresh namespace "
                                              "(tether.world() / tether.player(): the targeted PIE world and its pawn); "
                                              "with do: steps; "
@@ -497,6 +507,8 @@ def build_parser():
     s.add_argument("--all", action="store_true", help="also images and zero-size widgets")
     s.add_argument("--submit", action="store_true", help="with type: press Enter afterwards")
     s.add_argument("--event", action="store_true", help="with click: fire a UMG button's OnClicked instead of clicking")
+    s.add_argument("--slate", action="store_true", help="with key: send it to the focused Slate widget instead of the game's "
+                                                        "input (the editor's shortcuts then apply: Escape stops PIE)")
     s = add("anim", cmd_anim, "animation state in PIE: anim BP, montage, curves, its variables, movement; "
                               "`anim graph <ABP>`: its state machines as text")
     s.add_argument("target", help="actor, 'player', or Actor.Component; or `graph`")
@@ -607,12 +619,17 @@ def build_parser():
     s = add("api", cmd_api, "the unreal Python API: a class's methods and properties, or one member's doc")
     s.add_argument("name", help="class or class.member, e.g. EditorActorSubsystem or Actor.set_actor_location")
     s.add_argument("match", nargs="?", help="regex filter on member names")
-    s = add("game", cmd_game, "multiplayer outside PIE: server + clients as game processes (start|status|log|stop)")
-    s.add_argument("action", nargs="?", choices=["start", "status", "log", "stop"])
-    s.add_argument("index", nargs="?", type=int, help="with log: which process (0 = the server)")
+    s = add("game", cmd_game, "multiplayer outside PIE: server + clients as game processes (start|status|log|shot|stop)")
+    s.add_argument("action", nargs="?", choices=["start", "status", "log", "shot", "stop"])
+    s.add_argument("index", nargs="?", type=int, help="with log/shot: which process (0 = the server)")
+    s.add_argument("-o", "--output", help="with shot: PNG path (default Saved/Tether/shots/)")
     s.add_argument("--clients", type=int, default=1, help="with start: how many clients (1)")
     s.add_argument("--server", choices=["listen", "dedicated", "none"], default="listen",
-                   help="with start: listen server (a player hosts), dedicated (-server), or none (clients only)")
+                   help="with start: listen server (a player hosts), dedicated (-server), or none (each client plays on "
+                        "its own, on --map; --connect sends them to a server you run)")
+    s.add_argument("--connect", metavar="HOST:PORT", help="with start: clients join this server instead")
+    s.add_argument("--python", action="store_true", help="with start (editor binary): keep editor Python, as Play > "
+                                                         "Standalone does, so the project's start-up scripts run")
     s.add_argument("--map", help="with start: the server's map (default: the project's GameDefaultMap)")
     s.add_argument("--game", metavar="CLASS", help="with start: ?game= game mode for the server's map")
     s.add_argument("--packaged", action="store_true", help="with start: run the packaged build (ue package first)")

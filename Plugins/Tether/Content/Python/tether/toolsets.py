@@ -161,9 +161,9 @@ def _resolve(ref, pie=False):
     if not comp_ref:
         return actor
     comps = actor.get_components_by_class(unreal.ActorComponent)
-    for comp in comps:
-        if comp.get_name().lower() == comp_ref.lower():
-            return comp
+    found = _component_named(actor, comps, comp_ref)
+    if found is not None:
+        return found
     raise RuntimeError(f"{actor.get_actor_label()} has no component '{comp_ref}' (has: "
                        + ", ".join(c.get_name() for c in comps) + ")")
 
@@ -388,6 +388,36 @@ def _visible_bounds(actor, game=False):
     if lo is None:
         return actor.get_actor_location(), unreal.Vector(0, 0, 0)
     return (lo + hi) * 0.5, (hi - lo) * 0.5
+
+
+def _mesh_outline(actor):
+    """The four XY corners of a StaticMeshActor's mesh box, turned and scaled with the actor; None otherwise."""
+    comp = _try(lambda: actor.static_mesh_component)
+    mesh = _try(lambda: comp.get_editor_property("static_mesh")) if comp else None
+    box = _try(lambda: mesh.get_bounding_box()) if mesh else None
+    if box is None:
+        return None
+    xf = comp.get_world_transform()
+    lo, hi = box.min, box.max
+    corners = [xf.transform_location(unreal.Vector(x, y, (lo.z + hi.z) / 2))
+               for x, y in ((lo.x, lo.y), (hi.x, lo.y), (hi.x, hi.y), (lo.x, hi.y))]
+    return [[round(c.x, 1), round(c.y, 1)] for c in corners]
+
+
+def _component_named(actor, comps, ref):
+    """A component by its object name (CharMoveComp0), that name without the trailing number, the actor property
+    that holds it (CharacterMovement, as the C++ and Blueprints call it), or its class (CharacterMovementComponent)."""
+    want = ref.lower()
+    for test in (lambda c: c.get_name().lower() == want,
+                 lambda c: re.sub(r"_?\d+$", "", c.get_name()).lower() == want):
+        hit = next((c for c in comps if test(c)), None)
+        if hit is not None:
+            return hit
+    held = _try(lambda: actor.get_editor_property(_snake(ref)))
+    if isinstance(held, unreal.ActorComponent):
+        return held
+    classes = [c for c in comps if c.get_class().get_name().lower() in (want, want + "component")]
+    return classes[0] if len(classes) == 1 else None
 
 
 def _point_and_extent(ref, pie):
@@ -4875,7 +4905,7 @@ class TetherCore(_Base):
 
     @_tool
     @staticmethod
-    def map_data(area: str = "-", pie: bool = False, limit: int = 20000) -> str:
+    def map_data(area: str = "-", pie: bool = False, limit: int = 20000, footprints: bool = False) -> str:
         """The level from above, as data for `ue map`: every actor's footprint (axis-aligned bounds) and kind:
         geometry (meshes, blocking volumes), marker (gameplay actors: pawns, starts, triggers, Blueprints...), or
         landscape. Lights, sky, fog, post-process and other invisible infrastructure are left out.
@@ -4884,9 +4914,11 @@ class TetherCore(_Base):
             area: 'x,y,radius' to keep only what overlaps it, or '-' for the whole level.
             pie: Read the PIE world.
             limit: Maximum actors.
+            footprints: Also each geometry row's bottom z and its outline: the four XY corners of its mesh's own
+                box turned with the actor (a rotated wall is not its axis-aligned bounds).
 
         Returns:
-            JSON: {actors: [[label, class, kind, x, y, z_top, half_x, half_y]], landscape: bool}.
+            JSON: {actors: [[label, class, kind, x, y, z_top, half_x, half_y(, z_bottom, corners)]], landscape: bool}.
         """
         skip = ("WorldSettings", "Light", "SkyAtmosphere", "SkyLight", "ExponentialHeightFog", "VolumetricCloud",
                 "PostProcessVolume", "NavMeshBoundsVolume", "RecastNavMesh", "AbstractNavData", "NavigationData",
@@ -4920,8 +4952,13 @@ class TetherCore(_Base):
             kind = "geometry" if cls in geometry or (isinstance(actor, unreal.StaticMeshActor)) else "marker"
             if kind == "geometry" and cls == "InstancedFoliageActor":
                 continue  # foliage: thousands of instances; drawn as nothing rather than one huge box
-            rows.append([_label(actor), cls, kind, round(origin.x, 1), round(origin.y, 1), round(origin.z + extent.z, 1),
-                         round(extent.x, 1), round(extent.y, 1)])
+            row = [_label(actor), cls, kind, round(origin.x, 1), round(origin.y, 1), round(origin.z + extent.z, 1),
+                   round(extent.x, 1), round(extent.y, 1)]
+            if footprints and kind == "geometry":
+                row += [round(origin.z - extent.z, 1), _mesh_outline(actor) or
+                        [[round(origin.x + sx * extent.x, 1), round(origin.y + sy * extent.y, 1)]
+                         for sx, sy in ((-1, -1), (1, -1), (1, 1), (-1, 1))]]
+            rows.append(row)
             if len(rows) >= limit:
                 break
         return json.dumps({"actors": rows, "landscape": landscape})

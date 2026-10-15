@@ -159,9 +159,17 @@ PYTHON_PROPERTY_NAMES = ("import re as _r, json as _j\n"
                          "_j.dumps({{'python': _n, 'blueprint': _b}})")
 
 
+PROTECTED_PROPERTY = re.compile(r"Property '(\w+)' for attribute '\w+' on '(\w+)' is protected and cannot be read")
+
+
 def property_name_hint(ctx, error):
     """For "Failed to find property": the class's Python property names closest to the one asked for. The
-    pythonizer drops a bool's b prefix, then an In prefix (bInOrder is `order`), so the C++ name is no guide."""
+    pythonizer drops a bool's b prefix, then an In prefix (bInOrder is `order`), so the C++ name is no guide.
+    For a protected one: `ue props` reads it (through the engine's own export)."""
+    p = PROTECTED_PROPERTY.search(error)
+    if p:
+        return (f"{p.group(2)}.{p.group(1)} is protected from Python, but `ue props <object> --match {p.group(1)}` "
+                "(--pie in PIE) reads it, and `ue pie watch Actor.{0}` samples it".format(p.group(1)))
     m = MISSING_PROPERTY.search(error)
     if not m:
         return None
@@ -648,7 +656,30 @@ def cmd_exec(ctx, args):
         print(line)
     if shown.folded:
         print(f"({shown.folded} repeated line(s) in a row folded into \"xN\")")
+    for path in written_screenshots(ctx, lines):
+        print(f"screenshot: {path}")
     return 0
+
+
+SCREENSHOT_TAKEN = re.compile(r'Screenshot "([^"]+)" taken|High resolution screenshot saved as (.+\.png)')
+
+
+def written_screenshots(ctx, lines):
+    """The files a console screenshot command (shot, shot showui, HighResShot) wrote, from its log lines: `shot`
+    logs only a name, so it is found under Saved/Screenshots (the newest of that name)."""
+    folder = os.path.join(os.path.dirname(ctx.project), "Saved", "Screenshots")
+    found = []
+    for line in lines:
+        m = SCREENSHOT_TAKEN.search(line)
+        if not m:
+            continue
+        if m.group(2):
+            found.append(m.group(2).strip())
+            continue
+        names = [os.path.join(d, n) for d, _, files in os.walk(folder) for n in files if n == f"{m.group(1)}.png"]
+        if names:
+            found.append(max(names, key=os.path.getmtime))
+    return list(dict.fromkeys(found))
 
 
 def flush_editor_log(ctx):

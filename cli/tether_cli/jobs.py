@@ -6,9 +6,10 @@ import sys
 import time
 
 from .core import (
-    CliError, UE_SCRIPT, describe_crash, editor_executable, engine_root, filter_log, host_platform, pid_alive, read_json,
-    recent_crash, state_dir, subprocess, uat_command, write_json,
+    CliError, UE_SCRIPT, describe_crash, editor_executable, engine_root, filter_log, host_platform, pid_alive, process_tree,
+    read_json, recent_crash, state_dir, subprocess, uat_command, write_json,
 )
+from .images import window_png
 from .build import compact_diagnostics, editor_env, print_diagnostics
 from .assets import ini_value
 
@@ -406,18 +407,26 @@ def game_command(ctx, args, role, index, port, log):
             raise CliError("a packaged client build has no dedicated server: use --server listen")
         base = [exe]
     else:
-        # -DisablePython: the editor plugins' Python startup scripts (Tether's, Epic's toolsets) expect an editor
-        base = [editor_executable(engine_root(ctx.project)), ctx.project, "-DisablePython"]
+        # -DisablePython: the editor plugins' Python startup scripts (Tether's, Epic's toolsets) expect an editor.
+        # --python keeps it, as Play > Standalone Game does, so the project's own start-up scripts run (and can crash)
+        base = [editor_executable(engine_root(ctx.project)), ctx.project] + ([] if getattr(args, "python", False)
+                                                                           else ["-DisablePython"])
     level = args.map or default_map(ctx.project)
     if role in ("listen", "dedicated") and not level:
         raise CliError("no map: pass --map /Game/Maps/MyMap (the project has no GameDefaultMap)")
-    url = (level + ("?listen" if role == "listen" else "") + (f"?game={args.game}" if args.game else "")) \
-        if role != "client" else f"127.0.0.1:{port}"
+    if role != "client":
+        url = level + ("?listen" if role == "listen" else "") + (f"?game={args.game}" if args.game else "")
+    elif getattr(args, "connect", None):
+        url = args.connect
+    elif getattr(args, "server", "listen") == "none":  # each client plays on its own, on the map
+        url = (level or "") + (f"?game={args.game}" if args.game and level else "")
+    else:
+        url = f"127.0.0.1:{port}"
     mode = ["-server"] if role == "dedicated" else ([] if args.packaged else ["-game"])
     extra = (args.server_args if role != "client" else args.client_args) or ""
     view = ["-nullrhi", "-nosound"] if headless else ["-windowed", "-ResX=960", "-ResY=540", f"-WinX={60 + index * 40}",
                                                        f"-WinY={60 + index * 40}"]
-    return base + [url] + mode + [f"-port={port}", "-log", f"-abslog={log}", "-unattended", "-nosplash",
+    return base + ([url] if url else []) + mode + [f"-port={port}", "-log", f"-abslog={log}", "-unattended", "-nosplash",
                                  "-NoVerifyGC"] + view + extra.split()
 
 
@@ -495,6 +504,25 @@ def cmd_game(ctx, args):
     if not state.get("instances"):
         raise CliError("no game session (ue game start --clients 1)")
     instances = state["instances"]
+    if action == "shot":
+        index = args.index if args.index is not None else 0
+        inst = next((i for i in instances if i["index"] == index), None)
+        if inst is None:
+            raise CliError(f"no instance {index} (0..{len(instances) - 1})")
+        if not pid_alive(inst["pid"]):
+            raise CliError(f"{inst['role']} {index} has exited (ue game status)")
+        shot = window_png(set(process_tree(inst["pid"])))  # a packaged launcher's game is its child process
+        if shot is None:
+            raise CliError(f"{inst['role']} {index} has no window (started headless? ue game start --windowed)")
+        title, png = shot
+        path = os.path.abspath(args.output) if args.output else os.path.join(
+            state_dir(ctx.project), "shots", time.strftime(f"game{index}-%Y%m%d-%H%M%S.png"))
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(png)
+        print(f"{path}  {int.from_bytes(png[16:20], 'big')}x{int.from_bytes(png[20:24], 'big')}  "
+              f"({inst['role']} {index}, window \"{title}\")")
+        return 0
     if action == "log":
         index = args.index if args.index is not None else 0
         inst = next((i for i in instances if i["index"] == index), None)

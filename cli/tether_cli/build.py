@@ -5,8 +5,8 @@ import re
 import time
 
 from .core import (
-    CliError, engine_root, epic_settings_dir, host_platform, live_coding_holders, live_editors, log_end, log_path,
-    logged_dialogs, read_json,
+    CliError, chosen_editor, engine_root, epic_settings_dir, host_platform, live_coding_holders, live_editors, log_end,
+    log_path, logged_dialogs, read_json,
     read_new_log, state_dir, subprocess, uat_command, ubt_command, write_json,
 )
 from .share import file_owner
@@ -80,6 +80,53 @@ def print_error_owners(project, errors, limit=4):
         owner = file_owner(project, path)
         if owner:
             print(f"  {os.path.basename(path)}: {owner}")
+
+
+def layout_marker(project):
+    return os.path.join(state_dir(project), "live-coding-layout.json")
+
+
+def layout_patch_note(project, beacon):
+    """A warning when Live Coding patched reflected headers in the running editor process since it started: class
+    layouts may then disagree with the objects in memory, and UMG and replication misbehave until a restart."""
+    marker = read_json(layout_marker(project)) or {}
+    if not marker or marker.get("pid") != (beacon or {}).get("pid"):
+        return None
+    return (f"Live Coding patched reflected headers in this editor since it started ({', '.join(marker['headers'][:4])}): "
+            "class layouts may not match the objects in memory, so UMG, replication and Blueprints can misbehave "
+            "(a HUD that draws nothing). `ue build --restart` makes it clean")
+
+
+UNRESOLVED = re.compile(r"unresolved external symbol.*?\b(\w+)::(~?\w+)\s*\(")
+
+
+def print_link_owners(project, errors, limit=4):
+    """For unresolved externals, the header that declares the class and who last wrote it: a declaration with no
+    definition yet is usually another session's work in progress."""
+    wanted = list(dict.fromkeys(m.groups() for m in (UNRESOLVED.search(e) for e in errors) if m))
+    if not wanted:
+        return
+    headers = {}
+    root = os.path.join(os.path.dirname(project), "Source")
+    for folder, _, files in os.walk(root):
+        for name in files:
+            if not name.endswith(".h"):
+                continue
+            path = os.path.join(folder, name)
+            try:
+                with open(path, encoding="utf-8", errors="replace") as f:
+                    text = f.read()
+            except OSError:
+                continue
+            for cls, _ in wanted:
+                if cls not in headers and re.search(rf"\b(?:class|struct)\s+(?:\w+_API\s+)?{cls}\b", text):
+                    headers[cls] = path
+    for cls, function in wanted[:limit]:
+        path = headers.get(cls)
+        if path:
+            owner = file_owner(project, path)
+            print(f"  {cls}::{function}: declared in {os.path.basename(path)}"
+                  + (f" ({owner})" if owner else "") + ", no definition linked")
 
 
 def classify_changes(project):
@@ -270,6 +317,7 @@ def ubt_build(ctx, args, check=False):
     print_diagnostics(errors, warnings, args.limit)
     if not ok:
         print_error_owners(ctx.project, errors)
+        print_link_owners(ctx.project, errors)
     if ok and not check:  # a check builds the game, not the editor this marker is about
         mark_green(ctx.project)
     return 0 if ok else 1
@@ -352,6 +400,7 @@ def live_coding_build(ctx, args, changes):
     print_error_owners(ctx.project, errors)
     for line in link_errors[: args.limit]:
         print(f"  {line}")
+    print_link_owners(ctx.project, errors + link_errors)
     for hint in hints:
         print(f"  hint: {hint}")
     if not ok and not errors and not link_errors:
@@ -369,6 +418,12 @@ def live_coding_build(ctx, args, changes):
         print(f"  note: reflected headers changed ({names}). Function bodies and new UFUNCTIONs are live "
               "(call new ones via cdo.call_method('Name')); new UPROPERTYs, layout/CDO changes, Python "
               "wrappers and Blueprint use need `ue build --restart`")
+        # Remembered for this editor process: PIE starts and empty `ue ui` results say it again
+        editor = chosen_editor(ctx.project) or {}
+        marker = read_json(layout_marker(ctx.project)) or {}
+        headers = marker.get("headers", []) if marker.get("pid") == editor.get("pid") else []
+        write_json(layout_marker(ctx.project), {"pid": editor.get("pid"), "time": time.time(),
+                                                "headers": list(dict.fromkeys(headers + [os.path.basename(p) for p in changes[2]]))})
     if ok:
         mark_green(ctx.project)
     return 0 if ok else 1

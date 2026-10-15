@@ -37,8 +37,38 @@ def pie_screenshot(ctx, args, pose=None):
                            "inspector (ue init); or use Simulate (ue pie start --simulate) and ue shot --at")
         return raw
     if getattr(args, "hud", False):
+        client = pie_client_target(ctx)
+        if client:  # a multiplayer client plays in a window of its own: capture that window, not the host's
+            return client_window_shot(ctx, client)
         return hud_screenshot(ctx)
     return highres_shot(ctx, getattr(args, "res", None) or "1", pie=True)
+
+
+def pie_client_target(ctx):
+    """The client `ue pie target` picked (1, 2...), or 0 for the host / single-player."""
+    status = str(ctx.tether("pie_net", action="status", clients=1, net="-", target=-1, game="-"))
+    m = re.search(r"^\* (\d+):", status, re.M)
+    return int(m.group(1)) if m else 0
+
+
+def client_window_shot(ctx, client):
+    """PNG of a multiplayer PIE client's own window (the game view and its UMG HUD), through the Slate inspector."""
+    import base64
+    text, failed = ctx.mcp.call("SlateInspectorToolset.SlateInspectorToolset", "Snapshot",
+                                {"ref": "", "maxDepth": 3, "bIncludeSourceLocations": False})
+    snapshot = unwrap(text) if not failed else ""
+    snapshot = snapshot if isinstance(snapshot, str) else json.dumps(snapshot)
+    ref = next((SNAPSHOT_REF.search(l).group(1) for l in snapshot.splitlines()
+                if f"NetMode: Client {client}]" in l and SNAPSHOT_REF.search(l)), None)
+    if ref is None:
+        raise CliError(f"no PIE window for client {client} (is it a separate window? ue ui lists the windows)")
+    text, failed = ctx.mcp.call("SlateInspectorToolset.SlateInspectorToolset", "Screenshot", {"ref": ref})
+    value = unwrap(text) if not failed else None
+    value = value.get("returnValue", value) if isinstance(value, dict) else None
+    if not isinstance(value, dict) or not value.get("data"):
+        raise CliError(f"the Slate inspector could not capture client {client}'s window")
+    print(f"note: client {client}'s own window (ue pie target), with its UMG; canvas-drawn text is not in it")
+    return base64.b64decode(value["data"])
 
 
 def highres_shot(ctx, spec, pie):
@@ -509,6 +539,65 @@ def png_decode(data):
         out[y * stride:(y + 1) * stride] = line
         prev = line
     return width, height, channels, depth, bytes(out)
+
+
+def window_png(pids):
+    """PNG bytes of the largest visible titled top-level window of these processes (Windows), drawn with
+    PrintWindow(PW_RENDERFULLCONTENT), so GPU-rendered content and separate Slate windows such as the movie
+    player's loading screen come out, not what happens to be on top of it on screen. (title, png) or None."""
+    if os.name != "nt":
+        raise CliError("window screenshots are Windows-only for now")
+    import ctypes
+    from ctypes import wintypes
+    user32, gdi32 = ctypes.windll.user32, ctypes.windll.gdi32
+    callback = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    found = []
+
+    def visit(hwnd, _):
+        owner = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner))
+        if owner.value in pids and user32.IsWindowVisible(hwnd):
+            kind = ctypes.create_unicode_buffer(64)
+            user32.GetClassNameW(hwnd, kind, 64)
+            if kind.value != "UnrealWindow":  # not the -log console, or other helper windows
+                return True
+            title = ctypes.create_unicode_buffer(256)
+            user32.GetWindowTextW(hwnd, title, 256)
+            rect = wintypes.RECT()
+            user32.GetWindowRect(hwnd, ctypes.byref(rect))
+            w, h = rect.right - rect.left, rect.bottom - rect.top
+            if w > 50 and h > 50:
+                found.append((w * h, hwnd, title.value, w, h))
+        return True
+    user32.EnumWindows(callback(visit), 0)
+    if not found:
+        return None
+    _, hwnd, title, w, h = max(found)
+    gdi32.CreateCompatibleDC.restype = gdi32.CreateCompatibleBitmap.restype = ctypes.c_void_p
+    user32.GetWindowDC.restype = ctypes.c_void_p
+    screen = user32.GetWindowDC(ctypes.c_void_p(hwnd))
+    memdc = gdi32.CreateCompatibleDC(ctypes.c_void_p(screen))
+    bitmap = gdi32.CreateCompatibleBitmap(ctypes.c_void_p(screen), w, h)
+    try:
+        gdi32.SelectObject(ctypes.c_void_p(memdc), ctypes.c_void_p(bitmap))
+        user32.PrintWindow(ctypes.c_void_p(hwnd), ctypes.c_void_p(memdc), 2)  # PW_RENDERFULLCONTENT
+
+        class Header(ctypes.Structure):  # BITMAPINFOHEADER
+            _fields_ = [("biSize", wintypes.DWORD), ("biWidth", ctypes.c_long), ("biHeight", ctypes.c_long),
+                        ("biPlanes", wintypes.WORD), ("biBitCount", wintypes.WORD), ("biCompression", wintypes.DWORD),
+                        ("biSizeImage", wintypes.DWORD), ("biXPelsPerMeter", ctypes.c_long),
+                        ("biYPelsPerMeter", ctypes.c_long), ("biClrUsed", wintypes.DWORD), ("biClrImportant", wintypes.DWORD)]
+        header = Header(ctypes.sizeof(Header), w, -h, 1, 32, 0, 0, 0, 0, 0, 0)  # top-down BGRA
+        buffer = ctypes.create_string_buffer(w * h * 4)
+        gdi32.GetDIBits(ctypes.c_void_p(memdc), ctypes.c_void_p(bitmap), 0, h, buffer, ctypes.byref(header), 0)
+    finally:
+        gdi32.DeleteObject(ctypes.c_void_p(bitmap))
+        gdi32.DeleteDC(ctypes.c_void_p(memdc))
+        user32.ReleaseDC(ctypes.c_void_p(hwnd), ctypes.c_void_p(screen))
+    bgra = buffer.raw
+    rgb = bytearray(w * h * 3)
+    rgb[0::3], rgb[1::3], rgb[2::3] = bgra[2::4], bgra[1::4], bgra[0::4]
+    return title, png_bytes(w, h, bytes(rgb))
 
 
 def png_gray16_bytes(width, height, values):

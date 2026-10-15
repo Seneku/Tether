@@ -733,6 +733,42 @@ def parse_res(text):
     return int(m.group(1)), int(m.group(2))
 
 
+def process_tree(pid):
+    """A process and all its descendants' pids (a packaged game's launcher runs the real game as a child)."""
+    if os.name != "nt":
+        return [pid]
+    import ctypes
+    from ctypes import wintypes
+
+    class Entry(ctypes.Structure):  # PROCESSENTRY32W
+        _fields_ = [("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD), ("th32ProcessID", wintypes.DWORD),
+                    ("th32DefaultHeapID", ctypes.c_size_t), ("th32ModuleID", wintypes.DWORD),
+                    ("cntThreads", wintypes.DWORD), ("th32ParentProcessID", wintypes.DWORD),
+                    ("pcPriClassBase", ctypes.c_long), ("dwFlags", wintypes.DWORD), ("szExeFile", ctypes.c_wchar * 260)]
+    kernel32 = ctypes.windll.kernel32
+    kernel32.CreateToolhelp32Snapshot.restype = ctypes.c_void_p
+    kernel32.Process32FirstW.argtypes = kernel32.Process32NextW.argtypes = (ctypes.c_void_p, ctypes.POINTER(Entry))
+    kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
+    parents = {}
+    snapshot = kernel32.CreateToolhelp32Snapshot(0x2, 0)
+    try:
+        entry = Entry()
+        entry.dwSize = ctypes.sizeof(Entry)
+        ok = kernel32.Process32FirstW(snapshot, ctypes.byref(entry))
+        while ok:
+            parents.setdefault(entry.th32ParentProcessID, []).append(entry.th32ProcessID)
+            ok = kernel32.Process32NextW(snapshot, ctypes.byref(entry))
+    finally:
+        kernel32.CloseHandle(snapshot)
+    tree, queue = [], [pid]
+    while queue:
+        p = queue.pop()
+        if p not in tree:
+            tree.append(p)
+            queue += [c for c in parents.get(p, []) if c != p]
+    return tree
+
+
 def live_coding_holders(engine):
     """[(console pid, project name, editor pid)] for the LiveCodingConsoles running from this engine install. UBT's
     mutex is Global\\LiveCoding_ + the UnrealEditor.exe path, so any of them blocks editor builds of every project on

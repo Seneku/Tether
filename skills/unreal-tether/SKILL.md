@@ -94,6 +94,9 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
   `--csv tuning.csv`, edit, `--import tuning.csv --dry-run`, then `--import tuning.csv --save`.
 - Where things are in a level: `ue map` (or `ue map x,y,r`, `--pie` for the running game) draws it from above
   (works headless) with player starts, spawners, AI and triggers as numbered dots; read the PNG to plan placement.
+  `ue map --footprints` writes the collidable geometry as data (each mesh's turned outline, top and bottom) for
+  minimaps and layout checks. `ue map open /Game/Maps/X` switches the editor's map (`--save`/`--discard` when the
+  current one has unsaved edits).
 - On terrain, never guess heights: `ue spawn /Game/X/SM_Rock --at 1200,-300,0 --ground` (or `ue drop Rock1 Rock2`,
   `--align` to follow the slope) puts things on the surface below. A structure built of separate pieces (walls,
   roof) goes down as one: `ue drop Wall1 Wall2 Roof --group` (attached actors come along); it says how much the
@@ -187,6 +190,12 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
 - `ue build`: if the editor is up it uses Live Coding (~5 s, no restart); if not, UBT. Output is only
   your own errors and warnings, one line each. Never run Build.bat while an editor is open: one Live
   Coding session blocks UBT for every project on that engine.
+- With other sessions sharing the project, Live Coding refuses (exit 5) when files another session edited in the
+  last 15 minutes would be compiled, and names them; ask that session, or pass `--include-others`. Compile and
+  link errors name each file's (and each missing function's header's) last writer.
+- `ue lint --cpp` before a package or a restart: file-private names (anonymous namespace, `static`) defined in two
+  .cpp files of a module collide in a unity build, and reflected types whose names differ only by prefix
+  (`FSDThing` / `ASDThing`) fail UHT.
 - Function bodies and new UFUNCTIONs go live. Call a new UFUNCTION through reflection:
   `unreal.get_default_object(unreal.MyLib).call_method('NewFunc')`.
 - New UPROPERTYs, class layout or constructor defaults, Build.cs/.uproject changes, or Blueprint/Python
@@ -266,6 +275,10 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
   `ue game start --clients 2 [--server dedicated] [--map M] [--game MODE]` waits until the clients join;
   `ue game status` (crashes, errors per process), `ue game log 1` (client 1), `ue game stop`. `--packaged` (or
   `ue package --play 2`) runs the shipped build. Prefer `ue pie start --clients N` for quick checks.
+  `--server none` runs each client on its own (a solo `-game` run, the game's start-up included), `--connect
+  host:port` joins a server you run, and `--python` keeps editor Python as Play > Standalone does (start-up
+  scripts such as init_unreal.py run). `ue game shot 1 --windowed` captures a game window, loading screens
+  included (the movie player is off in PIE).
 - Cooks and other long commands: `ue job cook` or `ue job start -- <cmd>`, then `ue job wait` (errors only)
   or `ue job status`. Do not block a shell on them.
 
@@ -348,10 +361,16 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
   in PIE it also says which contexts are active. `ue input Move` shows matching actions only. A `pie do` step
   that presses an action no active context maps still works, but warns: a player could not do it.
 - Game UI in PIE: `ue ui` lists what is on screen (Slate and UMG texts, buttons, text boxes); `ue ui click
-  "Close"`, `ue ui type "Name" hello`, `ue ui key Escape`. In `ue pie do`: `click <label>`, `expect-ui <text>`,
+  "Close"`, `ue ui type "Name" hello`, `ue ui key Escape` (in PIE, keys and chords such as `Ctrl+G` go to the
+  game's input, so Escape opens its pause menu instead of stopping PIE; `--slate` sends to the focused widget).
+  In `ue pie do`: `click <label>`, `expect-ui <text>`,
   `ui-gone <text>`. Clicks are real mouse clicks at the widget, so whatever is on top receives them; labels are
   stable, refs (b12) change between reads. Canvas-drawn HUD text is not a widget: check it with `ue shot`.
-- Prefer `ue pie run check.py --expect '<log regex>' --reject 'Error|no subsystem'` for verifying gameplay:
+- `ue pie watch Actor.Component.Property` samples a component's property (the component by its property name,
+  e.g. `SDPlayerCharacter_0.CharacterMovement.MovementBase`); `ue props X --match Name --pie` reads properties
+  Python calls protected. After Live Coding patched class layouts, `ue pie start` warns: UMG and replication
+  can misbehave (a HUD drawing nothing) until `ue build --restart`.
+- Prefer `ue pie run check.py --expect '<log regex>' --reject 'Error|no subsystem'` (or `-c "<code>"`) for verifying gameplay:
   it starts PIE, runs the script in the PIE world, waits for the log lines, stops PIE and exits 0/1.
   Write the script once and rerun it after every change.
 - Animation in PIE: `ue anim <actor|player>` (anim BP and its variables, montage, curves, movement mode and
@@ -419,6 +438,11 @@ editor lease (`ue lease`).
   InstanceWorldPositionOffsetDisableDistance) go through `ue set Asset "GrassVarieties[0].Field=4000"`.
 - Ultra Dynamic Sky copies "Exposure Brightness Range" into its PostProcessComponent only at startup: write the
   component, not the variable.
+- `set_collision_enabled(NO_COLLISION)` from editor Python is undone by the next `set_editor_property` on the same
+  component (PostEditChange re-applies its collision profile): set the profile (`set_collision_profile_name(
+  'NoCollision')`) instead, then check with `ue world probe x,y,z`.
+- Components marked editor-only (`bIsEditorOnly`) exist in PIE but are null in `-game` and packaged runs: null-check
+  them outside `WITH_EDITOR` code, and try a `ue game start --server none` run before a package.
 - Live Coding locks UBT for every project on the same engine install: another project's open editor blocks your
   `ue build` with the editor closed (`ue doctor` names it).
 - Wrap edits in `with unreal.ScopedEditorTransaction("Agent: ...")` so the user can undo them.

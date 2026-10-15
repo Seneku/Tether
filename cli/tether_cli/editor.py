@@ -11,7 +11,7 @@ from .core import (
     write_json,
 )
 from .share import (
-    ACTIVE_MINUTES, active_lease, ago, check_shared, describe_lease, duration, lease_note, pie_owner,
+    ACTIVE_MINUTES, active_lease, ago, check_shared, describe_lease, duration, lease_note, others_edits, pie_owner,
     recent_sessions, release_lease, session_id, session_label, session_names, set_session_name, take_lease,
 )
 from .build import (
@@ -74,6 +74,9 @@ def cmd_status(ctx, args):
     return 0 if alive and age <= 10 else 2
 
 
+OTHERS_MINUTES = 15  # another session's edits this recent may be half-written
+
+
 def cmd_build(ctx, args):
     if args.check:
         code = compile_check(ctx, args.limit)
@@ -109,6 +112,17 @@ def cmd_build(ctx, args):
             print("restart required: Live Coding is Windows-only, so C++ changes on this host need "
                   "`ue build --restart`")
             return 3
+        if changes and changes[0] and not getattr(args, "include_others", False):
+            # A Live Coding patch compiles every changed file, another session's half-written ones included
+            theirs = others_edits(ctx.project, changes[0], minutes=OTHERS_MINUTES)
+            if theirs:
+                names = session_names(ctx.project)
+                print("Live Coding would also compile files another session edited in the last "
+                      f"{OTHERS_MINUTES} min and may still be writing:")
+                for path, sid, when in theirs[:8]:
+                    print(f"  {os.path.basename(path)}: {session_label(ctx.project, sid, names)}, {ago(time.time() - when)}")
+                print("  ask that session (ue who), wait until it builds, or pass --include-others")
+                return 5
         if changes is None or changes[0]:  # C++ changed, or no baseline yet
             code = live_coding_build(ctx, args, changes)
             if code:
@@ -348,9 +362,11 @@ def cmd_lease(ctx, args):
 
 def cmd_who(ctx, args):
     """`ue who`: the sessions that used this editor recently (last command, when), the lease and the PIE owner."""
+    me = session_id()
     if args.name:
         set_session_name(ctx.project, args.name)
-    me, now, names = session_id(), time.time(), session_names(ctx.project)
+        print(f"this session ({me}) is now '{args.name}' to the others")
+    now, names = time.time(), session_names(ctx.project)
     recent = recent_sessions(ctx.project, args.minutes, now=now)
     ctx.data = {"you": me, "sessions": recent, "lease": active_lease(ctx.project)}
     print(f"sessions using this editor in the last {args.minutes:g} min ({len(recent)}):" if recent
@@ -358,6 +374,8 @@ def cmd_who(ctx, args):
     for sid, row in recent.items():
         print(f"  {session_label(ctx.project, sid, names)}{' (you)' if sid == me else ''}: "
               f"{ago(now - row['time'])}, {row['cmd'][:100]}")
+    if me not in recent:
+        print(f"  {session_label(ctx.project, me, names)} (you): no commands in that time")
     lease = ctx.data["lease"]
     print("lease: " + (describe_lease(ctx.project, lease) if lease else "none"))
     owner = pie_owner(ctx.project, ctx.beacon)

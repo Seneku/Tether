@@ -2654,3 +2654,102 @@ class IslandHorrorRound(unittest.TestCase):
             self.assertEqual(ue.cmd_wait(ctx, argparse.Namespace(what="grass", clock="real", max=60)), 0)
         self.assertIn("grass settled: 2 batch(es)", out.getvalue())
         self.assertEqual([c[1]["command"] for c in ctx.calls], ["log LogGrass Verbose", "log LogGrass Log"])
+
+
+class ShooterDominationRound(unittest.TestCase):
+    """0.23: ShooterDomination's 0.20 notes."""
+
+    def setUp(self):
+        self.project = Project()
+
+    def tearDown(self):
+        self.project.close()
+
+    def test_game_key_holds_modifiers_around_the_key(self):
+        ctx = FakeCtx(json.dumps({"ok": True, "detail": ""}))
+        with unittest.mock.patch.object(ue.play.time, "sleep"):
+            self.assertEqual(ue.game_key(ctx, "Ctrl+g"), "LeftControl+G")
+            ue.game_key(ctx, "esc")
+        self.assertEqual([c[1]["step"] for c in ctx.calls],
+                         ["key LeftControl down", "key G tap", "key LeftControl up", "key Escape tap"])
+
+    def test_game_command_without_server(self):
+        args = argparse.Namespace(packaged=False, windowed=False, map="/Game/Maps/Title", game=None, server_args="",
+                                  client_args="", platform=None, server="none", connect=None, python=True)
+        ctx = types.SimpleNamespace(project=self.project.uproject)
+        with unittest.mock.patch("tether_cli.jobs.engine_root", return_value="E:/UE"):
+            solo = ue.game_command(ctx, args, "client", 0, 17777, "c.log")
+            joined = ue.game_command(ctx, argparse.Namespace(**dict(vars(args), connect="10.0.0.2:7777")), "client", 0,
+                                     17777, "c.log")
+        self.assertIn("/Game/Maps/Title", solo)
+        self.assertFalse(any("127.0.0.1" in a for a in solo))
+        self.assertNotIn("-DisablePython", solo)
+        self.assertIn("10.0.0.2:7777", joined)
+
+    def test_cli_version_and_lease_reason(self):
+        parser = ue.build_parser()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), self.assertRaises(SystemExit):
+            parser.parse_args(["--version"])
+        self.assertIn("ue (Tether)", out.getvalue())
+        self.assertEqual(parser.parse_args(["lease", "take", "--reason", "map rebuild"]).what, "map rebuild")
+        self.assertEqual(parser.parse_args(["pie", "run", "-c", "print(1)"]).code, "print(1)")
+
+    def test_screenshot_paths_from_exec(self):
+        shot = self.project.write("Saved/Screenshots/WindowsEditor/ScreenShot00003.png", "png")
+        ctx = types.SimpleNamespace(project=self.project.uproject)
+        lines = [stamped('LogCore: Display: Tracing Screenshot "ScreenShot00003" taken with size: 1280 x 720'),
+                 stamped("LogHighResScreenshot: High resolution screenshot saved as D:/x/HighresScreenshot00001.png")]
+        self.assertEqual(ue.written_screenshots(ctx, lines), [shot, "D:/x/HighresScreenshot00001.png"])
+
+    def test_map_open_refuses_unsaved_maps(self):
+        ctx = types.SimpleNamespace(project=self.project.uproject, beacon={}, tether=lambda *a, **k: "True")
+        args = argparse.Namespace(path="/Game/Maps/Spire", save=False, discard=False)
+        with unittest.mock.patch.object(ue.content, "py_json", return_value={"maps": ["/Game/Maps/Title"], "assets": 0}):
+            with self.assertRaises(ue.CliError) as caught:
+                ue.map_open(ctx, args)
+        self.assertIn("--save or --discard", str(caught.exception))
+        with self.assertRaises(ue.CliError):
+            ue.map_open(types.SimpleNamespace(project=self.project.uproject, beacon={"pie": True}), args)
+
+    def test_others_edits_and_link_owners(self):
+        p = self.project.uproject
+        header = self.project.write("Source/Game/SDPlayerController.h", "UCLASS()\nclass GAME_API ASDPlayerController : "
+                                                                         "public APlayerController {};\n")
+        cpp = self.project.write("Source/Game/SDMenu.cpp", "int x;")
+        with unittest.mock.patch.dict(os.environ, {"UE_SESSION": "menu"}):
+            ue.record_edit(p, header, "menu", now=time.time())
+            ue.record_edit(p, cpp, "menu", now=time.time())
+        with unittest.mock.patch.dict(os.environ, {"UE_SESSION": "robots"}):
+            theirs = ue.others_edits(p, [header, cpp], minutes=15)
+            self.assertEqual([os.path.basename(t[0]) for t in theirs], ["SDPlayerController.h", "SDMenu.cpp"])
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                ue.print_link_owners(p, ['LNK2001 unresolved external symbol "public: void __cdecl '
+                                         'ASDPlayerController::DebugGive(int)"'])
+            self.assertIn("ASDPlayerController::DebugGive: declared in SDPlayerController.h (edited by menu", out.getvalue())
+        with unittest.mock.patch.dict(os.environ, {"UE_SESSION": "menu"}):
+            self.assertEqual(ue.others_edits(p, [header], minutes=15), [])  # my own
+
+    def test_layout_patch_note_is_per_editor_process(self):
+        p = self.project.uproject
+        ue.write_json(ue.layout_marker(p), {"pid": 42, "time": 1, "headers": ["SDRobot.h"]})
+        self.assertIn("SDRobot.h", ue.layout_patch_note(p, {"pid": 42}))
+        self.assertIsNone(ue.layout_patch_note(p, {"pid": 43}))  # restarted since
+
+    def test_protected_property_hint(self):
+        error = ("Exception: Objective: Property 'Target' for attribute 'target' on 'SDObjective' is protected and "
+                 "cannot be read")
+        self.assertIn("ue props <object> --match Target", ue.property_name_hint(FakeCtx(), error))
+
+    def test_reflected_name_clashes(self):
+        self.project.write("Source/Game/Game.Build.cs", "")
+        self.project.write("Source/Game/SetPiece.h", "USTRUCT(BlueprintType)\nstruct FSDSetPiece {};\n")
+        self.project.write("Source/Game/SetPieceActor.h", "UCLASS()\nclass GAME_API ASDSetPiece : public AActor {};\n"
+                                                          "UENUM()\nenum class ESDMode : uint8 {};\n")
+        clashes = ue.reflected_name_clashes(self.project.uproject)
+        self.assertEqual(sorted(clashes), ["SDSetPiece"])
+        self.assertEqual(sorted(t for t, _ in clashes["SDSetPiece"]), ["ASDSetPiece", "FSDSetPiece"])
+
+    def test_process_tree_has_this_process(self):
+        self.assertIn(os.getpid(), ue.process_tree(os.getpid()))

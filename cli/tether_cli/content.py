@@ -7,6 +7,7 @@ import sys
 import time
 
 from .core import CliError, filter_log, human_bytes, log_end, log_path, state_dir
+from .share import file_owner
 from .transport import py_json
 from .calls import flush_editor_log
 from .images import flip_rows, grid_to_bytes, png_gray16_bytes, png_write, read_grid
@@ -434,8 +435,35 @@ def cpp_collisions(project):
     return found
 
 
+REFLECTED_TYPE = re.compile(r"\b(UCLASS|USTRUCT|UINTERFACE|UENUM)\s*\([^)]*\)\s*(?:class|struct|enum(?:\s+class)?)\s+"
+                            r"(?:\w+_API\s+)?([AUFIES])(\w+)")
+
+
+def reflected_name_clashes(project):
+    """{engine name: [(type, file)]} for reflected types whose names differ only by their prefix (FSDSetPiece and
+    ASDSetPiece are both SDSetPiece to UHT, which refuses the second)."""
+    seen = {}
+    for root in project_code_roots(project):
+        for dirpath, dirs, files in os.walk(root):
+            dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+            for f in files:
+                if not f.endswith(".h"):
+                    continue
+                path = os.path.join(dirpath, f)
+                with open(path, encoding="utf-8", errors="replace") as fh:
+                    for m in REFLECTED_TYPE.finditer(fh.read()):
+                        bare = m.group(3)
+                        seen.setdefault(bare, set()).add((m.group(2) + bare, os.path.relpath(path, os.path.dirname(project))))
+    return {name: sorted(types) for name, types in seen.items() if len({t for t, _ in types}) > 1}
+
+
 def lint_cpp(ctx, args):
-    """`ue lint --cpp`: unity-build collisions waiting to happen, from the sources alone."""
+    """`ue lint --cpp`: unity-build collisions and UHT name clashes waiting to happen, from the sources alone."""
+    clashes = reflected_name_clashes(ctx.project)
+    print(f"{len(clashes)} reflected type name(s) used twice once the prefix is dropped" + (
+        " (UHT knows types without A/U/F/I/E/S, so the second fails the build): rename one" if clashes else ""))
+    for name, types in sorted(clashes.items())[: args.limit]:
+        print(f"  {name}: " + ", ".join(f"{t} ({file_owner_label(ctx, path)})" for t, path in types))
     found = cpp_collisions(ctx.project)
     total = sum(len(v) for v in found.values())
     print(f"{total} file-private name(s) declared in more than one .cpp of a module" + (
@@ -445,8 +473,14 @@ def lint_cpp(ctx, args):
         print(f"{module}:")
         for name, files in sorted(clashes.items())[: args.limit]:
             print(f"  {name}: {', '.join(files[:4])}" + (f" +{len(files) - 4} more" if len(files) > 4 else ""))
-    ctx.data = found
-    return 1 if total and args.strict else 0
+    ctx.data = {"collisions": found, "reflected_clashes": clashes}
+    return 1 if (total or clashes) and args.strict else 0
+
+
+def file_owner_label(ctx, rel):
+    """'Robots/SDSetPiece.h, edited by objectives 5 min ago' style: where a file is and who last wrote it."""
+    owner = file_owner(ctx.project, os.path.join(os.path.dirname(ctx.project), rel))
+    return rel.replace("\\", "/") + (f", {owner}" if owner else "")
 
 
 def lint_config(ctx):
@@ -1182,9 +1216,76 @@ def map_picture(data, size, centre, half, grid=None, numbers=True):
     return canvas, legend, numbered
 
 
+MAP_STATE = ("import json\nU = unreal.EditorLoadingAndSavingUtils\n"
+             "json.dumps({'maps': [p.get_name() for p in U.get_dirty_map_packages()], "
+             "'assets': len(U.get_dirty_content_packages())})")
+
+
+def map_open(ctx, args):
+    """`ue map open <path> [--save|--discard]`: load another map into the running editor. Editor scripting loads it
+    without asking, so a map with unsaved edits would lose them: refused unless --save or --discard."""
+    if not args.path:
+        raise CliError("ue map open /Game/Maps/MyMap [--save|--discard]")
+    if (ctx.beacon or {}).get("pie"):
+        raise CliError("PIE is running (ue pie stop first)")
+    state = py_json(ctx, MAP_STATE)
+    if state["maps"] and not (args.save or args.discard):
+        raise CliError(f"unsaved changes in {', '.join(state['maps'])}: pass --save or --discard (ue changes lists "
+                       "them, ue diff <asset> shows what changed)")
+    if state["maps"] and args.save:
+        ctx.tether("py", code="unreal.EditorLoadingAndSavingUtils.save_dirty_packages(True, False)")
+        print(f"saved {', '.join(state['maps'])}")
+    target = args.path.split(".")[0]
+    if not str(ctx.tether("py", code=f"unreal.EditorAssetLibrary.does_asset_exist({target!r})")).strip().endswith("True"):
+        raise CliError(f"no map at {target} (ue find {target.rsplit('/', 1)[-1]})")
+    loaded = str(ctx.tether("py", code=f"unreal.get_editor_subsystem(unreal.LevelEditorSubsystem).load_level({target!r})\n"
+                                        "unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_editor_world()"
+                                        ".get_path_name().split('.')[0]")).strip().strip("'")
+    if loaded != target:  # load_level answers True even when nothing was loaded
+        raise CliError(f"could not load {target}: the editor is on {loaded} (ue log)")
+    print(f"opened {target}" + (f" (unsaved edits to {', '.join(state['maps'])} dropped)" if state["maps"] and args.discard
+                                 else "")
+          + (f"; {state['assets']} unsaved asset(s) stay unsaved in memory" if state["assets"] else ""))
+    return 0
+
+
+def map_footprints(ctx, args):
+    """`ue map --footprints`: the level's collidable geometry from above as data, for a minimap or a layout check:
+    each mesh's outline (its own box turned with it), top and bottom, written as JSON."""
+    data = ctx.tether("map_data", area=args.area or "-", pie=args.pie, footprints=True)
+    data = json.loads(data) if isinstance(data, str) else data
+    rx = re.compile(args.match, re.I) if args.match else None
+    rows = [{"label": a[0], "class": a[1], "centre": [a[3], a[4]], "half": [a[6], a[7]], "top": a[5], "bottom": a[8],
+             "outline": a[9]} for a in data["actors"] if a[2] == "geometry" and len(a) > 9
+            and (not rx or rx.search(a[0]) or rx.search(a[1]))]
+    if not rows and data["actors"] and not any(len(a) > 9 for a in data["actors"]):
+        raise CliError("this editor's Tether plugin predates --footprints (ue init, then ue reload)")
+    path = os.path.abspath(args.output) if args.output and args.output.endswith(".json") else os.path.join(
+        state_dir(ctx.project), "map", time.strftime("footprints-%Y%m%d-%H%M%S.json"))
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({"footprints": rows, "landscape": data["landscape"]}, f)
+    ctx.data = {"path": path, "footprints": rows}
+    if rows:
+        xs = [p[0] for r in rows for p in r["outline"]]
+        ys = [p[1] for r in rows for p in r["outline"]]
+        zs = [r["top"] for r in rows] + [r["bottom"] for r in rows]
+        print(f"{len(rows)} footprint(s) over x {min(xs):.0f}..{max(xs):.0f}, y {min(ys):.0f}..{max(ys):.0f}, "
+              f"z {min(zs):.0f}..{max(zs):.0f}: {path}")
+    else:
+        print(f"no collidable geometry found ({path})")
+    print("  each: label, class, outline (4 x,y corners: the mesh's box turned with it), top, bottom, centre, half; "
+          "--json puts them in the output too")
+    return 0
+
+
 def cmd_map(ctx, args):
     """`ue map`: the level (or an area) from above as a picture, with gameplay actors marked by class."""
     import math
+    if args.area == "open":
+        return map_open(ctx, args)
+    if args.footprints:
+        return map_footprints(ctx, args)
     data = ctx.tether("map_data", area=args.area or "-", pie=args.pie)
     data = json.loads(data) if isinstance(data, str) else data
     if args.match:

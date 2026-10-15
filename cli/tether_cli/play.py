@@ -14,7 +14,7 @@ from .core import (
     human_bytes, log_end, log_path, read_json, recent_crash, short, state_dir, subprocess, unwrap, write_json,
 )
 from .transport import catalog, py_json, resolve_toolset
-from .build import csharp_changes, csharp_layout, csharp_reload_build
+from .build import csharp_changes, csharp_layout, csharp_reload_build, layout_patch_note
 from .calls import flush_editor_log, metres_to_cm, scoped_cvars
 from .share import check_shared, clear_pie_start, record_pie_start
 from .images import (
@@ -310,6 +310,40 @@ def ui_has_text(ctx, text):
     return any(text.lower() in line.lower() for line in lines)
 
 
+MODIFIER_KEYS = {"ctrl": "LeftControl", "control": "LeftControl", "shift": "LeftShift", "alt": "LeftAlt",
+                 "cmd": "LeftCommand", "win": "LeftCommand"}
+KEY_NAMES = {"esc": "Escape", "escape": "Escape", "space": "SpaceBar", "enter": "Enter", "return": "Enter",
+             "tab": "Tab", "up": "Up", "down": "Down", "left": "Left", "right": "Right", "backspace": "BackSpace",
+             "del": "Delete", "delete": "Delete"}
+
+
+def game_key(ctx, text):
+    """A key or chord ("Escape", "Ctrl+G") pressed in the PIE game's input, as the player would: through the player
+    controller (Enhanced Input's forced keys), so the game's bindings get it, legacy BindKey chords included, and the
+    editor's own shortcuts (Escape stops PIE) do not. Modifiers are held around the key."""
+    parts = [p for p in re.split(r"\s*\+\s*", text.strip()) if p]
+    if not parts:
+        raise CliError("ue ui key <Key> | <Modifier+Key>, e.g. Escape, Ctrl+G")
+    mods = [MODIFIER_KEYS.get(p.lower(), p) for p in parts[:-1]]
+    key = KEY_NAMES.get(parts[-1].lower(), parts[-1].upper() if len(parts[-1]) == 1 else parts[-1])
+
+    def step(s):
+        result = ctx.tether("pie_step", step=s)
+        result = json.loads(result) if isinstance(result, str) else result
+        if not result.get("ok"):
+            raise CliError(f"{s}: {result.get('detail', 'failed')}")
+    for mod in mods:
+        step(f"key {mod} down")
+    try:
+        time.sleep(0.05)  # a frame with the modifier down before the key, as a hand would do it
+        step(f"key {key} tap")
+        time.sleep(0.15)
+    finally:
+        for mod in reversed(mods):
+            step(f"key {mod} up")
+    return "+".join(mods + [key])
+
+
 def cmd_ui(ctx, args):
     """The game's on-screen UI in PIE (Slate and UMG), and clicking, typing and keys."""
     if ctx.transport != "remote" and not (ctx.beacon or {}).get("pie"):
@@ -340,13 +374,18 @@ def cmd_ui(ctx, args):
         if sum(1 for h in hits if h.startswith("window")) > 1:
             print("note: several windows overlap here; a click goes to the one on top")
         return 0
+    if action == "key" and not getattr(args, "slate", False) and (ctx.beacon or {}).get("pie"):
+        # The game's input, not Slate's: through Slate the editor's shortcuts win (Escape stops PIE) and chords
+        # do not reach the game's bindings
+        print(f"pressed {game_key(ctx, ' '.join(args.rest))} in the game")
+        return 0
     if action in ("type", "key"):
         nodes, slate = ui_nodes(ctx)
         if not slate:
             raise CliError(f"ue ui {action} needs Epic's SlateInspectorToolset (ue init enables it)")
         if action == "key":
             mcp_tool(ctx, "SlateInspectorToolset", "PressKey", {"key": " ".join(args.rest)})
-            print(f"pressed {' '.join(args.rest)}")
+            print(f"pressed {' '.join(args.rest)} (Slate: the focused widget, the editor's shortcuts included)")
             return 0
         if len(args.rest) < 2:
             raise CliError("ue ui type <textbox label|ref> <text> [--submit]")
@@ -366,6 +405,9 @@ def cmd_ui(ctx, args):
     print(f"{len(lines)} widget(s) on screen" + (f" matching /{match}/" if match else "") + (":" if lines else ""))
     for line in lines[: args.limit if args.limit != 30 else 200]:
         print(line)
+    note = layout_patch_note(ctx.project, ctx.beacon) if not lines and not match else None
+    if note:
+        print("note: no widgets at all: " + note)
     return 0
 
 
@@ -1290,10 +1332,17 @@ def perf_trace_report(ctx, trace_path, region, frames, args):
 
 def pie_run(ctx, args):
     """A scripted gameplay check: PIE, a script in the game world, log expectations, then stop. Exit 0/1."""
-    if not args.script:
-        raise CliError("give a script: ue pie run checks.py --expect '<log regex>'")
-    with open(args.script[0], encoding="utf-8-sig") as f:
-        code = f.read()
+    inline = getattr(args, "code", None)
+    if not args.script and not inline:
+        raise CliError("give a script: ue pie run checks.py --expect '<log regex>' (or inline: ue pie run -c \"...\")")
+    if inline:
+        code = inline
+    else:
+        try:
+            with open(args.script[0], encoding="utf-8-sig") as f:
+                code = f.read()
+        except OSError:
+            raise CliError(f"no script file '{args.script[0][:60]}': for inline code use ue pie run -c \"<code>\"") from None
     expects = [re.compile(e, re.I) for e in args.expect or []]
     rejects = [re.compile(r, re.I) for r in args.reject or []]
     start, started = log_end(ctx.project), time.time()
@@ -1307,7 +1356,7 @@ def pie_run(ctx, args):
     failures = []
     # A fresh namespace per run: `ue py`'s persistent one keeps globals such as a `world` from an earlier PIE
     # session, which is dead now. tether.world() / tether.player() give the targeted PIE world and its pawn.
-    path = os.path.abspath(args.script[0])
+    path = os.path.abspath(args.script[0]) if args.script and not inline else "<pie run -c>"
     code = (f"exec(compile({code!r}, '<ue py>', 'exec'), "
             f"{{'unreal': unreal, 'tether': globals().get('tether'), '__name__': '__pie_run__', '__file__': {path!r}}})")
     try:
@@ -1521,9 +1570,8 @@ def pie_do(ctx, args):
         if verb in ("type", "key"):
             import shlex
             parts = shlex.split(rest)
-            if verb == "key":
-                mcp_tool(ctx, "SlateInspectorToolset", "PressKey", {"key": rest})
-                return True, f"pressed {rest}"
+            if verb == "key":  # the game's input, as `ue ui key` in PIE: Escape and chords reach its bindings
+                return True, f"pressed {game_key(ctx, rest)}"
             nodes, slate = ui_nodes(ctx)
             if not slate or len(parts) < 2:
                 raise CliError('type needs SlateInspectorToolset and: type "<textbox label>" <text>')
@@ -1619,6 +1667,9 @@ def cmd_pie(ctx, args):
         check_shared(ctx.project, "pie start", destructive=False)
         if not (ctx.beacon or {}).get("pie"):  # PIE already running stays whoever's it was
             record_pie_start(ctx.project)
+        note = layout_patch_note(ctx.project, ctx.beacon)
+        if note:
+            print("note: " + note)
     if args.action == "start" and getattr(args, "game", None):
         print(pie_net(ctx, "game", game=args.game))
     if args.action == "start" and getattr(args, "clients", None):

@@ -43,6 +43,10 @@ checks), 73, 74, 75 (screen percentage to the pixel count for gpu/perf, verified
 for shot, which in the editor needs a level viewport), 76 (the grass builder's Verbose batch lines), 77. Measured on
 Lvl_Island at its player start: 1440p ~15 ms GPU (BasePass most of it), 1080p ~11.5 ms.
 
+**Done in 0.23.0** (ShooterDomination's 0.20 notes): 78-89 and 35a (`ue map --footprints`). `ue props` already read
+protected properties; `ue py`'s error now says so. 90 (collision-profile lint) and 91 (a `-game` smoke step) are
+still open; the gotchas behind them are in the skill.
+
 ---
 
 ## Priority 1: asked for, or blocking real work
