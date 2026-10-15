@@ -2971,6 +2971,49 @@ def _mapped_keys():
     return keys
 
 
+_MODIFIERS = {"ctrl": "LeftControl", "control": "LeftControl", "shift": "LeftShift", "alt": "LeftAlt",
+              "cmd": "LeftCommand", "win": "LeftCommand"}
+
+
+def _tap(world, chord, value=""):
+    """Tap a key or chord ("G", "Ctrl+G") in whole engine frames. A forced key sends a new IE_Pressed on every frame
+    it is held, so a legacy BindKey(IE_Pressed) fires once per frame: force it for exactly one frame (two when an
+    Enhanced Input mapping uses the key, which misses a press and release processed in the same frame). Modifiers
+    go down two frames before the key and up after it. Sequenced at the end of each frame (Slate post-tick), so
+    the frame rate does not matter. Returns a note when an Enhanced mapping may consume a chord's key."""
+    parts = [p for p in re.split(r"\s*\+\s*", chord.strip()) if p]
+    mods = [_MODIFIERS.get(p.lower(), p) for p in parts[:-1]]
+    key = parts[-1]
+    mapped = key in _mapped_keys()
+    plan, frame = [], 0
+    for mod in mods:
+        plan.append((frame, f"Input.+key {mod}"))
+    frame += 2 if mods else 0
+    plan.append((frame, f"Input.+key {key} {value}".strip()))
+    # Releasing a forced key also flushes every key that is down (UPlayerInput::FlushPressedKeys), modifiers
+    # included: with a one-frame key, its press and the modifier's release land in the same frame and the chord
+    # sees no modifier. Two frames: the first press has the modifier down, the second comes after the flush (the
+    # modifier up), so a chord binding still fires once.
+    frame += 2 if mapped or mods else 1
+    plan.append((frame, f"Input.-key {key}"))
+    for mod in mods:
+        plan.append((frame + 1, f"Input.-key {mod}"))
+    state = {"frame": -1}
+
+    def tick(_delta):
+        state["frame"] += 1
+        for when, command in plan:
+            if when == state["frame"]:
+                unreal.SystemLibrary.execute_console_command(world, command)
+        if state["frame"] >= plan[-1][0]:
+            unreal.unregister_slate_post_tick_callback(state["handle"])
+    state["handle"] = unreal.register_slate_post_tick_callback(tick)
+    if mods and mapped:
+        return (f"{key} is also mapped in Enhanced Input: its mapping usually consumes the key, so a legacy BindKey chord "
+                f"on {chord} may never fire (the engine's input stack, not this tap)")
+    return ""
+
+
 def _raw_input(world, verb, rest):
     """`pie do` raw input: keys go in as if pressed (Enhanced Input's forced keys), so key mappings, triggers and
     modifiers (dead zones, scalars, swizzles) apply, unlike `hold IA_x`, which injects the action's value.
@@ -2985,12 +3028,13 @@ def _raw_input(world, verb, rest):
         if len(parts) < 2 or parts[1].lower() not in ("down", "up", "tap"):
             raise RuntimeError("key <Key> down [value] | up | tap   (Key as Unreal names it: SpaceBar, LeftShift, E)")
         key, action = parts[0], parts[1].lower()
+        if action == "tap":  # whole frames, chords included (Ctrl+G): one IE_Pressed per tap
+            note = _tap(world, key, " ".join(parts[2:]))
+            return f"{key} tap" + (f" ({note})" if note else "")
         if action == "up":
             unreal.SystemLibrary.execute_console_command(world, f"Input.-key {key}")
         else:
             force(key, " ".join(parts[2:]))
-            if action == "tap":  # held a few frames: down and up in one frame never fires a Started trigger
-                release(key, 0.1)
         return f"{key} {action}"
     if verb == "mouse":
         nums = _numbers(",".join(parts))

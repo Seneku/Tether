@@ -47,6 +47,10 @@ Lvl_Island at its player start: 1440p ~15 ms GPU (BasePass most of it), 1080p ~1
 protected properties; `ue py`'s error now says so. 90 (collision-profile lint) and 91 (a `-game` smoke step) are
 still open; the gotchas behind them are in the skill.
 
+**Done in 0.23.1**: `ue ui key` taps fired a legacy BindKey once per frame held (forced keys repeat IE_Pressed
+every frame): taps are now sequenced in whole frames, one press each, chords included, with a warning for a chord
+on a key an Enhanced Input mapping uses.
+
 ---
 
 ## Priority 1: asked for, or blocking real work

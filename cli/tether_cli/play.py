@@ -327,21 +327,17 @@ def game_key(ctx, text):
     mods = [MODIFIER_KEYS.get(p.lower(), p) for p in parts[:-1]]
     key = KEY_NAMES.get(parts[-1].lower(), parts[-1].upper() if len(parts[-1]) == 1 else parts[-1])
 
-    def step(s):
-        result = ctx.tether("pie_step", step=s)
-        result = json.loads(result) if isinstance(result, str) else result
-        if not result.get("ok"):
-            raise CliError(f"{s}: {result.get('detail', 'failed')}")
-    for mod in mods:
-        step(f"key {mod} down")
-    try:
-        time.sleep(0.05)  # a frame with the modifier down before the key, as a hand would do it
-        step(f"key {key} tap")
-        time.sleep(0.15)
-    finally:
-        for mod in reversed(mods):
-            step(f"key {mod} up")
-    return "+".join(mods + [key])
+    chord = "+".join(mods + [key])
+    # One step: the plugin sequences it in whole frames (modifiers down, the key for one frame, all up), so a
+    # legacy BindKey(IE_Pressed) sees one press however slowly a background editor ticks
+    result = ctx.tether("pie_step", step=f"key {chord} tap")
+    result = json.loads(result) if isinstance(result, str) else result
+    if not result.get("ok"):
+        raise CliError(f"key {chord}: {result.get('detail', 'failed')}")
+    detail = result.get("detail", "")
+    if "(" in detail:
+        print("note: " + detail[detail.index("(") + 1:].rstrip(")"))
+    return chord
 
 
 def cmd_ui(ctx, args):

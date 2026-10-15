@@ -363,6 +363,8 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
 - Game UI in PIE: `ue ui` lists what is on screen (Slate and UMG texts, buttons, text boxes); `ue ui click
   "Close"`, `ue ui type "Name" hello`, `ue ui key Escape` (in PIE, keys and chords such as `Ctrl+G` go to the
   game's input, so Escape opens its pause menu instead of stopping PIE; `--slate` sends to the focused widget).
+  One tap is one press, as on a keyboard. A legacy BindKey chord on a key an Enhanced Input mapping also uses
+  (Ctrl+G with G mapped) usually never fires: the mapping consumes the key; `ue ui key` warns when it sees that.
   In `ue pie do`: `click <label>`, `expect-ui <text>`,
   `ui-gone <text>`. Clicks are real mouse clicks at the widget, so whatever is on top receives them; labels are
   stable, refs (b12) change between reads. Canvas-drawn HUD text is not a widget: check it with `ue shot`.

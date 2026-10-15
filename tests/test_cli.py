@@ -2665,13 +2665,14 @@ class ShooterDominationRound(unittest.TestCase):
     def tearDown(self):
         self.project.close()
 
-    def test_game_key_holds_modifiers_around_the_key(self):
-        ctx = FakeCtx(json.dumps({"ok": True, "detail": ""}))
-        with unittest.mock.patch.object(ue.play.time, "sleep"):
+    def test_game_key_sends_one_frame_sequenced_step(self):
+        ctx = FakeCtx(json.dumps({"ok": True, "detail": "LeftControl+G tap (G is also mapped in Enhanced Input: ...)"}))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
             self.assertEqual(ue.game_key(ctx, "Ctrl+g"), "LeftControl+G")
             ue.game_key(ctx, "esc")
-        self.assertEqual([c[1]["step"] for c in ctx.calls],
-                         ["key LeftControl down", "key G tap", "key LeftControl up", "key Escape tap"])
+        self.assertEqual([c[1]["step"] for c in ctx.calls], ["key LeftControl+G tap", "key Escape tap"])
+        self.assertIn("note: G is also mapped in Enhanced Input", out.getvalue())
 
     def test_game_command_without_server(self):
         args = argparse.Namespace(packaged=False, windowed=False, map="/Game/Maps/Title", game=None, server_args="",
