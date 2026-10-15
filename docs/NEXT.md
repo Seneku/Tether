@@ -211,6 +211,21 @@ nav, hero-placing cliffs, tuning scatter and turning scattered rocks into foliag
 | 90 | **`ue lint`: StaticMeshActors whose CollisionEnabled disagrees with their profile** (editor Python's `set_collision_enabled` is undone by the next PostEditChange) | [field] every decorative piece in two generated maps was BlockAll | M |
 | 91 | **A `-game` smoke step**: load each map once in `-game` (in `ue test` or `ue package`): editor-only components are null there | [field] an access violation only `-game` and packaged runs hit | M |
 
+### 2K. From ShooterDomination's 0.23 notes (debug HUD, call-ins, level polish, core-kill shatter)
+| # | Addition | Why | Effort |
+|---|---|---|---|
+| 92 | **Bug: `build --restart --save` ended on the UBT line with no editor running**: check the relaunched editor came up, and say why not (its log, a crash, a dialog) | [field] `ue status` "not running" afterwards; `ue open` brought it back | S |
+| 93 | **Bug: `ue shot --res` in a windowed editor says "a headless editor has none"** after a builder reloaded the map: redraw the level viewport and retry, and only blame headless when the editor is headless | [field] failed for minutes after `load_level` | S |
+| 94 | **`ue build --check --files <paths>`**: compile just those translation units (UBT `-SingleFile`, no link), allowed while another session holds the lease | [field] a session could not check its own half-written files while another held the editor | S |
+| 95 | **`ue ui click "OFF" --near "DEBUG HUD: DIRECTOR"`** (the widget closest to a text) and **`OFF#11`** (the 11th of several same-label widgets) | [field] nine identical ON/OFF toggle buttons | S |
+| 96 | **`ue log --grep` includes Verbose lines** (it stopped at Log) | [field] a Verbose "took the jump pad" never showed | S |
+| 97 | **`ue shot --frames N --interval S [--after "<exec>"]`**: a contact sheet of a short event or an animated material, game time slowed while capturing so short intervals are reachable | [field] a 0.1 s flash fell between shots; light-strip pulses | M |
+| 98 | **`ue pie loop "<cmd; wait N; cmd>" --seconds 300 [--every 60 "<cmd>"]`**: console commands and waits run on the game thread, for soaks that do not drift | [field] ~250 `ue exec` round trips from bash, bursts drifting | M |
+| 99 | **`ue git stage --mine`**: stage the files this session last wrote (the post-edit hook's record), naming the ones another session also edited | [field] the riskiest step when two sessions commit from one checkout | S |
+| 100 | **`ue lint --cpp`: `BindKey` keys that an input mapping context also maps** (the mapping consumes the key; the binding never fires), with the editor's mappings when it runs | [field] Ctrl+G never fired; the menu moved to Insert | S |
+| 101 | **`ue ui key --viewport`**: keys through the game viewport the way a keyboard sends them (one InputKey per press) | [field] | M |
+| 102 | **`ue pie start` notes a HUD that is gone**: no UMG widgets after warmup when the last PIE run had some | [field] the first PIE after `ue open` showed 0 widgets, the next 34 | S |
+
 ### 2G. Code (C++ and C#)
 | # | Addition | Why | Effort |
 |---|---|---|---|
