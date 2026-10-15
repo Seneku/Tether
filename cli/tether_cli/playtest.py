@@ -11,7 +11,7 @@ import shutil
 import sys
 import time
 
-from .core import CliError, editor_mode, log_end, log_path, read_json, state_dir, subprocess
+from .core import CliError, editor_mode, filter_log, log_end, log_path, read_json, state_dir, subprocess
 from .calls import flush_editor_log, scoped_cvars
 from .assets import cmd_bp, cmd_size, code_usages, folder_packages, package_bytes
 from .content import cmd_tex
@@ -291,7 +291,7 @@ def pie_watch(ctx, args):
     code = 0
     try:
         with unthrottled(ctx):  # samples at the rate asked for, and the game at its real speed
-            print(ctx.tether("pie_watch", action="start", targets=json.dumps(specs), every=args.every))
+            print(ctx.tether("pie_watch", action="start", targets=json.dumps(specs), every=args.every or 0.1))
             if args.file:
                 code = pie_do(ctx, argparse.Namespace(script=[], file=args.file, reject=args.reject, keep=True,
                                                       keep_going=args.keep_going, warmup=args.warmup, quiet=True))
@@ -838,6 +838,13 @@ def perf_scalability(ctx, args):
 
 def pie_command(ctx, args):
     """`ue pie`: watch and record live here; everything else is play.cmd_pie."""
+    every = getattr(args, "every", None) or []  # --every N, and with loop --every N "cmd; cmd"
+    try:
+        args.every, args.every_cmd = (float(every[0]) if every else None), " ".join(every[1:])
+    except ValueError:
+        raise CliError(f"--every takes seconds first: --every 60 \"memreport\" (not '{every[0]}')") from None
+    if args.every_cmd and args.action != "loop":
+        raise CliError("--every N \"cmd\" is for ue pie loop; with watch it is only N")
     if args.action == "watch":
         return pie_watch(ctx, args)
     if args.action == "do" and (args.watch or (args.file and watch_header(args.file))):
@@ -865,7 +872,63 @@ def pie_command(ctx, args):
         return pie_watch(ctx, watch_args)
     if args.action == "record":
         return pie_record(ctx, args)
+    if args.action == "loop":
+        return pie_loop(ctx, args)
     return cmd_pie(ctx, args)
+
+
+def loop_line(result):
+    result = json.loads(result) if isinstance(result, str) else result
+    state = ("running" if result.get("running") else f"ended ({result.get('ended')})")
+    return (f"loop {state} after {result.get('elapsed', 0):.0f}s"
+            + (f" of {result['seconds']:g}s" if result.get("seconds") else "")
+            + f": {result.get('ran', 0)} command(s), {result.get('passes', 0)} pass(es)"
+            + (f", the --every commands {result['every_runs']} time(s)" if result.get("every_runs") else "")
+            + (f"; {len(result['errors'])} error(s): " + "; ".join(result["errors"][-3:]) if result.get("errors") else ""))
+
+
+def pie_loop(ctx, args):
+    """`ue pie loop "cmd; wait 5; cmd" [--seconds S] [--every N "cmd"]`: console commands and waits run from the
+    editor's tick in the PIE game, on a schedule kept from the start, so a soak does not drift with CLI round trips.
+    Waits for the end (a killed `ue` leaves it running: `ue pie loop status` / `stop`)."""
+    words = list(args.script or [])
+    if len(words) == 1 and words[0] in ("status", "stop"):
+        result = ctx.tether("pie_loop", action=words[0], script="", every_script="")
+        print(loop_line(result))
+        ctx.data = json.loads(result) if isinstance(result, str) else result
+        return 0
+    if len(words) != 1:
+        raise CliError('ue pie loop "stat unit; wait 5; SD.Spawn 4; wait 30" --seconds 300 [--every 60 "memreport"] '
+                       "(the commands in one quoted argument)")
+    if args.every and not args.every_cmd:
+        raise CliError('--every N "cmd; cmd": the commands to run every N seconds')
+    if not (ctx.beacon or {}).get("pie"):
+        raise CliError("PIE is not running (ue pie start)")
+    seconds = args.seconds or 0
+    start = log_end(ctx.project)
+    result = ctx.tether("pie_loop", action="start", script=words[0], seconds=seconds,
+                        every=args.every or 0, every_script=args.every_cmd)
+    print("looping on the game thread" + (f" for {seconds:g}s" if seconds else " (one pass)")
+          + (f", '{args.every_cmd}' every {args.every:g}s" if args.every_cmd else "")
+          + "; a killed `ue` leaves it running (ue pie loop status | stop)")
+    while True:
+        result = json.loads(result) if isinstance(result, str) else result
+        if not result.get("running"):
+            break
+        left = (seconds - result.get("elapsed", 0)) if seconds else 5
+        time.sleep(max(0.2, min(5.0, left + 0.1)))
+        result = ctx.tether("pie_loop", action="status", script="", every_script="")
+    print(loop_line(result))
+    ctx.data = result
+    flush_editor_log(ctx)
+    with open(log_path(ctx.project), "rb") as f:
+        f.seek(start)
+        issues = filter_log(f.read().decode("utf-8", "replace").splitlines(), level="Warning")
+    if issues:
+        print(f"{len(issues)} warning(s)/error(s) in the log meanwhile:")
+        for line in issues[: args.limit]:
+            print("  " + line)
+    return 1 if result.get("errors") or result.get("ended") == "PIE ended" else 0
 
 
 # Config/Tether/budget.json: limits, and what to measure them on.

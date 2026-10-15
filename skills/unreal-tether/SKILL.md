@@ -21,7 +21,9 @@ lease to everyone. While another session holds it, `build --restart`, `close` an
 and say who holds it and for what: wait, or ask that session, rather than passing `--ignore-lease`. A restart or
 close also asks for the lease when another session used the editor in the last 5 minutes. A build error in a file
 you did not touch says who last edited it ("edited by spire ... (not you)"): leave it to that session.
-`ue who --as NAME` gives your session a name the others see.
+`ue who --as NAME` gives your session a name the others see. Committing from a shared checkout: `ue git stage
+--mine` stages only the files your session wrote last (Edit/Write), and names the ones another session also
+wrote since their last commit (stage your hunks with `git add -p`), the ones it wrote, and the unrecorded ones.
 
 Several reads or edits in a row? Put them in one `ue batch` (one command per line, from stdin or a file):
 one process and one editor session for all of them.
@@ -159,6 +161,8 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
   Buoyancy lift is shared across pontoons, so tune the coefficient for the whole body, not per pontoon.
 - Real resolutions from the small offscreen viewport: `ue gpu --res 2560x1440`, `ue perf --res 2560x1440` (screen
   percentage to that pixel count) and `ue shot --res 1920x1080` (in PIE, or a windowed editor).
+- A short event or an animated material: `ue shot --frames 6 --interval 0.1 [--after "<console command>"]` makes
+  one contact sheet labelled with times; in PIE the game slows while capturing, so a 0.1 s flash still lands.
 - Try something in the running game without editing the level: `ue spawn /Game/X/BP_Buoy --pie --at x,y,z`.
 - Many props at once: `ue scatter /Game/X/SM_Rock --count 30 --area 1200,-300,2000 --spacing 250 --scale 0.7,1.4
   --align` (one undo step; same `--seed`, same layout).
@@ -178,7 +182,7 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
 - `ue log [--level Warning|Display|Log] [--cat X] [--grep re]`: only entries that are new since the last
   `ue log`, de-duplicated. Run it after anything that might have warned or errored.
 - `ue log --since pie` reads from the last PIE start (`--since 2m` for the last two minutes); `--grep` searches
-  every line (Log and up) unless `--level` is given, and keeps the lines in order.
+  every line (Verbose included) unless `--level` is given, and keeps the lines in order.
 - `ue log --summary`: the whole session's warnings and errors grouped by message shape with counts. Noise the
   project knows about goes in Config/Tether/log-ignore.json (`ue log --ignore '^LogX: known thing' --why ...`);
   ue log, pie and ci then hide it and say how many lines they hid (`--all` shows them). Add an entry only for
@@ -195,7 +199,8 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
   link errors name each file's (and each missing function's header's) last writer.
 - `ue lint --cpp` before a package or a restart: file-private names (anonymous namespace, `static`) defined in two
   .cpp files of a module collide in a unity build, and reflected types whose names differ only by prefix
-  (`FSDThing` / `ASDThing`) fail UHT.
+  (`FSDThing` / `ASDThing`) fail UHT. It also lists BindKey keys an input mapping context maps (the mapping
+  consumes the key, so the BindKey never fires).
 - Function bodies and new UFUNCTIONs go live. Call a new UFUNCTION through reflection:
   `unreal.get_default_object(unreal.MyLib).call_method('NewFunc')`.
 - New UPROPERTYs, class layout or constructor defaults, Build.cs/.uproject changes, or Blueprint/Python
@@ -205,8 +210,10 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
   Exit code 3 from `ue build` means a restart is required. Batch reflection changes so you restart once.
 - Before closing, `--restart` compiles the game target (UBT, ~20 s): if that fails, the editor stays open
   for everyone sharing it. `ue build --check` runs the same check alone, with the editor up and Live
-  Coding untouched (it misses editor-only modules and WITH_EDITOR code). Do not compile the editor
-  target with UBT `-Module=` while the editor runs: Live Coding breaks until a restart.
+  Coding untouched (it misses editor-only modules and WITH_EDITOR code). `ue build --check --files
+  Source/X/A.cpp Source/X/B.h` compiles just those files (a header: the .cpp files that include it), with no
+  link and no lease needed, for checking your own work while another session holds the editor. Do not
+  compile the editor target with UBT `-Module=` while the editor runs: Live Coding breaks until a restart.
 
 ## C# changes (UnrealSharp projects: a `Script/` folder plus `Plugins/UnrealSharp`)
 - Edit `.cs` files under `Script/`, then run `ue build`. It hot-reloads in ~1 s, covering function
@@ -357,6 +364,9 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
 - To see how values change during play (instead of adding print nodes): `ue pie watch player.Health
   BP_Enemy_C_1.State BP_Enemy_C_1 --seconds 10` (an actor alone = its location; `-f steps.txt` plays a step file
   while watching). Prints each value's range, path or changes with times; the full samples go to a CSV.
+- Soaks and repeated console commands: `ue pie loop "SD.SpawnWave 4; wait 30; stat unit; wait 30" --seconds 600
+  --every 60 "memreport"` runs them from the game thread on a fixed schedule (no drift, no round trip each);
+  it waits for the end, and a killed `ue` leaves it running (`ue pie loop status` / `stop`).
 - Which input actions exist and what keys reach them: `ue input` (by mapping context, and who adds each context);
   in PIE it also says which contexts are active. `ue input Move` shows matching actions only. A `pie do` step
   that presses an action no active context maps still works, but warns: a player could not do it.
@@ -365,6 +375,8 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
   game's input, so Escape opens its pause menu instead of stopping PIE; `--slate` sends to the focused widget).
   One tap is one press, as on a keyboard. A legacy BindKey chord on a key an Enhanced Input mapping also uses
   (Ctrl+G with G mapped) usually never fires: the mapping consumes the key; `ue ui key` warns when it sees that.
+  Several buttons with one label (nine ON/OFF toggles): `ue ui click "OFF" --near "DEBUG HUD: DIRECTOR"` (the one
+  closest to that text) or `ue ui click "OFF#3"` (the third, in `ue ui`'s order).
   In `ue pie do`: `click <label>`, `expect-ui <text>`,
   `ui-gone <text>`. Clicks are real mouse clicks at the widget, so whatever is on top receives them; labels are
   stable, refs (b12) change between reads. Canvas-drawn HUD text is not a widget: check it with `ue shot`.

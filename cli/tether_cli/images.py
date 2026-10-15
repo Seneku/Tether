@@ -1,4 +1,5 @@
 """Pictures: viewport and PIE screenshots, ue look contact sheets, PNG read/write/diff."""
+import contextlib
 import json
 import os
 import re
@@ -71,13 +72,13 @@ def client_window_shot(ctx, client):
     return base64.b64decode(value["data"])
 
 
-def highres_shot(ctx, spec, pie):
+def highres_shot(ctx, spec, pie, wait=15):
     """PNG bytes from HighResShot: "1" for the viewport's size, "2560x1440" for a real resolution (the scene is
     rendered at that size even though the offscreen viewport is small)."""
     start = log_end(ctx.project)
     ctx.tether("console", command=f"HighResShot {spec}", pie=pie)
     saved = re.compile(r"High resolution screenshot saved as (.+\.png)")
-    deadline = time.time() + 15
+    deadline = time.time() + wait
     while time.time() < deadline:
         flush_editor_log(ctx)
         with open(log_path(ctx.project), "rb") as f:
@@ -90,7 +91,7 @@ def highres_shot(ctx, spec, pie):
             os.remove(path)  # it moves to Saved/Tether/shots (or -o) below
             return raw
         time.sleep(0.2)
-    raise CliError("the screenshot did not appear within 15 s (ue log --level Warning)", 4)
+    raise CliError(f"the screenshot did not appear within {wait} s (ue log --level Warning)", 4)
 
 
 SNAPSHOT_BOX = re.compile(r"^(\s*)(\w+).*?\[pos=(-?\d+),(-?\d+) size=(\d+),(\d+)\]")
@@ -293,7 +294,7 @@ def capture_viewport(ctx, pose, annotations=None, ui=False):
 GLYPHS = {"0": "111101101101111", "1": "010110010010111", "2": "111001111100111", "3": "111001111001111",
           "4": "101101111001001", "5": "111100111001111", "6": "111100111101111", "7": "111001010010010",
           "8": "111101111101111", "9": "111101111001111", ".": "000000000000010", "-": "000000111000000",
-          "s": "000011010001110"}
+          "s": "000011010001110", "+": "000010111010000"}
 
 
 def draw_text(rgb, width, x, y, text, colour=(255, 255, 255), shadow=(0, 0, 0)):
@@ -383,11 +384,92 @@ def cmd_look(ctx, args):
     return 0
 
 
+GAME_TIME = ("w = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_game_world()\n"
+             "{set}print(unreal.GameplayStatics.get_time_seconds(w), unreal.GameplayStatics.get_global_time_dilation(w))")
+SET_DILATION = "unreal.GameplayStatics.set_global_time_dilation(w, {})\n"
+SHOT_SECONDS = 1.5  # what one capture costs in real time, with margin: HighResShot, then the file in the log
+
+
+def game_clock(ctx, dilation=None):
+    """(game seconds, time dilation) of the PIE world, setting the dilation first when given."""
+    out = ctx.tether("py", code=GAME_TIME.format(set=SET_DILATION.format(dilation) if dilation else ""))
+    now, dil = str(out).strip().splitlines()[-1].split()
+    return float(now), float(dil)
+
+
+def shot_frames(ctx, args, pie, capture):
+    """`ue shot --frames N --interval S [--after CMD]`: N captures S seconds apart in one contact sheet. With a game
+    world (PIE or Simulate) the game is slowed while capturing, so intervals shorter than a capture still land,
+    and each tile is labelled with its game time; in the editor the interval is real time."""
+    n, interval = args.frames, args.interval
+    if not 2 <= n <= 36:
+        raise CliError("--frames takes 2 to 36")
+    if interval <= 0:
+        raise CliError("--interval is in seconds and above 0")
+    tiles, stamps = [], []
+    if pie:
+        _, before = game_clock(ctx)
+        dilation = max(0.01, min(1.0, interval / SHOT_SECONDS))
+        game_clock(ctx, dilation)
+        try:
+            if args.after:
+                ctx.tether("console", command=args.after, pie=True)
+            start = None
+            for i in range(n):
+                now, _ = game_clock(ctx)
+                start = now if start is None else start
+                wait = (start + i * interval - now) / dilation
+                if wait > 0:
+                    time.sleep(wait)
+                    now, _ = game_clock(ctx)
+                stamps.append(now - start)
+                tiles.append(png_read(capture()))
+        finally:
+            with contextlib.suppress(CliError):
+                game_clock(ctx, before)
+        note = (f"game slowed to {dilation:.2g}x while capturing (time dilation {before:g} put back)" if dilation < 1
+                else "game at its own speed")
+    else:
+        if args.after:
+            ctx.tether("console", command=args.after, pie=False)
+        start = time.time()
+        for i in range(n):
+            wait = start + i * interval - time.time()
+            if wait > 0:
+                time.sleep(wait)
+            stamps.append(time.time() - start)
+            tiles.append(png_read(capture()))
+        late = [s - i * interval for i, s in enumerate(stamps) if s - i * interval > interval / 2]
+        note = "real time (no game world to slow: PIE or Simulate for game time)" + (
+            f"; {len(late)} capture(s) came late, a capture takes longer than --interval" if late else "")
+    columns = n if n <= 3 else 2 if n == 4 else 3 if n <= 9 else 4
+    tile_width = 480 if n <= 6 else 360
+    width, height, rgb = contact_sheet(tiles, columns=columns, tile_width=tile_width)
+    rgb, gap = bytearray(rgb), 4
+    w0, h0 = tiles[0][0], tiles[0][1]
+    th = max(1, round(h0 * tile_width / w0))
+    for i, stamp in enumerate(stamps):
+        x0, y0 = gap + (i % columns) * (tile_width + gap), gap + (i // columns) * (th + gap)
+        draw_text(rgb, width, x0 + 6, y0 + 6, f"+{stamp:.2f}s")
+    if args.output:
+        path = os.path.abspath(args.output)
+    else:
+        folder = os.path.join(state_dir(ctx.project), "shots")
+        os.makedirs(folder, exist_ok=True)
+        path = os.path.join(folder, time.strftime("frames-%Y%m%d-%H%M%S.png"))
+    png_write(path, width, height, bytes(rgb))
+    print(f"{path}  {width}x{height}  {n} frames, {columns} per row")
+    print(f"at +" + ", +".join(f"{s:.2f}" for s in stamps) + f" s; {note}")
+    ctx.data = {"path": path, "times": stamps}
+    return 0
+
+
 def shot_args(**given):
     """Arguments for calling cmd_shot from other commands: every option at its default, then `given`. A unit
     test keeps these in step with the `shot` parser, so a new option cannot break the callers again."""
     defaults = dict(actor=None, at=None, look_at=None, rot=None, annotate=False, grid_z=0, ui=False, hud=False,
-                    output=None, baseline=None, compare=None, tolerance=0.5, threshold=32, res=None)
+                    output=None, baseline=None, compare=None, tolerance=0.5, threshold=32, res=None, frames=None,
+                    interval=0.25, after=None)
     import argparse
     return argparse.Namespace(**dict(defaults, **given))
 
@@ -417,6 +499,15 @@ def cmd_shot(ctx, args):
         parse_res(args.res)
         if getattr(args, "hud", False) or args.annotate or args.ui:
             raise CliError("--res renders the scene alone (HighResShot): not with --hud, --annotate or --ui")
+    if getattr(args, "frames", None):
+        if getattr(args, "res", None) or args.baseline or args.compare:
+            raise CliError("--frames makes a contact sheet: not with --res, --baseline or --compare")
+        if pie and not simulate:
+            capture = lambda: pie_screenshot(ctx, args, pose)
+        else:
+            annotations = dict(ANNOTATIONS, gridHeight=args.grid_z) if args.annotate else NO_ANNOTATIONS
+            capture = lambda: capture_viewport(ctx, pose, annotations, args.ui)
+        return shot_frames(ctx, args, pie, capture)
     if pie and not simulate:  # Play: CaptureViewport would render the editor world, so HighResShot the game
         if getattr(args, "res", None) and (args.actor or args.at or args.look_at or args.rot):
             raise CliError("--res with a spectator pose in PIE is not supported; take the player's view, or Simulate")
@@ -434,12 +525,24 @@ def cmd_shot(ctx, args):
         ctx.tether("py", code=place.format(loc["x"], loc["y"], loc["z"], rot["pitch"], rot["yaw"], rot["roll"]))
         try:
             time.sleep(0.2)
-            raw = highres_shot(ctx, args.res, pie=False)
+            try:
+                raw = highres_shot(ctx, args.res, pie=False, wait=8)
+            except CliError as exc:
+                if exc.code != 4 or launch.get("headless"):
+                    raise
+                # a windowed editor whose level viewport has not drawn since a map load (or is behind another
+                # tab) takes no HighResShot until it redraws: invalidate it and try once more
+                ctx.tether("py", code="unreal.EditorLevelLibrary.editor_invalidate_viewports()")
+                time.sleep(0.5)
+                raw = highres_shot(ctx, args.res, pie=False)
         except CliError as exc:
             if exc.code != 4:
                 raise
-            raise CliError("--res in the editor needs a level viewport to HighResShot, and a headless editor has none: "
-                           "take it during PIE (ue pie start), or in a windowed editor", 4) from None
+            if launch.get("headless"):
+                raise CliError("--res in the editor needs a level viewport to HighResShot, and a headless editor has "
+                               "none: take it during PIE (ue pie start), or in a windowed editor", 4) from None
+            raise CliError("--res: the level viewport took no HighResShot, even after a redraw. Is the editor "
+                           "minimised, or the viewport tab hidden behind another? (ue log --level Warning)", 4) from None
         finally:
             ctx.tether("py", code=place.format(*camera[0], *camera[1]))
     else:  # editor, or Simulate-In-Editor, whose simulation the level viewport shows

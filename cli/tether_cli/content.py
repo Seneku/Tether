@@ -6,7 +6,7 @@ import re
 import sys
 import time
 
-from .core import CliError, filter_log, human_bytes, log_end, log_path, state_dir
+from .core import CliError, editor_live, filter_log, human_bytes, log_end, log_path, state_dir
 from .share import file_owner
 from .transport import py_json
 from .calls import flush_editor_log
@@ -457,6 +457,84 @@ def reflected_name_clashes(project):
     return {name: sorted(types) for name, types in seen.items() if len({t for t, _ in types}) > 1}
 
 
+BIND_KEY = re.compile(r"\bBindKey\s*\(\s*(FInputChord\s*\(\s*)?EKeys::(\w+)([^;]*)")
+CHORD_FLAGS = ("Shift", "Ctrl", "Alt", "Cmd")  # FInputChord(Key, bShift, bCtrl, bAlt, bCmd)
+
+
+def bind_keys(project):
+    """[(chord, key, file, line)] of the legacy BindKey calls in the project's C++ ("Ctrl+G", "G", ...)."""
+    found = []
+    for root in project_code_roots(project):
+        for dirpath, dirs, files in os.walk(root):
+            dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+            for f in files:
+                if not f.endswith((".cpp", ".h")):
+                    continue
+                path = os.path.join(dirpath, f)
+                with open(path, encoding="utf-8", errors="replace") as fh:
+                    text = fh.read()
+                for m in BIND_KEY.finditer(text):
+                    key, mods = m.group(2), []
+                    if m.group(1):  # the chord's flags follow the key, up to its closing parenthesis
+                        flags = re.sub(r"/\*.*?\*/", "", m.group(3).split(")")[0]).split(",")[1:]
+                        mods = [name for name, flag in zip(CHORD_FLAGS, flags) if flag.strip() == "true"]
+                    found.append(("+".join(mods + [key]), key, os.path.relpath(path, os.path.dirname(project)),
+                                  text.count("\n", 0, m.start()) + 1))
+    return found
+
+
+IMC_KEYS = """import json
+out = {}
+for a in unreal.AssetRegistryHelpers.get_asset_registry().get_assets_by_class(
+        unreal.TopLevelAssetPath("/Script/EnhancedInput", "InputMappingContext"), True):
+    path = str(a.package_name)
+    if not path.startswith("/Game"):
+        continue
+    imc = unreal.load_asset(path)
+    try:
+        maps = imc.get_editor_property("default_key_mappings").get_editor_property("mappings")
+    except Exception:
+        maps = imc.get_editor_property("mappings")
+    for m in maps:
+        text = m.get_editor_property("key").export_text()
+        key = text.split('KeyName="')[1].split('"')[0] if 'KeyName="' in text else text.strip('()"')
+        action = m.get_editor_property("action")
+        out.setdefault(key, []).append([path.rsplit("/", 1)[-1], action.get_name() if action else ""])
+print(json.dumps(out))
+"""
+
+
+def imc_keys_offline(project, keys):
+    """{key: [(IMC, "")]} for the given key names found in the name tables of the project's input mapping contexts
+    (assets named IMC_*), read from the .uasset files: no editor needed, no action names."""
+    out = {}
+    content = os.path.join(os.path.dirname(project), "Content")
+    for dirpath, dirs, files in os.walk(content) if os.path.isdir(content) else []:
+        dirs[:] = [d for d in dirs if d not in SKIP_DIRS and d != "__ExternalActors__"]
+        for f in files:
+            if not (f.startswith("IMC_") and f.endswith(".uasset")):
+                continue
+            with open(os.path.join(dirpath, f), "rb") as fh:
+                data = fh.read(1 << 20)
+            for key in keys:  # an FName in the name map: int32 length (with the terminator), the chars, NUL
+                if (len(key) + 1).to_bytes(4, "little") + key.encode() + b"\0" in data:
+                    out.setdefault(key, []).append((f[:-7], ""))
+    return out
+
+
+def bind_key_conflicts(ctx, binds):
+    """[(chord, file, line, [(IMC, action)])] for BindKey keys that an input mapping context also maps, and
+    where the mappings came from ("the editor" or "the IMC_ .uasset files")."""
+    keys = {key for _, key, _, _ in binds}
+    if not keys:
+        return [], None
+    if editor_live(ctx.project):
+        mapped, source = py_json(ctx, IMC_KEYS), "the editor's input mapping contexts"
+    else:
+        mapped, source = imc_keys_offline(ctx.project, keys), "the IMC_ .uasset files (start the editor for all of them)"
+    return [(chord, path, line, mapped[key]) for chord, key, path, line in binds if key in mapped], source
+
+
 def lint_cpp(ctx, args):
     """`ue lint --cpp`: unity-build collisions and UHT name clashes waiting to happen, from the sources alone."""
     clashes = reflected_name_clashes(ctx.project)
@@ -473,8 +551,18 @@ def lint_cpp(ctx, args):
         print(f"{module}:")
         for name, files in sorted(clashes.items())[: args.limit]:
             print(f"  {name}: {', '.join(files[:4])}" + (f" +{len(files) - 4} more" if len(files) > 4 else ""))
-    ctx.data = {"collisions": found, "reflected_clashes": clashes}
-    return 1 if (total or clashes) and args.strict else 0
+    binds = bind_keys(ctx.project)
+    conflicts, source = bind_key_conflicts(ctx, binds)
+    if binds:
+        print(f"{len(conflicts)} of {len(binds)} BindKey key(s) also mapped by an input mapping context (from {source})"
+              + (": Enhanced Input consumes a mapped key, so the BindKey never fires; use another key, or an "
+                 "input action" if conflicts else ""))
+        for chord, path, line, where in conflicts[: args.limit]:
+            maps = ", ".join(sorted({f"{imc}" + (f" ({action})" if action else "") for imc, action in where}))
+            print(f"  {chord} at {path.replace(os.sep, '/')}:{line}: mapped in {maps}")
+    ctx.data = {"collisions": found, "reflected_clashes": clashes,
+                "bind_key_conflicts": [{"chord": c, "file": p, "line": n, "mapped": w} for c, p, n, w in conflicts]}
+    return 1 if (total or clashes or conflicts) and args.strict else 0
 
 
 def file_owner_label(ctx, rel):

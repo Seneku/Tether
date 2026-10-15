@@ -2754,3 +2754,142 @@ class ShooterDominationRound(unittest.TestCase):
 
     def test_process_tree_has_this_process(self):
         self.assertIn(os.getpid(), ue.process_tree(os.getpid()))
+
+
+def ui_node(role, label, ref, pos="0,0", size="100,20", flags=()):
+    return {"role": role, "label": label, "ref": ref, "pos": pos, "size": size, "flags": list(flags), "indent": 2}
+
+
+class ShooterDominationRound2(unittest.TestCase):
+    """0.24: ShooterDomination's 0.23 notes."""
+
+    def setUp(self):
+        self.project = Project()
+
+    def tearDown(self):
+        self.project.close()
+
+    def test_find_ui_by_index_and_near(self):
+        nodes = [ui_node("text", "DEBUG HUD: DIRECTOR", "t1", pos="10,100"), ui_node("button", "OFF", "b1", pos="300,10"),
+                 ui_node("button", "OFF", "b2", pos="300,100"), ui_node("text", "DEBUG HUD: WAVES", "t2", pos="10,200"),
+                 ui_node("button", "OFF", "b3", pos="300,200"), ui_node("button", "OFF", "b0", size="0,0")]
+        self.assertEqual(ue.find_ui(nodes, "OFF#2")["ref"], "b2")
+        self.assertEqual(ue.find_ui(nodes, "OFF", near="debug hud: waves")["ref"], "b3")
+        self.assertEqual(ue.find_ui(nodes, "OFF", near="DIRECTOR")["ref"], "b2")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(ue.find_ui(nodes, "OFF")["ref"], "b1")  # the first visible one, with a note
+        self.assertIn("3 widgets match 'OFF'", out.getvalue())
+        with self.assertRaises(ue.CliError):
+            ue.find_ui(nodes, "OFF#4")
+        with self.assertRaises(ue.CliError):
+            ue.find_ui(nodes, "OFF", near="nowhere")
+        literal = nodes + [ui_node("button", "Slot#2", "s2")]
+        self.assertEqual(ue.find_ui(literal, "Slot#2")["ref"], "s2")  # a label that really has a #
+
+    def test_edit_ledger_keeps_every_writer(self):
+        p = self.project.uproject
+        path = self.project.write("Docs/Notes.md", "x")
+        ue.record_edit(p, path, "menu", now=time.time() - 60)
+        ue.record_edit(p, path, "depth", now=time.time())
+        record = ue.read_json(ue.edits_path(p))[ue.edit_key(p, path)]
+        self.assertEqual(record["session"], "depth")
+        self.assertEqual(sorted(record["by"]), ["depth", "menu"])
+
+    def test_post_edit_hook_records_any_project_file(self):
+        notes = self.project.write("Docs/Notes.md", "x")
+        self.assertIsNone(ue.hook_post_edit({"tool_input": {"file_path": notes}, "session_id": "abcdef1234"}))
+        record = ue.read_json(ue.edits_path(self.project.uproject))[ue.edit_key(self.project.uproject, notes)]
+        self.assertEqual(record["session"], "abcdef12")
+
+    def test_sort_changes_mine_shared_theirs_unknown(self):
+        p = self.project.uproject
+        now = time.time()
+        files = {name: self.project.write(f"Source/Game/{name}.cpp", "x", mtime=now - 30)
+                 for name in ("Mine", "Shared", "Theirs", "Saved")}
+        ue.record_edit(p, files["Mine"], "me", now=now - 20)
+        ue.record_edit(p, files["Shared"], "menu", now=now - 25)
+        ue.record_edit(p, files["Shared"], "me", now=now - 20)
+        ue.record_edit(p, files["Theirs"], "menu", now=now - 20)
+        rows = [(" M", f) for f in files.values()] + [(" D", os.path.join(self.project.root, "Gone.cpp"))]
+        with unittest.mock.patch.dict(os.environ, {"UE_SESSION": "me"}):
+            split = ue.sort_changes(p, rows, committed=lambda path: now - 3600)
+            self.assertEqual(split["mine"], [files["Mine"]])
+            self.assertEqual(split["shared"], [(files["Shared"], ["menu"])])
+            self.assertEqual(split["theirs"], [(files["Theirs"], "menu")])
+            self.assertEqual(len(split["unknown"]), 2)  # written by something else, and a deletion
+            # menu's write came before the last commit: no longer shared
+            self.assertEqual(ue.sort_changes(p, rows, committed=lambda path: now - 22)["mine"],
+                             [files["Mine"], files["Shared"]])
+
+    def test_bind_keys_and_imc_name_tables(self):
+        self.project.write("Source/Game/PC.cpp", "InputComponent->BindKey(FInputChord(EKeys::G, /*Shift*/false, "
+                                                 "/*Ctrl*/true, false, false), IE_Pressed, this, &A::Menu);\n"
+                                                 "InputComponent->BindKey(EKeys::F5, IE_Pressed, this, &A::Save);\n")
+        binds = ue.bind_keys(self.project.uproject)
+        self.assertEqual([(c, k, line) for c, k, _, line in binds], [("Ctrl+G", "G", 1), ("F5", "F5", 2)])
+        imc = os.path.join(self.project.root, "Content", "Input", "IMC_Default.uasset")
+        os.makedirs(os.path.dirname(imc))
+        with open(imc, "wb") as f:
+            f.write(b"\x00junk" + (2).to_bytes(4, "little") + b"G\x00" + b"more")
+        self.assertEqual(ue.imc_keys_offline(self.project.uproject, {"G", "F5"}), {"G": [("IMC_Default", "")]})
+        ctx = types.SimpleNamespace(project=self.project.uproject)
+        with unittest.mock.patch.object(ue.content, "editor_live", return_value=None):
+            conflicts, source = ue.bind_key_conflicts(ctx, binds)
+        self.assertEqual([c[0] for c in conflicts], ["Ctrl+G"])
+        self.assertIn("IMC_", source)
+
+    def test_log_grep_reaches_verbose(self):
+        lines = [stamped("LogSD: Verbose: took the jump pad"), stamped("LogSD: Warning: low ammo")]
+        self.assertEqual(len(ue.filter_log(lines, "VeryVerbose", pattern="jump pad")), 1)
+        self.assertEqual(len(ue.filter_log(lines, "Log", pattern="jump pad")), 0)
+
+    def test_hud_gone_note(self):
+        p = self.project.uproject
+        ue.write_json(os.path.join(ue.state_dir(p), "last-hud.json"), {"widgets": 34, "map": "/Game/Spire", "time": 1})
+        ctx = FakeCtx("0")
+        ctx.project, ctx.beacon = p, {"map": "/Game/Spire", "pie": True}
+        self.assertIn("had 34", ue.hud_gone_note(ctx))
+        ctx.reply = "12"
+        self.assertIsNone(ue.hud_gone_note(ctx))
+        ctx.reply, ctx.beacon = "0", {"map": "/Game/Title"}
+        self.assertIsNone(ue.hud_gone_note(ctx))  # another map: nothing to compare with
+
+    def test_pie_loop_arguments(self):
+        parser = ue.build_parser()
+        args = parser.parse_args(["pie", "loop", "stat unit; wait 5", "--seconds", "30", "--every", "10", "memreport"])
+        ctx = FakeCtx(json.dumps({"running": False, "ended": "done", "ran": 7, "passes": 6, "every_runs": 3,
+                                  "elapsed": 30, "seconds": 30, "errors": []}))
+        ctx.project, ctx.beacon = self.project.uproject, {"pie": True}
+        self.project.write("Saved/Logs/Game.log", "")
+        out = io.StringIO()
+        with unittest.mock.patch.object(ue.playtest, "flush_editor_log"), contextlib.redirect_stdout(out):
+            self.assertEqual(ue.pie_command(ctx, args), 0)
+        tool, kwargs = ctx.calls[0]
+        self.assertEqual((tool, kwargs["script"], kwargs["seconds"], kwargs["every"], kwargs["every_script"]),
+                         ("pie_loop", "stat unit; wait 5", 30, 10.0, "memreport"))
+        self.assertIn("7 command(s), 6 pass(es), the --every commands 3 time(s)", out.getvalue())
+        with self.assertRaises(ue.CliError):
+            ue.pie_command(ctx, parser.parse_args(["pie", "watch", "player.Health", "--every", "x"]))
+
+    def test_shot_frames_contact_sheet(self):
+        tile = ue.png_bytes(8, 4, bytes([200, 40, 40] * 32))
+        ctx = FakeCtx()
+        ctx.project = self.project.uproject
+        args = ue.shot_args(frames=3, interval=0.01, output=os.path.join(self.project.root, "sheet.png"))
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(ue.shot_frames(ctx, args, False, lambda: tile), 0)
+        with open(args.output, "rb") as f:
+            width, height, _, _ = ue.png_read(f.read())
+        self.assertEqual(len(ctx.data["times"]), 3)
+        self.assertGreater(width, height)
+        with self.assertRaises(ue.CliError):
+            ue.shot_frames(ctx, ue.shot_args(frames=1), False, lambda: tile)
+
+    def test_build_files_go_with_check(self):
+        parser = ue.build_parser()
+        self.assertEqual(parser.parse_args(["build", "--check", "--files", "Source/A.cpp", "Source/B.h"]).files,
+                         ["Source/A.cpp", "Source/B.h"])
+        with self.assertRaises(ue.CliError):
+            ue.cmd_build(types.SimpleNamespace(project=self.project.uproject),
+                         parser.parse_args(["build", "--files", "Source/A.cpp"]))

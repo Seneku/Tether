@@ -278,22 +278,32 @@ def game_target(project):
     return name if os.path.isfile(os.path.join(os.path.dirname(project), "Source", f"{name}.Target.cs")) else None
 
 
-def compile_check(ctx, limit):
+def compile_check(ctx, limit, files=None):
     """Compile the game target with UBT: its intermediates and binaries are separate from the editor's, so a
     running editor and its Live Coding are left alone (a `-Module=` build of the editor target breaks Live Coding
-    until a restart). Misses WITH_EDITOR code and editor-only modules. None when there is no game target."""
+    until a restart). Misses WITH_EDITOR code and editor-only modules. None when there is no game target.
+    With files: only those translation units (a header: the .cpp files that include it), compiled, not linked."""
     target = game_target(ctx.project)
     if not target:
         return None
-    return ubt_build(ctx, argparse.Namespace(target=target, config="Development", limit=limit), check=True)
+    extra = []
+    for path in files or []:
+        full = os.path.abspath(path)
+        if not os.path.isfile(full):
+            raise CliError(f"no such file: {path}")
+        extra.append(f"-SingleFile={full}")
+    if any(p.lower().endswith((".h", ".hpp", ".inl")) for p in files or []):
+        extra.append("-SingleFileBuildDependents")  # a header compiles through the files that include it
+    return ubt_build(ctx, argparse.Namespace(target=target, config="Development", limit=limit), check=True, extra=extra)
 
 
-def ubt_build(ctx, args, check=False):
+def ubt_build(ctx, args, check=False, extra=None):
     root = engine_root(ctx.project)
     name = os.path.splitext(os.path.basename(ctx.project))[0]
     target = args.target or f"{name}Editor"
     started = time.time()
-    extra = []
+    single = bool(extra)
+    extra = list(extra or [])
     if check or not live_editors(ctx.project):
         # UBT refuses to build while any editor on this engine has Live Coding on: its mutex is named after the
         # shared UnrealEditor.exe, so another project's editor blocks this one. The check protects a running
@@ -305,7 +315,8 @@ def ubt_build(ctx, args, check=False):
     errors, warnings, hidden = compact_diagnostics(lines, os.path.dirname(ctx.project))
     result = next((l.strip() for l in reversed(lines) if l.strip().startswith("Result:")), f"exit {proc.returncode}")
     ok = proc.returncode == 0
-    print(("compile check, game target " if check else "ubt ")
+    print(("compile check, game target " if check else "ubt ") + (f"({len([e for e in extra if e.startswith('-SingleFile=')])} "
+                                                                  "file(s), no link) " if single else "")
           + f"{target}: {'OK' if ok else 'FAILED'} in {time.time() - started:.1f}s ({result})"
           + (f", {hidden} engine-header warnings hidden" if hidden else ""))
     if any("Unable to build while Live Coding is active" in l for l in lines):

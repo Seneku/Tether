@@ -827,6 +827,82 @@ sys._tether_watch = _WATCH
 _WATCH_LIMIT = 20000
 
 
+# `ue pie loop`: console commands and waits run from the editor tick, on a schedule kept from its start, so a
+# soak neither drifts nor pays a CLI round trip per command. Stashed on sys like _WATCH.
+_LOOP = getattr(sys, "_tether_loop", None) or {"handle": None}
+sys._tether_loop = _LOOP
+
+
+def _loop_steps(script):
+    """[("wait", seconds) | ("cmd", text)] from 'cmd; wait 5; cmd' (also newlines)."""
+    steps = []
+    for part in (p.strip() for p in script.replace("\n", ";").split(";")):
+        if not part:
+            continue
+        verb, _, rest = part.partition(" ")
+        if verb.lower() == "wait":
+            try:
+                steps.append(("wait", max(0.0, float(rest))))
+            except ValueError:
+                raise RuntimeError(f"'{part}': wait takes seconds, e.g. wait 2.5")
+        else:
+            steps.append(("cmd", part))
+    return steps
+
+
+def _loop_run(state, command):
+    try:
+        if _networked(state["world"]):  # as pie_step's exec: RPCs need the player's own console
+            _queue_command(state["world"], command)
+        else:
+            unreal.SystemLibrary.execute_console_command(state["world"], command)
+        state["ran"] += 1
+    except Exception as exc:
+        state["errors"] = (state["errors"] + [f"{command}: {exc}"])[-20:]
+
+
+def _loop_end(state, why):
+    state["ended"] = why
+    state["elapsed"] = round(time.time() - state["start"], 2)
+    if state.get("handle") is not None:
+        unreal.unregister_slate_post_tick_callback(state["handle"])
+        state["handle"] = None
+
+
+def _loop_tick(_delta):
+    state = _LOOP
+    game = _game_world()
+    if game is None or game != state.get("world"):
+        return _loop_end(state, "PIE ended")
+    now = time.time()
+    if state["end"] and now >= state["end"]:
+        return _loop_end(state, "done")
+    while state["every_steps"] and now >= state["every_at"]:
+        for _, command in state["every_steps"]:
+            _loop_run(state, command)
+        state["every_runs"] += 1
+        state["every_at"] += state["every"]  # from the schedule, not from now: no drift
+    budget = 64  # commands per tick at most, should a script without waits come round again
+    while budget and now >= state["next"]:
+        kind, value = state["steps"][state["index"]]
+        if kind == "wait":
+            state["next"] += value
+        else:
+            _loop_run(state, value)
+            budget -= 1
+        state["index"] += 1
+        if state["index"] >= len(state["steps"]):
+            state["index"], state["passes"] = 0, state["passes"] + 1
+            if not state["end"]:  # no --seconds: one pass
+                return _loop_end(state, "done")
+
+
+def _loop_status(state):
+    return {k: state.get(k) for k in ("ran", "passes", "every_runs", "errors", "ended")} | {
+        "elapsed": state.get("elapsed") if state.get("ended") else round(time.time() - state.get("start", time.time()), 2),
+        "seconds": state.get("seconds"), "running": state.get("handle") is not None}
+
+
 def _watch_value(value):
     """A sampled value as JSON: numbers and booleans as is, vectors/rotators as lists, the rest as short text."""
     if isinstance(value, (bool, int, float)) or value is None:
@@ -7648,6 +7724,51 @@ class TetherCore(_Base):
         running = state.get("handle") is not None
         return (f"watching {len(state['specs'])} value(s), {len(state['samples'])} sample(s)" if running
                 else "no watch running")
+
+    @_tool
+    @staticmethod
+    def pie_loop(action: str = "status", script: str = "", seconds: float = 0.0, every: float = 0.0,
+                 every_script: str = "", token: str = "") -> str:
+        """Console commands and waits run from the editor tick in the PIE game ('stat unit; wait 5; ...'), looped
+        for `seconds` on a schedule kept from the start (no drift), with `every_script` every `every` seconds.
+
+        Args:
+            action: 'start' (replaces a running loop), 'stop', or 'status'.
+            script: With start: commands and 'wait N' separated by ';' or newlines.
+            seconds: With start: how long to loop (0: one pass through the script).
+            every: With start: seconds between runs of every_script (0: none).
+            every_script: With start: commands (';'-separated) run every `every` seconds.
+            token: Session token from Saved/Tether/editors/<pid>.token (needed with start).
+
+        Returns:
+            JSON {ran, passes, every_runs, errors, ended, elapsed, seconds, running}.
+        """
+        state = _LOOP
+        if action == "start":
+            _authorize(token)
+            if state.get("handle") is not None:
+                _loop_end(state, "replaced")
+            game = _game_world()
+            if game is None:
+                raise RuntimeError("PIE is not running")
+            steps = _loop_steps(script)
+            if not steps:
+                raise RuntimeError("give commands, e.g. 'stat unit; wait 5; SD.Spawn 10; wait 30'")
+            if seconds > 0 and not any(k == "wait" and v > 0 for k, v in steps):
+                raise RuntimeError("a looped script needs a wait (it would run every frame): add 'wait N'")
+            every_steps = [s for s in _loop_steps(every_script) if s[0] == "cmd"] if every > 0 else []
+            now = time.time()
+            state.clear()
+            state.update(handle=None, world=game, steps=steps, index=0, next=now, start=now, seconds=seconds,
+                         end=now + seconds if seconds > 0 else 0, every=every, every_steps=every_steps,
+                         every_at=now + every, ran=0, passes=0, every_runs=0, errors=[], ended=None)
+            state["handle"] = unreal.register_slate_post_tick_callback(_loop_tick)
+            return json.dumps(_loop_status(state))
+        if "start" not in state:
+            raise RuntimeError("no loop was started (ue pie loop)")
+        if action == "stop" and state.get("handle") is not None:
+            _loop_end(state, "stopped")
+        return json.dumps(_loop_status(state))
 
     @_tool
     @staticmethod

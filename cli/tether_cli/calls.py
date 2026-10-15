@@ -730,7 +730,7 @@ def cmd_log(ctx, args):
     if args.ignore:
         return add_log_ignore(ctx, args.ignore, args.why)
     flush_editor_log(ctx)
-    level = args.level or ("Log" if args.grep else "Warning")  # a search looks at every line unless told otherwise
+    level = args.level or ("VeryVerbose" if args.grep else "Warning")  # a search looks at every line unless told otherwise
     if args.summary:
         lines = read_new_log(ctx.project, from_start=True, advance=False)
         lines = since_pie(lines) if args.since == "pie" else lines

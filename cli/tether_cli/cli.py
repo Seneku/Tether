@@ -9,7 +9,7 @@ import time
 from .core import CliError, crash_summary, find_project, recent_crash, stall_report
 from .transport import Ctx
 from .share import LEASE_MINUTES, record_activity
-from .editor import cmd_build, cmd_close, cmd_crash, cmd_lease, cmd_open, cmd_status, cmd_who
+from .editor import cmd_build, cmd_close, cmd_crash, cmd_git, cmd_lease, cmd_open, cmd_status, cmd_who
 from .calls import (
     cmd_actors, cmd_ai, cmd_anim, cmd_api, cmd_asset, cmd_call, cmd_changes, cmd_config, cmd_delete, cmd_drop,
     cmd_duplicate, cmd_exec, cmd_find, cmd_log, cmd_mat, cmd_mv, cmd_nav, cmd_new, cmd_props, cmd_py, cmd_refs,
@@ -101,6 +101,8 @@ def build_parser():
     s.add_argument("--check", action="store_true", help="compile the game target only (UBT): the running editor and its "
                                                          "Live Coding are untouched; misses editor-only code")
     s.add_argument("--no-check", action="store_true", help="with --restart: skip the compile check made before closing")
+    s.add_argument("--files", nargs="+", metavar="PATH", help="with --check: compile only these files (a header: the "
+                                                              ".cpp files including it), no link; needs no lease")
     s.add_argument("--include-others", action="store_true", help="Live Coding: compile even files another session edited "
                                                                  "in the last 15 min (it refuses otherwise)")
     s.add_argument("--ignore-lease", action="store_true", help="with --restart: go ahead although another session holds "
@@ -129,7 +131,12 @@ def build_parser():
     s = add("who", cmd_who, "sessions that used this editor recently, their last command, the lease, who started PIE")
     s.add_argument("--minutes", type=float, default=15, help="how far back (15)")
     s.add_argument("--as", dest="name", help="a name for this session that the others see (kept)")
-    s = add("tools", cmd_tools, "list toolsets, a toolset's tools, or one tool's schema (toolset:tool)")
+    s = add("git", cmd_git, "stage --mine: stage the changed files this session wrote last (the edit hook's record), "
+                            "naming those another session also wrote")
+    s.add_argument("action", choices=["stage"])
+    s.add_argument("--mine", action="store_true", help="the files this session wrote (Edit/Write) since nobody else did")
+    s.add_argument("--dry-run", action="store_true", help="list, stage nothing")
+    s = add("tools",cmd_tools, "list toolsets, a toolset's tools, or one tool's schema (toolset:tool)")
     s.add_argument("query", nargs="?")
     s.add_argument("-v", "--verbose", action="store_true")
     s = add("call", cmd_call, "invoke <toolset>.<tool> k=v ... (required blanks auto-filled)")
@@ -338,7 +345,12 @@ def build_parser():
     s.add_argument("--compare", metavar="NAME", help="re-shoot a baseline's camera and report what changed (exit 1)")
     s.add_argument("--tolerance", type=float, default=0.5, help="with --compare: changed pixels allowed, %% (0.5)")
     s.add_argument("--threshold", type=int, default=32, help="with --compare: per-channel difference that counts (32)")
-    s = add("look", cmd_look, "render an asset (mesh, Blueprint, material) from six angles into one contact sheet")
+    s.add_argument("--frames", type=int, metavar="N", help="N captures --interval apart in one contact sheet; in PIE the "
+                                                           "game slows while capturing, so short intervals land")
+    s.add_argument("--interval", type=float, default=0.25, help="with --frames: seconds between captures, game time in "
+                                                                "PIE (0.25)")
+    s.add_argument("--after", metavar="CMD", help="with --frames: a console command run just before the first capture")
+    s = add("look",cmd_look, "render an asset (mesh, Blueprint, material) from six angles into one contact sheet")
     s.add_argument("asset", help="/Game/... asset path")
     s.add_argument("--tile", type=int, default=400, help="width of each view in pixels (400)")
     s.add_argument("--distance", type=float, default=2.6, help="camera distance in bounds radii (2.6)")
@@ -362,15 +374,17 @@ def build_parser():
     s.add_argument("--ignore", metavar="REGEX", help="add known noise to Config/Tether/log-ignore.json (hidden from log, pie, ci)")
     s.add_argument("--why", help="with --ignore: a note kept next to the pattern")
     s.add_argument("--all", action="store_true", help="show known noise too")
-    s.add_argument("--level", help="Error, Warning (default), Display, Log, Verbose; with --grep: Log")
+    s.add_argument("--level", help="Error, Warning (default), Display, Log, Verbose, VeryVerbose; with --grep: every level")
     s.add_argument("--cat", help="only this log category")
     s.add_argument("--grep", help="regex filter")
-    s = add("pie", pie_command, "Play-In-Editor: start | stop | status | run <script> | do <steps...> | watch <props> | record")
-    s.add_argument("action", choices=["start", "stop", "status", "run", "do", "target", "watch", "record"])
+    s = add("pie", pie_command, "Play-In-Editor: start | stop | status | run <script> | do <steps...> | watch <props> | record "
+                                "| loop <commands>")
+    s.add_argument("action", choices=["start", "stop", "status", "run", "do", "target", "watch", "record", "loop"])
     s.add_argument("-c", "--code", help="with run: inline Python instead of a script file")
     s.add_argument("script", nargs="*", help="with run: Python file to execute in the PIE world, in a fresh namespace "
                                              "(tether.world() / tether.player(): the targeted PIE world and its pawn); "
                                              "with do: steps; "
+                                             "with loop: \"cmd; wait N; cmd\", or status/stop; "
                                              "with watch: Actor.Property ... (an actor alone: its location)")
     s.add_argument("-f", "--file", help="with do: a file of steps, one per line (# comments); with watch: run it while sampling")
     s.add_argument("--keep-going", action="store_true", help="with do: run every step even after a failure")
@@ -388,7 +402,8 @@ def build_parser():
     s.add_argument("--seconds", type=float, help="with run: how long to wait for expectations (5); with watch: how long "
                                                  "to sample (10, or until the -f steps finish); with record: stop "
                                                  "after this long (default: when PIE stops)")
-    s.add_argument("--every", type=float, default=0.1, help="with watch: seconds between samples (0.1)")
+    s.add_argument("--every", nargs="+", metavar="N", help="with watch: seconds between samples (0.1); with loop: "
+                                                          "--every N \"cmd; cmd\" runs those every N seconds")
     s.add_argument("--watch", nargs="+", metavar="ACTOR.PROP", help="with do: watch these while the steps run "
                                                                    "(or a `# watch:` line in the step file)")
     s.add_argument("--baseline", metavar="NAME", help="with watch/do: record the watched values as a baseline "
@@ -502,11 +517,13 @@ def build_parser():
     s.add_argument("section", nargs="?", help="Maps, Rendering, Engine/General, or Container/Category/Section")
     s.add_argument("rest", nargs="*", metavar="regex|Name=value", help="a regex to filter settings, or values to set")
     s = add("ui", cmd_ui, "the game's on-screen UI in PIE (Slate + UMG); click | type | key to interact")
-    s.add_argument("action", nargs="?", help="click <label|ref>, type <textbox> <text>, key <Key>, or a regex filter")
+    s.add_argument("action", nargs="?", help="click <label|LABEL#N|ref>, type <textbox> <text>, key <Key>, or a regex filter")
     s.add_argument("rest", nargs="*")
     s.add_argument("--all", action="store_true", help="also images and zero-size widgets")
     s.add_argument("--submit", action="store_true", help="with type: press Enter afterwards")
     s.add_argument("--event", action="store_true", help="with click: fire a UMG button's OnClicked instead of clicking")
+    s.add_argument("--near", metavar="TEXT", help="with click/type: of several same-label widgets, the one closest to "
+                                                  "a widget showing TEXT")
     s.add_argument("--slate", action="store_true", help="with key: send it to the focused Slate widget instead of the game's "
                                                         "input (the editor's shortcuts then apply: Escape stops PIE)")
     s = add("anim", cmd_anim, "animation state in PIE: anim BP, montage, curves, its variables, movement; "

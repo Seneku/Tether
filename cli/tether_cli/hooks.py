@@ -161,23 +161,23 @@ def hook_post_edit(payload):
     """After an edit to project C++/C#/build files, one line on how to get it into the running editor."""
     tool_input = payload.get("tool_input") or {}
     path = tool_input.get("file_path") or ""
-    if not path.lower().endswith((".h", ".hpp", ".cpp", ".inl", ".cs", ".uproject", ".uplugin")):
-        return None
-    project = project_of(path)
+    project = project_of(path) if path else None
     if not project:
         return None
     root = os.path.normcase(os.path.dirname(project)) + os.sep
     full = os.path.normcase(os.path.abspath(path))
     rel = full[len(root):].lower() if full.startswith(root) else ""  # normcase lowercases only on Windows
-    if not (rel.startswith(("source" + os.sep, "plugins" + os.sep, "script" + os.sep)) or rel.endswith(".uproject")):
-        return None
-    if rel.endswith(".cs") and not rel.endswith((".build.cs", ".target.cs")) and not csharp_layout(project):
-        return None
-    if payload.get("session_id"):  # who wrote it, for build errors in a project several sessions share
+    if rel and payload.get("session_id"):  # who wrote it: build errors and `ue git stage --mine` in a shared project
         try:
             record_edit(project, path, payload["session_id"][:8])
         except OSError:
             pass
+    if not path.lower().endswith((".h", ".hpp", ".cpp", ".inl", ".cs", ".uproject", ".uplugin")):
+        return None
+    if not (rel.startswith(("source" + os.sep, "plugins" + os.sep, "script" + os.sep)) or rel.endswith(".uproject")):
+        return None
+    if rel.endswith(".cs") and not rel.endswith((".build.cs", ".target.cs")) and not csharp_layout(project):
+        return None
     route, reason = classify_edit(path, tool_input)
     live = editor_live(project)
     advice = EDIT_ADVICE[route] if live else "editor not running: `ue build` compiles with UBT"

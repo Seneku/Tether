@@ -5,14 +5,15 @@ import time
 
 from .core import (
     CliError, blocking_dialogs, crash_reports, crash_summary, describe_crash, editor_beacons, editor_executable, forget_beacon,
-    editor_process,
+    editor_live, editor_process,
     decline_package_restore, editor_label, engine_root, filter_log, live_coding_available, live_editors, logged_dialogs,
-    pick_port, pid_alive, port_open, read_json, read_new_log, recent_crash, startup_dialogs, state_dir, subprocess,
-    write_json,
+    pick_port, pid_alive, port_open, read_json, read_new_log, recent_crash, run_git, startup_dialogs, state_dir,
+    subprocess, write_json,
 )
 from .share import (
-    ACTIVE_MINUTES, active_lease, ago, check_shared, describe_lease, duration, lease_note, others_edits, pie_owner,
-    recent_sessions, release_lease, session_id, session_label, session_names, set_session_name, take_lease,
+    ACTIVE_MINUTES, active_lease, ago, changed_files, check_shared, describe_lease, duration, lease_note, others_edits,
+    pie_owner, recent_sessions, release_lease, session_id, session_label, session_names, set_session_name,
+    sort_changes, take_lease,
 )
 from .build import (
     classify_changes, compile_check, csharp_changes, csharp_layout, csharp_reload_build, editor_env, live_coding_build,
@@ -78,8 +79,10 @@ OTHERS_MINUTES = 15  # another session's edits this recent may be half-written
 
 
 def cmd_build(ctx, args):
+    if getattr(args, "files", None) and not args.check:
+        raise CliError("--files goes with --check: ue build --check --files Source/X/A.cpp Source/X/B.h")
     if args.check:
-        code = compile_check(ctx, args.limit)
+        code = compile_check(ctx, args.limit, getattr(args, "files", None))
         if code is None:
             raise CliError("no game target (Source/<Project>.Target.cs) to check; `ue build` compiles the editor")
         print("  (the game target: editor-only modules and WITH_EDITOR code are not compiled; the editor is untouched)")
@@ -179,7 +182,18 @@ def reopen_editor(ctx, args, how):
                                             render=how.get("render", False), sound=how.get("sound", False),
                                             unattended=how.get("unattended"), no_build=True,
                                             limit=args.limit, wait=600, no_wait=False))
-    print(f"restart cycle: {time.time() - how.get('started', time.time()):.1f}s total")
+    # The last line says whether the editor is really back: a restart that ends on the build's line with no
+    # editor running sends every session sharing it looking for what happened
+    back = editor_live(ctx.project)
+    total = time.time() - how.get("started", time.time())
+    if code or not back:
+        crash = recent_crash(ctx.project, how.get("started", time.time()) - 5)
+        errors = filter_log(read_new_log(ctx.project, from_start=True), level="Error")[-3:]
+        raise CliError(f"the editor did not come back after the build ({total:.0f}s): "
+                       + (f"it crashed: {crash_summary(crash, 140)} (ue crash)" if crash else
+                          "; ".join(errors) if errors else "no crash report and no errors in its log")
+                       + ". `ue open` starts it again", 2)
+    print(f"restart cycle: {total:.1f}s total; editor pid {back.get('pid')} ready on {back.get('map')}")
     return code
 
 
@@ -383,6 +397,45 @@ def cmd_who(ctx, args):
         print(f"pie: {owner}")
     if me not in names:
         print(f"you are {me}; `ue who --as NAME` gives this session a name the others see")
+    return 0
+
+
+def cmd_git(ctx, args):
+    """`ue git stage --mine [--dry-run]`: stage the changed files this session last wrote (the post-edit hook's
+    record), and name the rest: the ones another session also wrote since their last commit, the ones another
+    session wrote, and the ones nothing recorded (editor saves, scripts, shell commands)."""
+    if not args.mine:
+        raise CliError("ue git stage --mine [--dry-run]: stage what this session wrote (plain git for the rest)")
+    rows = changed_files(ctx.project)
+    if rows is None:
+        raise CliError("the project is not in a git repository")
+    split = sort_changes(ctx.project, rows)
+    ctx.data = split
+    rel = lambda p: os.path.relpath(p, os.path.dirname(ctx.project)).replace("\\", "/")
+    me = session_label(ctx.project, session_id())
+    if split["mine"] and not args.dry_run:
+        for i in range(0, len(split["mine"]), 50):
+            run_git(ctx.project, "add", "--", *split["mine"][i:i + 50])
+    verb = "would stage" if args.dry_run else "staged"
+    print(f"{verb} {len(split['mine'])} file(s) {me} wrote last" + (":" if split["mine"] else ""))
+    for path in split["mine"]:
+        print(f"  {rel(path)}")
+    if split["shared"]:
+        print(f"not staged, also written by another session since the last commit ({len(split['shared'])}): "
+              "`git add -p PATH` takes your hunks only")
+        for path, others in split["shared"]:
+            print(f"  {rel(path)}  (also {', '.join(session_label(ctx.project, s) for s in others)})")
+    if split["theirs"]:
+        print(f"not staged, another session wrote them last ({len(split['theirs'])}):")
+        for path, sid in split["theirs"][: args.limit]:
+            print(f"  {rel(path)}  ({session_label(ctx.project, sid)})")
+    if split["unknown"]:
+        print(f"not staged, no edit record ({len(split['unknown'])}): editor saves, scripts, shell commands; "
+              "stage the ones you made yourself")
+        for path in split["unknown"][: args.limit]:
+            print(f"  {rel(path)}")
+        if len(split["unknown"]) > args.limit:
+            print(f"  ... +{len(split['unknown']) - args.limit} more (--limit)")
     return 0
 
 

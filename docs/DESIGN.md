@@ -575,7 +575,8 @@ project's `Plugins/`, and updates hot-reload without restarting the editor.
   - `ue hook session-start` adds two lines of editor state.
   - `ue hook post-edit` (PostToolUse) classifies a C++/C# edit: Live Coding, a new UFUNCTION (live via
     reflection, wrappers stale), maybe-restart (header edits), restart (reflected declarations,
-    `Build.cs`), or C# reload.
+    `Build.cs`), or C# reload. It also records which session wrote any file in the project (`edits.json`):
+    build errors name a file's last writer, and `ue git stage --mine` stages only this session's files.
   - `ue hook stop` asks once (`stop_hook_active` guard) for `ue build` when code changed in the last
     hour since the last green build and the editor is running.
   - Each hook costs ~190 ms, mostly Python start-up; the CLI imports sockets and subprocess lazily

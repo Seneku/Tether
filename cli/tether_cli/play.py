@@ -267,28 +267,65 @@ def ui_lines(nodes, show_all=False, match=None):
     return out
 
 
-def find_ui(nodes, target, roles=INTERACTIVE):
-    """A game widget by ref or by label (exact, then contained; case-insensitive)."""
+def visible(node):
+    return not (node["size"].startswith("0,") or node["size"].endswith(",0"))
+
+
+def centre(node):
+    b = box(node)
+    return (b[0] + b[2] / 2, b[1] + b[3] / 2) if b else None
+
+
+def find_ui(nodes, target, roles=INTERACTIVE, near=None):
+    """A game widget by ref or by label (exact, then contained; case-insensitive). Of several with that label:
+    "LABEL#N" takes the Nth in `ue ui`'s order, `near` the one closest to a widget showing that text."""
+    nth = None
     if re.fullmatch(r"[a-z]+\d+", target):
         hit = [n for n in nodes if n["ref"] == target]
     else:
         key = target.lower()
         pool = [n for n in nodes if n["role"] in roles]
+        numbered = re.fullmatch(r"(.+?)#(\d+)", target)
+        if numbered and not any(n["label"].lower() == key for n in pool):  # "OFF#11", unless a label really is that
+            key, nth = numbered.group(1).lower(), int(numbered.group(2))
         hit = [n for n in pool if n["label"].lower() == key] or [n for n in pool if key in n["label"].lower()]
+        if len(hit) > 1:
+            hit = [n for n in hit if visible(n)] or hit
     if not hit:
         names = ", ".join(f'{n["role"]} "{n["label"]}"' for n in nodes if n["role"] in roles and n["label"])[:300]
         raise CliError(f"no {'/'.join(sorted(roles)) if len(roles) < 4 else 'interactive'} widget '{target}' on screen"
                        + (f" (have: {names})" if names else ""))
-    if "disabled" in hit[0]["flags"]:
-        raise CliError(f'{hit[0]["role"]} "{hit[0]["label"]}" is disabled')
-    return hit[0]
+    if nth is not None:
+        if not 1 <= nth <= len(hit):
+            raise CliError(f"'{target}': {len(hit)} widget(s) match '{key}', numbered 1 to {len(hit)}")
+        node = hit[nth - 1]
+    elif near:
+        anchors = [n for n in nodes if near.lower() in n["label"].lower() and visible(n) and n not in hit]
+        anchors = [a for a in anchors if a["label"].lower() == near.lower()] or anchors
+        if not anchors:
+            raise CliError(f"--near: no widget showing '{near}' on screen (ue ui {near.split()[0]} lists them)")
+        spots = [centre(a) for a in anchors if centre(a)]
+        dist = lambda n: min(((c[0] - s[0]) ** 2 + (c[1] - s[1]) ** 2 for s in spots), default=1e18) \
+            if (c := centre(n)) else 1e18
+        node = min(hit, key=dist)
+    else:
+        node = hit[0]
+        if len(hit) > 1:
+            print(f"note: {len(hit)} widgets match '{target}'; took the first. Pick one with '{target}#N' "
+                  f"(1 to {len(hit)}, in ue ui's order) or --near \"<text beside it>\"")
+    if "disabled" in node["flags"]:
+        raise CliError(f'{node["role"]} "{node["label"]}" is disabled')
+    return node
 
 
-def ui_click(ctx, target, event=False):
+def ui_click(ctx, target, event=False, near=None):
     nodes, slate = ui_nodes(ctx)
     if not slate or event:  # a UMG button's OnClicked, fired directly
+        if near or re.search(r"#\d+$", target):
+            raise CliError("--near and LABEL#N pick a widget by where it is on screen, which needs Epic's "
+                           "SlateInspectorToolset (ue init enables it), not --event")
         return ctx.tether("umg", click=target)
-    node = find_ui(nodes, target)
+    node = find_ui(nodes, target, near=near)
     # Epic's Click synthesizes a mouse press at the widget's centre on screen: whatever window is on top there gets
     # it. Check first, and for a UMG button fire its OnClicked instead of clicking another window.
     cover = covering_window(getattr(ctx, "ui_all", nodes), node)
@@ -346,7 +383,7 @@ def cmd_ui(ctx, args):
         raise CliError("PIE is not running (ue pie start)")
     action = args.action or "show"
     if action == "click":
-        print(ui_click(ctx, " ".join(args.rest), getattr(args, "event", False)))
+        print(ui_click(ctx, " ".join(args.rest), getattr(args, "event", False), getattr(args, "near", None)))
         return 0
     if action == "at":  # what is on screen at a point, every window included
         try:
@@ -385,7 +422,7 @@ def cmd_ui(ctx, args):
             return 0
         if len(args.rest) < 2:
             raise CliError("ue ui type <textbox label|ref> <text> [--submit]")
-        node = find_ui(nodes, args.rest[0], {"textbox", "spinbox"})
+        node = find_ui(nodes, args.rest[0], {"textbox", "spinbox"}, getattr(args, "near", None))
         mcp_tool(ctx, "SlateInspectorToolset", "Type", {"ref": node["ref"], "text": " ".join(args.rest[1:]),
                                                         "submit": args.submit})
         print(f'typed into textbox "{node["label"]}"')
@@ -1647,6 +1684,41 @@ def shot_check(ctx, rest):
     return ok, f"{share * 100:.2f}% changed (tolerance {tolerance:g}%)" + ("" if ok else f"; diff in red: {diff_path}")
 
 
+HUD_COUNT = ("w = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_game_world()\n"
+             "print(len([u for u in unreal.WidgetLibrary.get_all_widgets_of_class(w, unreal.UserWidget, True) "
+             "if u.is_in_viewport()]) if w else -1)")
+
+
+def hud_count(ctx):
+    """How many UMG widgets the PIE game has in its viewport (-1: no game world)."""
+    out = ctx.tether("py", code=HUD_COUNT)
+    return int(str(out).strip().splitlines()[-1])
+
+
+def record_hud(ctx):
+    """`pie stop`: how many UMG widgets the game showed, for the next `pie start` to compare with."""
+    with contextlib.suppress(CliError, ValueError, IndexError):
+        count = hud_count(ctx)
+        if count >= 0:
+            write_json(os.path.join(state_dir(ctx.project), "last-hud.json"),
+                       {"widgets": count, "map": (ctx.beacon or {}).get("map"), "time": time.time()})
+
+
+def hud_gone_note(ctx):
+    """A note when the last PIE run on this map had UMG widgets on screen and this one has none after warmup."""
+    last = read_json(os.path.join(state_dir(ctx.project), "last-hud.json")) or {}
+    if not last.get("widgets") or last.get("map") != (ctx.beacon or {}).get("map"):
+        return None
+    try:
+        if hud_count(ctx) != 0:
+            return None
+    except (CliError, ValueError, IndexError):
+        return None
+    return (f"no UMG widgets on screen after the warmup, where the last PIE run on this map had {last['widgets']} "
+            f"({time.strftime('%H:%M', time.localtime(last['time']))}): a HUD created later, or one that failed "
+            "to appear (ue ui; ue log --since pie --level Warning). A stop and start often brings it back")
+
+
 def cmd_pie(ctx, args):
     """Play-In-Editor through Epic's EditorAppToolset, reporting only what went wrong."""
     if args.action == "run":
@@ -1659,6 +1731,8 @@ def cmd_pie(ctx, args):
         return 0
     if args.action == "stop":
         clear_pie_start(ctx.project)
+        if (ctx.beacon or {}).get("pie"):
+            record_hud(ctx)
     if args.action == "start":  # every PIE start goes through here, run/do/watch/record included
         check_shared(ctx.project, "pie start", destructive=False)
         if not (ctx.beacon or {}).get("pie"):  # PIE already running stays whoever's it was
@@ -1752,6 +1826,10 @@ def cmd_pie(ctx, args):
                 print(note)
     elif args.action == "start" and getattr(args, "clients", None):
         print(pie_net(ctx, "status"))
+    if args.action == "start" and not args.simulate:
+        note = hud_gone_note(ctx)
+        if note:
+            print("note: " + note)
     if layout_note:
         print("WARNING: " + layout_note)
     return 0

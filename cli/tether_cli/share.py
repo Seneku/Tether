@@ -186,10 +186,14 @@ def edit_key(project, path):
 
 
 def record_edit(project, path, sid, now=None):
-    """The post-edit hook notes which session last wrote a project source file (Claude Code's Edit/Write)."""
+    """The post-edit hook notes which session last wrote a project file (Claude Code's Edit/Write), and when each
+    session that wrote it last did ("by")."""
     edits = read_json(edits_path(project)) or {}
     now = time.time() if now is None else now
-    edits[edit_key(project, path)] = {"session": sid, "time": round(now, 1)}
+    key = edit_key(project, path)
+    by = {s: t for s, t in ((edits.get(key) or {}).get("by") or {}).items() if t > now - 7 * 86400}
+    by[sid] = round(now, 1)
+    edits[key] = {"session": sid, "time": round(now, 1), "by": by}
     edits = {k: v for k, v in edits.items() if v.get("time", 0) > now - 7 * 86400}  # a week is plenty
     write_json(edits_path(project), edits)
 
@@ -208,6 +212,57 @@ def others_edits(project, paths, minutes=10, now=None):
         if record and record["session"] != me and record["time"] >= mtime - 2 and now - record["time"] <= minutes * 60:
             found.append((path, record["session"], record["time"]))
     return found
+
+
+def changed_files(project):
+    """[(status, absolute path)] of the uncommitted files under the project folder (git status), or None outside git."""
+    top = (run_git(project, "rev-parse", "--show-toplevel", check=False) or "").strip()
+    if not top:
+        return None
+    out = run_git(project, "status", "--porcelain=v1", "-z", "--untracked-files=all", "--", ".") or ""
+    entries, rows = out.split("\0"), []
+    i = 0
+    while i < len(entries):
+        entry = entries[i]
+        i += 1
+        if len(entry) < 4:
+            continue
+        status, rel = entry[:2], entry[3:]
+        if status[0] in "RC":  # a rename: the old name follows
+            i += 1
+        rows.append((status, os.path.normpath(os.path.join(top, rel))))
+    return rows
+
+
+def sort_changes(project, rows, now=None, committed=None):
+    """Split changed files by who last wrote them, from the post-edit hook's record: {"mine": [...], "shared":
+    [(path, [other sessions])], "theirs": [(path, session)], "unknown": [...]}. Shared: mine, but another session
+    also wrote it since its last commit (`committed(path)` gives that time; 0 when never committed)."""
+    now = time.time() if now is None else now
+    edits, me = read_json(edits_path(project)) or {}, session_id()
+    if committed is None:
+        def committed(path):
+            out = run_git(project, "log", "-1", "--format=%ct", "--", path, check=False)
+            return float(out.strip()) if out and out.strip() else 0.0
+    out = {"mine": [], "shared": [], "theirs": [], "unknown": []}
+    for status, path in rows:
+        record = edits.get(edit_key(project, path))
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            mtime = None  # deleted: no edit tool deletes, so the record cannot say who
+        if not record or mtime is None or record["time"] < mtime - 2:
+            out["unknown"].append(path)
+        elif record["session"] != me:
+            out["theirs"].append((path, record["session"]))
+        else:
+            since = committed(path)
+            others = sorted(s for s, t in (record.get("by") or {}).items() if s != me and t > since)
+            if others:
+                out["shared"].append((path, others))
+            else:
+                out["mine"].append(path)
+    return out
 
 
 def file_owner(project, path, now=None):

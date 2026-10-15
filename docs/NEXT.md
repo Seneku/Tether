@@ -51,6 +51,13 @@ still open; the gotchas behind them are in the skill.
 every frame): taps are now sequenced in whole frames, one press each, chords included, with a warning for a chord
 on a key an Enhanced Input mapping uses.
 
+**Done in 0.24.0** (ShooterDomination's 0.23 notes): 92-100 and 102. `build --restart` checks the editor came back
+and says why not; `shot --res` redraws a windowed editor's viewport and retries; `build --check --files`;
+`ui click --near` / `LABEL#N`; `log --grep` includes Verbose; `shot --frames` (time dilation in PIE);
+`pie loop` (a game-thread runner in the plugin: the plugin copy needs updating); `git stage --mine` (the edit hook
+now records every project file and each session that wrote it); BindKey/IMC conflicts in `lint --cpp`; the
+missing-HUD note on `pie start`. 101 (`ui key --viewport`) is still open.
+
 ---
 
 ## Priority 1: asked for, or blocking real work
