@@ -2886,6 +2886,17 @@ class ShooterDominationRound2(unittest.TestCase):
         with self.assertRaises(ue.CliError):
             ue.shot_frames(ctx, ue.shot_args(frames=1), False, lambda: tile)
 
+    def test_python_only_plugin_update(self):
+        uplugin = '{\n\t"Version": %d,\n\t"VersionName": "0.%d.0",\n\t"Modules": []\n}\n'
+        for side, version in (("src", 33), ("dst", 32)):
+            self.project.write(f"{side}/Tether.uplugin", uplugin % (version, version))
+            self.project.write(f"{side}/Content/Python/tether/toolsets.py", f"V = {version}\n")
+            self.project.write(f"{side}/Source/Tether/Tether.cpp", "// same\n")
+        src, dst = (os.path.join(self.project.root, d) for d in ("src", "dst"))
+        self.assertTrue(ue.python_only_update(src, dst))
+        self.project.write("src/Source/Tether/Tether.cpp", "// changed\n")
+        self.assertFalse(ue.python_only_update(src, dst))
+
     def test_build_files_go_with_check(self):
         parser = ue.build_parser()
         self.assertEqual(parser.parse_args(["build", "--check", "--files", "Source/A.cpp", "Source/B.h"]).files,

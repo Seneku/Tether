@@ -58,6 +58,9 @@ and says why not; `shot --res` redraws a windowed editor's viewport and retries;
 now records every project file and each session that wrote it); BindKey/IMC conflicts in `lint --cpp`; the
 missing-HUD note on `pie start`. 101 (`ui key --viewport`) is still open.
 
+**Done in 0.24.1**: `ue init` updating a plugin copy whose only changes are its Python (and version fields) says
+`ue reload` instead of `ue build --restart`.
+
 ---
 
 ## Priority 1: asked for, or blocking real work

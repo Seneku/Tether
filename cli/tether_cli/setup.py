@@ -191,6 +191,34 @@ def tree_digest(root):
     return digest.hexdigest()
 
 
+def tree_files(root):
+    """{relative path: contents with LF line ends} of a plugin folder's sources (build output ignored)."""
+    out = {}
+    for here, dirs, files in os.walk(root):
+        dirs[:] = [d for d in dirs if d not in COPY_SKIP]
+        for name in files:
+            with open(os.path.join(here, name), "rb") as f:
+                out[os.path.relpath(os.path.join(here, name), root).replace("\\", "/")] = f.read().replace(b"\r\n", b"\n")
+    return out
+
+
+VERSION_LINE = re.compile(rb'^\s*"(?:Version|VersionName)"\s*:.*$', re.M)
+
+
+def python_only_update(source, target):
+    """True when a plugin copy differs from its source only in Content/Python and the .uplugin's version fields:
+    the editor picks that up with `ue reload`, no restart."""
+    old, new = tree_files(target), tree_files(source)
+    for path in set(old) | set(new):
+        if old.get(path) == new.get(path) or path.startswith("Content/Python/"):
+            continue
+        if path.endswith(".uplugin") and path in old and path in new and \
+                VERSION_LINE.sub(b"", old[path]) == VERSION_LINE.sub(b"", new[path]):
+            continue
+        return False
+    return True
+
+
 SKILL_REL = os.path.join(".claude", "skills", "unreal-tether", "SKILL.md")
 SKILL_PARTS = re.compile(r"\A(---.*?\n---[ \t]*\n.*?^# [^\n]*\n\s*\n)(.*?\n)(\s*\n.*)\Z", re.S | re.M)
 
@@ -309,11 +337,17 @@ def cmd_init(ctx, args):
         out = json.dumps(data, indent="\t") + (newline if text.endswith(("\n", "\r\n")) else "")
         with open(project, "w", encoding="utf-8", newline="") as f:
             f.write(out.replace("\n", newline) if newline != "\n" else out)
+    # Python only (the usual Tether update): the running editor reloads it without a restart
+    python_only = not changes and all(exists and python_only_update(source, target)
+                                      for name, source, target, exists in copies)
     for name, source, target, exists in copies:
         if exists:
             shutil.rmtree(target)
         shutil.copytree(source, target, ignore=shutil.ignore_patterns(*COPY_SKIP))
     running = editor_live(project)
+    if running and python_only:
+        print("next: `ue reload` (only the plugin's Python changed: no restart needed)")
+        return 0
     print("next: " + ("`ue build --restart` to load the plugins" if running else "`ue open --headless`")
           + ("; TetherUnrealSharp is C++, so the first build compiles it" if any(n == "TetherUnrealSharp" for n, *_ in copies) else ""))
     return 0
