@@ -14,6 +14,7 @@ from .core import (
     read_json, read_new_log, short, state_dir, unwrap,
 )
 from .fabfiles import fab_origin, listing_url, project_fab
+from .share import lease_note
 from .transport import catalog, fill_args, py_json, resolve_toolset, schema, signature
 
 
@@ -117,8 +118,9 @@ def cmd_py(ctx, args):
         code = sys.stdin.read()
     else:
         code = " ".join(args.code)
-    for note in py_pitfalls(code):
-        print(f"note: {note}", file=sys.stderr)
+    for note in py_pitfalls(code) + [lease_note(ctx.project)]:
+        if note:
+            print(note if note.startswith("note: ") else f"note: {note}", file=sys.stderr)
     start = log_end(ctx.project)
     try:
         out = ctx.tether("py", code=code.lstrip("﻿"))  # PowerShell pipes a BOM
@@ -400,12 +402,36 @@ def cmd_mat(ctx, args):
 def cmd_nav(ctx, args):
     """Navmesh state, path queries and actors off the navmesh."""
     action = args.action or "status"
-    if action == "path" and len(args.points) != 2:
-        raise CliError("ue nav path <start> <end>   (x,y,z or actor)")
-    start, end = (args.points + ["", ""])[:2] if action == "path" else ("", "")
+    if action == "path":
+        if not args.points or len(args.points) % 2:
+            raise CliError("ue nav path <start> <end> [<start> <end> ...]   (x,y,z or actor; --m for metres)")
+        points = [metres_to_cm(p) if args.m else p for p in args.points]
+        extra = {"agent": args.agent or ""}
+        failed = 0
+        for start, end in zip(points[::2], points[1::2]):
+            try:
+                result = ctx.tether("nav", action="path", start=start, end=end, match="", pie=args.pie,
+                                    limit=args.limit, **extra)
+            except CliError as exc:
+                if '"agent"' not in str(exc) or args.agent:
+                    raise
+                extra = {}  # a project's plugin from before 0.20 has no agent parameter
+                result = ctx.tether("nav", action="path", start=start, end=end, match="", pie=args.pie,
+                                    limit=args.limit)
+            failed += not str(result).startswith("path:")
+            print(f"{start} -> {end}: {result}" if len(points) > 2 else result)
+        return 1 if failed else 0
     match = " ".join(args.points) if action == "check" else ""
-    print(ctx.tether("nav", action=action, start=start, end=end, match=match, pie=args.pie, limit=args.limit))
+    print(ctx.tether("nav", action=action, start="", end="", match=match, pie=args.pie, limit=args.limit, agent=""))
     return 0
+
+
+def metres_to_cm(point):
+    """'12,-4,18' in metres as Unreal centimetres; an actor name stays as it is."""
+    try:
+        return ",".join(f"{float(v) * 100:g}" for v in point.split(","))
+    except ValueError:
+        return point
 
 
 def cmd_config(ctx, args):
@@ -486,6 +512,9 @@ def cmd_actors(ctx, args):
 
 
 def cmd_exec(ctx, args):
+    note = lease_note(ctx.project)
+    if note:
+        print(note, file=sys.stderr)
     start = log_end(ctx.project)
     command = " ".join(args.command)
     world = ctx.tether("console", command=command, pie=args.pie)

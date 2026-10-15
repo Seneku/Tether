@@ -14,7 +14,8 @@ from .core import (
 )
 from .transport import catalog, py_json, resolve_toolset
 from .build import csharp_changes, csharp_layout, csharp_reload_build
-from .calls import flush_editor_log, scoped_cvars
+from .calls import flush_editor_log, metres_to_cm, scoped_cvars
+from .share import check_shared, clear_pie_start, record_pie_start
 from .images import (
     cmd_shot, contact_sheet, draw_text, crop_pixels, hud_screenshot, image_diff, png_read, png_write, shot_args, widget_capture,
 )
@@ -391,7 +392,7 @@ NAV_SETTLE = 30  # seconds `world build nav` waits for tiles after the build fla
 
 
 def nav_status(ctx, args):
-    return str(ctx.tether("nav", action="status", start="", end="", match="", pie=False, limit=args.limit))
+    return str(ctx.tether("nav", action="status", start="", end="", match="", pie=False, limit=args.limit, agent=""))
 
 
 def nav_incomplete(status):
@@ -399,14 +400,126 @@ def nav_incomplete(status):
     return "NO navmesh inside" in status or "being built right now" in status
 
 
+NAV_LOCK_WAIT = 180  # seconds `world build nav` retries a build the navigation system refused as locked
+NAV_LOCKED = re.compile(r"Navigation NOT building because navigation build is locked \(flags: 0x([0-9a-fA-F]+)\)")
+NAV_LOCKS = {  # ENavigationBuildLock
+    0x2: "NoUpdateInEditor",
+    0x4: "NoUpdateInPIE (PIE is running)",
+    0x8: "InitialLock (levels still streaming in)",
+    0x10: "Custom (a game or plugin lock)",
+    0x20: "AsyncLoadLock (the editor waits until assets have finished compiling after a load, then 2 s and 16 frames)",
+}
+
+
+def nav_lock(lines):
+    """Why the navigation system refused the build, from its log warning, or None if it did not."""
+    flags = None
+    for line in lines:
+        m = NAV_LOCKED.search(line)
+        if m:
+            flags = int(m.group(1), 16)
+    if flags is None:
+        return None
+    if not flags & ~0x2:  # the editor flag alone does not stop an explicit build: there was nothing to build
+        return "nothing to build (no navigation bounds registered)"
+    return ", ".join(name for bit, name in NAV_LOCKS.items() if flags & bit and bit != 0x2) or f"flags 0x{flags:x}"
+
+
+def rebuild_navigation(ctx, wait):
+    """RebuildNavigation, retried while the navigation system refuses it as locked (which it says only in the log)."""
+    started, said = time.time(), False
+    while True:
+        start = log_end(ctx.project)
+        ctx.tether("console", command="RebuildNavigation")
+        time.sleep(0.5)
+        why = nav_lock(new_log_lines(ctx, start))
+        if why is None:
+            return
+        if why.startswith("nothing to build"):
+            raise CliError(f"navigation not built: {why}; a NavMeshBoundsVolume over the floor makes one")
+        if time.time() - started > wait:
+            raise CliError(f"navigation build still locked after {wait:g}s: {why}", 4)
+        if not said:
+            print(f"navigation build locked: {why}; retrying until it clears (up to {wait:g}s)")
+            said = True
+        time.sleep(3)
+
+
+PROBE = """
+import json
+w = tether.world() if {pie!r} else unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_editor_world()
+nav = unreal.NavigationSystemV1
+types = [getattr(unreal.ObjectTypeQuery, f"OBJECT_TYPE_QUERY{{i}}") for i in range(1, 7)]
+out = []
+for ref in {refs!r}:
+    try:
+        nums = [float(v) for v in ref.split(",")]
+        p = unreal.Vector(*nums)
+    except ValueError:
+        a = next((a for a in unreal.GameplayStatics.get_all_actors_of_class(w, unreal.Actor)
+                  if a.get_actor_label() == ref or a.get_name() == ref), None)
+        if a is None:
+            out.append({{"ref": ref, "error": "no such actor"}})
+            continue
+        p = a.get_actor_location()
+    def hits(radius):
+        found = unreal.SystemLibrary.sphere_overlap_actors(w, p, radius, types, None, [])  # None: no overlaps
+        return [(x.get_actor_label(), x.get_class().get_name(), x.get_actor_location().distance(p)) for x in (found or [])]
+    on = nav.project_point_to_navigation(w, p, None, None, unreal.Vector(50, 50, 250))
+    near = None if on is not None else nav.project_point_to_navigation(w, p, None, None, unreal.Vector(1000, 1000, 1000))
+    out.append({{"ref": ref, "point": [p.x, p.y, p.z], "inside": hits(1.0), "near": hits({radius!r}),
+                "nav": None if on is None else on.distance(p), "nav_near": None if near is None else
+                [near.x, near.y, near.z, near.distance(p)]}})
+print(json.dumps(out))
+"""
+
+
+def world_probe(ctx, args):
+    """`ue world probe x,y,z|actor ...`: the actors whose collision overlaps each point (inside one: the point is
+    in geometry), those within --radius, and whether the navmesh reaches it, for spawns, pickups and teleports."""
+    refs = [metres_to_cm(r) if args.m else r for r in args.what]
+    if args.pie and not (ctx.beacon or {}).get("pie"):
+        raise CliError("--pie needs PIE running (ue pie start)")
+    rows = py_json(ctx, PROBE.format(pie=args.pie, refs=refs, radius=args.radius))
+    ctx.data = rows
+    bad = 0
+    for row in rows:
+        if row.get("error"):
+            print(f"{row['ref']}: {row['error']}")
+            bad += 1
+            continue
+        x, y, z = row["point"]
+        inside = sorted({f"{label} ({cls})" for label, cls, _ in row["inside"]})
+        near = [r for r in sorted(row["near"], key=lambda r: r[2]) if f"{r[0]} ({r[1]})" not in inside]
+        if row["nav"] is not None:
+            nav = f"on the navmesh ({row['nav']:.0f} cm)"
+        elif row["nav_near"]:
+            nx, ny, nz, d = row["nav_near"]
+            nav = f"OFF the navmesh: nearest {d:.0f} cm away at ({nx:.0f}, {ny:.0f}, {nz:.0f})"
+        else:
+            nav = "OFF the navmesh: none within 10 m"
+        bad += bool(inside) or row["nav"] is None
+        print(f"({x:.0f}, {y:.0f}, {z:.0f})" + (f" [{row['ref']}]" if not row["ref"][:1].lstrip("-").isdigit() else "")
+              + f": {'INSIDE ' + ', '.join(inside) if inside else 'clear'}; {nav}")
+        if near:
+            print(f"  within {args.radius:g} cm: " + ", ".join(f"{label} ({cls}, {d:.0f} cm)" for label, cls, d in near[:6])
+                  + (f" +{len(near) - 6} more" if len(near) > 6 else ""))
+    return 1 if bad else 0
+
+
 def cmd_world(ctx, args):
-    """World builds: navmesh and lighting in the live editor; HLODs and other World Partition builders as jobs."""
-    what = args.what.lower()
+    """World builds: navmesh and lighting in the live editor; HLODs and other World Partition builders as jobs.
+    `world probe`: what is at a point."""
+    if args.action == "probe":
+        return world_probe(ctx, args)
+    if len(args.what) != 1:
+        raise CliError("ue world build <what>: one of nav, lighting, hlod, minimap, nav-wp, resave or a builder class")
+    what = args.what[0].lower()
     if what == "nav":
         dirty_before = set(py_json(ctx, DIRTY_PACKAGES))
         started = time.time()
-        ctx.tether("console", command="RebuildNavigation")
-        building = "unreal.NavigationSystemV1.is_navigation_being_built(unreal.get_editor_subsystem(" \
+        rebuild_navigation(ctx, min(args.wait, NAV_LOCK_WAIT))
+        building ="unreal.NavigationSystemV1.is_navigation_being_built(unreal.get_editor_subsystem(" \
                    "unreal.UnrealEditorSubsystem).get_editor_world())"
         time.sleep(0.5)
         while str(ctx.tether("py", code=building)).strip().endswith("True"):
@@ -464,7 +577,7 @@ def cmd_world(ctx, args):
         for line in problems[: args.limit]:
             print("  " + line)
         return 0 if result.startswith("Illumination") else 1
-    builder = WP_BUILDERS.get(what, args.what)
+    builder = WP_BUILDERS.get(what, args.what[0])
     target_map = args.map or (ctx.beacon or {}).get("map")
     if not target_map:
         raise CliError("give the map: ue world build hlod --map /Game/Maps/L")
@@ -1434,6 +1547,12 @@ def cmd_pie(ctx, args):
         index = int(args.script[0]) if args.script else -1
         print(pie_net(ctx, "target", target=index))
         return 0
+    if args.action == "stop":
+        clear_pie_start(ctx.project)
+    if args.action == "start":  # every PIE start goes through here, run/do/watch/record included
+        check_shared(ctx.project, "pie start", destructive=False)
+        if not (ctx.beacon or {}).get("pie"):  # PIE already running stays whoever's it was
+            record_pie_start(ctx.project)
     if args.action == "start" and getattr(args, "game", None):
         print(pie_net(ctx, "game", game=args.game))
     if args.action == "start" and getattr(args, "clients", None):
@@ -1549,6 +1668,20 @@ def wait_game_seconds(ctx, seconds):
         if time.time() - start_real > seconds * 30 + 10:
             return False, f"only {now - start_game:.2f} s of game time passed in {time.time() - start_real:.0f} s"
         time.sleep(0.1)
+
+
+def cmd_wait(ctx, args):
+    """`ue wait N [game]`: N seconds, or N seconds of game time in the running PIE (`pie do "wait N game"`), for
+    the pauses between `ue exec` or `ue pie do` calls."""
+    if args.clock == "game":
+        if not (ctx.beacon or {}).get("pie"):
+            raise CliError("`ue wait N game` needs PIE running (ue pie start); `ue wait N` waits wall-clock seconds")
+        ok, detail = wait_game_seconds(ctx, args.seconds)
+        print(detail)
+        return 0 if ok else 4
+    time.sleep(args.seconds)
+    print(f"waited {args.seconds:g}s")
+    return 0
 
 
 def pie_throttle(ctx, action):

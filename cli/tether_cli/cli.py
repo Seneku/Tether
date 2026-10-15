@@ -8,7 +8,8 @@ import time
 
 from .core import CliError, crash_summary, find_project, recent_crash, stall_report
 from .transport import Ctx
-from .editor import cmd_build, cmd_close, cmd_crash, cmd_open, cmd_status
+from .share import LEASE_MINUTES, record_activity
+from .editor import cmd_build, cmd_close, cmd_crash, cmd_lease, cmd_open, cmd_status, cmd_who
 from .calls import (
     cmd_actors, cmd_ai, cmd_anim, cmd_api, cmd_asset, cmd_call, cmd_changes, cmd_config, cmd_delete, cmd_drop,
     cmd_duplicate, cmd_exec, cmd_find, cmd_log, cmd_mat, cmd_mv, cmd_nav, cmd_new, cmd_props, cmd_py, cmd_refs,
@@ -20,7 +21,7 @@ from .assets import cmd_data, cmd_diff, cmd_fx, cmd_net, cmd_overview, cmd_pcg, 
 from .content import cmd_import, cmd_landscape, cmd_lint, cmd_map, cmd_mesh, cmd_tex, cmd_unused
 from .fab import cmd_fab
 from .jobs import cmd_game, cmd_job, cmd_package
-from .play import cmd_audio, cmd_gpu, cmd_mem, cmd_sound, cmd_soak, cmd_ui, cmd_world
+from .play import cmd_audio, cmd_gpu, cmd_mem, cmd_sound, cmd_soak, cmd_ui, cmd_wait, cmd_world
 from .playtest import bp_command, cmd_budget, cmd_input, package_command, perf_command, pie_command
 from .hooks import cmd_hook
 from .setup import cmd_doctor, cmd_init, cmd_reload
@@ -99,6 +100,8 @@ def build_parser():
     s.add_argument("--check", action="store_true", help="compile the game target only (UBT): the running editor and its "
                                                          "Live Coding are untouched; misses editor-only code")
     s.add_argument("--no-check", action="store_true", help="with --restart: skip the compile check made before closing")
+    s.add_argument("--ignore-lease", action="store_true", help="with --restart: go ahead although another session holds "
+                                                               "the lease or used the editor in the last few minutes")
     s.add_argument("--target", help="UBT target (default <Project>Editor)")
     s.add_argument("--config", default="Development")
     s.add_argument("--wait", type=float, default=300, help="seconds to wait for Live Coding (300)")
@@ -106,6 +109,21 @@ def build_parser():
     s.add_argument("--save", action="store_true", help="save dirty packages first")
     s.add_argument("--discard", action="store_true", help="drop unsaved changes (terminates if a dialog blocks)")
     s.add_argument("--force", action="store_true", help="terminate immediately")
+    s.add_argument("--ignore-lease", action="store_true", help="close although another session holds the lease or "
+                                                               "used the editor in the last few minutes")
+    s = add("lease", cmd_lease, "share the editor between sessions: take --for WHAT [--minutes N] | release | (show)")
+    s.add_argument("action", nargs="?", choices=["take", "release"])
+    s.add_argument("--for", dest="what", help="with take: what the editor is for, as the other sessions will see it")
+    s.add_argument("--minutes", type=float, default=LEASE_MINUTES, help=f"with take: how long ({LEASE_MINUTES}); "
+                                                                         "take again to renew")
+    s.add_argument("--as", dest="name", help="a name for this session that the others see (kept)")
+    s.add_argument("--force", action="store_true", help="with release: release another session's lease")
+    s = add("wait", cmd_wait, "wait N seconds, or N seconds of game time in PIE: ue wait 4 game (as pie do \"wait 4 game\")")
+    s.add_argument("seconds", type=float)
+    s.add_argument("clock", nargs="?", choices=["game", "real"], default="real", help="game: PIE game time")
+    s = add("who", cmd_who, "sessions that used this editor recently, their last command, the lease, who started PIE")
+    s.add_argument("--minutes", type=float, default=15, help="how far back (15)")
+    s.add_argument("--as", dest="name", help="a name for this session that the others see (kept)")
     s = add("tools", cmd_tools, "list toolsets, a toolset's tools, or one tool's schema (toolset:tool)")
     s.add_argument("query", nargs="?")
     s.add_argument("-v", "--verbose", action="store_true")
@@ -339,6 +357,8 @@ def build_parser():
     s.add_argument("-o", "--output", help="with watch: CSV path (default Saved/Tether/watch/); with record: step file "
                                                "(default Saved/Tether/recordings/)")
     s.add_argument("--keep", action="store_true", help="with run/do: leave PIE running afterwards")
+    s.add_argument("--ignore-lease", action="store_true", help="with start/run/do: start PIE although another session "
+                                                               "holds the editor lease")
     s.add_argument("--simulate", action="store_true", help="Simulate-In-Editor (no player pawn)")
     s.add_argument("--warmup", type=float, default=0.5, help="seconds to let BeginPlay settle (0.5)")
     s = add("bp", bp_command, "Blueprint graphs as text: read, --diff, --apply; check; edit; trace (what ran in PIE)")
@@ -423,10 +443,12 @@ def build_parser():
     s.add_argument("assignments", nargs="*", metavar="Name=value", help="scalar, r,g,b[,a], true/false, texture path")
     s.add_argument("--reset", action="append", metavar="NAME", help="stop overriding NAME (instances; repeatable)")
     s.add_argument("--compile", action="store_true", help="recompile the base material and list compile errors")
-    s = add("nav", cmd_nav, "navmesh: status (and why it is missing), path <a> <b>, check [actor regex]")
+    s = add("nav", cmd_nav, "navmesh: status (and why it is missing), path <a> <b> [<a> <b> ...], check [actor regex]")
     s.add_argument("action", nargs="?", choices=["status", "path", "check"])
-    s.add_argument("points", nargs="*", help="path: start end (x,y,z or actor); check: actor regex")
+    s.add_argument("points", nargs="*", help="path: start end [start end ...] (x,y,z or actor); check: actor regex")
     s.add_argument("--pie", action="store_true", help="the PIE world's (runtime-generated) navmesh")
+    s.add_argument("--agent", help="with path: an actor (pawn) whose navigation agent to path for")
+    s.add_argument("--m", action="store_true", help="with path: x,y,z points are in metres")
     s = add("size", cmd_size, "biggest assets on disk under a folder, or what an asset loads with it (--deps)")
     s.add_argument("path", nargs="?", help="content folder (default /Game) or an asset")
     s.add_argument("--deps", action="store_true", help="with an asset: total it with everything it loads")
@@ -464,9 +486,14 @@ def build_parser():
     s.add_argument("--budget", type=float, default=20, help="seconds to spend reading Blueprint graphs (20)")
     s = add("overview", cmd_overview, "one-screen project brief from its files: modules, key classes, maps, input, content")
     s.add_argument("--brief", action="store_true", help="the short version the session-start hook uses")
-    s = add("world", cmd_world, "world builds: build nav|lighting (live editor), hlod|minimap|nav-wp|<Builder> (job)")
-    s.add_argument("action", choices=["build"])
-    s.add_argument("what", help="nav, lighting, hlod, minimap, nav-wp, resave, or a WorldPartition builder class")
+    s = add("world", cmd_world, "world builds: build nav|lighting (live editor), hlod|minimap|nav-wp|<Builder> (job); "
+                                "probe x,y,z: what is at a point")
+    s.add_argument("action", choices=["build", "probe"])
+    s.add_argument("what", nargs="+", help="build: nav, lighting, hlod, minimap, nav-wp, resave, or a WorldPartition "
+                                          "builder class; probe: x,y,z points or actors")
+    s.add_argument("--radius", type=float, default=50, help="with probe: overlap radius in cm (50)")
+    s.add_argument("--m", action="store_true", help="with probe: x,y,z points are in metres")
+    s.add_argument("--pie", action="store_true", help="with probe: the PIE world")
     s.add_argument("--map", help="with builders: the map (default: the editor's)")
     s.add_argument("--quality", default="Preview", help="with lighting: Preview, Medium, High, Production")
     s.add_argument("--save", action="store_true", help="with nav: save the packages the build changed")
@@ -630,6 +657,8 @@ def parse_command(parser, raw):
             setattr(args, key, default)
     if args.pid:  # every lookup of "the editor" reads this, the beacon helpers in core included
         os.environ["UE_EDITOR_PID"] = str(args.pid)
+    if getattr(args, "ignore_lease", False):  # reaches the PIE starts inside run/do/watch/record too
+        os.environ["UE_IGNORE_LEASE"] = "1"
     return args
 
 
@@ -649,6 +678,7 @@ def cmd_batch(ctx, args):
             argv = argv[1:]
         print(f"$ ue {line[3:] if line.startswith('ue ') else line}", flush=True)
         chosen = os.environ.get("UE_EDITOR_PID")  # a line's --pid applies to that line only
+        ignoring = os.environ.get("UE_IGNORE_LEASE")  # and its --ignore-lease
         try:
             sub = parse_command(parser, undo_msys_paths(argv))
             if sub.fn in (cmd_batch, cmd_hook):
@@ -664,6 +694,8 @@ def cmd_batch(ctx, args):
                 os.environ.pop("UE_EDITOR_PID", None)
             else:
                 os.environ["UE_EDITOR_PID"] = chosen
+            if ignoring is None:
+                os.environ.pop("UE_IGNORE_LEASE", None)
         worst = max(worst, code)
         if code and args.stop_on_error:
             print(f"(stopped at the first failure; {len(lines) - lines.index(line) - 1} line(s) not run)")
@@ -671,6 +703,10 @@ def cmd_batch(ctx, args):
     sys.stdout.flush()
     print(f"({len(lines)} command(s) in {time.perf_counter() - started:.1f}s, exit {worst})", file=sys.stderr)
     return worst
+
+
+# Commands that only look at the sharing state: running them does not count as using the editor.
+UNRECORDED = {"help", "hook", "status", "who", "lease", "doctor"}
 
 
 def main(argv=None):
@@ -685,6 +721,11 @@ def main(argv=None):
     if envelope:
         import io
         captured = sys.stdout = io.StringIO()
+    if args.cmd not in UNRECORDED:
+        try:  # who ran what, for `ue who` and the shared-editor checks
+            record_activity(find_project(args.project), ["ue"] + (sys.argv[1:] if argv is None else list(argv)))
+        except CliError:
+            pass  # not in a project: the command itself will say so
     try:
         ctx = Ctx(args)
         try:

@@ -1,4 +1,4 @@
-"""Editor lifecycle: status, open, close, build, crash."""
+"""Editor lifecycle: status, open, close, build, crash; the shared editor's lease and `ue who`."""
 import argparse
 import os
 import time
@@ -9,6 +9,10 @@ from .core import (
     decline_package_restore, editor_label, engine_root, filter_log, live_coding_available, live_editors, logged_dialogs,
     pick_port, pid_alive, port_open, read_json, read_new_log, recent_crash, startup_dialogs, state_dir, subprocess,
     write_json,
+)
+from .share import (
+    ACTIVE_MINUTES, active_lease, ago, check_shared, describe_lease, duration, lease_note, pie_owner,
+    recent_sessions, release_lease, session_id, session_label, session_names, set_session_name, take_lease,
 )
 from .build import (
     classify_changes, compile_check, csharp_changes, csharp_layout, csharp_reload_build, editor_env, live_coding_build,
@@ -43,20 +47,23 @@ def cmd_status(ctx, args):
         dialogs = blocking_dialogs(beacon.get("pid"))
         state = f"HUNG? (no heartbeat for {age:.0f}s" + (f"; blocked by modal: \"{dialogs[0][:80]}\")" if dialogs else ")")
     else:
-        state = "pie" if beacon.get("pie") else "ready"
+        owner = pie_owner(ctx.project, beacon)
+        state = ("pie" + (f" ({owner})" if owner else "")) if beacon.get("pie") else "ready"
+    lease = active_lease(ctx.project)
     if ctx.transport == "remote":
         link = "via python remote execution"
     else:
         link = f"mcp :{port} " + ("up" if alive and port and port_open(port) else "down")
     dirty = beacon.get("dirty") if alive else None
     others = [b for b in live_editors(ctx.project) if b.get("pid") != beacon.get("pid")] if alive else []
-    ctx.data = dict(beacon, state=state, alive=bool(alive), heartbeat_age=round(age, 1),
+    ctx.data = dict(beacon, state=state, alive=bool(alive), heartbeat_age=round(age, 1), lease=lease,
                     others=[{"pid": b.get("pid"), "headless": b.get("headless"),
                              "launched_by_tether": b.get("launched_by_tether")} for b in others])
     print(f"{name} | {state} | UE {beacon.get('engine', '?').split('+')[0]} | {editor_label(beacon)} | "
           f"map {beacon.get('map')} | {link} | heartbeat {age:.1f}s ago"
           + (f" | {dirty} unsaved (ue changes)" if dirty else "")
-          + (f" | revision control {beacon['vcs']}" if alive and beacon.get("vcs") else ""))
+          + (f" | revision control {beacon['vcs']}" if alive and beacon.get("vcs") else "")
+          + (f" | {describe_lease(ctx.project, lease)}" if lease else ""))
     if alive and not port and ctx.transport != "remote":
         print("  no MCP server in this editor: run `ue reload` (Tether starts one), or in the editor's console: "
               "ModelContextProtocol.StartServer")
@@ -90,6 +97,9 @@ def cmd_build(ctx, args):
                   "ue build --restart (or ue open) reopens it")
         return code
     if not args.restart:
+        note = lease_note(ctx.project)
+        if note:  # a Live Coding patch changes the code another session's task is running on
+            print(note)
         if changes and changes[1]:
             names = ", ".join(os.path.basename(p) for p in changes[1])
             print(f"restart required: module/project files changed ({names}); run `ue build --restart`")
@@ -113,6 +123,7 @@ def cmd_build(ctx, args):
         if not did:
             print("nothing to build: no C++ or C# changes since the last green build")
         return 0
+    check_shared(ctx.project, "build --restart", destructive=True, ignore=args.ignore_lease)
     launch = read_json(os.path.join(state_dir(ctx.project), "launch.json")) or {}
     reopen = {"map": beacon.get("map") if beacon.get("map") and not beacon["map"].startswith("/Temp") else None,
               "started": time.time()}
@@ -133,7 +144,7 @@ def cmd_build(ctx, args):
             print("  editor left open: the restart's build would fail (errors above). Fix them and run it again; "
                   "--no-check skips this check")
             return code
-    cmd_close(ctx, argparse.Namespace(save=args.save, discard=args.discard, force=False))
+    cmd_close(ctx, argparse.Namespace(save=args.save, discard=args.discard, force=False, ignore_lease=True))
     os.environ.pop("UE_EDITOR_PID", None)  # --pid named the editor to close; it is gone now
     code = ubt_build(ctx, args) or (uat_user_solution(ctx, args.limit) if has_csharp else 0)
     if code:
@@ -271,6 +282,7 @@ def close_editor(ctx, args, explicit):
     if beacon.get("launched_by_tether") is False and not explicit:
         raise CliError(f"pid {pid} is an editor you opened yourself, not one `ue open` started; close it in the "
                        f"editor, or pass --pid {pid} to close it from here")
+    check_shared(ctx.project, "close", destructive=True, ignore=getattr(args, "ignore_lease", False))
     if not args.force:
         dirty = ctx.tether("py", code=(
             "U = unreal.EditorLoadingAndSavingUtils\n"
@@ -304,6 +316,55 @@ def close_editor(ctx, args, explicit):
             print("declined the restore of the discarded packages' autosaves")
     else:
         print("closed")
+    return 0
+
+
+def cmd_lease(ctx, args):
+    """`ue lease take --for WHAT [--minutes N]` / `release` / (no action) show: an advisory lock on the shared
+    editor that `build --restart`, `close` and `pie start` respect, and `status`, `py` and `exec` mention."""
+    if args.name:
+        set_session_name(ctx.project, args.name)
+    if args.action == "take":
+        if not args.what:
+            raise CliError('say what the editor is for: ue lease take --for "map rebuild + PIE"')
+        lease, renewed = take_lease(ctx.project, args.what, args.minutes)
+        print(("renewed: " if renewed else "taken: ") + describe_lease(ctx.project, lease)
+              + "; `ue lease release` when done")
+        others = recent_sessions(ctx.project, ACTIVE_MINUTES, exclude=session_id())
+        if others:
+            print("  other sessions active in the last few minutes (they see it in `ue status`): "
+                  + ", ".join(session_label(ctx.project, s) for s in others))
+        return 0
+    if args.action == "release":
+        held = release_lease(ctx.project, force=args.force)
+        print(f"released ({held.get('what')}, held {duration(time.time() - held['since'])})" if held
+              else "no lease was held")
+        return 0
+    lease = active_lease(ctx.project)
+    ctx.data = lease
+    print(describe_lease(ctx.project, lease) if lease else "no lease: the editor is free (ue lease take --for ...)")
+    return 0
+
+
+def cmd_who(ctx, args):
+    """`ue who`: the sessions that used this editor recently (last command, when), the lease and the PIE owner."""
+    if args.name:
+        set_session_name(ctx.project, args.name)
+    me, now, names = session_id(), time.time(), session_names(ctx.project)
+    recent = recent_sessions(ctx.project, args.minutes, now=now)
+    ctx.data = {"you": me, "sessions": recent, "lease": active_lease(ctx.project)}
+    print(f"sessions using this editor in the last {args.minutes:g} min ({len(recent)}):" if recent
+          else f"no `ue` commands in the last {args.minutes:g} min")
+    for sid, row in recent.items():
+        print(f"  {session_label(ctx.project, sid, names)}{' (you)' if sid == me else ''}: "
+              f"{ago(now - row['time'])}, {row['cmd'][:100]}")
+    lease = ctx.data["lease"]
+    print("lease: " + (describe_lease(ctx.project, lease) if lease else "none"))
+    owner = pie_owner(ctx.project, ctx.beacon)
+    if owner:
+        print(f"pie: {owner}")
+    if me not in names:
+        print(f"you are {me}; `ue who --as NAME` gives this session a name the others see")
     return 0
 
 

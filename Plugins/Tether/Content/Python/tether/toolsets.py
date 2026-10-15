@@ -6103,7 +6103,7 @@ class TetherCore(_Base):
     @_tool
     @staticmethod
     def nav(action: str = "status", start: str = "", end: str = "", match: str = "", pie: bool = False,
-            limit: int = 40) -> str:
+            limit: int = 40, agent: str = "") -> str:
         """Navigation: whether the level has a usable navmesh (and why not), paths between points, and which
         actors stand off the navmesh.
 
@@ -6114,6 +6114,7 @@ class TetherCore(_Base):
             match: With check: regex on actor label and class (default: player starts, spawns, patrol points).
             pie: Use the PIE world (runtime-generated navmesh) instead of the editor level.
             limit: Maximum number of actor lines for check.
+            agent: With path: an actor (a pawn) whose navigation agent the path is for (default: the default agent).
 
         Returns:
             A few lines.
@@ -6160,7 +6161,12 @@ class TetherCore(_Base):
                 raise RuntimeError("path needs a start and an end (x,y,z or actor)")
             a, b = _point(start, pie), _point(end, pie)
             straight = a.distance(b)
-            path = navsys.find_path_to_location_synchronously(world, a, b)
+            context = None
+            if agent:
+                context = _resolve(agent, pie)
+                if not isinstance(context, unreal.Actor):
+                    raise RuntimeError(f"agent '{agent}' is not an actor")
+            path = navsys.find_path_to_location_synchronously(world, a, b, context)
             if path is None or not path.is_valid() or not path.path_points:
                 notes = []
                 for label, point in (("start", a), ("end", b)):
@@ -6170,9 +6176,14 @@ class TetherCore(_Base):
                                      (f" ({point.distance(near):.0f} cm from it)" if near is not None else " (none within 10 m)"))
                 return f"no path ({straight:.0f} cm straight line)" + (": " + "; ".join(notes) if notes else "")
             length = path.get_path_length()
-            return (f"{'partial path' if path.is_partial() else 'path'}: {length:.0f} cm over {len(path.path_points)} "
-                    f"points (straight line {straight:.0f} cm)" +
-                    (f"; it ends {path.path_points[-1].distance(b):.0f} cm short" if path.is_partial() else ""))
+            points = list(path.path_points)
+            top = max(points, key=lambda p: p.z)
+            last = points[-1]
+            # A partial path stops where the navmesh stops connecting (a step too high, a gap): say where.
+            return (f"{'partial path' if path.is_partial() else 'path'}: {length:.0f} cm over {len(points)} "
+                    f"points (straight line {straight:.0f} cm), highest point z {top.z:.0f}" +
+                    (f"; it stops at ({last.x:.0f}, {last.y:.0f}, {last.z:.0f}), {last.distance(b):.0f} cm short "
+                     f"({b.z - last.z:+.0f} cm in height)" if path.is_partial() else ""))
         if action == "check":
             rx = re.compile(match or r"PlayerStart|Spawn|Patrol|Waypoint|TargetPoint", re.I)
             rows, off = [], 0

@@ -11,6 +11,7 @@ from .core import (
 )
 from .transport import FAB_GUARD, SLATE_INPUT, Mcp, fab_tab_open
 from .build import classify_changes, csharp_changes, csharp_layout
+from .share import record_edit
 from .assets import project_overview
 
 
@@ -172,6 +173,11 @@ def hook_post_edit(payload):
         return None
     if rel.endswith(".cs") and not rel.endswith((".build.cs", ".target.cs")) and not csharp_layout(project):
         return None
+    if payload.get("session_id"):  # who wrote it, for build errors in a project several sessions share
+        try:
+            record_edit(project, path, payload["session_id"][:8])
+        except OSError:
+            pass
     route, reason = classify_edit(path, tool_input)
     live = editor_live(project)
     advice = EDIT_ADVICE[route] if live else "editor not running: `ue build` compiles with UBT"

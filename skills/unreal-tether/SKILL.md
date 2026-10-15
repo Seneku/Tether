@@ -14,6 +14,15 @@ do not start a second editor, and do not close or restart theirs (`ue build --re
 the user may be working in it, so say before you save. With two editors open (`ue status` lists both), commands
 go to the user's; `ue --pid <pid> ...` picks the other, and saving the same assets from both loses work.
 
+Other Claude sessions may share this editor (`ue who` lists who ran what in the last 15 min, and who started PIE).
+Before anything that takes the editor away from them (a map rebuild, a long PIE run, `ue build --restart`,
+`ue close`), run `ue lease take --for "map rebuild + PIE"` and `ue lease release` when done; `ue status` shows the
+lease to everyone. While another session holds it, `build --restart`, `close` and `pie start` refuse with exit 5
+and say who holds it and for what: wait, or ask that session, rather than passing `--ignore-lease`. A restart or
+close also asks for the lease when another session used the editor in the last 5 minutes. A build error in a file
+you did not touch says who last edited it ("edited by spire ... (not you)"): leave it to that session.
+`ue who --as NAME` gives your session a name the others see.
+
 Several reads or edits in a row? Put them in one `ue batch` (one command per line, from stdin or a file):
 one process and one editor session for all of them.
 
@@ -334,9 +343,15 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
   project's getters). State a C++ class keeps in plain members is invisible: suggest exposing it as a
   `UFUNCTION(BlueprintPure)` getter.
 - No navmesh in the editor (headless editors do not build it by themselves): `ue world build nav` rebuilds it
-  and says what it changed. `ue world build lighting|hlod` for lightmaps and World Partition HLODs.
+  and says what it changed (it waits out a navigation build lock and says which). `ue world build
+  lighting|hlod` for lightmaps and World Partition HLODs.
 - AI that does not move: `ue nav` (is there a navmesh, and if not why), `ue nav check` (spawn/patrol points
-  off the navmesh), `ue nav path <a> <b>` (reachable? how long?); add `--pie` for runtime-generated navmeshes.
+  off the navmesh), `ue nav path <a> <b> [<a> <b> ...]` (reachable? how long, how high, and where a partial
+  path stops; exit 1 if any pair is not a full path; `--m` for metres, `--agent <pawn>`); add `--pie` for
+  runtime-generated navmeshes. Run the pairs for new routes after every `world build nav`.
+- Spawn points, pickups, teleports: `ue world probe x,y,z|actor ...` says whether each point is inside geometry,
+  what is within `--radius`, and whether the navmesh reaches it (exit 1 if any is inside or off the navmesh).
+- `ue wait 4 game` waits 4 s of game time in PIE between `ue exec` calls (`ue wait 4`: wall-clock seconds).
 - Leaks and rare failures: `ue soak --minutes 10 -f tests/play/x.txt` loops a step file (or wanders) and
   reports the memory trend, frame rate and errors. Run it in the background (it blocks for the duration).
 - Multiplayer: `ue pie start --clients 2` (listen server; `--net client` for a dedicated one), `ue pie status`
@@ -356,7 +371,8 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
 - If the editor dies (`ue status` says "crashed", or a call reports "the editor crashed"), run `ue crash`
   before restarting: it shows the error, whether your modules were on the stack, and what ran last.
 Output is compact text, capped at 30 rows (`--limit N`). Exit codes: 0 ok, 1 tool
-error (one-line message), 2 editor unavailable, 3 restart required, 4 timeout.
+error (one-line message), 2 editor unavailable, 3 restart required, 4 timeout, 5 another session holds the
+editor lease (`ue lease`).
 - `--json` on any command prints one JSON document: `{command, ok, exit, error, lines, data}`; `data` is
   structured where it helps (status, doctor, validate, audio, usages, size, ui, perf, overview), and
   `ue call`/`test`/`selftest` print their own JSON. Use it when a script reads the result.

@@ -24,6 +24,12 @@ closes the editor, and `ue build --check` does that alone; Live Coding failures 
 "0 errors"; `ue exec` folds only repeats in a row and says so; `pie run` scripts get a fresh namespace; `ue py`
 suggests the Python property names closest to a missing one; the unsaved-work refusal points at `ue changes`/`ue diff`.
 
+**Done in 0.20.0**: 1, 2 and 4 as `ue lease` (one lease for the editor rather than per-kind locks) and `ue who`,
+with the PIE owner in `ue status`; from the 0.19.1 front-end and Spire notes: `world build nav` retries a build the
+navigation system refused as locked and names the lock; build errors say who last edited each file; `ue wait N
+[game]`; `ue nav path` takes several pairs and reports the highest point and where a partial path stops (part of
+27a; "search limit hit" and islands are still open); `ue world probe`.
+
 ---
 
 ## Priority 1: asked for, or blocking real work

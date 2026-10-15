@@ -8,6 +8,7 @@ from .core import (
     CliError, engine_root, epic_settings_dir, host_platform, live_editors, log_end, log_path, logged_dialogs, read_json,
     read_new_log, state_dir, subprocess, uat_command, ubt_command, write_json,
 )
+from .share import file_owner
 
 
 # ---------------------------------------------------------------- builds
@@ -65,6 +66,19 @@ def print_diagnostics(errors, warnings, limit):
     extra = len(errors) + len(warnings) - limit
     if extra > 0:
         print(f"  ... +{extra} more (--limit)")
+
+
+ERROR_FILE = re.compile(r"^(?P<file>(?!\w:)[^:]+\.(?:h|hpp|cpp|inl|cs)):\d+:", re.I)
+
+
+def print_error_owners(project, errors, limit=4):
+    """Who last wrote each project file with an error: with sessions sharing a project, a build can fail on
+    another session's half-written file, and that session is the one to fix it."""
+    files = list(dict.fromkeys(m.group("file") for m in (ERROR_FILE.match(e) for e in errors) if m))
+    for path in files[:limit]:
+        owner = file_owner(project, path)
+        if owner:
+            print(f"  {os.path.basename(path)}: {owner}")
 
 
 def classify_changes(project):
@@ -250,6 +264,8 @@ def ubt_build(ctx, args, check=False):
         print("  Live Coding is active in an editor on this engine (the mutex is per engine, not per project):"
               " build through that editor with `ue build`, or close it")
     print_diagnostics(errors, warnings, args.limit)
+    if not ok:
+        print_error_owners(ctx.project, errors)
     if ok and not check:  # a check builds the game, not the editor this marker is about
         mark_green(ctx.project)
     return 0 if ok else 1
@@ -329,6 +345,7 @@ def live_coding_build(ctx, args, changes):
     print(f"live coding: {'OK' if ok else 'FAILED'} in {time.time() - started:.1f}s"
           + ("" if ok else f" ({len(errors) + len(link_errors)} errors)"))
     print_diagnostics(errors, warnings, args.limit)
+    print_error_owners(ctx.project, errors)
     for line in link_errors[: args.limit]:
         print(f"  {line}")
     for hint in hints:

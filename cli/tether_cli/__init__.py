@@ -4,10 +4,12 @@ Talks to Epic's in-editor MCP server (ModelContextProtocol plugin) plus the Teth
 toolset, and reads Saved/Tether/editor.json and Saved/Logs directly, so status and
 logs keep working when the editor is hung or gone. Stdlib only.
 
-Exit codes: 0 ok, 1 tool/command failed, 2 editor unavailable, 3 restart required, 4 timeout.
+Exit codes: 0 ok, 1 tool/command failed, 2 editor unavailable, 3 restart required, 4 timeout,
+5 another session holds the editor lease.
 
 Modules, lowest layer first (each imports only from those above it):
   core       project/beacon files, engine discovery, ports, dialogs, crash reports, git, rendering, logs
+  share      sessions sharing one editor: identity, activity log, the editor lease, PIE owner
   fabfiles   Fab content from files: the launcher's vault, each project's Fab record, nearby projects
   transport  Epic's MCP server, Python remote execution (5.4-5.7), the toolset catalog
   build      UBT, Live Coding, the UnrealSharp C# build, compiler diagnostics
@@ -30,6 +32,7 @@ Everything is re-exported here, so `import tether_cli` reaches any name; patch a
 defines it, since the others hold their own reference.
 """
 from .core import *  # noqa: F401,F403
+from .share import *  # noqa: F401,F403
 from .fabfiles import *  # noqa: F401,F403
 from .transport import *  # noqa: F401,F403
 from .build import *  # noqa: F401,F403

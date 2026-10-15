@@ -2180,8 +2180,9 @@ class Fixes0192(unittest.TestCase):
                 return replies[tool]
         ctx = Ctx()
         dirty = iter([[], ["/Game/Maps/Spire"], ["/Game/Maps/Spire"]])
-        args = argparse.Namespace(what="nav", save=save, wait=0, limit=20)
+        args = argparse.Namespace(action="build", what=["nav"], save=save, wait=0, limit=20)
         with unittest.mock.patch.object(ue.play, "py_json", side_effect=lambda c, code: next(dirty)), \
+                unittest.mock.patch.object(ue.play, "rebuild_navigation"), \
                 unittest.mock.patch.object(ue.play.time, "sleep"), unittest.mock.patch("builtins.print"):
             try:
                 return ue.cmd_world(ctx, args), ctx.calls
@@ -2241,7 +2242,8 @@ class Fixes0192(unittest.TestCase):
         project = Project()
         try:
             ctx = types.SimpleNamespace(project=project.uproject, beacon={"pid": 1, "map": "/Game/M"})
-            args = argparse.Namespace(check=False, no_check=False, restart=True, save=True, discard=False, limit=20)
+            args = argparse.Namespace(check=False, no_check=False, restart=True, save=True, discard=False, limit=20,
+                                      ignore_lease=False)
             with unittest.mock.patch.object(ue.editor, "editor_process", return_value=True), \
                     unittest.mock.patch.object(ue.editor, "classify_changes", return_value=(["A.h"], [], ["A.h"])), \
                     unittest.mock.patch.object(ue.editor, "compile_check", return_value=1), \
@@ -2276,3 +2278,157 @@ class Fixes0192(unittest.TestCase):
             self.assertIn("script: False True __pie_run__", out.getvalue())
         finally:
             project.close()
+
+
+class SharedEditor(unittest.TestCase):
+    """0.20: the editor lease, `ue who`, the PIE owner and who wrote a failing file."""
+
+    def setUp(self):
+        self.project = Project()
+        self.env = unittest.mock.patch.dict(os.environ, {"UE_SESSION": "menu"})
+        self.env.start()
+        os.environ.pop("UE_IGNORE_LEASE", None)
+
+    def tearDown(self):
+        self.env.stop()
+        self.project.close()
+
+    def as_session(self, sid):
+        return unittest.mock.patch.dict(os.environ, {"UE_SESSION": sid})
+
+    def test_lease_take_renew_refuse_release(self):
+        p = self.project.uproject
+        lease, renewed = ue.take_lease(p, "map rebuild + PIE", 15, now=1000)
+        self.assertFalse(renewed)
+        self.assertEqual(ue.take_lease(p, "map rebuild + PIE", 15, now=1100)[0]["since"], 1000)  # renewal keeps since
+        with self.as_session("spire"):
+            with self.assertRaises(ue.CliError) as caught:
+                ue.take_lease(p, "mine", 15, now=1200)
+            self.assertEqual(caught.exception.code, ue.LEASED)
+            self.assertIn("leased by menu: map rebuild + PIE", str(caught.exception))
+            with unittest.mock.patch.object(ue.share.time, "time", return_value=1200):
+                with self.assertRaises(ue.CliError):
+                    ue.release_lease(p)
+        self.assertIsNone(ue.active_lease(p, now=1100 + 15 * 60 + 1))  # expired
+        with unittest.mock.patch.object(ue.share.time, "time", return_value=1200):
+            self.assertEqual(ue.release_lease(p)["what"], "map rebuild + PIE")
+            self.assertIsNone(ue.active_lease(p))
+
+    def test_check_shared(self):
+        p = self.project.uproject
+        with self.as_session("spire"):
+            ue.record_activity(p, ["ue", "pie", "do", "wait 4 game"], now=1000)
+        # no lease, another session active 2 min ago: a restart asks for the lease; a PIE start does not
+        with self.assertRaises(ue.CliError) as caught:
+            ue.check_shared(p, "build --restart", destructive=True, now=1120)
+        self.assertIn("spire 2 min ago: ue pie do wait 4 game", str(caught.exception))
+        ue.check_shared(p, "pie start", destructive=False, now=1120)
+        ue.check_shared(p, "build --restart", destructive=True, now=1000 + 6 * 60)  # long enough ago
+        ue.check_shared(p, "build --restart", destructive=True, ignore=True, now=1120)
+        ue.take_lease(p, "restart", 15, now=1100)
+        ue.check_shared(p, "build --restart", destructive=True, now=1120)  # my lease
+        with self.as_session("spire"):
+            with self.assertRaises(ue.CliError) as caught:
+                ue.check_shared(p, "pie start", destructive=False, now=1120)
+            self.assertEqual(caught.exception.code, ue.LEASED)
+            with unittest.mock.patch.dict(os.environ, {"UE_IGNORE_LEASE": "1"}):
+                ue.check_shared(p, "pie start", destructive=False, now=1120)
+
+    def test_who_lists_sessions_names_and_lease(self):
+        p = self.project.uproject
+        now = time.time()
+        with self.as_session("spire"):
+            ue.record_activity(p, ["ue", "world", "build", "nav", "--save"], now=now - 30)
+            ue.set_session_name(p, "Spire district")
+        ue.record_activity(p, ["ue", "build"], now=now - 200)
+        ue.record_activity(p, ["ue", "exec", "x"], now=now - 3600)  # too old
+        ctx = types.SimpleNamespace(project=p, beacon=None, data=None)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            ue.cmd_who(ctx, argparse.Namespace(minutes=15, name=None))
+        text = out.getvalue()
+        self.assertIn("in the last 15 min (2)", text)
+        self.assertIn("Spire district (spire): 30s ago, ue world build nav --save", text)
+        self.assertIn("menu (you): 3 min ago, ue build", text)
+        self.assertIn("lease: none", text)
+
+    def test_pie_owner(self):
+        p = self.project.uproject
+        ue.record_pie_start(p, now=1000)
+        self.assertEqual(ue.pie_owner(p, {"pie": True, "pie_since": 1003}), "started by menu")
+        self.assertEqual(ue.pie_owner(p, {"pie": True, "pie_since": 5000}), "started by hand in the editor")
+        ue.clear_pie_start(p)  # pie stop
+        self.assertEqual(ue.pie_owner(p, {"pie": True, "pie_since": 1003}), "started by hand in the editor")
+        self.assertIsNone(ue.pie_owner(p, {"pie": False}))
+        self.assertIsNone(ue.pie_owner(p, {"pie": True}))  # an older plugin: no pie_since
+
+    def test_error_owners(self):
+        p = self.project.uproject
+        path = self.project.write("Source/Game/UI/MainMenu.cpp", "int x")
+        with self.as_session("spire"):
+            ue.record_edit(p, path, "menu", now=time.time())
+            self.assertIn("edited by menu", ue.file_owner(p, "Source/Game/UI/MainMenu.cpp"))
+            self.assertIn("(not you)", ue.file_owner(p, "Source/Game/UI/MainMenu.cpp"))
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                ue.print_error_owners(p, ["Source/Game/UI/MainMenu.cpp:220: C2664 cannot convert", "LNK2019 x"])
+            self.assertIn("MainMenu.cpp: edited by menu", out.getvalue())
+        os.utime(path, (time.time() + 60, time.time() + 60))  # written after the recorded edit: not that session's
+        self.assertIn("written", ue.file_owner(p, path))
+
+    def test_nav_lock_reasons_and_retry(self):
+        locked = stamped("LogNavigation: Warning: UNavigationSystemV1::Build Navigation NOT building because "
+                         "navigation build is locked (flags: 0x20).")
+        self.assertIn("AsyncLoadLock", ue.nav_lock([locked]))
+        self.assertIsNone(ue.nav_lock([stamped("LogTemp: Display: hi")]))
+        self.assertTrue(ue.nav_lock([locked.replace("0x20", "0x2")]).startswith("nothing to build"))
+        logs = iter([[locked], [locked], []])
+        ctx = FakeCtx()
+        ctx.project = self.project.uproject
+        with unittest.mock.patch.object(ue.play, "new_log_lines", side_effect=lambda c, s: next(logs)), \
+                unittest.mock.patch.object(ue.play.time, "sleep"), unittest.mock.patch("builtins.print") as said:
+            ue.rebuild_navigation(ctx, 60)
+        self.assertEqual([t for t, _ in ctx.calls], ["console"] * 3)
+        self.assertIn("AsyncLoadLock", said.call_args_list[0][0][0])
+
+    def test_nav_path_pairs(self):
+        replies = iter(["path: 900 cm over 4 points", "partial path: 360 cm over 3 points"])
+
+        class Ctx(FakeCtx):
+            def tether(self, tool, **kwargs):
+                self.calls.append((tool, kwargs))
+                return next(replies)
+        ctx = Ctx()
+        args = argparse.Namespace(action="path", points=["0,0,0", "9,0,0", "1,2,3", "Tower"], pie=False, limit=20,
+                                  agent=None, m=True)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(ue.cmd_nav(ctx, args), 1)  # one partial path
+        self.assertEqual(ctx.calls[0][1]["end"], "900,0,0")
+        self.assertEqual(ctx.calls[1][1]["end"], "Tower")
+        self.assertEqual(ctx.calls[0][1]["agent"], "")  # Epic's MCP schema requires every parameter
+        self.assertIn("100,200,300 -> Tower: partial path", out.getvalue())
+
+    def test_world_probe(self):
+        rows = [{"ref": "0,0,0", "point": [0, 0, 0], "inside": [["Block_3", "StaticMeshActor", 40.0]],
+                 "near": [["Block_3", "StaticMeshActor", 40.0], ["Crate", "StaticMeshActor", 30.0]], "nav": None,
+                 "nav_near": [100, 0, 0, 100.0]},
+                {"ref": "Pickup_2", "point": [500, 0, 10], "inside": [], "near": [], "nav": 12.0, "nav_near": None}]
+        ctx = types.SimpleNamespace(beacon={}, data=None)
+        out = io.StringIO()
+        with unittest.mock.patch.object(ue.play, "py_json", return_value=rows), contextlib.redirect_stdout(out):
+            code = ue.world_probe(ctx, argparse.Namespace(what=["0,0,0", "Pickup_2"], m=False, pie=False, radius=50))
+        self.assertEqual(code, 1)
+        text = out.getvalue()
+        self.assertIn("(0, 0, 0): INSIDE Block_3 (StaticMeshActor); OFF the navmesh: nearest 100 cm away", text)
+        self.assertIn("within 50 cm: Crate (StaticMeshActor, 30 cm)", text)
+        self.assertIn("(500, 0, 10) [Pickup_2]: clear; on the navmesh (12 cm)", text)
+
+    def test_metres_and_wait(self):
+        self.assertEqual(ue.metres_to_cm("1.5,-2,18"), "150,-200,1800")
+        self.assertEqual(ue.metres_to_cm("Tower_2"), "Tower_2")
+        with unittest.mock.patch.object(ue.play.time, "sleep") as slept, unittest.mock.patch("builtins.print"):
+            self.assertEqual(ue.cmd_wait(types.SimpleNamespace(beacon={}), argparse.Namespace(seconds=4, clock="real")), 0)
+        slept.assert_called_once_with(4)
+        with self.assertRaises(ue.CliError):
+            ue.cmd_wait(types.SimpleNamespace(beacon={}), argparse.Namespace(seconds=4, clock="game"))

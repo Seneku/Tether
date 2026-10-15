@@ -146,6 +146,8 @@ def _snapshot():
         except Exception:
             pass
     _state["map"] = level
+    # When this PIE session began: `ue status` matches it with the `ue pie start` that asked for it.
+    _state["pie_since"] = (_state.get("pie_since") or time.time()) if game is not None else None
     try:
         utils = unreal.EditorLoadingAndSavingUtils
         dirty = len(utils.get_dirty_content_packages()) + len(utils.get_dirty_map_packages())
@@ -166,6 +168,7 @@ def _snapshot():
         "mcp_port": _state["port"],
         "map": level,
         "pie": game is not None,
+        "pie_since": _state["pie_since"],
         "headless": _state["headless"],
         "nullrhi": _state["nullrhi"],  # no rendering at all: no ue shot
         "sound": _state["sound"],
