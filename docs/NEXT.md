@@ -163,6 +163,21 @@ nav, hero-placing cliffs, tuning scatter and turning scattered rocks into foliag
 | 65 | **A small Tether C++ editor module** for what Python cannot do: create a landscape from a heightmap file, assemble HISM actors. Optional, so Blueprint-only projects are not forced to compile it | [field] IslandHorror carries its own `IslandTerrainTools` / `IslandFoliageTools` for these | L |
 | 66 | **`ue wait compile`**: wait until shader and asset compilation has finished (after opening a big level or editing a material), printing what remains; `ue open` reports the backlog | [field] Lvl_Island must be opened once for its landscape and water shaders; the nav lock (0.20) also waits on asset compilation | S |
 
+### 2I. From IslandHorror's visual pass (0.21, terrain, grass, forest, water, buoyancy, night lighting)
+| # | Addition | Why | Effort |
+|---|---|---|---|
+| 67 | **Bug: `ue shot --hud` in a headless `--render` editor during PIE** captures the editor's panels with a black game view (plain `ue shot` works, HUD included). `--hud` crops a `shot showui` of the editor window to the viewport; offscreen, that crop goes wrong | [field] repro: `ue open --headless --render`, `ue pie start`, `ue shot --hud` | S |
+| 68 | **`ue spawn ... --pie`**: spawn into the PIE world (deferred spawn on the game world), gone when PIE stops | [field] an A/B of Epic's BP_BuoyancyExample took stop PIE, place, restart, delete | S |
+| 69 | **`ue build` / `ue doctor` name the process holding the Live Coding mutex** (`Global\LiveCoding_` + the UnrealEditor.exe path, so one project's Live Coding blocks editor builds of every project on the install): which editor or LiveCodingConsole, and its project | [field] ShooterDomination's LiveCodingConsole blocked IslandHorror's builds | S |
+| 70 | **Landscape grass in `ue foliage check`**: per LandscapeGrassType variety, density as the engine uses it (**per 100 m²**, though the header says per 10 m²), cull and WPO disable distances, and the instances in view | [field] the first grass pass came out 10x too sparse | S |
+| 71 | **`foliage check` material warnings**: Fab `M_MS_Foliage` instances with "use Distance Based WPO Fade" on (that permutation fails to compile, `Missing function input 'Function Distance Input'`, and instances fall back to the grey default); materials whose shaders failed to compile in general | [field] verified on IslandHorror's grass | S |
+| 72 | **`foliage check` for InstancedSkinnedMeshComponents with no TransformProvider** (Megaplants without a DynamicWind data asset: every Nanite branch assembly collapses to the root) | [field] | S |
+| 73 | **Buoyancy in `ue water`**: placed actors with a BuoyancyComponent but `bGenerateOverlapEventsDuringLevelStreaming` off (actors present at load get no begin-overlap, so they never enter the water and sink; Epic's BP_BuoyancyExample does), and lift against body mass (lift is normalised across pontoons: about BuoyancyCoefficient x one pontoon's submerged volume) | [field] both verified | M |
+| 74 | **Setting uint32 and Blueprint-variable properties**: `ue set` round-trips uint32 fields Python cannot set (e.g. a grass variety's InstanceWorldPositionOffsetDisableDistance) through export/import text; `ue py`'s property hint also suggests Blueprint variables by display name ("Time of Day": names with spaces resolve only that way) | [field] | S |
+| 75 | **`--res WxH` for `ue gpu`, `ue shot`, `ue perf`**: measure pixel-bound passes (BasePass, VSM raster) at a real resolution from the 799x521 offscreen viewport, e.g. by screen percentage to the same pixel count, saying how it was done | [field] "is the dense forest affordable at 1440p" without a package | M |
+| 76 | **`ue wait grass` (or `ue shot --settle`)**: wait until landscape grass for the current view has been built after a camera move or a landscape material change (grass instances are GPU-only, so `get_instance_count()` reads 0) | [field] shots showed bare ground; the masks were blamed before PIE proved the grass fine | M |
+| 77 | **Gotchas for the skill / `ue explain`**: UDS copies "Exposure Brightness Range" into its PostProcessComponent only at startup (write the component); Live Coding is per engine install, not per project | [field] | S |
+
 ### 2G. Code (C++ and C#)
 | # | Addition | Why | Effort |
 |---|---|---|---|
