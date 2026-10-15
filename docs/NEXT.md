@@ -185,6 +185,24 @@ nav, hero-placing cliffs, tuning scatter and turning scattered rocks into foliag
 | 76 | **`ue wait grass` (or `ue shot --settle`)**: wait until landscape grass for the current view has been built after a camera move or a landscape material change (grass instances are GPU-only, so `get_instance_count()` reads 0) | [field] shots showed bare ground; the masks were blamed before PIE proved the grass fine | M |
 | 77 | **Gotchas for the skill / `ue explain`**: UDS copies "Exposure Brightness Range" into its PostProcessComponent only at startup (write the component); Live Coding is per engine install, not per project | [field] | S |
 
+### 2J. From ShooterDomination's 0.20 notes (menu, objectives, robots, debug menu, intensity director)
+| # | Addition | Why | Effort |
+|---|---|---|---|
+| 78 | **Bug: `ue ui key Escape` in PIE stops PIE** (the editor's shortcut wins): send keys to the game's input; and **chords** (`ue ui key Ctrl+G`) reach the game's `FInputChord` bindings | [field] no way to open the pause menu or the debug menu from the CLI | S |
+| 79 | **Bug: `ue shot --hud` ignores `ue pie target`** (the host's view with target 1) | [field] | S |
+| 80 | **Bug: `ue game start --server none` still connects the clients** to 127.0.0.1: launch them on the map, without an address | [field] a solo `-game` run sat in a pending connection | S |
+| 81 | **Small CLI fixes**: `ue --version`; `ue who --as NAME` confirms the name; `ue lease take --reason` as an alias of `--for`; `ue pie run -c "<code>"` (inline code, and a clear message for a missing file); `ue exec "shot showui"` prints the screenshot it wrote | [field] | S |
+| 82 | **`ue map open <path> [--save\|--discard]`**: load another map into the running editor (refused during PIE, or with unsaved changes unless told) | [field] took a `ue py` load_level | S |
+| 83 | **`ue game start --python`** (and say that `-game` from Tether disables editor Python): start-up scripts such as `init_unreal.py` then run as in Play > Standalone | [field] a crash only Standalone hit | S |
+| 84 | **`ue build` (Live Coding) names other sessions' changed files** before compiling them (from the post-edit ledger and `ue who`), and asks for `--include-others` when an active session changed them in the last few minutes | [field] Live Coding patched another session's half-written reflected headers | S |
+| 85 | **Link errors name their owner**: an unresolved `Class::Function` maps to the header declaring it and that header's last writer | [field] six LNK2001 lines, no owner | S |
+| 86 | **`ue pie start` warns after Live Coding layout changes** ("class layouts patched since the last restart: UMG and replication may misbehave"), and `ue ui` with 0 widgets in PIE says the same | [field] a HUD that silently stopped drawing | S |
+| 87 | **`ue props --pie` reads protected properties** (ToolsetLibrary, not `get_editor_property`), and **`ue pie watch Actor.Component.Property`** samples component properties in the same CSV | [field] | S |
+| 88 | **`ue lint --cpp` flags reflected type names that differ only by prefix** (`FSDSetPiece` / `ASDSetPiece` both become `SDSetPiece`, which UHT rejects); the existing unity-collision rule goes into the skill | [field] the same UHT trap twice | S |
+| 89 | **`ue game shot <n>`**: a screenshot of a `-game` window, the launcher's child process resolved, the movie player's loading screen included | [field] loading screens are invisible to PIE and to FScreenshotRequest | M |
+| 90 | **`ue lint`: StaticMeshActors whose CollisionEnabled disagrees with their profile** (editor Python's `set_collision_enabled` is undone by the next PostEditChange) | [field] every decorative piece in two generated maps was BlockAll | M |
+| 91 | **A `-game` smoke step**: load each map once in `-game` (in `ue test` or `ue package`): editor-only components are null there | [field] an access violation only `-game` and packaged runs hit | M |
+
 ### 2G. Code (C++ and C#)
 | # | Addition | Why | Effort |
 |---|---|---|---|
