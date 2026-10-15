@@ -5,7 +5,9 @@ import re
 import sys
 import time
 
-from .core import CliError, compact_error, editor_mode, log_end, log_path, read_json, state_dir, unwrap, write_json, zlib
+from .core import (
+    CliError, compact_error, editor_mode, log_end, log_path, parse_res, read_json, state_dir, unwrap, write_json, zlib,
+)
 from .calls import flush_editor_log
 
 
@@ -36,8 +38,14 @@ def pie_screenshot(ctx, args, pose=None):
         return raw
     if getattr(args, "hud", False):
         return hud_screenshot(ctx)
+    return highres_shot(ctx, getattr(args, "res", None) or "1", pie=True)
+
+
+def highres_shot(ctx, spec, pie):
+    """PNG bytes from HighResShot: "1" for the viewport's size, "2560x1440" for a real resolution (the scene is
+    rendered at that size even though the offscreen viewport is small)."""
     start = log_end(ctx.project)
-    ctx.tether("console", command="HighResShot 1", pie=True)
+    ctx.tether("console", command=f"HighResShot {spec}", pie=pie)
     saved = re.compile(r"High resolution screenshot saved as (.+\.png)")
     deadline = time.time() + 15
     while time.time() < deadline:
@@ -52,7 +60,7 @@ def pie_screenshot(ctx, args, pose=None):
             os.remove(path)  # it moves to Saved/Tether/shots (or -o) below
             return raw
         time.sleep(0.2)
-    raise CliError("the PIE screenshot did not appear within 15 s (ue log --level Warning)", 4)
+    raise CliError("the screenshot did not appear within 15 s (ue log --level Warning)", 4)
 
 
 SNAPSHOT_BOX = re.compile(r"^(\s*)(\w+).*?\[pos=(-?\d+),(-?\d+) size=(\d+),(\d+)\]")
@@ -203,9 +211,37 @@ def hud_screenshot(ctx, cache=None):
         print(f"note: could not place the {view_w}x{view_h} game viewport in the window (DPI scale {dpi:g}; Slate "
               "inspector unavailable, or PIE runs in its own window): this is the whole window")
         return raw
+    cropped = png_crop(raw, rect)
+    if cache is None:  # a single shot: check the crop is the game view (a film checks nothing per frame)
+        widget = widget_screenshot(ctx, {})
+        if widget is not None and thumb_difference(cropped, widget) > HUD_MISMATCH:
+            # The window grab did not line up with the viewport (another editor layout, or the offscreen view not
+            # composited into the window): the Slate inspector's capture of the viewport itself is right.
+            print("note: the window screenshot did not line up with the game view; this is the viewport's own "
+                  "capture, with UMG but without canvas-drawn text (AHUD, on-screen debug messages)")
+            return widget
     if cache is not None:
         cache.update(rect=rect)
-    return png_crop(raw, rect)
+    return cropped
+
+
+HUD_MISMATCH = 10  # mean grey-level difference (0-255) of 32x20 thumbnails above which a crop is not the game view
+
+
+def thumb_difference(png_a, png_b, size=(32, 20)):
+    """Mean absolute grey difference between two PNGs shrunk to the same small size (overlaid text barely moves it,
+    a different picture does)."""
+    def thumb(raw):
+        w, h, channels, pixels = png_read(raw)
+        out = []
+        for ty in range(size[1]):
+            y = min(h - 1, int((ty + 0.5) * h / size[1]))
+            for tx in range(size[0]):
+                i = (y * w + min(w - 1, int((tx + 0.5) * w / size[0]))) * channels
+                out.append(sum(pixels[i:i + min(3, channels)]) / min(3, channels))
+        return out
+    a, b = thumb(png_a), thumb(png_b)
+    return sum(abs(x - y) for x, y in zip(a, b)) / len(a)
 
 
 def capture_viewport(ctx, pose, annotations=None, ui=False):
@@ -321,7 +357,7 @@ def shot_args(**given):
     """Arguments for calling cmd_shot from other commands: every option at its default, then `given`. A unit
     test keeps these in step with the `shot` parser, so a new option cannot break the callers again."""
     defaults = dict(actor=None, at=None, look_at=None, rot=None, annotate=False, grid_z=0, ui=False, hud=False,
-                    output=None, baseline=None, compare=None, tolerance=0.5, threshold=32)
+                    output=None, baseline=None, compare=None, tolerance=0.5, threshold=32, res=None)
     import argparse
     return argparse.Namespace(**dict(defaults, **given))
 
@@ -347,8 +383,35 @@ def cmd_shot(ctx, args):
     pie, simulate = pose.pop("pie", False), pose.pop("simulate", False)
     if getattr(args, "hud", False) and not (pie and not simulate):
         raise CliError("--hud needs PIE (ue pie start): it shows the game's UMG HUD over the player's view")
+    if getattr(args, "res", None):
+        parse_res(args.res)
+        if getattr(args, "hud", False) or args.annotate or args.ui:
+            raise CliError("--res renders the scene alone (HighResShot): not with --hud, --annotate or --ui")
     if pie and not simulate:  # Play: CaptureViewport would render the editor world, so HighResShot the game
+        if getattr(args, "res", None) and (args.actor or args.at or args.look_at or args.rot):
+            raise CliError("--res with a spectator pose in PIE is not supported; take the player's view, or Simulate")
         raw = pie_screenshot(ctx, args, pose)
+    elif getattr(args, "res", None):  # the level viewport at a real resolution: move its camera, HighResShot, put back
+        camera = ctx.tether("py", code="c = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem)."
+                                       "get_level_viewport_camera_info()\nimport json\n"
+                                       "v = next(x for x in c if isinstance(x, unreal.Vector))\n"
+                                       "r = next(x for x in c if isinstance(x, unreal.Rotator))\n"
+                                       "json.dumps([[v.x, v.y, v.z], [r.pitch, r.yaw, r.roll]])")
+        camera = json.loads(camera) if isinstance(camera, str) else camera
+        place = ("unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).set_level_viewport_camera_info("
+                 "unreal.Vector({0}, {1}, {2}), unreal.Rotator(pitch={3}, yaw={4}, roll={5}))")
+        loc, rot = pose["location"], pose["rotation"]
+        ctx.tether("py", code=place.format(loc["x"], loc["y"], loc["z"], rot["pitch"], rot["yaw"], rot["roll"]))
+        try:
+            time.sleep(0.2)
+            raw = highres_shot(ctx, args.res, pie=False)
+        except CliError as exc:
+            if exc.code != 4:
+                raise
+            raise CliError("--res in the editor needs a level viewport to HighResShot, and a headless editor has none: "
+                           "take it during PIE (ue pie start), or in a windowed editor", 4) from None
+        finally:
+            ctx.tether("py", code=place.format(*camera[0], *camera[1]))
     else:  # editor, or Simulate-In-Editor, whose simulation the level viewport shows
         annotations = dict(ANNOTATIONS, gridHeight=args.grid_z) if args.annotate else NO_ANNOTATIONS
         raw = capture_viewport(ctx, pose, annotations, args.ui)

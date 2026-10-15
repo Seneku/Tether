@@ -639,6 +639,43 @@ def landscape_png(grid, path):
     return lo, hi
 
 
+FAILED_MATERIAL = re.compile(r"((?:[A-Za-z]:)?[\\/][^:\[\]]*?\.uasset): Failed to compile Material for platform")
+
+
+def failed_materials(ctx):
+    """Content paths of the materials the editor failed to compile this session (each falls back to the default
+    material in game): from its log, which is the only place that says."""
+    try:
+        flush_editor_log(ctx)
+        with open(log_path(ctx.project), encoding="utf-8", errors="replace") as f:
+            text = f.read()
+    except (OSError, CliError):
+        return []
+    content = os.path.join(os.path.dirname(ctx.project), "Content")
+    found = []
+    for m in FAILED_MATERIAL.finditer(text):
+        path = os.path.normpath(m.group(1).strip())
+        rel = os.path.relpath(path, content) if os.path.normcase(path).startswith(os.path.normcase(content)) else None
+        name = "/Game/" + os.path.splitext(rel)[0].replace("\\", "/") if rel else os.path.basename(path)
+        if name not in found:
+            found.append(name)
+    return found
+
+
+USAGE_FLAG = re.compile(r"Material (/\S+?)(?:\.\S+)? needed to set usage flag (\w+)")
+
+
+def usage_flagged_materials(ctx):
+    """[(material, usage)] the editor set a missing usage flag on this session (bUsedWithInstancedStaticMeshes and
+    the like): set at render time, it dirties the material and lasts only if saved."""
+    try:
+        with open(log_path(ctx.project), encoding="utf-8", errors="replace") as f:
+            text = f.read()
+    except OSError:
+        return []
+    return list(dict.fromkeys((m.group(1), m.group(2)) for m in USAGE_FLAG.finditer(text)))
+
+
 def cmd_foliage(ctx, args):
     """Foliage instances: list by type, add over an area or a mask, remove; check, convert actors, fix."""
     import base64
@@ -665,6 +702,22 @@ def cmd_foliage(ctx, args):
             raise CliError(f"--avoid REGEX:RADIUS_CM (not '{rule}')") from None
     if args.action == "fix" and args.what not in ("billboards", "cull", "wpo"):
         raise CliError("ue foliage fix billboards | cull --distance N | wpo --distance N")
+    if args.action == "check":
+        print(ctx.tether("foliage", action="check", what=opt(args.what), area="-", density=-1.0, count=-1,
+                         spacing=-1.0, slope="-", height="-", scale="-", align=False, seed=0, folder=args.folder,
+                         mask="", avoid="", value=-1.0, scope=""))
+        failed, flagged = failed_materials(ctx), usage_flagged_materials(ctx)
+        if failed:
+            print(f"! {len(failed)} material(s) failed to compile this session and render as the default grey material: "
+                  + ", ".join(failed[:8]) + (" ..." if len(failed) > 8 else "") + " (ue log --grep 'Failed to compile')")
+        if flagged:
+            usages = sorted({u for _, u in flagged})
+            names = list(dict.fromkeys(m for m, _ in flagged))
+            print(f"! {len(names)} material(s) lacked a usage flag ({', '.join(usages)}) that the editor set this session, "
+                  "which left them unsaved: save them (ue save), or the next session sets it again and a cooked game "
+                  "renders those meshes with the default material: " + ", ".join(n.rsplit('/', 1)[-1] for n in names[:8])
+                  + (" ..." if len(names) > 8 else ""))
+        return 0
     print(ctx.tether("foliage", action=args.action, what=opt(args.what), area=opt(args.area),
                      density=-1.0 if args.density is None else args.density, count=-1 if args.count is None else args.count,
                      spacing=-1.0 if args.spacing is None else args.spacing, slope=opt(args.slope),
@@ -676,7 +729,8 @@ def cmd_foliage(ctx, args):
 
 WATER = """
 import json
-w = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_editor_world()
+_editor = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem)
+w = _editor.get_game_world() or _editor.get_editor_world()  # during PIE the editor world does not answer
 def get(obj, name, default=None):
     try:
         return obj.get_editor_property(name)
@@ -702,8 +756,25 @@ for a in actors if WaterZone else []:  # no Water plugin: no water classes
                        "material": path(get(c, "water_material")) if c else None,
                        "lod_material": path(get(c, "water_static_mesh_material")) if c else None,
                        "waves": bool(get(a, "water_waves"))})
+import math, re
+floats = []
+Buoyancy = getattr(unreal, "BuoyancyComponent", None)
+for a in actors if Buoyancy else []:
+    for c in a.get_components_by_class(Buoyancy):
+        data = get(c, "buoyancy_data")
+        text = data.export_text() if data is not None else ""
+        number = lambda f, d=0.0: float(re.search(f + r"=(-?[\\d.]+)", text).group(1)) if re.search(f + r"=(-?[\\d.]+)", text) else d
+        radii = [float(p.get_editor_property("radius")) for p in (get(data, "pontoons", []) or [])] if data is not None else []
+        root = a.root_component
+        body = get(root, "body_instance") if root else None
+        floats.append({"label": a.get_actor_label(), "radii": radii, "coefficient": number("BuoyancyCoefficient"),
+                       "max_force": number("MaxBuoyantForce", 0.0),
+                       "overlaps_at_load": bool(get(a, "generate_overlap_events_during_level_streaming", False)),
+                       "mass": (root.get_mass() if hasattr(root, "get_mass") else None) if root else None,
+                       "simulates": bool(get(body, "simulate_physics", False)) if body is not None else None})
 landscapes = len(unreal.GameplayStatics.get_all_actors_of_class(w, unreal.LandscapeProxy))
-print(json.dumps({"zones": zones, "bodies": bodies, "landscapes": landscapes, "plugin": WaterZone is not None}))
+print(json.dumps({"zones": zones, "bodies": bodies, "landscapes": landscapes, "plugin": WaterZone is not None,
+                  "floats": floats}))
 """
 WATER_SHORE_M = 0.5  # metres per water-info texel above which the shoreline fade shows as slivers
 
@@ -717,7 +788,7 @@ def cmd_water(ctx, args):
     if not data.get("plugin", True):
         print("the Water plugin is not enabled in this project")
         return 0
-    if not zones and not bodies:
+    if not zones and not bodies and not data.get("floats"):
         print("no water in the edited level (WaterZone, WaterBody actors)")
         return 0
     issues = 0
@@ -753,8 +824,49 @@ def cmd_water(ctx, args):
     if bodies and not zones:
         issues += 1
         print("! water bodies but no WaterZone: nothing renders them")
-    print(f"{len(zones)} zone(s), {len(bodies)} body(ies), {issues} issue(s)")
+    for f in data.get("floats") or []:
+        issues += buoyancy_lines(f)
+    print(f"{len(zones)} zone(s), {len(bodies)} body(ies)"
+          + (f", {len(data['floats'])} buoyant actor(s)" if data.get("floats") else "") + f", {issues} issue(s)")
     return 1 if issues else 0
+
+
+GRAVITY = 980.0  # cm/s^2
+
+
+def buoyancy_lines(f):
+    """Print one buoyant actor and its problems; return how many. Lift is shared across pontoons (their coefficients
+    come from ComputeSprungMasses with a mass of 1, so they sum to 1): fully under water, the total is about
+    BuoyancyCoefficient x one pontoon's volume (cm^3), each pontoon capped at MaxBuoyantForce."""
+    import math
+    radii = f["radii"]
+    sizes = ", ".join(f"{radii.count(r)} x r {r:.3g}" if radii.count(r) > 1 else f"r {r:.3g}" for r in dict.fromkeys(radii))
+    line = (f"buoyant {f['label']}: {len(radii)} pontoon(s)" + (f" ({sizes} cm)" if radii else "")
+            + f", coefficient {f['coefficient']:g}" + (f", mass {f['mass']:.0f} kg" if f.get("mass") else ""))
+    problems = []
+    if not f["overlaps_at_load"]:
+        problems.append("generate overlap events during level streaming is off: an actor placed in the level gets no "
+                        "begin-overlap at load, so it never enters the water and sinks (Epic's BP_BuoyancyExample "
+                        f"does this too): ue set {f['label']} bGenerateOverlapEventsDuringLevelStreaming=true (or in "
+                        "its Blueprint's class defaults)")
+    if f.get("simulates") is False:
+        problems.append("its root does not simulate physics: buoyancy pushes nothing")
+    if radii and f.get("mass"):
+        volume = sum(4 / 3 * math.pi * r ** 3 for r in radii) / len(radii)  # coefficients near-equal: the mean
+        lift = volume * f["coefficient"]
+        if f.get("max_force"):
+            lift = min(lift, f["max_force"])
+        weight = f["mass"] * GRAVITY
+        line += f"; most lift ~{lift / weight:.2f}x its weight"
+        if lift < weight:
+            needed = 2 * weight / volume  # floating half under water
+            problems.append(f"it cannot float: fully under water it lifts about {lift / weight:.2f}x its weight. Lift is "
+                            "shared across pontoons (total ~ coefficient x one pontoon's volume), so per-pontoon tuning "
+                            f"sinks it; a coefficient around {needed:.2g} floats it about half under")
+    print(line)
+    for p in problems:
+        print("  ! " + p)
+    return len(problems)
 
 
 def landscape_file(ctx, args):

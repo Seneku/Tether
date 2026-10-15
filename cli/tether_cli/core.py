@@ -726,6 +726,40 @@ def running_editors():
     return rows
 
 
+def parse_res(text):
+    m = re.fullmatch(r"(\d{2,5})[xX](\d{2,5})", (text or "").strip())
+    if not m:
+        raise CliError(f"--res WIDTHxHEIGHT, e.g. 2560x1440 (not '{text}')")
+    return int(m.group(1)), int(m.group(2))
+
+
+def live_coding_holders(engine):
+    """[(console pid, project name, editor pid)] for the LiveCodingConsoles running from this engine install. UBT's
+    mutex is Global\\LiveCoding_ + the UnrealEditor.exe path, so any of them blocks editor builds of every project on
+    the install. Windows only (Live Coding is)."""
+    if os.name != "nt":
+        return []
+    try:
+        out = subprocess.run(["powershell", "-NoProfile", "-Command",
+                              "Get-CimInstance Win32_Process -Filter \"Name like 'LiveCodingConsole%'\" | ForEach-Object "
+                              "{ \"$($_.ProcessId)`t$($_.ParentProcessId)`t$($_.ExecutablePath)`t$($_.CommandLine)\" }"],
+                             capture_output=True, text=True, timeout=30).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    root = os.path.normcase(os.path.abspath(engine))
+    rows = []
+    for line in out.splitlines():
+        parts = line.split("\t", 3)
+        if len(parts) < 4 or not parts[0].strip().isdigit():
+            continue
+        pid, parent, exe, command = parts
+        if exe and not os.path.normcase(os.path.abspath(exe)).startswith(root):
+            continue  # another engine install: its own mutex
+        m = re.search(r'-ProjectName="?([^"\s]+)', command) or re.search(r"-Group=UE_(\w+?)_0x", command)
+        rows.append((int(pid), m.group(1) if m else "?", int(parent) if parent.strip().isdigit() else None))
+    return rows
+
+
 def process_name(pid):
     """The executable name of a running process, or None when it cannot be told."""
     try:

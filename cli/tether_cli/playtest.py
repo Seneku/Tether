@@ -18,7 +18,10 @@ from .content import cmd_tex
 from .images import cmd_shot, shot_args
 from .jobs import cmd_package, package_staleness, packaged_executable
 from .play import frame_stats, read_profile_csv
-from .play import cmd_mem, cmd_perf, cmd_pie, insights_exe, insights_export, pie_do, unthrottled
+from .play import (
+    cmd_mem, cmd_perf, cmd_pie, insights_exe, insights_export, parse_res, pie_do, pie_viewport_size, res_cvars,
+    res_percentage, unthrottled,
+)
 
 
 def input_lines(data, match=None, code_refs=None):
@@ -746,7 +749,30 @@ def perf_command(ctx, args):
         return perf_load(ctx, args)
     if getattr(args, "scalability", None):
         return perf_scalability(ctx, args)
+    if getattr(args, "res", None):
+        return perf_at_res(ctx, args)
     return cmd_perf(ctx, args)
+
+
+def perf_at_res(ctx, args):
+    """`ue perf --res WxH`: the capture with the 3D scene rendered at that resolution's pixel count (screen
+    percentage on the PIE viewport, which offscreen is small and fixed)."""
+    res = parse_res(args.res)
+    started = str(ctx.tether("pie", action="status")).strip() != "running"
+    if started and cmd_pie(ctx, argparse.Namespace(action="start", simulate=False, warmup=1.0, limit=0, script=None)):
+        raise CliError("could not start PIE to measure")
+    try:
+        size = pie_viewport_size(ctx)
+        percentage, clamped = res_percentage(res, size)
+        print(f"rendering the 3D scene at {percentage:.0f}%{clamped} of the {size[0]}x{size[1]} PIE viewport: the pixel "
+              f"count of {res[0]}x{res[1]} (post after the upscaler and the UI stay at the viewport's size)")
+        with scoped_cvars(ctx, res_cvars(percentage, True)):
+            time.sleep(1.0)  # let the render targets resize
+            args.no_record = True  # not the baseline for later captures at the viewport's own size
+            return cmd_perf(ctx, args)
+    finally:
+        if started:
+            cmd_pie(ctx, argparse.Namespace(action="stop", simulate=False, warmup=0, limit=0, script=None))
 
 
 SCALABILITY_LEVELS = {"low": 0, "medium": 1, "high": 2, "epic": 3, "cinematic": 4}

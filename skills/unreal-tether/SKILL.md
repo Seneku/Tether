@@ -147,6 +147,16 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
   Fab/Megascans billboard last LODs (oversized and spidery far away), heavy single LODs, shadows and collision on
   thousands of small plants, and scatter left as separate actors. Fix with `ue foliage fix billboards`,
   `fix cull --distance 15000`, `fix wpo --distance 4000`, and `ue foliage convert <regex>` (actors to instances).
+  It also covers landscape grass (density is per 100 m^2, whatever the header says), Fab M_MS_Foliage instances
+  with "use Distance Based WPO Fade" on (that permutation does not compile), Megaplants without a TransformProvider,
+  materials that failed to compile, and usage flags the editor had to set (save those materials).
+- Landscape grass builds over many frames after a camera move or a landscape material change: `ue wait grass`
+  before a shot, or the ground looks bare. Grass instances are GPU-only (counts read 0 from Python).
+- Floating things: `ue water` checks buoyant actors (the overlap-at-load flag they need, lift against weight).
+  Buoyancy lift is shared across pontoons, so tune the coefficient for the whole body, not per pontoon.
+- Real resolutions from the small offscreen viewport: `ue gpu --res 2560x1440`, `ue perf --res 2560x1440` (screen
+  percentage to that pixel count) and `ue shot --res 1920x1080` (in PIE, or a windowed editor).
+- Try something in the running game without editing the level: `ue spawn /Game/X/BP_Buoy --pie --at x,y,z`.
 - Many props at once: `ue scatter /Game/X/SM_Rock --count 30 --area 1200,-300,2000 --spacing 250 --scale 0.7,1.4
   --align` (one undo step; same `--seed`, same layout).
 - Level edits: `ue spawn PointLight --at 0,0,300 --label Lamp` (or an asset path), `ue duplicate Lamp --count 3`,
@@ -404,6 +414,12 @@ editor lease (`ue lease`).
 ## Python gotchas (UE 5.8)
 - `unreal.Rotator(roll, pitch, yaw)` positional order: always pass keywords.
 - `set_editor_property` names drop the bool `b` prefix (`bLocked` -> `locked`); JSON property names
-  from Epic tools keep it, in camelCase.
+  from Epic tools keep it, in camelCase. Blueprint variables with spaces resolve only by their own name:
+  `get_editor_property('Time of Day')`. Fields Python cannot set at all (uint32, e.g. a grass variety's
+  InstanceWorldPositionOffsetDisableDistance) go through `ue set Asset "GrassVarieties[0].Field=4000"`.
+- Ultra Dynamic Sky copies "Exposure Brightness Range" into its PostProcessComponent only at startup: write the
+  component, not the variable.
+- Live Coding locks UBT for every project on the same engine install: another project's open editor blocks your
+  `ue build` with the editor closed (`ue doctor` names it).
 - Wrap edits in `with unreal.ScopedEditorTransaction("Agent: ...")` so the user can undo them.
 - Tool calls run on the game thread. Keep each call short and split long jobs into steps.

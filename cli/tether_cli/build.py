@@ -5,7 +5,8 @@ import re
 import time
 
 from .core import (
-    CliError, engine_root, epic_settings_dir, host_platform, live_editors, log_end, log_path, logged_dialogs, read_json,
+    CliError, engine_root, epic_settings_dir, host_platform, live_coding_holders, live_editors, log_end, log_path,
+    logged_dialogs, read_json,
     read_new_log, state_dir, subprocess, uat_command, ubt_command, write_json,
 )
 from .share import file_owner
@@ -261,8 +262,11 @@ def ubt_build(ctx, args, check=False):
           + f"{target}: {'OK' if ok else 'FAILED'} in {time.time() - started:.1f}s ({result})"
           + (f", {hidden} engine-header warnings hidden" if hidden else ""))
     if any("Unable to build while Live Coding is active" in l for l in lines):
-        print("  Live Coding is active in an editor on this engine (the mutex is per engine, not per project):"
-              " build through that editor with `ue build`, or close it")
+        holders = live_coding_holders(root)
+        who = "; ".join(f"{name} (LiveCodingConsole pid {pid}" + (f", editor pid {editor})" if editor else ")")
+                        for pid, name, editor in holders)
+        print("  Live Coding is active in an editor on this engine (the mutex is per engine install, not per project)"
+              + (f": {who}" if who else "") + ". Build through that editor with `ue build`, or close it")
     print_diagnostics(errors, warnings, args.limit)
     if not ok:
         print_error_owners(ctx.project, errors)

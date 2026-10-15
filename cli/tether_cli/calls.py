@@ -147,7 +147,16 @@ MISSING_PROPERTY = re.compile(r"Failed to find property '[^']*' for attribute '(
 # The class's docstring lists its editor properties by their Python names: "- ``order`` (bool): ..."
 PYTHON_PROPERTY_NAMES = ("import re as _r, json as _j\n"
                          "_t = getattr(unreal, {cls!r}, None)\n"
-                         "_j.dumps(_r.findall(r'^- ``(\\w+)`` \\(', (_t.__doc__ or '') if _t else '', _r.M))")
+                         "_n = _r.findall(r'^- ``(\\w+)`` \\(', (_t.__doc__ or '') if _t else '', _r.M)\n"
+                         "_b = []\n"
+                         "if {cls!r}.endswith('_C'):  # a Blueprint class: its variables by their own names\n"
+                         "    _reg = unreal.AssetRegistryHelpers.get_asset_registry()\n"
+                         "    for _a in _reg.get_assets_by_class(unreal.TopLevelAssetPath('/Script/Engine', 'Blueprint'), True):\n"
+                         "        if str(_a.asset_name) == {cls!r}[:-2]:\n"
+                         "            _c = unreal.load_asset(str(_a.package_name)).generated_class()\n"
+                         "            _b = list(_j.loads(unreal.ToolsetLibrary.list_struct_properties(_c)))\n"
+                         "            break\n"
+                         "_j.dumps({{'python': _n, 'blueprint': _b}})")
 
 
 def property_name_hint(ctx, error):
@@ -161,7 +170,15 @@ def property_name_hint(ctx, error):
         names = py_json(ctx, PYTHON_PROPERTY_NAMES.format(cls=cls))
     except (CliError, ValueError, IndexError):
         return None
-    close = difflib.get_close_matches(attr, names or [], n=3, cutoff=0.6)
+    names = names if isinstance(names, dict) else {"python": names or [], "blueprint": []}
+    close = difflib.get_close_matches(attr, names.get("python") or [], n=3, cutoff=0.6)
+    # A Blueprint variable resolves by its own name, spaces and all ('Time of Day'), not as time_of_day
+    squash = {re.sub(r"[\s_]", "", n).lower(): n for n in names.get("blueprint") or [] if n not in close}
+    spaced = [squash[k] for k in difflib.get_close_matches(re.sub(r"[\s_]", "", attr).lower(), list(squash), n=3,
+                                                           cutoff=0.75)]
+    if spaced:
+        return (f"{cls} is a Blueprint class: its variables resolve by their own names, e.g. "
+                + ", ".join(f"get_editor_property({n!r})" for n in spaced))
     if not close:
         return None
     return (f"{cls}'s Python property names closest to '{attr}': {', '.join(close)} (Python names drop a bool's "
@@ -248,8 +265,99 @@ def cmd_set(ctx, args):
 
 
 def cmd_spawn(ctx, args):
+    if args.pie:
+        return spawn_in_pie(ctx, args)
     print(ctx.tether("spawn", what=args.what, at=args.at, rot=args.rot or "", label=args.label or "",
                      ground=args.ground, align=args.align))
+    return 0
+
+
+# Python cannot spawn into the game world (GameplayStatics' deferred spawn is not exposed), but the cheat manager's
+# `summon <class>` can, in front of the player: summon it, find it, then move it into place.
+PIE_SPAWN_CLASS = """
+import json
+what = {what!r}
+mesh = None
+if what.startswith("/") and not what.startswith("/Script/"):
+    asset = unreal.load_asset(what)
+    if asset is None:
+        raise RuntimeError(f"no asset at {{what}} (ue find)")
+    if isinstance(asset, unreal.StaticMesh):
+        cls, mesh = unreal.StaticMeshActor, asset.get_path_name()
+    elif isinstance(asset, unreal.Blueprint):
+        cls = asset.generated_class()
+    else:
+        raise RuntimeError(f"{{what}} is a {{asset.get_class().get_name()}}: give a StaticMesh, a Blueprint or a class")
+else:
+    cls = unreal.load_class(None, what) if what.startswith("/Script/") else getattr(unreal, what, None)
+    if cls is None:
+        raise RuntimeError(f"no class '{{what}}' (try a /Script/Module.Class path)")
+if isinstance(cls, type):  # a Python wrapper type (unreal.StaticMeshActor), not the UClass
+    cls = cls.static_class()
+w = tether.world()
+before = [a.get_name() for a in unreal.GameplayStatics.get_all_actors_of_class(w, cls)]
+print(json.dumps({{"path": cls.get_path_name(), "mesh": mesh, "before": before}}))
+"""
+PIE_SPAWN_PLACE = """
+import json
+from tether import toolsets
+w = tether.world()
+cls = unreal.load_class(None, {path!r})
+new = [a for a in unreal.GameplayStatics.get_all_actors_of_class(w, cls) if a.get_name() not in {before!r}]
+if not new:
+    print(json.dumps(None))
+else:
+    a = new[0]
+    if {mesh!r}:
+        c = a.static_mesh_component
+        c.set_mobility(unreal.ComponentMobility.MOVABLE)
+        c.set_static_mesh(unreal.load_asset({mesh!r}))
+    if {at!r} is not None:
+        a.set_actor_location(unreal.Vector(*{at!r}), False, True)
+    a.set_actor_rotation(unreal.Rotator(roll={rot!r}[2], pitch={rot!r}[0], yaw={rot!r}[1]), True)
+    if {label!r}:
+        try:
+            a.set_actor_label({label!r})
+        except Exception:
+            pass
+    landed = None
+    if {ground!r}:
+        try:
+            landed = toolsets._ground_actor(a, {align!r})[2]
+        except RuntimeError as exc:
+            landed = "not grounded: " + str(exc)
+    loc = a.get_actor_location()
+    print(json.dumps({{"name": a.get_name(), "label": a.get_actor_label(), "class": a.get_class().get_name(),
+                      "at": [loc.x, loc.y, loc.z], "landed": landed}}))
+"""
+
+
+def spawn_in_pie(ctx, args):
+    """`ue spawn ... --pie`: an actor in the running PIE world (the target `ue pie target` picked), gone when PIE
+    stops. Through the cheat manager's `summon`, then moved to --at."""
+    if not (ctx.beacon or {}).get("pie"):
+        raise CliError("--pie needs PIE running (ue pie start)")
+    at = [float(v) for v in args.at.split(",")] if args.at else None
+    if at is not None and len(at) != 3:
+        raise CliError("--at x,y,z")
+    rot = [float(v) for v in args.rot.split(",")] if args.rot else [0.0, 0.0, 0.0]
+    found = py_json(ctx, PIE_SPAWN_CLASS.format(what=args.what))
+    ctx.tether("console", command=f"summon {found['path']}", pie=True)
+    placed, deadline = None, time.time() + 8  # in multiplayer PIE the command runs on the world's next tick
+    while placed is None and time.time() < deadline:
+        time.sleep(0.25)
+        placed = py_json(ctx, PIE_SPAWN_PLACE.format(path=found["path"], before=found["before"], mesh=found["mesh"],
+                                                     at=at, rot=rot, label=args.label or "", ground=args.ground,
+                                                     align=args.align))
+    if placed is None:
+        raise CliError(f"summon {found['path']} spawned nothing within 8 s (the PIE player needs a cheat manager; "
+                       "ue log --grep Fabricate)", 4)
+    ctx.data = placed
+    x, y, z = placed["at"]
+    landed = placed["landed"]
+    print(f"spawned {placed['label'] or placed['name']} ({placed['class']}) in the PIE world at ({x:g}, {y:g}, {z:.6g})"
+          + (f" on {landed}" if landed and not landed.startswith("not grounded") else f" ({landed})" if landed else "")
+          + "; it goes when PIE stops")
     return 0
 
 

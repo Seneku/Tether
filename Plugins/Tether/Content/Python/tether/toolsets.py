@@ -1699,6 +1699,127 @@ def _spaced_points(sample, count, spacing):
     return points
 
 
+_PATH_KEY = re.compile(r"^(\w+)(?:\[(\d+)\])?\.(\w+)$")
+
+
+def _text_field(text, field, new=None):
+    """A top-level Field=value of a struct's export text '(A=1,B=(X=1,Y=2),C="s")': its value, or with new, the
+    text with it replaced (or added)."""
+    parts = _text_parts(text)
+    for i, part in enumerate(parts):
+        key, _, value = part.partition("=")
+        if key.strip().lower() == field.lower():
+            if new is None:
+                return value
+            parts[i] = f"{key.strip()}={new}"
+            return "(" + ",".join(parts) + ")"
+    if new is None:
+        return None
+    return "(" + ",".join(parts + [f"{field}={new}"]) + ")"
+
+
+def _text_took(wanted, now):
+    """Whether a field's text reads back as asked: numbers as numbers (4000 = 4000.000000), a struct by the fields
+    given ('(Default=15000)' against '(Default=15000,PerPlatform=())')."""
+    wanted, now = wanted.strip().strip('"'), now.strip().strip('"')
+    if wanted.startswith("(") and now.startswith("("):
+        return all(_text_took(v, _text_field(now, k.strip()) or "")
+                   for k, _, v in (p.partition("=") for p in _text_parts(wanted)))
+    try:
+        return abs(float(wanted) - float(now)) < 1e-4
+    except ValueError:
+        return wanted.lower() == now.lower()
+
+
+def _text_parts(text):
+    """The top-level 'Field=value' parts of a struct's export text."""
+    body = text.strip()
+    if not (body.startswith("(") and body.endswith(")")):
+        raise RuntimeError(f"not a struct's text: {text[:60]}")
+    parts, depth, cur, quoted = [], 0, "", False
+    for ch in body[1:-1]:
+        if ch == '"':
+            quoted = not quoted
+        elif not quoted and ch in "([":
+            depth += 1
+        elif not quoted and ch in ")]":
+            depth -= 1
+        elif not quoted and ch == "," and depth == 0:
+            parts.append(cur)
+            cur = ""
+            continue
+        cur += ch
+    if cur:
+        parts.append(cur)
+    return parts
+
+
+def _python_name(obj, name):
+    """The editor-Python name of a reflected property given its C++ or display name (GrassVarieties ->
+    grass_varieties, bInOrder -> order; Blueprint variables with spaces go as they are)."""
+    snake = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", name).lower()
+    for candidate in (name, snake, re.sub(r"^b_", "", snake), re.sub(r"^(b_)?in_", "", snake)):
+        if _try(lambda c=candidate: obj.get_editor_property(c), _MISSING) is not _MISSING:
+            return candidate
+    raise RuntimeError(f"{_label(obj)} has no property '{name}' (ue props {_label(obj)})")
+
+
+_MISSING = object()
+
+
+def _set_paths(obj, items, pie):
+    """`Name[i].Field=value` / `Name.Field=value` for struct fields, including ones editor Python cannot set
+    (uint32 and the like): the struct's export text is edited and imported back, then the field is read back."""
+    rows = []
+    changes = {}  # (property, index): (container, element), so several fields of one element edit one copy
+    containers = {}
+    for key, raw in items:
+        m = _PATH_KEY.match(key)
+        if not m:
+            raise RuntimeError(f"'{key}': a path is Name[index].Field or Name.Field")
+        name, index, field = m.group(1), m.group(2), m.group(3)
+        prop = _python_name(obj, name)
+        if (prop, index) in changes:
+            container, element = changes[(prop, index)]
+        else:
+            container = containers.setdefault(prop, obj.get_editor_property(prop))  # one copy per property
+            if index is not None and int(index) >= len(container):
+                raise RuntimeError(f"{name} has {len(container)} element(s); [{index}] is not one")
+            element = container[int(index)] if index is not None else container
+        if not isinstance(element, unreal.StructBase):
+            raise RuntimeError(f"{name}{f'[{index}]' if index is not None else ''} is not a struct")
+        text = element.export_text()
+        old = _text_field(text, field)
+        if old is None:
+            raise RuntimeError(f"{type(element).__name__} has no field '{field}' (its fields: "
+                               + ", ".join(p.partition("=")[0] for p in _text_parts(text)) + ")")
+        value = raw if isinstance(raw, str) else json.dumps(raw)
+        element.import_text(_text_field(text, field, value))
+        now = _text_field(element.export_text(), field)
+        if now is None or not _text_took(value, now):
+            raise RuntimeError(f"{field} did not take '{value}' (it reads {now})")
+        changes[(prop, index)] = (container, element)
+        rows.append(f"{name}{f'[{index}]' if index is not None else ''}.{field}: {old} -> {now}")
+
+    def apply():
+        for (prop, index), (container, element) in changes.items():
+            if index is not None:
+                container[int(index)] = element
+            else:
+                containers[prop] = element
+        for prop, value in containers.items():
+            obj.set_editor_property(prop, value)
+    if pie:
+        apply()
+    else:
+        before = unreal.ToolsetLibrary.get_active_undo_count() if not _LEGACY else 0
+        with unreal.ScopedEditorTransaction(f"ue set {_label(obj)}"):
+            obj.modify()
+            apply()
+        _record_undo(before, f"{_label(obj)}: " + ", ".join(k for k, _ in items))
+    return rows
+
+
 def _landscape_rect(world):
     """(x0, y0, x1, y1) covering the level's landscapes, or None without one."""
     boxes = [p.get_actor_bounds(False) for p in unreal.GameplayStatics.get_all_actors_of_class(world, unreal.LandscapeProxy)]
@@ -1788,6 +1909,127 @@ def _instanced_groups(world, match):
     return groups
 
 
+def _material_warnings(materials):
+    """Known-broken material setups: Fab's M_MS_Foliage with "use Distance Based WPO Fade" on (that permutation does
+    not compile, "Missing function input 'Function Distance Input'", and instances fall back to the default
+    material)."""
+    notes = []
+    for mi in materials:
+        if not isinstance(mi, unreal.MaterialInstance):
+            continue
+        base = _try(lambda: mi.get_base_material())
+        if base is None or not base.get_name().lower().startswith("m_ms_foliage"):
+            continue
+        L = unreal.MaterialEditingLibrary
+        for name in [str(n) for n in (_try(lambda: L.get_static_switch_parameter_names(base), []) or [])]:
+            if "distance based wpo fade" in name.lower() and \
+                    _try(lambda n=name: L.get_material_instance_static_switch_parameter_value(mi, n), False):
+                notes.append(f"{mi.get_name()}: '{name}' is on, and that permutation of {base.get_name()} fails to "
+                             "compile (instances fall back to the grey default material): turn it off and cap wind "
+                             "with a WPO disable distance instead")
+    return notes
+
+
+def _mesh_materials(mesh, comp=None):
+    """A mesh's materials as a component (or foliage type) shows them: overrides first, then the mesh's own."""
+    own = [s.material_interface for s in (_try(lambda: mesh.get_editor_property("static_materials"), []) or [])]
+    overrides = list(_try(lambda: comp.get_editor_property("override_materials"), []) or []) if comp else []
+    return [overrides[i] if i < len(overrides) and overrides[i] else m for i, m in enumerate(own)]
+
+
+def _grass_types(world):
+    """The LandscapeGrassType assets the level's landscape materials use (through instances and functions)."""
+    reg = unreal.AssetRegistryHelpers.get_asset_registry()
+    options = unreal.AssetRegistryDependencyOptions()
+    queue, seen, found = [], set(), []
+    for proxy in unreal.GameplayStatics.get_all_actors_of_class(world, unreal.LandscapeProxy):
+        material = _try(lambda p=proxy: p.get_editor_property("landscape_material"))
+        if material is not None:
+            queue.append(material.get_outermost().get_name())
+    while queue and len(seen) < 300:
+        package = queue.pop()
+        if package in seen or package.startswith("/Script/"):
+            continue
+        seen.add(package)
+        for data in reg.get_assets_by_package_name(package) or []:
+            kind = str(_try(lambda d=data: d.asset_class_path.asset_name, ""))
+            if kind == "LandscapeGrassType":
+                asset = unreal.load_asset(package)
+                if asset is not None and asset not in found:
+                    found.append(asset)
+            elif kind.startswith("Material"):
+                queue += [str(d) for d in (_try(lambda p=package: reg.get_dependencies(p, options), []) or [])]
+    return found
+
+
+def _grass_rows(world):
+    """Rows and an issue count for the landscape grass the level's landscape materials spawn. GrassDensity is per
+    100 m^2 (LandscapeGrass.cpp: extent^2 in cm x density / 1000 / 1000), although its header says per 10 m^2."""
+    rows, issues = [], 0
+    span = lambda values, unit="": (f"{min(values):g}" if min(values) == max(values)  # noqa: E731
+                                    else f"{min(values):g}-{max(values):g}") + unit
+    for grass in _grass_types(world):
+        varieties, problems = [], []
+        for i, variety in enumerate(grass.get_editor_property("grass_varieties") or []):
+            text = variety.export_text()
+            get = lambda f: _text_field(text, f) or ""  # noqa: E731
+            number = lambda f: float(re.search(r"Default=(-?[\d.]+)", get(f)).group(1)) if "Default=" in get(f) \
+                else float(get(f) or 0)  # noqa: E731
+            mesh = variety.get_editor_property("grass_mesh")
+            end, wpo = number("EndCullDistance"), number("InstanceWorldPositionOffsetDisableDistance")
+            varieties.append((number("GrassDensity"), number("StartCullDistance") / 100, end / 100, wpo / 100))
+            name = f"[{i}] {mesh.get_name() if mesh else 'no mesh'}"
+            if end <= 0:
+                problems.append(f"{name}: never culled (EndCullDistance 0)")
+            if mesh and _mesh_facts(mesh).get("wpo") and wpo <= 0:
+                problems.append(f"{name}: wind (WPO) at every distance: ue set {grass.get_name()} "
+                                f"\"GrassVarieties[{i}].InstanceWorldPositionOffsetDisableDistance=4000\"")
+            problems += [f"{name}: {n}" for n in _material_warnings(list(variety.get_editor_property("override_materials") or [])
+                                                                    + (_mesh_materials(mesh) if mesh else []))]
+        if not varieties:
+            continue
+        issues += bool(problems)
+        densities, starts, ends, wpos = zip(*varieties)
+        rows.append(f"{'!' if problems else ' '} grass {grass.get_name()}: {len(varieties)} variet{'y' if len(varieties) == 1 else 'ies'}, "
+                    f"{span(densities)} per 100 m^2 each ({sum(densities):g} in all), "
+                    + (f"cull {starts[0]:g}-{ends[0]:g} m" if len(set(starts)) == 1 and len(set(ends)) == 1
+                       else f"cull from {span(starts, ' m')} to {span(ends, ' m')}")
+                    + (f", WPO off beyond {span(wpos, ' m')}" if min(wpos) > 0 else ""))
+        rows += [f"    - {p}" for p in problems[:6]] + ([f"    - ... +{len(problems) - 6} more"] if len(problems) > 6 else [])
+    if rows:
+        rows.append("  (grass density is per 100 m^2, as LandscapeGrass.cpp uses it; the header's 'per 10 square "
+                    "meters' is wrong by 10x. Grass instances live on the GPU: counts read 0 from Python)")
+    return rows, issues
+
+
+def _skinned_instance_rows(world):
+    """InstancedSkinnedMeshComponents (Megaplants and the like) without a TransformProvider: no bone transforms,
+    so every instance's Nanite assemblies collapse onto the root."""
+    cls = getattr(unreal, "InstancedSkinnedMeshComponent", None)
+    rows, issues, fine = [], 0, []
+    if cls is None:
+        return rows, issues
+    for actor in unreal.GameplayStatics.get_all_actors_of_class(world, unreal.Actor):
+        for comp in actor.get_components_by_class(cls):
+            mesh = _try(lambda c=comp: c.get_editor_property("skinned_asset") or c.get_editor_property("skeletal_mesh"))
+            provider = _try(lambda c=comp: c.get_editor_property("transform_provider"))
+            count = _try(lambda c=comp: c.get_instance_count(), None)
+            bad = provider is None
+            issues += bad
+            if not bad:
+                fine.append((count or 0, provider.get_name()))
+                continue
+            rows.append(f"{'!' if bad else ' '} skinned {mesh.get_name() if mesh else '?'} in {_actor_label(actor)}"
+                        + (f": {count} instance(s)" if count is not None else "")
+                        + (f", transform provider {provider.get_name()}" if provider else ""))
+            rows.append("    - no TransformProvider (a DynamicWind data asset for Megaplants): instances get no "
+                        "bone transforms, so their Nanite branch assemblies collapse onto the root")
+    if fine:
+        rows.insert(0, f"  {len(fine)} instanced skinned mesh component(s), {sum(n for n, _ in fine)} instance(s), with a "
+                       f"transform provider ({', '.join(sorted({p for _, p in fine}))})")
+    return rows, issues
+
+
 def _foliage_check(world, match, limit):
     """Per instanced or repeated mesh: count, culling, LODs (and the impostor billboard), Nanite, wind (WPO)
     distance, shadows and collision on small instances, and meshes placed as many separate actors."""
@@ -1800,36 +2042,49 @@ def _foliage_check(world, match, limit):
         if not instances and separate < 20:
             continue  # a few plain actors of a mesh are not scatter
         facts = _mesh_facts(g["mesh"])
-        comps = g["comps"]
+        # Components that are never drawn (invisible collision proxies, e.g. tree-trunk colliders) only cost physics:
+        # leave them out of the render checks
+        drawn = [c for c in g["comps"] if _try(lambda c=c: c.is_visible(), True)
+                 and not _try(lambda c=c: c.get_editor_property("hidden_in_game"), False)]
+        hidden = len(g["comps"]) - len(drawn)
+        comps = drawn
+        instances_drawn = sum(c.get_instance_count() for c in comps)
         issues = []
         if facts["billboard"]:
             issues.append(f"last LOD is a {facts['tris'][-1]}-triangle billboard (renders oversized far away; "
                           "ue foliage fix billboards)")
-        if comps and instances >= 200 and any(c.get_editor_property("instance_end_cull_distance") <= 0 for c in comps):
+        if comps and instances_drawn >= 200 and any(c.get_editor_property("instance_end_cull_distance") <= 0 for c in comps):
             issues.append("never culled (no end cull distance; ue foliage fix cull --distance N)")
-        if comps and facts["wpo"] and instances >= 200 and any(
+        if comps and facts["wpo"] and instances_drawn >= 200 and any(
                 _try(lambda c=c: c.get_editor_property("world_position_offset_disable_distance"), 1) <= 0 for c in comps):
             issues.append("wind (WPO) runs at every distance (ue foliage fix wpo --distance N)")
         if facts["lods"] == 1 and not facts["nanite"] and facts["tris"][0] >= 2000 and instances + separate >= 100:
             issues.append(f"one LOD of {facts['tris'][0]} triangles and not Nanite")
         small = facts["radius"] < _FOLIAGE_SMALL
-        if small and instances >= 1000 and any(c.get_editor_property("cast_shadow") for c in comps):
-            issues.append(f"{instances} small instances cast shadows")
+        if small and instances_drawn >= 1000 and any(c.get_editor_property("cast_shadow") for c in comps):
+            issues.append(f"{instances_drawn} small instances cast shadows")
         if small and instances >= 500 and any(c.get_collision_enabled() != unreal.CollisionEnabled.NO_COLLISION
-                                              for c in comps):
+                                              for c in g["comps"]):
             issues.append(f"collision on {instances} small instances")
         if separate >= 20:
             issues.append(f"{separate} separate actors (ue foliage convert {g['mesh'].get_name()} makes them instances)")
+        materials = [m for c in comps[:4] for m in _mesh_materials(g["mesh"], c)] or _mesh_materials(g["mesh"])
+        issues += list(dict.fromkeys(_material_warnings(materials)))
         flagged += bool(issues)
         cull = max((c.get_editor_property("instance_end_cull_distance") for c in comps), default=0)
         where = ", ".join(sorted(g["kinds"])) or "actors"
         rows.append(f"{'!' if issues else ' '} {g['mesh'].get_name()}: {instances} instance(s)"
-                    + (f" + {separate} actor(s)" if separate else "") + f" ({where}); LODs "
+                    + (f" + {separate} actor(s)" if separate else "") + f" ({where}"
+                    + (", not drawn: collision only" if hidden and not comps else "") + "); LODs "
                     + "/".join(str(t) for t in facts["tris"]) + (" Nanite" if facts["nanite"] else "")
                     + (f"; cull {cull / 100:.0f} m" if cull > 0 else ""))
         rows += [f"    - {i}" for i in issues]
-    head = f"{len(groups)} instanced or repeated mesh(es), {flagged} with issues"
-    return _capped(head, rows, limit)
+    grass, grass_issues = _grass_rows(world) if match in ("", "-") else ([], 0)
+    skinned, skinned_issues = _skinned_instance_rows(world)
+    head = (f"{len(groups)} instanced or repeated mesh(es), {flagged} with issues"
+            + (f"; landscape grass: {grass_issues} with issues" if grass else "")
+            + (f"; instanced skinned meshes: {skinned_issues} with issues" if skinned else ""))
+    return _capped(head, rows + skinned + grass, limit)
 
 
 def _foliage_fix(world, kind, match, value, scope, by_mesh=None):
@@ -2856,6 +3111,17 @@ class TetherCore(_Base):
             One 'name: old -> new' line per property.
         """
         _authorize(token)
+        requested_all = json.loads(values)
+        paths = [(k, v) for k, v in requested_all.items() if isinstance(requested_all, dict) and ("[" in k or "." in k)]
+        if paths:  # struct fields (Name[i].Field): through the struct's text, which also reaches uint32 fields
+            obj = _resolve(target, pie)
+            rows = _set_paths(obj, paths, pie)
+            rest = {k: v for k, v in requested_all.items() if (k, v) not in paths}
+            head = _label(obj) + (" (PIE)" if pie else "")
+            if not rest:
+                return "\n".join([head] + rows)
+            more = TetherCore.set_props(target, json.dumps(rest), pie, token).split("\n")[1:]
+            return "\n".join([head] + rows + more)
         legacy_obj = _resolve(target, pie) if not _LEGACY else None
         legacy_cls = legacy_obj and (legacy_obj if isinstance(legacy_obj, unreal.Struct) else legacy_obj.get_class())
         if _LEGACY or (legacy_cls and not unreal.ToolsetLibrary.list_struct_properties(legacy_cls)):

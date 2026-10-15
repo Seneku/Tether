@@ -2540,3 +2540,117 @@ class TerrainRound(unittest.TestCase):
         with unittest.mock.patch("builtins.print"):
             ue.cmd_drop(ctx, argparse.Namespace(actors=["A", "B"], align=False, group=True, rest="mean"))
         self.assertEqual(ctx.calls[0][1], {"targets": "A,B", "align": False, "group": True, "rest": "mean"})
+
+
+class IslandHorrorRound(unittest.TestCase):
+    """0.22: IslandHorror's visual-pass feedback."""
+
+    def test_live_coding_holders(self):
+        out = ("65800\t101708\tC:\\UE_5.8\\Engine\\Binaries\\Win64\\LiveCodingConsole.exe\t"
+               "-Group=UE_ShooterDomination_0xe2e0a70c -Hidden -ProjectName=\"ShooterDomination\"\n"
+               "70000\t1\tC:\\UE_5.7\\Engine\\Binaries\\Win64\\LiveCodingConsole.exe\t-ProjectName=\"Other\"\n")
+        with unittest.mock.patch.object(ue.core.os, "name", "nt"), \
+                unittest.mock.patch.object(ue.core.subprocess, "run",
+                                           return_value=types.SimpleNamespace(stdout=out, returncode=0)):
+            self.assertEqual(ue.live_coding_holders("C:\\UE_5.8"), [(65800, "ShooterDomination", 101708)])
+
+    def test_res_percentage_and_upscaler_line(self):
+        self.assertEqual(ue.parse_res("2560x1440"), (2560, 1440))
+        with self.assertRaises(ue.CliError):
+            ue.parse_res("1440p")
+        percentage, clamped = ue.res_percentage((2560, 1440), (799, 525))
+        self.assertAlmostEqual(percentage, 100 * (2560 * 1440 / (799 * 525)) ** 0.5, places=3)
+        self.assertEqual(clamped, "")
+        self.assertEqual(ue.res_percentage((7680, 4320), (200, 100))[0], ue.MAX_SCREEN_PERCENTAGE)
+        line = "LogRHI: 92.7%  0.29ms   TemporalSuperResolution(sg.AntiAliasingQuality=3) 2397x1575 -> 799x525"
+        noise = "LogRHI: 0.7%  0.00ms   Downsample 50x33 -> 25x17"
+        self.assertEqual(ue.UPSCALE.findall(line + "\n" + noise), [("2397", "1575", "799", "525")])
+        self.assertEqual(ue.res_cvars(296.0, True), {"r.ScreenPercentage": "296.0"})
+        self.assertIn("r.Editor.Viewport.ScreenPercentage", ue.res_cvars(296.0, False))
+
+    def test_hud_crop_check(self):
+        dark = ue.png_bytes(32, 20, bytes(32 * 20 * 3))
+        lit = ue.png_bytes(32, 20, bytes([200]) * (32 * 20 * 3))
+        self.assertEqual(ue.thumb_difference(dark, dark), 0)
+        self.assertGreater(ue.thumb_difference(dark, lit), ue.HUD_MISMATCH)
+
+    def test_buoyancy_lines(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            issues = ue.buoyancy_lines({"label": "Raft", "radii": [30, 30, 30, 30], "coefficient": 0.1, "max_force": 0,
+                                        "overlaps_at_load": False, "mass": 200, "simulates": True})
+        text = out.getvalue()
+        self.assertEqual(issues, 2)
+        self.assertIn("ue set Raft bGenerateOverlapEventsDuringLevelStreaming=true", text)
+        self.assertIn("it cannot float", text)  # 0.1 x 113097 cm^3 = 11310 < 200 kg x 980
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(ue.buoyancy_lines({"label": "Buoy", "radii": [100] * 4, "coefficient": 0.1, "max_force": 0,
+                                                "overlaps_at_load": True, "mass": 50, "simulates": True}), 0)
+
+    def test_failed_materials_from_the_log(self):
+        project = Project()
+        try:
+            content = os.path.join(project.root, "Content", "Fab", "M_MS_Foliage.uasset")
+            project.write("Saved/Logs/Game.log", stamped(f"LogMaterial: Warning: [AssetLog] {content}: Failed to compile "
+                                                         "Material for platform PCD3D_SM6, Default Material will be used "
+                                                         "in game.") + "\n")
+            ctx = types.SimpleNamespace(project=project.uproject, beacon=None, transport="mcp")
+            with unittest.mock.patch.object(ue.content, "flush_editor_log"):
+                self.assertEqual(ue.failed_materials(ctx), ["/Game/Fab/M_MS_Foliage"])
+        finally:
+            project.close()
+
+    def test_usage_flags_set_by_the_editor(self):
+        project = Project()
+        try:
+            line = stamped("LogMaterial: Display: Material /Game/IH/MI_Fern.MI_Fern needed to set usage flag "
+                           "InstancedStaticMeshes")
+            project.write("Saved/Logs/Game.log", line + "\n" + line + "\n")
+            ctx = types.SimpleNamespace(project=project.uproject, beacon=None)
+            self.assertEqual(ue.usage_flagged_materials(ctx), [("/Game/IH/MI_Fern", "InstancedStaticMeshes")])
+        finally:
+            project.close()
+
+    def test_property_hint_for_blueprint_variables(self):
+        error = "Exception: Actor: Failed to find property 'time_of_day' for attribute 'time_of_day' on 'BP_UDS_C'"
+        hint = ue.property_name_hint(FakeCtx(json.dumps({"python": ["hidden"], "blueprint": ["Time of Day", "Cloud Speed"]})),
+                                     error)
+        self.assertIn("get_editor_property('Time of Day')", hint)
+
+    def test_spawn_in_pie_moves_the_summoned_actor(self):
+        replies = iter([{"path": "/Script/Engine.StaticMeshActor", "mesh": "/Engine/BasicShapes/Cube.Cube", "before": []},
+                        None,
+                        {"name": "StaticMeshActor_3", "label": "Buoy", "class": "StaticMeshActor", "at": [10, 20, 30],
+                         "landed": "Island"}])
+        sent = []
+
+        class Ctx(FakeCtx):
+            beacon = {"pie": True}
+            data = None
+
+            def tether(self, tool, **kwargs):
+                sent.append((tool, kwargs))
+                return ""
+        out = io.StringIO()
+        with unittest.mock.patch.object(ue.calls, "py_json", side_effect=lambda ctx, code: next(replies)), \
+                unittest.mock.patch.object(ue.calls.time, "sleep"), contextlib.redirect_stdout(out):
+            ue.cmd_spawn(Ctx(), argparse.Namespace(what="/Engine/BasicShapes/Cube", at="10,20,500", rot=None,
+                                                   label="Buoy", ground=True, align=False, pie=True))
+        self.assertEqual(sent[0], ("console", {"command": "summon /Script/Engine.StaticMeshActor", "pie": True}))
+        self.assertIn("spawned Buoy (StaticMeshActor) in the PIE world at (10, 20, 30) on Island", out.getvalue())
+
+    def test_wait_grass_until_batches_stop(self):
+        done = stamped("LogGrass: Verbose: ASYNC GRASS INSTANCES COMPLETE a b 1 2 (3)")
+        logs = iter([[], [done], [done, done], [done, done]] + [[done, done]] * 20)
+        clock = iter(range(0, 100))
+        ctx = FakeCtx()
+        ctx.beacon, ctx.project = {"pie": True}, "Game.uproject"
+        out = io.StringIO()
+        with unittest.mock.patch.object(ue.play, "new_log_lines", side_effect=lambda c, s: next(logs)), \
+                unittest.mock.patch.object(ue.play, "unthrottled", contextlib.nullcontext), \
+                unittest.mock.patch.object(ue.play, "log_end", return_value=0), \
+                unittest.mock.patch.object(ue.play.time, "time", side_effect=lambda: next(clock)), \
+                unittest.mock.patch.object(ue.play.time, "sleep"), contextlib.redirect_stdout(out):
+            self.assertEqual(ue.cmd_wait(ctx, argparse.Namespace(what="grass", clock="real", max=60)), 0)
+        self.assertIn("grass settled: 2 batch(es)", out.getvalue())
+        self.assertEqual([c[1]["command"] for c in ctx.calls], ["log LogGrass Verbose", "log LogGrass Log"])

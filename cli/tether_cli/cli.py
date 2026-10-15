@@ -120,9 +120,9 @@ def build_parser():
     s.add_argument("--force", action="store_true", help="with release: release another session's lease")
     s = add("wait", cmd_wait, "wait N seconds, N seconds of game time in PIE (ue wait 4 game), or until shaders and "
                               "assets have compiled (ue wait compile)")
-    s.add_argument("what", help="seconds, or compile")
+    s.add_argument("what", help="seconds, compile, or grass (until landscape grass for the view has been built)")
     s.add_argument("clock", nargs="?", choices=["game", "real"], default="real", help="game: PIE game time")
-    s.add_argument("--max", type=float, default=900, help="with compile: give up after this many seconds (900)")
+    s.add_argument("--max", type=float, default=900, help="with compile or grass: give up after this many seconds (900)")
     s = add("who", cmd_who, "sessions that used this editor recently, their last command, the lease, who started PIE")
     s.add_argument("--minutes", type=float, default=15, help="how far back (15)")
     s.add_argument("--as", dest="name", help="a name for this session that the others see (kept)")
@@ -163,6 +163,7 @@ def build_parser():
     s.add_argument("--label", help="actor label")
     s.add_argument("--ground", action="store_true", help="drop it onto the surface below --at")
     s.add_argument("--align", action="store_true", help="with --ground: tilt it to the surface")
+    s.add_argument("--pie", action="store_true", help="spawn into the running PIE world instead (gone when PIE stops)")
     s = add("scatter", cmd_scatter, "place many copies on the ground in an area or along a line (one undo step)")
     s.add_argument("what", help="asset (/Game/...) or class")
     s.add_argument("--count", type=int, default=10)
@@ -195,6 +196,8 @@ def build_parser():
     s.add_argument("action", nargs="?", default="info", choices=["info", "actors", "load", "unload"])
     s.add_argument("where", nargs="?", help="a name/class regex, or an area x,y,radius")
     s = add("gpu", cmd_gpu, "GPU time per pass (ProfileGPU): by kind (Lumen, shadows, base pass, post...) and the top passes")
+    s.add_argument("--res", metavar="WxH", help="render the 3D scene with this resolution's pixel count (screen percentage "
+                                               "on the small offscreen viewport), e.g. 2560x1440")
     s.add_argument("--frames", type=int, default=3, help="frames to profile and average (3)")
     s.add_argument("--pie", action="store_true", help="require PIE (default: PIE when it runs, else the editor)")
     s.add_argument("--top", type=int, default=12, help="how many passes to list (12)")
@@ -311,6 +314,8 @@ def build_parser():
     s.add_argument("--seconds", type=float, default=60, help="give up after this long (60)")
     s.add_argument("--pie", action="store_true", help="with --prop: read the PIE world")
     s = add("shot", cmd_shot, "capture the viewport (or the PIE view) to a PNG; prints the path")
+    s.add_argument("--res", metavar="WxH", help="render at a real resolution (HighResShot), e.g. 2560x1440; not with "
+                                               "--hud/--annotate/--ui")
     s.add_argument("--actor", help="frame this actor, keeping the current view direction")
     s.add_argument("--at", help="camera location x,y,z")
     s.add_argument("--look-at", help="aim at x,y,z or an actor")
@@ -419,6 +424,8 @@ def build_parser():
     s.add_argument("--seconds", type=float, help="capture length (10); with load: how long to play (10, or 0 after -f)")
     s.add_argument("-f", "--file", help="with load: a `ue pie do` route to play while measuring")
     s.add_argument("--hitch", type=float, default=50, help="with load: frames longer than this many ms are hitches (50)")
+    s.add_argument("--res", metavar="WxH", help="render the 3D scene with this resolution's pixel count (screen percentage "
+                                               "on the PIE viewport), e.g. 2560x1440")
     s.add_argument("--editor", action="store_true", help="measure the editor as is, without starting PIE")
     s.add_argument("--no-record", action="store_true", help="do not make this capture the comparison baseline")
     s.add_argument("--trace", action="store_true", help="also an Unreal Insights trace: top CPU scopes per thread")

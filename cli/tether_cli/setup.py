@@ -7,7 +7,8 @@ import sys
 import time
 
 from .core import (
-    CLI_DIR, CliError, crash_summary, editor_executable, editor_live, engine_root, filter_log, log_end, log_path,
+    CLI_DIR, CliError, crash_summary, editor_executable, editor_live, engine_root, filter_log, live_coding_holders, log_end,
+    log_path,
     pick_port, pid_alive, port_open,
     read_json, recent_crash, run_git, running_editors, stall_report, state_dir, subprocess,
 )
@@ -91,8 +92,16 @@ def cmd_doctor(ctx, args):
             report("WARN", f"port {port} (this project's MCP port) is in use by another program",
                    "ue open picks the next free port; close the other program to keep this one")
     others = [(p, c) for p, c in running_editors() if p != pid]
+    holders = live_coding_holders(engine) if engine else []
+    mine = os.path.splitext(os.path.basename(project))[0]
+    for console, name, editor in holders:
+        if name != mine:  # UBT's Live Coding mutex is per engine install: it blocks this project's editor builds too
+            report("WARN", f"Live Coding is active for {name} (LiveCodingConsole pid {console}"
+                           + (f", editor pid {editor}" if editor else "") + ") on this engine install",
+                   "UBT builds of this project's editor fail while it runs: close that editor, or build in it")
     if engine and others:
-        same = [(p, c) for p, c in others if os.path.normcase(engine) in os.path.normcase(c)]
+        same = [(p, c) for p, c in others if os.path.normcase(engine) in os.path.normcase(c)
+                and p not in {editor for _, _, editor in holders}]  # those already have their Live Coding line
         for p, c in same[:3]:
             name = next((os.path.basename(t.strip('"')) for t in c.split() if t.strip('"').endswith(".uproject")), "?")
             report("WARN", f"another editor on this engine: pid {p} ({name})",

@@ -36,6 +36,13 @@ type), 61, 62, 63 (`paint` backs up the layer by rendering it at the vertex reso
 compile`, which watches shader-worker and editor CPU because neither compile queue is visible to Python (`ue open`
 does not report the backlog yet). 65 (a C++ module) is still open.
 
+**Done in 0.22.0** (IslandHorror's visual pass, 67-77): 67 (`shot --hud` checks its window crop against the
+viewport's own capture and falls back to it), 68 (through the cheat manager's `summon`), 69, 70-72 (plus materials
+that failed to compile and usage flags the editor set, both from the log; collision-only components skip the render
+checks), 73, 74, 75 (screen percentage to the pixel count for gpu/perf, verified in the upscaler's line; HighResShot
+for shot, which in the editor needs a level viewport), 76 (the grass builder's Verbose batch lines), 77. Measured on
+Lvl_Island at its player start: 1440p ~15 ms GPU (BasePass most of it), 1080p ~11.5 ms.
+
 ---
 
 ## Priority 1: asked for, or blocking real work

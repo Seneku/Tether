@@ -10,7 +10,7 @@ import time
 
 from .core import (
     CliError, compact_error, compile_cpu, crash_summary, editor_executable, editor_live, editor_process, engine_root,
-    filter_log, host_platform,
+    filter_log, host_platform, parse_res,
     human_bytes, log_end, log_path, read_json, recent_crash, short, state_dir, subprocess, unwrap, write_json,
 )
 from .transport import catalog, py_json, resolve_toolset
@@ -928,35 +928,100 @@ GPU_CVARS = {"r.ProfileGPU.ShowUI": "0", "r.ProfileGPU.TableFormatting": "0", "r
              "r.ProfileGPU.ShowEmptyQueues": "0"}
 
 
+# The upscaler's line in ProfileGPU, render size -> output size: "TemporalSuperResolution(...) 2397x1575 -> 799x525"
+UPSCALE = re.compile(r"(?:TemporalSuperResolution|TemporalAA|TAA)\b[^\n]*?(\d{2,5})x(\d{2,5}) -> (\d{2,5})x(\d{2,5})")
+MAX_SCREEN_PERCENTAGE = 400
+
+
+def res_percentage(res, size):
+    """The screen percentage that renders the 3D scene with the pixel count of res from a viewport of size (the
+    offscreen viewport is small and cannot be resized), clamped; and a note when it had to be."""
+    import math
+    (w, h), (cw, ch) = res, size
+    wanted = 100 * math.sqrt(w * h / (cw * ch))
+    used = max(10.0, min(MAX_SCREEN_PERCENTAGE, wanted))
+    return used, ("" if used == wanted else f" (clamped from {wanted:.0f}%)")
+
+
+def pie_viewport_size(ctx):
+    size = str(ctx.tether("py", code="s = unreal.WidgetLayoutLibrary.get_viewport_size(unreal.get_editor_subsystem("
+                                     "unreal.UnrealEditorSubsystem).get_game_world())\nf'{s.x:.0f} {s.y:.0f}'"))
+    w, h = (int(v) for v in size.strip().strip("'").split())
+    return w, h
+
+
+def res_cvars(percentage, pie):
+    """Console variables for a screen percentage: PIE reads r.ScreenPercentage; editor viewports their own."""
+    if pie:
+        return {"r.ScreenPercentage": f"{percentage:.1f}"}
+    return {"r.Editor.Viewport.ScreenPercentageMode.RealTime": "0", "r.Editor.Viewport.ScreenPercentage": f"{percentage:.1f}"}
+
+
+def profile_gpu(ctx, pie, frames, timeout):
+    """ProfileGPU blocks for frames frames, and the log text they came in."""
+    blocks, texts = [], []
+    for _ in range(frames):
+        start = log_end(ctx.project)
+        ctx.tether("console", command="ProfileGPU", pie=pie)
+        got, text = [], ""
+        while time.time() < timeout:
+            flush_editor_log(ctx)
+            with open(log_path(ctx.project), "rb") as f:
+                f.seek(start)
+                text = f.read().decode("utf-8", "replace")
+            got = gpu_profile_blocks(text.splitlines())
+            if any("Graphics" in b["pipeline"] and b["nodes"] for b in got):
+                time.sleep(0.2)  # let the other pipelines' blocks land too
+                break
+            time.sleep(0.3)
+        else:
+            raise CliError("no GPU profile in the log (does this editor render? ue open --headless needs --render)", 4)
+        blocks += got
+        texts.append(text)
+    return blocks, "\n".join(texts)
+
+
 def cmd_gpu(ctx, args):
-    """GPU time per pass from ProfileGPU (PIE if it runs, else the editor's viewports), averaged over --frames."""
+    """GPU time per pass from ProfileGPU (PIE if it runs, else the editor's viewports), averaged over --frames.
+    --res renders the 3D scene with the pixel count of a real resolution (screen percentage), checked in the
+    upscaler's line of the profile."""
     pie = str(ctx.tether("pie", action="status")).strip() == "running"
     if args.pie and not pie:
         raise CliError("PIE is not running (ue pie start)")
-    blocks, timeout = [], time.time() + 20 + 3 * args.frames
-    with unthrottled(ctx), scoped_cvars(ctx, GPU_CVARS):  # ShowUI=0: no profiler window on the user's screen
-        for _ in range(args.frames):
-            start = log_end(ctx.project)
-            ctx.tether("console", command="ProfileGPU", pie=pie)
-            got = []
-            while time.time() < timeout:
-                flush_editor_log(ctx)
-                with open(log_path(ctx.project), "rb") as f:
-                    f.seek(start)
-                    got = gpu_profile_blocks(f.read().decode("utf-8", "replace").splitlines())
-                if any("Graphics" in b["pipeline"] and b["nodes"] for b in got):
-                    time.sleep(0.2)  # let the other pipelines' blocks land too
-                    break
-                time.sleep(0.3)
-            else:
-                raise CliError("no GPU profile in the log (does this editor render? ue open --headless needs --render)", 4)
-            blocks += got
+    timeout = time.time() + 30 + 3 * args.frames
+    cvars, res_note = dict(GPU_CVARS), ""
+    with unthrottled(ctx):
+        if args.res:
+            res = parse_res(args.res)
+            if pie:
+                size = pie_viewport_size(ctx)
+            else:  # the level viewport's size, from the upscaler's output in one profile
+                with scoped_cvars(ctx, GPU_CVARS):
+                    sizes = UPSCALE.findall(profile_gpu(ctx, pie, 1, timeout)[1])
+                if not sizes:
+                    raise CliError("--res: could not tell the viewport's size (no TSR/TAA line in the profile)")
+                size = (int(sizes[-1][2]), int(sizes[-1][3]))
+            percentage, clamped = res_percentage(res, size)
+            cvars.update(res_cvars(percentage, pie))
+        with scoped_cvars(ctx, cvars):  # ShowUI=0: no profiler window on the user's screen
+            if args.res:
+                time.sleep(1.5)  # the first frames at a new size reallocate render targets and history
+            blocks, text = profile_gpu(ctx, pie, args.frames, timeout + 2)
+    if args.res:
+        seen = UPSCALE.findall(text)
+        rendered = (int(seen[-1][0]), int(seen[-1][1])) if seen else None
+        res_note = (f"; 3D scene rendered at {rendered[0]}x{rendered[1]} (screen {percentage:.0f}%{clamped}: the pixel count "
+                    f"of {res[0]}x{res[1]}), upscaled to the {size[0]}x{size[1]} viewport; passes after the upscaler "
+                    "and the UI ran at the viewport's size" if rendered else
+                    f"; screen {percentage:.0f}%{clamped} asked, but the profile shows no upscaler line to confirm it")
+        if rendered and abs(rendered[0] * rendered[1] - res[0] * res[1]) > 0.1 * res[0] * res[1] and not clamped:
+            res_note += " (NOT the asked pixel count: the screen percentage did not take)"
     summary = gpu_summary(blocks)
     if summary is None:
         raise CliError("ProfileGPU logged no graphics pipeline")
     where = "PIE" if pie else "editor"
     print(f"GPU {summary['gpu_ms']:.2f} ms per frame ({where}, " + (f"average of {summary['frames']} frames"
-          if summary["frames"] > 1 else f"frame {summary['frame_numbers'][0]}") + ")")
+          if summary["frames"] > 1 else f"frame {summary['frame_numbers'][0]}") + ")" + res_note)
     if not summary["scene"]:
         print("note: no 3D scene was rendered in " + ("that frame" if summary["frames"] == 1 else "those frames")
               + (": the PIE viewport is not drawing" if pie else ": start PIE (ue pie start) or make a level viewport "
@@ -1704,15 +1769,52 @@ def wait_compile(ctx, args):
                            f"{editor:.1f} cores)", 4)
 
 
+GRASS_DONE = re.compile(r"ASYNC GRASS INSTANCES COMPLETE")
+GRASS_QUIET = 2.0  # seconds without a finished grass batch that count as settled
+GRASS_NONE = 6.0   # seconds with no grass work at all: nothing to build for this view
+
+
+def wait_grass(ctx, args):
+    """`ue wait grass`: until landscape grass for the current view has been built (after a camera move, a teleport
+    or a landscape material change). Grass instances live on the GPU, so they cannot be counted from Python; the
+    grass builder logs each finished batch at Verbose, so watch those until they stop."""
+    pie = bool((ctx.beacon or {}).get("pie"))
+    start, started = log_end(ctx.project), time.time()
+    ctx.tether("console", command="log LogGrass Verbose", pie=pie)
+    batches, last = 0, None
+    try:
+        with unthrottled(ctx):  # a background editor otherwise ticks grass a few times a second
+            while True:
+                time.sleep(0.5)
+                count = sum(1 for line in new_log_lines(ctx, start) if GRASS_DONE.search(line))
+                now = time.time()
+                if count != batches:  # another batch finished: the quiet period starts again
+                    batches, last = count, now
+                if batches and now - last >= GRASS_QUIET:
+                    print(f"grass settled: {batches} batch(es) built in {last - started:.1f}s")
+                    return 0
+                if not batches and now - started >= GRASS_NONE:
+                    print(f"no grass was built in {GRASS_NONE:g}s: the view's grass is already there, or nothing in view "
+                          "spawns grass" + ("" if pie else " (a headless editor has no level viewport: grass builds "
+                                                           "for PIE views; ue pie start)"))
+                    return 0
+                if now - started > args.max:
+                    raise CliError(f"grass still building after {args.max:g}s ({batches} batch(es) so far)", 4)
+    finally:
+        ctx.tether("console", command="log LogGrass Log", pie=pie)
+
+
 def cmd_wait(ctx, args):
     """`ue wait N [game]`: N seconds, or N seconds of game time in the running PIE (`pie do "wait N game"`), for
     the pauses between `ue exec` or `ue pie do` calls. `ue wait compile`: until shaders and assets have compiled."""
     if args.what == "compile":
         return wait_compile(ctx, args)
+    if args.what == "grass":
+        return wait_grass(ctx, args)
     try:
         args.seconds = float(args.what)
     except ValueError:
-        raise CliError("ue wait <seconds> [game] | ue wait compile") from None
+        raise CliError("ue wait <seconds> [game] | ue wait compile | ue wait grass") from None
     if args.clock == "game":
         if not (ctx.beacon or {}).get("pie"):
             raise CliError("`ue wait N game` needs PIE running (ue pie start); `ue wait N` waits wall-clock seconds")
