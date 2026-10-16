@@ -3130,7 +3130,8 @@ class UnrealRacingRound2(unittest.TestCase):
             with self.assertRaises(ue.CliError):
                 ue.grant_lease(p)  # not the holder
         with unittest.mock.patch.dict(os.environ, {"UE_SESSION": "holder"}):
-            self.assertIn("asker asks for the editor", ue.lease_messages(p)[0])
+            self.assertIn("waiting for the editor: asker", ue.lease_messages(p)[0])
+            self.assertEqual(ue.lease_messages(p), [])  # said once
             lease = ue.grant_lease(p)
         self.assertEqual((lease["session"], lease["what"]), ("asker", "build --restart"))
         self.assertEqual(ue.lease_requests(p), [])
@@ -3214,12 +3215,252 @@ class UnrealRacingRound2(unittest.TestCase):
     def test_collide_picture(self):
         ctx = FakeCtx()
         ctx.project, ctx.beacon = self.project.uproject, {}
-        data = {"n": 2, "grid": [[1, 0], [0, 2]], "classes": {"NRRoadNode": [1, 1, ["J_1"]], "Wall": [2, 1, ["W"]]}}
+        parts = [{"keys": ["NRRoadNode"], "grid": [[1, 0]], "actors": {"NRRoadNode": ["J_1"]}},
+                 {"keys": ["Wall", "NRRoadNode"], "grid": [[2, 1]], "actors": {"Wall": ["W"], "NRRoadNode": ["J_2"]}}]
         args = argparse.Namespace(where="0,0,100", m=False, step=100.0, z=None, half=40.0, pie=False,
                                   output=os.path.join(self.project.root, "c.png"))
-        with unittest.mock.patch.object(ue.content, "py_json", return_value=data), \
+        with unittest.mock.patch.object(ue.content, "COLLIDE_CELLS", 2), \
+                unittest.mock.patch.object(ue.content, "py_json", side_effect=parts), \
                 contextlib.redirect_stdout(io.StringIO()) as out:
             self.assertEqual(ue.cmd_collide(ctx, args), 0)
         self.assertTrue(os.path.isfile(args.output))
-        self.assertIn("50% blocked", out.getvalue())
-        self.assertIn("NRRoadNode: 1 cell(s), e.g. J_1", out.getvalue())
+        self.assertIn("75% blocked", out.getvalue())  # two calls of one row each, merged
+        self.assertIn("NRRoadNode: 2 cell(s), e.g. J_1, J_2", out.getvalue())
+        self.assertIn("Wall: 1 cell(s)", out.getvalue())
+        with self.assertRaisesRegex(ue.CliError, "not JSON: Traceback ... RuntimeError: boom"):
+            ue.py_json(FakeCtx("Traceback ...\nRuntimeError: boom"), "x")
+
+
+class UnrealRacingRound3(unittest.TestCase):
+    """0.27: UnrealRacing's notes 142-159."""
+
+    def setUp(self):
+        self.project = Project()
+
+    def tearDown(self):
+        self.project.close()
+
+    def beacon(self, pid, **fields):
+        ue.write_json(os.path.join(ue.state_dir(self.project.uproject), "editors", f"{pid}.json"),
+                      dict({"pid": pid, "heartbeat": time.time(), "started": 0}, **fields))
+
+    def test_second_editor_is_its_owners_only(self):
+        p = self.project.uproject
+        self.beacon(os.getpid(), launched_by_tether=True, headless=True, started=100)
+        self.beacon(os.getppid(), launched_by_tether=True, headless=True, started=200, owner="captures")
+        with unittest.mock.patch.dict(os.environ, {"UE_SESSION": "other"}):  # newest, but another session's
+            self.assertEqual(ue.chosen_editor(p)["pid"], os.getpid())
+        with unittest.mock.patch.dict(os.environ, {"UE_SESSION": "captures"}):
+            ue.remember_target(p, {"pid": os.getppid()})
+            self.assertEqual(ue.chosen_editor(p)["pid"], os.getppid())
+            self.assertIn("this session's own", ue.editor_label(ue.chosen_editor(p)))
+            with unittest.mock.patch.dict(os.environ, {"UE_SESSION": "holder"}):
+                ue.take_lease(p, "map rebuild", 15)
+            ue.check_shared(p, "build --restart", destructive=True)  # its own editor: the lease is the shared one's
+            self.assertIsNone(ue.lease_note(p))
+        with unittest.mock.patch.dict(os.environ, {"UE_SESSION": "other"}):
+            with self.assertRaises(ue.CliError):
+                ue.check_shared(p, "build --restart", destructive=True)
+        args = ue.build_parser().parse_args(["open", "--second"])
+        self.assertTrue(args.second)
+
+    def test_lease_requests_are_said_once_then_reminded(self):
+        p = self.project.uproject
+        with unittest.mock.patch.dict(os.environ, {"UE_SESSION": "holder"}):
+            ue.take_lease(p, "menu pass", 60)
+        for sid, what in (("a", "captures"), ("b", "material rebuild")):
+            with unittest.mock.patch.dict(os.environ, {"UE_SESSION": sid}):
+                ue.request_lease(p, what, 10)
+        with unittest.mock.patch.dict(os.environ, {"UE_SESSION": "holder"}):
+            first = ue.lease_messages(p)
+            self.assertEqual(len(first), 1)  # both requests on one line
+            self.assertIn("a (", first[0])
+            self.assertIn("material rebuild", first[0])
+            self.assertEqual(ue.lease_messages(p), [])
+            self.assertEqual(len(ue.lease_messages(p, now=time.time() + 11 * 60)), 1)  # reminded
+
+    def test_wait_lease(self):
+        p = self.project.uproject
+        ctx = FakeCtx()
+        ctx.project = p
+        args = argparse.Namespace(what="lease", max=0, clock="real")
+        with unittest.mock.patch.dict(os.environ, {"UE_SESSION": "holder"}):
+            ue.take_lease(p, "menu pass", 60)
+        with unittest.mock.patch.dict(os.environ, {"UE_SESSION": "waiter"}):
+            with self.assertRaisesRegex(ue.CliError, "leased by holder"):
+                ue.cmd_wait(ctx, args)
+            with unittest.mock.patch.dict(os.environ, {"UE_SESSION": "holder"}):
+                ue.release_lease(p)
+            self.beacon(os.getpid(), pie=True)
+            with self.assertRaisesRegex(ue.CliError, "PIE is running"):
+                ue.cmd_wait(ctx, args)
+            self.beacon(os.getpid(), pie=False)
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(ue.cmd_wait(ctx, args), 0)
+            self.assertIn("the editor is free", out.getvalue())
+
+    def test_validate_without_git_takes_what_the_editor_saved(self):
+        p = self.project.uproject
+        self.project.write("Saved/Logs/Game.log")
+        old = self.project.write("Content/Maps/L_Old.umap", "", mtime=1000)
+        new = self.project.write("Content/Maps/L_Hikari.umap")
+        self.project.write("Plugins/Kit/Content/K.uasset")
+        found = ue.saved_since(p, 2000)
+        self.assertIn(new, found)
+        self.assertNotIn(old, found)
+        self.assertTrue(any(f.endswith("K.uasset") for f in found))
+        ctx = FakeCtx({"checked": 1, "not_validated": 0, "problems": [], "broken_refs": []})
+        ctx.project, ctx.beacon = p, {"started": 2000, "map": "/Game/Maps/L_Hikari"}
+        args = argparse.Namespace(paths=[], changed=None, map_check=False, limit=20, strict=False)
+        with unittest.mock.patch.object(ue.assets, "run_git", return_value=None), \
+                unittest.mock.patch.object(ue.assets, "flush_editor_log"), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            ue.cmd_validate(ctx, args)
+        sent = ctx.calls[0][1]["paths"].split(",")
+        self.assertIn("/Game/Maps/L_Hikari", sent)
+        self.assertNotIn("/Game/Maps/L_Old", sent)
+        self.assertIn("saved since the editor started", out.getvalue())
+
+    def test_tethers_own_screenshot_lookups_leave_the_log(self):
+        lines = [stamped("LogConsoleManager: Warning: Performance warning: Many (31) failed FindConsoleObject() for 'shot'"),
+                 stamped("LogGame: Warning: rival stuck")]
+        kept = ue.filter_log(lines, level="Warning")
+        self.assertEqual(len(kept), 1)
+        self.assertIn("rival stuck", kept[0])
+
+    def test_unlabeled_buttons_take_the_text_under_them(self):
+        nodes = ue.parse_snapshot(
+            'generic [pos=0,0 size=400,100]\n'
+            '  image [pos=0,0 size=400,100]\n'
+            '  text "GARAGE" [pos=20,30 size=100,40]\n'
+            '  button [ref=b120] [pos=0,0 size=400,100]\n'
+            '  button "QUIT" [ref=b121] [pos=0,200 size=400,100]\n')
+        ue.label_buttons(nodes)
+        node = ue.find_ui(nodes, "GARAGE")
+        self.assertEqual(node["ref"], "b120")
+        self.assertIn("text under it", node["flags"])
+        lines = ue.ui_lines(nodes, rects=True)
+        self.assertTrue(any('button "GARAGE" [text under it]  (b120)  @0,0 400x100' in l for l in lines))
+        self.assertIsNone(ue.os_window_at((10, 10), None))
+
+    def test_keys_go_through_slate_when_a_menu_has_focus(self):
+        focused = ue.parse_snapshot('button "PLAY" [ref=b1] [focused] [pos=0,0 size=10,10]')
+        sent = []
+        with unittest.mock.patch.object(ue.play, "ui_nodes", return_value=(focused, True)), \
+                unittest.mock.patch.object(ue.play, "mcp_tool", side_effect=lambda *a: sent.append(a[3]["key"])), \
+                unittest.mock.patch.object(ue.play, "game_key", side_effect=lambda ctx, t: t):
+            self.assertIn('through Slate (button "PLAY" has keyboard focus)', ue.press_key(None, "enter"))
+            self.assertEqual(sent, ["Enter"])
+            self.assertIn("in the game", ue.press_key(None, "Escape"))  # Escape stays the game's
+            self.assertIn("in the game", ue.press_key(None, "Enter", "game"))
+        with unittest.mock.patch.object(ue.play, "ui_nodes", return_value=([], True)), \
+                unittest.mock.patch.object(ue.play, "game_key", side_effect=lambda ctx, t: t):
+            self.assertEqual(ue.press_key(None, "Enter"), "pressed Enter in the game")
+        args = ue.build_parser().parse_args(["ui", "key", "Enter", "--game"])
+        self.assertTrue(args.game)
+
+    def test_world_subsystem_hint(self):
+        hint = ue.property_name_hint(FakeCtx(), "AttributeError: module 'unreal' has no attribute "
+                                                "'SubsystemBlueprintLibrary'")
+        self.assertIn("tether.world_subsystem(", hint)
+
+    def test_fab_remove(self):
+        p = self.project.uproject
+        files = [self.project.write(f"Content/Tokyo/{n}") for n in ("Maps/Demo.umap", "Input/IA_Look.uasset")]
+        ue.write_json(os.path.join(ue.state_dir(p), "fab.json"),
+                      {"added": {"/Game/Tokyo": {"title": "Tokyo Stylized Environment", "listing": "9eec"}}})
+        ue.write_json(os.path.join(ue.state_dir(p), "fab-listings.json"), {})
+        item = {"kind": "pack", "path": "/Game/Tokyo", "title": "Tokyo Stylized Environment", "listing": "9eec"}
+        ctx = FakeCtx()
+        ctx.project, ctx.beacon = p, {"map": "/Game/Maps/L_Hikari"}
+        args = argparse.Namespace(rest=["Tokyo"], dry_run=False, force=False, ignore_lease=False)
+        refs = {"assets": 2, "outside": [["/Game/Maps/L_Hikari", "/Game/Tokyo/Input/IA_Look"]]}
+        with unittest.mock.patch.object(ue.fab, "project_fab", return_value=[item]), \
+                unittest.mock.patch.object(ue.fab, "editor_live", return_value=True), \
+                unittest.mock.patch.object(ue.fab, "py_json", return_value=refs), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(ue.fab_remove(ctx, args), 1)
+        self.assertIn("nothing deleted", out.getvalue())
+        self.assertTrue(all(os.path.isfile(f) for f in files))
+        real_remove = os.remove
+
+        def locked(path):  # the editor holds the Input Action open
+            if path.endswith("IA_Look.uasset"):
+                raise PermissionError(path)
+            real_remove(path)
+        args.force = True
+        with unittest.mock.patch.object(ue.fab, "project_fab", return_value=[item]), \
+                unittest.mock.patch.object(ue.fab, "editor_live", return_value=True), \
+                unittest.mock.patch.object(ue.fab, "py_json", side_effect=[refs, [["/Game/Tokyo", False]]]), \
+                unittest.mock.patch.object(ue.fab.os, "remove", side_effect=locked), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(ue.fab_remove(ctx, args), 0)
+        self.assertIn("deleted when it closes", out.getvalue())
+        self.assertFalse(os.path.exists(files[0]))
+        self.assertTrue(os.path.exists(files[1]))
+        self.assertNotIn("/Game/Tokyo", ue.read_json(os.path.join(ue.state_dir(p), "fab.json"))["added"])
+        done, left = ue.flush_deletes(p)  # the editor has closed
+        self.assertEqual((len(done), left), (1, []))
+        self.assertFalse(os.path.isdir(os.path.join(self.project.root, "Content", "Tokyo")))
+        args = ue.build_parser().parse_args(["fab", "remove", "Tokyo", "--dry-run"])
+        self.assertEqual((args.action, args.dry_run), ("remove", True))
+
+    def test_failed_steps_release_held_keys(self):
+        calls = []
+
+        class Ctx:
+            project = "x.uproject"
+
+            def tether(self, tool, **kw):
+                calls.append((tool, kw))
+                if tool == "pie":
+                    return "running"
+                return {"ok": "fail" not in kw["step"], "detail": "d"}
+
+        args = argparse.Namespace(script=["key W down", "key E down", "key E up", "expect fail.x = 1"], file=None,
+                                  reject=None, warmup=0, keep=False, keep_going=False)
+        with unittest.mock.patch.object(ue, "log_end", return_value=0), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(ue.pie_do(Ctx(), args), 1)
+        steps = [kw["step"] for tool, kw in calls if tool == "pie_step"]
+        self.assertEqual(steps[-1], "key W up")
+        self.assertNotIn("key E up", steps[4:])
+        self.assertIn("released W (still down", out.getvalue())
+
+    def test_watch_csv_names_rotator_parts(self):
+        path = os.path.join(self.project.root, "w.csv")
+        result = {"targets": ["player.GetActorRotation()", "player.location"], "kinds": ["rotator", None],
+                  "samples": [[0.0, 0.0, [0, 90, 0], [1, 2, 3]]]}
+        ue.write_watch_csv(path, result)
+        with open(path, encoding="utf-8") as f:
+            header = f.readline().strip().split(",")
+        self.assertIn("player.GetActorRotation().yaw", header)
+        self.assertIn("player.location.x", header)
+        del result["kinds"]  # an older plugin: told apart by the name
+        ue.write_watch_csv(path, result)
+        with open(path, encoding="utf-8") as f:
+            self.assertIn("player.GetActorRotation().pitch", f.readline())
+
+    def test_overlay_folders_are_per_session(self):
+        p = self.project.uproject
+        mine = ue.claim_overlay(p, None, "handling")
+        self.assertTrue(mine.endswith(os.path.join("staging", "handling")))
+        shared = os.path.join(self.project.root, "staging")
+        os.makedirs(shared)
+        self.assertEqual(ue.claim_overlay(p, shared, "menus"), shared)
+        with self.assertRaisesRegex(ue.CliError, "session menus compiled"):
+            ue.claim_overlay(p, os.path.join(self.project.root, "Staging"), "handling")  # same folder on Windows
+        self.assertEqual(ue.claim_overlay(p, shared, "handling", now=time.time() + 13 * 3600), shared)  # stale claim
+        self.assertEqual(ue.build_parser().parse_args(["build", "--check", "--overlay"]).overlay, "-")
+
+    def test_an_active_lease_lasts_past_the_last_command(self):
+        p = self.project.uproject
+        with unittest.mock.patch.dict(os.environ, {"UE_SESSION": "holder"}):
+            ue.take_lease(p, "city rebuild", 15)
+            later = time.time() + 12 * 60  # 3 min left
+            notes = ue.lease_messages(p, now=later)
+            self.assertIn("lasts 5 min past your last", notes[0])
+            self.assertAlmostEqual(ue.active_lease(p, later)["until"], later + 300, delta=1)
+            self.assertEqual(ue.lease_messages(p, now=later + 120), [])  # extended again, said once
+            self.assertAlmostEqual(ue.active_lease(p, later + 120)["until"], later + 420, delta=1)
+        self.assertIsNone(ue.active_lease(p, later + 900))  # idle: it runs out

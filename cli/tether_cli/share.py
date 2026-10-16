@@ -9,7 +9,7 @@ import os
 import re
 import time
 
-from .core import CliError, read_json, run_git, session_id, state_dir, write_json
+from .core import CliError, chosen_editor, read_json, run_git, session_id, state_dir, write_json
 
 LEASE_MINUTES = 15      # default length of `ue lease take`
 ACTIVE_MINUTES = 5      # other sessions' commands this recent make a restart or close ask for the lease
@@ -143,6 +143,8 @@ def check_shared(project, action, destructive, ignore=False, now=None):
     the lease: those sessions would lose the editor mid-task. `ignore` (--ignore-lease) skips both."""
     if ignore or os.environ.get("UE_IGNORE_LEASE") == "1":  # --ignore-lease anywhere on the command line
         return
+    if own_editor(project):  # `ue open --second`: this session's own editor, outside the shared one's lease
+        return
     now = time.time() if now is None else now
     held = active_lease(project, now)
     me = session_id()
@@ -160,10 +162,18 @@ def check_shared(project, action, destructive, ignore=False, now=None):
                            "--ignore-lease", LEASED)
 
 
+def own_editor(project):
+    """True when the editor this session talks to is its own (`ue open --second`)."""
+    try:
+        return bool((chosen_editor(project) or {}).get("owner") == session_id() and session_id())
+    except CliError:
+        return False
+
+
 def lease_note(project):
     """A warning line when another session holds the lease (for commands that only read or edit), else None."""
     held = active_lease(project)
-    if held and held["session"] != session_id():
+    if held and held["session"] != session_id() and not own_editor(project):
         return f"note: the editor is {describe_lease(project, held)}"
     return None
 
@@ -221,20 +231,37 @@ def grant_lease(project, to=None, now=None):
     return lease
 
 
+REMIND_MINUTES = 10  # a request the lease holder was told about is said again after this
+LEASE_KEEP = 5       # a lease whose holder keeps running `ue` commands lasts this long past the last one
+
+
 def lease_messages(project, now=None):
     """Lines for this session at the start of any `ue` command: requests waiting on its lease, or a lease just
-    granted to it (said once)."""
+    granted to it (said once). Each request is said once, again when it changes, and again every REMIND_MINUTES
+    while it waits (`ue status` and `ue who` list them all)."""
     now = time.time() if now is None else now
     me, held, out = session_id(), active_lease(project, now), []
     if held and held["session"] == me:
         if held.get("granted_by") and not held.get("told"):
             out.append(f"note: the editor lease is yours now, granted by {session_label(project, held['granted_by'])} "
                        f"({max(1, round((held['until'] - now) / 60))} min; `ue lease release` when done)")
-            write_json(lease_path(project), dict(held, told=True))
-        for r in lease_requests(project, now):
-            if r["session"] != me:
-                out.append(f"note: {session_label(project, r['session'])} asks for the editor "
-                           f"({ago(now - r['time'])}): {r['what']}. `ue lease grant` hands it over when you are done")
+            held = dict(held, told=True)
+            write_json(lease_path(project), held)
+        if held["until"] - now < LEASE_KEEP * 60:  # in use: it lasts LEASE_KEEP min past the holder's last command
+            if not held.get("kept"):
+                out.append(f"note: your editor lease ({held.get('what')}) was about to run out; it now lasts "
+                           f"{LEASE_KEEP} min past your last `ue` command (`ue lease release` when done)")
+            write_json(lease_path(project), dict(held, until=now + LEASE_KEEP * 60, kept=True))
+        rows, due = lease_requests(project, now), []
+        for r in rows:
+            if r["session"] != me and now - r.get("told", 0) >= REMIND_MINUTES * 60:
+                due.append(r)
+                r["told"] = now
+        if due:
+            out.append("note: waiting for the editor: " + "; ".join(
+                f"{session_label(project, r['session'])} ({ago(now - r['time'])}): {r['what']}" for r in due)
+                + ". `ue lease grant` hands it over when you are done")
+            write_json(requests_path(project), rows)
     return out
 
 

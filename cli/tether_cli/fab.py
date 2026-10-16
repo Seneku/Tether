@@ -10,7 +10,9 @@ import re
 import shutil
 import time
 
-from .core import CliError, editor_live, human_bytes, read_json, state_dir, write_json
+from .core import CliError, editor_live, human_bytes, queue_deletes, read_json, state_dir, write_json
+from .transport import py_json
+from .share import check_shared
 from .assets import folder_packages
 from .content import unused_roots
 from .fabfiles import (
@@ -100,10 +102,10 @@ def resolve_project(path):
 def cmd_fab(ctx, args):
     """Fab content the user has, and getting it into the project; never buys or claims anything."""
     action = args.action or "list"
-    handler = {"list": fab_list, "library": fab_library, "add": fab_add, "open": fab_open, "settings": fab_settings,
-               "clean": fab_clean}.get(action)
+    handler = {"list": fab_list, "library": fab_library, "add": fab_add, "remove": fab_remove, "open": fab_open,
+               "settings": fab_settings, "clean": fab_clean}.get(action)
     if not handler:
-        raise CliError(f"ue fab {action}: unknown (list, library, add, open, settings, clean)")
+        raise CliError(f"ue fab {action}: unknown (list, library, add, remove, open, settings, clean)")
     return handler(ctx, args)
 
 
@@ -265,6 +267,10 @@ def pick(candidates, query, describe):
     raise CliError(f"'{query}' matches {len(candidates)}; be more specific:\n{names}")
 
 
+AI_TERMS = ("note: Fab marks each listing \"Allows usage with AI: Yes/No\", and the vault does not record it: "
+            "have the user check {link} before this is used in an AI-driven project")
+
+
 def fab_add(ctx, args):
     query = " ".join(args.rest)
     if not query:
@@ -323,6 +329,8 @@ def fab_add(ctx, args):
             ctx.data = {"new": len(new), "same": len(same), "differ": [d for _, d in differ]}
             return 1
     if args.dry_run or not new:
+        if args.dry_run:
+            print(AI_TERMS.format(link=listing_url(listing) if listing else "its Fab listing (ue fab open <name>)"))
         print("dry run: nothing copied" if args.dry_run else "nothing to copy")
         ctx.data = {"new": len(new), "same": len(same), "differ": [d for _, d in differ], "bytes": size}
         return 0
@@ -355,10 +363,108 @@ def fab_add(ctx, args):
         record.setdefault("added", {})[folder] = {"title": title, "listing": listing, "from": origin,
                                                   "files": len(new), "at": time.strftime("%Y-%m-%d %H:%M")}
     write_json(path, record)
+    print(AI_TERMS.format(link=listing_url(listing) if listing else "its Fab listing (ue fab open <name>)"))
     live = " The editor has scanned them;" if editor_live(ctx.project) else ""
     print(f"copied {len(new)} file(s) in {time.time() - started:.0f}s.{live} next: ue find --under {record_paths[0]}, "
           f"ue lint {record_paths[0]}, ue fab")
     ctx.data = {"copied": len(new), "bytes": size, "folders": record_paths}
+    return 0
+
+
+# ---------------------------------------------------------------- ue fab remove
+
+FAB_REFS = """import json
+reg = unreal.AssetRegistryHelpers.get_asset_registry()
+folders = {folders!r}
+inside = set()
+for f in folders:
+    inside |= {{str(a.package_name) for a in reg.get_assets_by_path(f, True)}}
+opts = unreal.AssetRegistryDependencyOptions(include_soft_package_references=True, include_hard_package_references=True,
+    include_searchable_names=False, include_soft_management_references=False, include_hard_management_references=False)
+outside = {{}}
+for p in sorted(inside):
+    for r in reg.get_referencers(p, opts) or []:
+        r = str(r)
+        if r not in inside and not r.startswith("/Script/"):
+            outside.setdefault(r, p)
+print(json.dumps({{"assets": len(inside), "outside": sorted(outside.items())}}))
+"""
+FAB_DELETE = """import json
+print(json.dumps([[f, bool(unreal.EditorAssetLibrary.delete_directory(f))] for f in {folders!r}
+                  if unreal.EditorAssetLibrary.does_directory_exist(f)]))
+"""
+
+
+def fab_remove(ctx, args):
+    """`ue fab remove <pack>`: delete a Fab pack or Megascans asset from the project. Through the editor when it
+    runs (it unloads the assets and lets go of the files, and the asset registry forgets them); files it still
+    holds are deleted when it closes. Refuses while assets outside the pack reference it, unless --force."""
+    query = " ".join(args.rest)
+    if not query:
+        raise CliError("ue fab remove <pack or Megascans name> [--dry-run] [--force]")
+    items = [i for i in project_fab(ctx.project) if i["kind"] != "library" and matches(f"{i['title']} {i['path']}", query)]
+    item = pick(items, query, lambda i: f"{item_name(i)}  {i['path']}")
+    if not item:
+        raise CliError(f"no Fab content matches '{query}' in {project_name(ctx.project)} (ue fab)")
+    folders = item_folders(item)
+    sizes = item_packages(ctx.project, item)
+    disk = [content_path(ctx.project, f) for f in folders]
+    files = [os.path.join(dp, n) for d in disk if d and os.path.isdir(d) for dp, _, names in os.walk(d) for n in names]
+    print(f"{item_name(item)}: {len(sizes)} asset(s), {len(files)} file(s), "
+          f"{human_bytes(sum(os.path.getsize(f) for f in files if os.path.isfile(f)))} in {', '.join(folders)}")
+    live = editor_live(ctx.project)
+    beacon = ctx.beacon or {}
+    if live:
+        if beacon.get("pie"):
+            raise CliError("PIE is running: stop it first (ue pie stop)")
+        if any((beacon.get("map") or "").startswith(f + "/") for f in folders):
+            raise CliError(f"the open level {beacon.get('map')} is in the pack: load another one first (ue level open ...)")
+        refs = py_json(ctx, FAB_REFS.format(folders=folders))
+        if refs["outside"]:
+            print(f"{len(refs['outside'])} asset(s) outside it reference it:")
+            for user, used in refs["outside"][:10]:
+                print(f"  {user} -> {used}")
+            if len(refs["outside"]) > 10:
+                print(f"  ... +{len(refs['outside']) - 10} more (ue refs <asset>)")
+            if not args.force:
+                print("nothing deleted: their references would break. Replace them first, or pass --force")
+                ctx.data = {"outside": refs["outside"]}
+                return 1
+    elif not args.force and not args.dry_run:
+        raise CliError("the editor is not running, so references to the pack from the rest of the project cannot be "
+                       "checked: `ue open --headless` first, or pass --force")
+    if args.dry_run:
+        print("dry run: nothing deleted")
+        return 0
+    if live:
+        check_shared(ctx.project, "fab remove", destructive=False, ignore=getattr(args, "ignore_lease", False))
+        failed = [f for f, ok in py_json(ctx, FAB_DELETE.format(folders=folders)) if not ok]
+        if failed:
+            print(f"note: the editor did not delete all of {', '.join(failed)} (ue log); removing the files")
+    left = []
+    for path in files:
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except OSError:
+            left.append(path)
+    for d in disk:
+        for dp, _, _ in sorted(os.walk(d), key=lambda w: -len(w[0])) if d and os.path.isdir(d) else []:
+            try:
+                os.rmdir(dp)
+            except OSError:
+                pass
+    if left:
+        queue_deletes(ctx.project, left)
+    path = os.path.join(state_dir(ctx.project), "fab.json")
+    record = read_json(path) or {}
+    for folder in folders:
+        (record.get("added") or {}).pop(folder, None)
+    write_json(path, record)
+    print(f"removed {item_name(item)}" + (f"; {len(left)} file(s) the editor keeps open are deleted when it closes "
+                                          "(ue close, or the next ue open)" if left else "")
+          + (". `ue fab add` brings it back from the vault" if item["kind"] == "pack" else ""))
+    ctx.data = {"removed": folders, "files": len(files), "queued": len(left)}
     return 0
 
 

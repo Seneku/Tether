@@ -7,7 +7,8 @@ import time
 
 from .core import (
     CliError, GATED, TETHER, chosen_editor, compact_error, editor_label, editor_token, engine_root, find_project,
-    live_editors, load_log_ignore, pid_alive, port_from_log, read_json, socket, stall_report, state_dir, unwrap, write_json,
+    live_editors, load_log_ignore, pid_alive, port_from_log, read_json, session_id, socket, stall_report, state_dir, unwrap,
+    write_json,
 )
 
 
@@ -232,12 +233,24 @@ class Ctx:
             self._mcp = Mcp(self.port, self.args.timeout).connect(cache if beacon.get("pid") else None)
         return self._mcp
 
+    def _first_note(self, beacon, others):
+        """Say which of several editors a command goes to once per session and set of editors (`ue status` keeps
+        saying it), not on every command."""
+        path = os.path.join(state_dir(self.project), "editors-noted.json")
+        seen = read_json(path) or {}
+        key = f"{(beacon or {}).get('pid')}:" + ",".join(sorted(str(b.get("pid")) for b in others))
+        if seen.get(session_id()) == key:
+            return False
+        seen[session_id()] = key
+        write_json(path, seen)
+        return True
+
     def tether(self, tool, **kwargs):
         if tool in GATED:  # the editor writes a per-session token next to the beacon
             beacon = self.beacon
             kwargs["token"] = editor_token(self.project, beacon)
             others = [b for b in live_editors(self.project) if b.get("pid") != (beacon or {}).get("pid")]
-            if others and not self._warned:
+            if others and not self._warned and self._first_note(beacon, others):
                 self._warned = True
                 print(f"note: {len(others) + 1} editors are open on this project; this goes to {editor_label(beacon)} "
                       f"(--pid to choose). Saving the same assets from both loses work.", file=sys.stderr)
@@ -350,4 +363,11 @@ def fill_args(tool, given):
 def py_json(ctx, code):
     """Run editor Python that prints JSON last, and decode it (ue py output may already be decoded)."""
     out = ctx.tether("py", code=code)
-    return out if not isinstance(out, str) else json.loads(out.strip().splitlines()[-1])
+    if not isinstance(out, str):
+        return out
+    lines = out.strip().splitlines()
+    try:
+        return json.loads(lines[-1])
+    except (ValueError, IndexError):
+        text = " ".join(lines[-3:]) if lines else "nothing"
+        raise CliError("the editor's reply was not JSON: " + (text[:300] + " ..." if len(text) > 300 else text)) from None

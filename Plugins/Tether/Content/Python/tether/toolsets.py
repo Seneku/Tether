@@ -1131,7 +1131,10 @@ def _watch_tick(_delta):
         value = None
         if reader is not None:
             try:
-                value = _watch_value(reader())
+                raw = reader()
+                if i not in state.setdefault("kinds", {}) and isinstance(raw, (unreal.Rotator, unreal.Vector)):
+                    state["kinds"][i] = "rotator" if isinstance(raw, unreal.Rotator) else "vector"
+                value = _watch_value(raw)
             except Exception:  # the object went away mid-session
                 state["readers"][i] = None
         row.append(value)
@@ -1587,24 +1590,45 @@ def _frame_tick(_delta):
 _COMPARE = re.compile(r"^(?P<lhs>\S+)\s*(?P<op>==|!=|<=|>=|=|<|>|~)\s*(?P<rhs>.*)$")
 
 
+_AXES = {"x", "y", "z", "pitch", "yaw", "roll"}
+
+
+def _as_fields(value):
+    """A vector or rotator as {x, y, z} / {pitch, yaw, roll}; anything else as it is."""
+    if isinstance(value, unreal.Vector):
+        return {"x": value.x, "y": value.y, "z": value.z}
+    if isinstance(value, unreal.Rotator):
+        return {"pitch": value.pitch, "yaw": value.yaw, "roll": value.roll}
+    return value
+
+
+def _expect_value(lhs, pawn, controller):
+    """The value `expect`/`until` compare: what `pie watch` would sample for the same expression (a property,
+    hidden ones included, a getter call like player.Movement.GetSpeedKmh(), Actor.Mesh@bone, an action), plus
+    a part of a vector or rotator: player.location.z, player.GetActorRotation().yaw."""
+    target, _, prop = lhs.rpartition(".")
+    if not target:
+        raise RuntimeError(f"'{lhs}': give target.property, e.g. player.Health or Door_1.bIsOpen")
+    if prop.lower() in _AXES and "." in target:  # a part of a vector or rotator, unless it is a property called x
+        try:
+            base = _as_fields(_expect_value(target, pawn, controller))
+        except RuntimeError:
+            base = None
+        if isinstance(base, dict) and prop.lower() in base:
+            return base[prop.lower()]
+    if prop.lower() in ("location", "rotation") and not prop.endswith(")"):
+        obj = _pie_object(target, pawn, controller)
+        return _actor_pose(obj if isinstance(obj, unreal.Actor) else obj.get_owner())[prop.lower()]
+    return _as_fields(_watch_reader(lhs, pawn, controller)())
+
+
 def _pie_expect(expr, pawn, controller):
     """'<target>.<prop> <op> <value>': (ok, actual text)."""
     match = _COMPARE.match(expr.strip())
     if not match:
         raise RuntimeError(f"expected '<target>.<property> <op> <value>' (op: = != < > <= >= ~), got '{expr}'")
     lhs, op, rhs = match.group("lhs"), match.group("op"), match.group("rhs").strip()
-    target, _, prop = lhs.rpartition(".")
-    if not target:
-        raise RuntimeError(f"'{lhs}': give target.property, e.g. player.Health or Door_1.bIsOpen")
-    obj = _pie_object(target, pawn, controller)
-    if prop.lower() in ("location", "rotation"):
-        value = _actor_pose(obj if isinstance(obj, unreal.Actor) else obj.get_owner())[prop.lower()]
-    else:
-        schema = _reflect(_pie_schema(obj.get_class()), obj)
-        name = {n.lower(): n for n in schema}.get(prop.lower())
-        if name is None:
-            raise RuntimeError(f"{_label(obj)} has no property '{prop}'")
-        value = _reflect(unreal.ToolsetLibrary.get_object_properties(obj, [name]), obj).get(name)
+    value = _expect_value(lhs, pawn, controller)
     actual = str(value).lower() if isinstance(value, bool) else _compact(value)
     if op == "~":
         return bool(re.search(rhs, actual, re.I)), actual
@@ -7655,12 +7679,23 @@ class TetherCore(_Base):
                 kids.sort(key=lambda w: _try(lambda: parent.get_child_index(w), 0))
         rows, buttons = [], []
 
+        def button_label(widget):
+            """Its text children, else its accessible text, else the text of its siblings (a transparent button
+            laid over a text row in an Overlay)."""
+            text = label(widget) or str(_try(lambda: widget.get_accessible_text(), "") or "")
+            if text:
+                return text
+            siblings = [label(c) for c in children.get(widget.get_parent(), [])
+                        if c is not widget and not isinstance(c, unreal.Button)
+                        and isinstance(c, (unreal.TextBlock, unreal.PanelWidget))]
+            return " ".join(t for t in siblings if t)
+
         def walk(widget, depth):
             if not widget.is_visible():
                 return
             kind = None
             if isinstance(widget, unreal.Button):
-                kind, text = "button", label(widget)
+                kind, text = "button", button_label(widget)
                 buttons.append((text, widget))
             elif isinstance(widget, unreal.TextBlock):
                 kind, text = "text", str(widget.get_text())
@@ -8066,7 +8101,7 @@ class TetherCore(_Base):
                     missing.append(f"{spec}: {exc}")
             now = time.time()
             state.update(world=game, specs=specs, readers=readers, retry=[now] * len(specs), every=max(0.0, every),
-                         samples=[], start=now, last=0.0, ended=None, missing=missing, rebind=now,
+                         samples=[], start=now, last=0.0, ended=None, missing=missing, rebind=now, kinds={},
                          bound=[pawn if r is not None else None for r in readers])
             state["handle"] = unreal.register_slate_post_tick_callback(_watch_tick)
             return f"watching {len(specs)} value(s) every {every:g}s" + (f"; not found yet: {'; '.join(missing)}"
@@ -8079,6 +8114,7 @@ class TetherCore(_Base):
                 raise RuntimeError("no watch was started (ue pie watch)")
             return json.dumps({"targets": state["specs"], "columns": ["real", "game"] + state["specs"],
                                "samples": state["samples"], "ended": state.get("ended"),
+                               "kinds": [state.get("kinds", {}).get(i) for i in range(len(state["specs"]))],
                                "missing": state.get("missing", []), "capped": len(state["samples"]) >= _WATCH_LIMIT})
         running = state.get("handle") is not None
         return (f"watching {len(state['specs'])} value(s), {len(state['samples'])} sample(s)" if running

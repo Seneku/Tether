@@ -4,10 +4,12 @@ import os
 import time
 
 from .core import (
-    CliError, blocking_dialogs, crash_reports, crash_summary, describe_crash, editor_beacons, editor_executable, forget_beacon,
+    CliError, blocking_dialogs, crash_reports, crash_summary, describe_crash, editor_beacons, editor_executable, flush_deletes,
+    forget_beacon,
     editor_live, editor_process,
     decline_package_restore, editor_label, engine_root, filter_log, live_coding_available, live_editors, logged_dialogs,
-    pick_port, pid_alive, port_open, read_json, read_new_log, recent_crash, run_git, startup_dialogs, state_dir,
+    pick_port, pid_alive, port_open, read_json, read_new_log, recent_crash, remember_target, run_git, startup_dialogs,
+    state_dir,
     subprocess, write_json,
 )
 from .share import (
@@ -97,7 +99,7 @@ def cmd_build(ctx, args):
         print(f"no editor open ({time.strftime('%H:%M')}): building")
     if (getattr(args, "files", None) or getattr(args, "overlay", None)) and not args.check:
         raise CliError("--files and --overlay go with --check: ue build --check --files Source/X/A.cpp | "
-                       "ue build --check --overlay staging/")
+                       "ue build --check --overlay")
     if args.check and getattr(args, "overlay", None):
         return compile_overlay(ctx, args.overlay, args.limit, session_id())
     if args.check:
@@ -218,10 +220,25 @@ def reopen_editor(ctx, args, how):
 
 def cmd_open(ctx, args):
     beacon = ctx.beacon
-    if beacon and editor_process(beacon.get("pid")):  # attach to the open editor, the user's own included
-        print(f"already open ({editor_label(beacon)}); using it")
+    second = getattr(args, "second", False)
+    if second and not live_editors(ctx.project):
+        print("note: no editor is open on this project; starting an ordinary one (--second is for a private editor "
+              "next to a shared one)")
+        second = False
+    elif beacon and editor_process(beacon.get("pid")) and not second:  # attach to the open editor, the user's own included
+        print(f"already open ({editor_label(beacon)}); using it"
+              + ("" if beacon.get("owner") in (None, session_id()) else
+                 " (another session's private editor: `ue open --second` starts your own)"))
         return cmd_status(ctx, args)
+    if second:
+        # Its own MCP port, beacon and log; nobody else's default; outside the shared editor's lease. Headless:
+        # a second window of the same project on the user's screen would only confuse.
+        args.headless, args.no_build = True, True  # the binaries are the open editor's: nothing can be rebuilt
     has_csharp = csharp_layout(ctx.project) is not None
+    if not live_editors(ctx.project):
+        done, _ = flush_deletes(ctx.project)
+        if done:
+            print(f"deleted {len(done)} file(s) the last editor kept open (ue fab remove)")
     last = (beacon or {}).get("heartbeat", 0)
     crash = recent_crash(ctx.project, last - 120) if last else None
     if crash:  # the previous session ended in a crash: say so before starting a new one
@@ -239,6 +256,8 @@ def cmd_open(ctx, args):
     cmd = [exe, ctx.project] + ([args.map] if args.map else []) + [
         "-nosplash", "-ModelContextProtocolStartServer", f"-ModelContextProtocolPort={port}",
         "-TetherLaunched"]  # marks the editors the CLI started, so it never closes one the user opened
+    if second:
+        cmd += [f"-TetherOwner={session_id()}"]
     # UnrealSharp disables C# hot reload under -unattended, so headless UnrealSharp editors stay
     # attended; the bridge suppresses dialogs per operation instead.
     unattended = args.unattended if args.unattended is not None else bool(args.headless and not has_csharp)
@@ -286,6 +305,10 @@ def cmd_open(ctx, args):
             errors = filter_log(boot, level="Error")
             print(f"ready in {time.time() - started:.1f}s | map {beacon.get('map')} | "
                   f"{len(errors)} errors at boot" + (" (ue log --since start --level Error)" if errors else ""))
+            if second:
+                remember_target(ctx.project, beacon)
+                print(f"this session now uses pid {proc.pid} (its own: other sessions keep the shared editor, and "
+                      "its work needs no lease); `ue close` closes it, `ue --pid N ...` reaches the other")
             for line in errors[:5]:
                 print("  " + line)
             for title, text in logged_dialogs(boot):
@@ -363,6 +386,11 @@ def close_editor(ctx, args, explicit):
             print("declined the restore of the discarded packages' autosaves")
     else:
         print("closed")
+    if not live_editors(ctx.project):
+        done, left = flush_deletes(ctx.project)
+        if done or left:
+            print(f"deleted {len(done)} file(s) the editor kept open (ue fab remove)"
+                  + (f"; {len(left)} still locked (deleted at the next ue open)" if left else ""))
     patches = live_patches(ctx.project)
     if patches:
         print(f"note: {patches} Live Coding patch(es) since the last UBT build lived only in that editor: `ue open` "
@@ -404,7 +432,7 @@ def cmd_lease(ctx, args):
             drop_request(ctx.project, session_id())
             raise CliError("nobody holds the lease: take it (ue lease take --for ...)")
         print(f"asked: the editor is {describe_lease(ctx.project, held)}. That session sees your request on its next "
-              "`ue` command; once it grants it, the lease is yours (ue status shows it)")
+              "`ue` command; once it grants it, the lease is yours (`ue wait lease` returns then, or when the editor is free)")
         return 0
     if args.action == "grant":
         lease = grant_lease(ctx.project, args.to)

@@ -595,14 +595,40 @@ def cmd_diff(ctx, args):
     return 0
 
 
+def saved_since(project, since):
+    """Content files (.uasset/.umap, the project's and its plugins') written since a time: the changed files when
+    there is no git."""
+    root, found, tops = os.path.dirname(project), [], [os.path.join(os.path.dirname(project), "Content")]
+    for folder, dirs, _ in os.walk(os.path.join(root, "Plugins")):
+        if "Content" in dirs:
+            tops.append(os.path.join(folder, "Content"))
+        dirs[:] = [d for d in dirs if d not in ("Content", "Binaries", "Intermediate", "Source", "Saved")]
+    for top in tops:
+        for folder, _, names in os.walk(top):
+            for name in names:
+                if name.endswith((".uasset", ".umap")):
+                    path = os.path.join(folder, name)
+                    try:
+                        if os.path.getmtime(path) >= since - 1:
+                            found.append(path)
+                    except OSError:
+                        pass
+    return found
+
+
 MAP_CHECK = re.compile(r"Map check complete: (\d+) Error\(s\), (\d+) Warning\(s\)")
 
 
 def cmd_validate(ctx, args):
     """Data validation on assets (the given ones, or those changed in git plus unsaved ones), then Map Check."""
-    paths, deleted, dirty = list(args.paths), [], False
+    paths, deleted, dirty, since = list(args.paths), [], False, None
     if args.changed is not None or not paths:
-        files, gone = git_changes(ctx.project, args.changed or None)
+        if not args.changed and not (run_git(ctx.project, "rev-parse", "--show-toplevel", check=False) or "").strip():
+            # no repository: what this editor saved since it started stands in for "changed"
+            since = (ctx.beacon or {}).get("started") or time.time()
+            files, gone = saved_since(ctx.project, since), []
+        else:
+            files, gone = git_changes(ctx.project, args.changed or None)
         paths += sorted({p for p in (content_package(ctx.project, f) for f in files) if p})
         deleted = sorted({p for p in (content_package(ctx.project, f) for f in gone) if p})
         dirty = True
@@ -624,8 +650,11 @@ def cmd_validate(ctx, args):
     problems = report["problems"]
     invalid = sum(1 for p in problems if p["result"] == "invalid")
     scope = "changed and unsaved assets" if dirty else "assets"
+    if since:
+        scope = f"unsaved assets and assets saved since the editor started ({time.strftime('%H:%M', time.localtime(since))}; no git)"
     if not report["checked"] and dirty:
-        print("no changed or unsaved assets (git status" + (f" + commits since {args.changed}" if args.changed else "") + ")")
+        print(f"no {scope}" if since else
+              "no changed or unsaved assets (git status" + (f" + commits since {args.changed}" if args.changed else "") + ")")
     else:
         print(f"validated {report['checked']} {scope}" +
               (f" ({report['not_validated']} not covered by any validator)" if report["not_validated"] else "") +

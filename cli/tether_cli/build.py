@@ -372,6 +372,38 @@ def shadow_project(project, overlay, sid):
     return os.path.join(shadow, os.path.basename(project)), sorted(overlaid)
 
 
+OVERLAY_HOURS = 12  # a staging folder another session compiled within this long is that session's
+
+
+def default_overlay(project, sid):
+    return os.path.join(state_dir(project), "staging", sid or "user")
+
+
+def claim_overlay(project, overlay, sid, now=None):
+    """The staging folder for this session's overlay, as an absolute path: its own under Saved/Tether/staging when
+    none is given. Refuses a folder another session compiled lately (on Windows staging/ and Staging/ are one
+    folder): two sessions staging into one folder copy each other's work into Source/."""
+    now = time.time() if now is None else now
+    if overlay in (None, "", "-"):
+        overlay = default_overlay(project, sid)
+        os.makedirs(os.path.join(overlay, "Source"), exist_ok=True)
+    overlay = os.path.abspath(overlay)
+    if not os.path.isdir(overlay):
+        raise CliError(f"no folder {overlay}")
+    path = os.path.join(state_dir(project), "overlays.json")
+    claims = {k: v for k, v in (read_json(path) or {}).items() if now - v.get("time", 0) < OVERLAY_HOURS * 3600}
+    key = os.path.normcase(os.path.realpath(overlay))
+    other = claims.get(key)
+    if other and other.get("session") != sid:
+        raise CliError(f"{overlay} is the staging folder session {other['session']} compiled "
+                       f"{max(1, round((now - other['time']) / 60))} min ago (on Windows staging/ and Staging/ are "
+                       f"one folder): stage your files in your own, e.g. `ue build --check --overlay` with no folder "
+                       f"uses {default_overlay(project, sid)}")
+    claims[key] = {"session": sid, "time": now}
+    write_json(path, claims)
+    return overlay
+
+
 def compile_overlay(ctx, overlay, limit, sid):
     """`ue build --check --overlay DIR`: compile the game target of a copy of the project with DIR's files on top,
     so work staged outside Source/ is checked without another session's Live Coding picking it up. Errors in
@@ -379,9 +411,8 @@ def compile_overlay(ctx, overlay, limit, sid):
     target = game_target(ctx.project)
     if not target:
         raise CliError("--overlay compiles the game target, and this project has none (Source/<Project>.Target.cs)")
-    if not os.path.isdir(overlay):
-        raise CliError(f"no folder {overlay}")
-    shadow, overlaid = shadow_project(ctx.project, os.path.abspath(overlay), sid)
+    overlay = claim_overlay(ctx.project, overlay, sid)
+    shadow, overlaid = shadow_project(ctx.project, overlay, sid)
     print(f"overlay: {len(overlaid)} staged file(s) on a copy of the project's code "
           f"({os.path.relpath(os.path.dirname(shadow), os.path.dirname(ctx.project))}); the real Source/ is untouched")
     code = ubt_build(argparse.Namespace(project=shadow), argparse.Namespace(target=target, config="Development",

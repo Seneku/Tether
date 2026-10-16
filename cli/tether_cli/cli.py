@@ -123,6 +123,9 @@ def build_parser():
                    help="force -unattended (default for headless, except UnrealSharp projects)")
     s.add_argument("--attended", dest="unattended", action="store_false", help="never pass -unattended")
     s.add_argument("--no-build", action="store_true", help="skip the C++/C# pre-build")
+    s.add_argument("--second", action="store_true", help="a private headless editor next to the open one (own MCP "
+                                                         "port; this session's from now on, no lease needed; other "
+                                                         "sessions keep the shared one). No pre-build")
     s.add_argument("--wait", type=float, default=600, help="seconds to wait for ready (600)")
     s.add_argument("--no-wait", action="store_true")
     s = add("build", build_command, "compile: Live Coding if the editor is up, UBT if not; --restart for reflection changes")
@@ -138,9 +141,10 @@ def build_parser():
                                                              "closed (a background job: ue job status), so the code a "
                                                              "launcher start loads has the Live Coding patches")
     s.add_argument("--after-close", action="store_true", help=argparse.SUPPRESS)
-    s.add_argument("--overlay", metavar="DIR", help="with --check: compile a copy of the project's code with DIR's files "
-                                                    "on top (DIR/Source/<Module>/...), for work kept out of Source/ "
-                                                    "while another session's Live Coding builds")
+    s.add_argument("--overlay", metavar="DIR", nargs="?", const="-",
+                   help="with --check: compile a copy of the project's code with DIR's files on top "
+                        "(DIR/Source/<Module>/...), for work kept out of Source/ while another session's Live Coding "
+                        "builds. No DIR: this session's own, Saved/Tether/staging/<session>/")
     s.add_argument("--include-others", action="store_true", help="Live Coding: compile even files another session edited "
                                                                  "in the last 15 min (it refuses otherwise)")
     s.add_argument("--ignore-lease", action="store_true", help="with --restart: go ahead although another session holds "
@@ -166,9 +170,11 @@ def build_parser():
     s = add("wait", cmd_wait, "wait N seconds, N seconds of game time in PIE (ue wait 4 game), or until shaders and "
                               "assets have compiled (ue wait compile)")
     s.add_argument("what", help="seconds, compile, grass (until landscape grass for the view has been built), or idle "
-                                "(until the editor ticks again: a timed-out `ue py` script finished)")
+                                "(until the editor ticks again: a timed-out `ue py` script finished), or lease (until the lease is free or "
+                                "granted to this session and PIE has stopped)")
     s.add_argument("clock", nargs="?", choices=["game", "real"], default="real", help="game: PIE game time")
-    s.add_argument("--max", type=float, default=900, help="with compile or grass: give up after this many seconds (900)")
+    s.add_argument("--max", type=float, default=900, help="with compile, grass, idle or lease: give up "
+                                                                         "after this many seconds (900)")
     s = add("who", cmd_who, "sessions that used this editor recently, their last command, the lease, who started PIE")
     s.add_argument("--minutes", type=float, default=15, help="how far back (15)")
     s.add_argument("--as", dest="name", help="a name for this session that the others see (kept)")
@@ -582,7 +588,11 @@ def build_parser():
     s.add_argument("--near", metavar="TEXT", help="with click/type: of several same-label widgets, the one closest to "
                                                   "a widget showing TEXT")
     s.add_argument("--slate", action="store_true", help="with key: send it to the focused Slate widget instead of the game's "
-                                                        "input (the editor's shortcuts then apply: Escape stops PIE)")
+                                                        "input (the editor's shortcuts then apply: Escape stops PIE). "
+                                                        "Without --slate or --game, a key goes through Slate when a "
+                                                        "game widget has keyboard focus (not Escape or chords)")
+    s.add_argument("--game", action="store_true", help="with key: always through the game's input (player controller)")
+    s.add_argument("--rects", action="store_true", help="each widget's screen rectangle (@x,y wxh, as ue ui at takes)")
     s = add("anim", cmd_anim, "animation state in PIE: anim BP, montage, curves, its variables, movement; "
                               "`anim graph <ABP>`: its state machines as text")
     s.add_argument("target", help="actor, 'player', or Actor.Component; or `graph`")
@@ -664,13 +674,16 @@ def build_parser():
     s.add_argument("--save", action="store_true", help="save the imported assets")
     s = add("fab", cmd_fab, "Fab content you have: in the project, downloaded packs, other projects; add it in "
                             "(never buys or claims anything)")
-    s.add_argument("action", nargs="?", choices=["list", "library", "add", "open", "settings", "clean"],
+    s.add_argument("action", nargs="?", choices=["list", "library", "add", "remove", "open", "settings", "clean"],
                    help="list (default): Fab content in this project; library: packs you have downloaded and Fab "
-                        "content in nearby projects; add: copy one in; open: a listing's URL for the user; settings: "
+                        "content in nearby projects; add: copy one in; remove: delete one (through the editor; refuses "
+                        "while the rest of the project references it); open: a listing's URL for the user; settings: "
                         "download quality/format/cache; clean: unused Fab content and cache sizes")
     s.add_argument("rest", nargs="*", help="a name or regex (list, library, add, open), or key=value (settings)")
     s.add_argument("--from", dest="from_", metavar="PROJECT", help="library/add: another local project's folder")
-    s.add_argument("--dry-run", action="store_true", help="add: show what would be copied")
+    s.add_argument("--dry-run", action="store_true", help="add/remove: show what would be copied or deleted")
+    s.add_argument("--force", action="store_true", help="remove: delete even when other assets reference it, or "
+                                                        "without an editor to check")
     s.add_argument("--skip-existing", action="store_true", help="add: copy only new files when some differ")
     s.add_argument("--top", type=int, default=20, help="rows to show (20)")
     s.add_argument("--all", action="store_true", help="show every row")

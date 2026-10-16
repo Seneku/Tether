@@ -18,7 +18,9 @@ from .core import (
 from .transport import catalog, py_json, resolve_toolset
 from .build import csharp_changes, csharp_layout, csharp_reload_build, layout_patch_note
 from .calls import flush_editor_log, metres_to_cm, scoped_cvars
-from .share import check_shared, clear_pie_start, record_pie_start
+from .share import (
+    active_lease, check_shared, clear_pie_start, describe_lease, pie_owner, record_pie_start, session_id,
+)
 from .images import (
     cmd_shot, contact_sheet, draw_text, crop_pixels, hud_screenshot, image_diff, png_read, png_write, shot_args, widget_capture,
 )
@@ -200,7 +202,23 @@ def ui_nodes(ctx):
     target = re.search(r"^\* (\d+):", pie_net(ctx, "status"), re.M)  # `ue pie target` picks a client's window
     nodes = parse_snapshot(text if isinstance(text, str) else json.dumps(text))
     ctx.ui_all = nodes  # every window, for hit tests
-    return game_ui(nodes, int(target.group(1)) if target else 0), True
+    return label_buttons(game_ui(nodes, int(target.group(1)) if target else 0)), True
+
+
+def label_buttons(nodes):
+    """Name a button with no label of its own (no accessible text, no single text child: a transparent button over
+    a sibling text row) after the text widgets inside its rectangle, so it can be clicked by that text. Flagged
+    "text under it" in `ue ui`."""
+    texts = [(n, box(n)) for n in nodes if n["role"] == "text" and n["label"] and visible(n)]
+    for n in nodes:
+        b = box(n)
+        if n["role"] != "button" or n["label"] or not b or not b[2] or not b[3]:
+            continue
+        inner = [t["label"] for t, tb in texts if tb and inside((tb[0] + tb[2] / 2, tb[1] + tb[3] / 2), b)]
+        if inner:
+            n["label"] = " ".join(dict.fromkeys(inner))[:80]
+            n["flags"] = n["flags"] + ["text under it"]
+    return nodes
 
 
 def box(node):
@@ -254,7 +272,39 @@ def covering_window(nodes, node):
     return None
 
 
-def ui_lines(nodes, show_all=False, match=None):
+def os_window_at(point, pid):
+    """The title of another program's top-level window at a screen point (Windows), or None: Slate only knows its own
+    windows, and a click under another app's window presses the button without releasing over it."""
+    if sys.platform != "win32" or not pid:
+        return None
+    import ctypes
+    from ctypes import wintypes
+    user32 = ctypes.windll.user32
+    old = None
+    try:  # Slate positions are physical pixels: ask in those
+        user32.SetThreadDpiAwarenessContext.restype = ctypes.c_void_p
+        old = user32.SetThreadDpiAwarenessContext(ctypes.c_void_p(-4))
+        user32.WindowFromPoint.restype = wintypes.HWND
+        hwnd = user32.WindowFromPoint(wintypes.POINT(int(point[0]), int(point[1])))
+        user32.GetAncestor.restype = wintypes.HWND
+        root = user32.GetAncestor(hwnd, 2) if hwnd else None  # GA_ROOT
+        if not root:
+            return None
+        owner = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(root, ctypes.byref(owner))
+        if owner.value == int(pid):
+            return None
+        title = ctypes.create_unicode_buffer(256)
+        user32.GetWindowTextW(root, title, 256)
+        return title.value or "a window of another program"
+    except (AttributeError, OSError, ValueError):
+        return None
+    finally:
+        if old:
+            user32.SetThreadDpiAwarenessContext(ctypes.c_void_p(old))
+
+
+def ui_lines(nodes, show_all=False, match=None, rects=False):
     base = min((n["indent"] for n in nodes), default=0)
     rx = re.compile(match, re.I) if match else None
     out = []
@@ -264,6 +314,9 @@ def ui_lines(nodes, show_all=False, match=None):
             continue
         line = "  " * ((n["indent"] - base) // 2) + n["role"] + (f' "{n["label"]}"' if n["label"] else "") + \
             "".join(f" [{f}]" for f in n["flags"]) + (f"  ({n['ref']})" if n["role"] in INTERACTIVE else "")
+        if rects and box(n):
+            x, y, w, h = box(n)
+            line += f"  @{x:.0f},{y:.0f} {w:.0f}x{h:.0f}"
         if not rx or rx.search(line):
             out.append(line)
     return out
@@ -331,14 +384,18 @@ def ui_click(ctx, target, event=False, near=None):
     # Epic's Click synthesizes a mouse press at the widget's centre on screen: whatever window is on top there gets
     # it. Check first, and for a UMG button fire its OnClicked instead of clicking another window.
     cover = covering_window(getattr(ctx, "ui_all", nodes), node)
+    beacon = ctx.beacon or {}
+    if not cover and not beacon.get("headless") and centre(node):
+        cover = os_window_at(centre(node), beacon.get("pid"))  # a windowed editor under another program's window
     if cover:
         try:
             fired = ctx.tether("umg", click=node["label"] or target)
             return fired + f' (window "{cover}" covers it on screen, so its OnClicked was fired instead of a click)'
         except CliError:
             raise CliError(f'{node["role"]} "{node["label"]}" is covered by window "{cover}": a click would land '
-                           f"there. Close it (ue call SlateInspectorToolset.Windows action=list, then action=close "
-                           f"index=N) and retry") from None
+                           f"there (a press without a release over the button: it only takes focus). Move or close "
+                           f"that window, or for an editor window: ue call SlateInspectorToolset.Windows action=list, "
+                           f"then action=close index=N") from None
     mcp_tool(ctx, "SlateInspectorToolset", "Click", {"ref": node["ref"]})
     return f'clicked {node["role"]} "{node["label"]}"'
 
@@ -379,6 +436,34 @@ def game_key(ctx, text):
     return chord
 
 
+def focused_widget(nodes):
+    """The game widget with keyboard focus (a UMG menu reading keys in NativeOnKeyDown), or None while the game
+    viewport itself has it (the player controller's input)."""
+    for n in nodes or []:
+        if "focused" in n["flags"] and "Viewport" not in n["src"] and n["role"] not in ("window", "tab"):
+            return n
+    return None
+
+
+def press_key(ctx, text, route="auto"):
+    """A key in PIE: through the game's input (the player controller), or through Slate to the focused widget
+    (UMG menus). auto: Slate when a game widget has keyboard focus, except Escape and chords (through Slate those
+    can reach the editor's shortcuts: Escape stops PIE). Returns what was done."""
+    text, why = text.strip(), "the focused widget, the editor's shortcuts included"
+    if route == "auto" and "+" not in text.strip("+") and KEY_NAMES.get(text.lower()) != "Escape":
+        nodes, slate = ui_nodes(ctx)
+        focus = focused_widget(nodes) if slate else None
+        if focus:
+            route = "slate"
+            why = (f'{focus["role"]} "{focus["label"]}"' if focus["label"] else f'a {focus["role"]} widget') + \
+                " has keyboard focus"
+    if route == "slate":
+        key = KEY_NAMES.get(text.lower(), text)
+        mcp_tool(ctx, "SlateInspectorToolset", "PressKey", {"key": key})
+        return f"pressed {key} through Slate ({why})"
+    return f"pressed {game_key(ctx, text)} in the game"
+
+
 def cmd_ui(ctx, args):
     """The game's on-screen UI in PIE (Slate and UMG), and clicking, typing and keys."""
     if ctx.transport != "remote" and not (ctx.beacon or {}).get("pie"):
@@ -392,7 +477,7 @@ def cmd_ui(ctx, args):
             point = tuple(float(v) for v in " ".join(args.rest).replace(" ", "").split(","))
             assert len(point) == 2
         except (ValueError, AssertionError):
-            raise CliError("ue ui at <x,y> (absolute screen pixels, as ue ui shows positions)") from None
+            raise CliError("ue ui at <x,y> (absolute screen pixels, as `ue ui --rects` shows them)") from None
         _, slate = ui_nodes(ctx)
         if not slate:
             raise CliError("ue ui at needs Epic's SlateInspectorToolset (ue init enables it)")
@@ -410,9 +495,9 @@ def cmd_ui(ctx, args):
             print("note: several windows overlap here; a click goes to the one on top")
         return 0
     if action == "key" and not getattr(args, "slate", False) and (ctx.beacon or {}).get("pie"):
-        # The game's input, not Slate's: through Slate the editor's shortcuts win (Escape stops PIE) and chords
-        # do not reach the game's bindings
-        print(f"pressed {game_key(ctx, ' '.join(args.rest))} in the game")
+        # The game's input, not Slate's (through Slate the editor's shortcuts win: Escape stops PIE, and chords do
+        # not reach the game's bindings), unless a UMG widget has keyboard focus
+        print(press_key(ctx, " ".join(args.rest), "game" if getattr(args, "game", False) else "auto"))
         return 0
     if action in ("type", "key"):
         nodes, slate = ui_nodes(ctx)
@@ -435,8 +520,8 @@ def cmd_ui(ctx, args):
         print("(UMG only: enable Epic's SlateInspectorToolset, e.g. with ue init, to also see Slate widgets)")
         print(ctx.tether("umg"))
         return 0
-    lines = ui_lines(nodes, args.all, match or None)
-    ctx.data = [{k: n[k] for k in ("role", "label", "ref", "flags")} for n in nodes]
+    lines = ui_lines(nodes, args.all, match or None, getattr(args, "rects", False))
+    ctx.data = [dict({k: n[k] for k in ("role", "label", "ref", "flags")}, rect=box(n)) for n in nodes]
     print(f"{len(lines)} widget(s) on screen" + (f" matching /{match}/" if match else "") + (":" if lines else ""))
     for line in lines[: args.limit if args.limit != 30 else 200]:
         print(line)
@@ -1659,7 +1744,11 @@ def pie_do(ctx, args):
                 return ok, "" if ok else "no such sound playing"
             return poll(heard, seconds or 3)
         if verb == "click":
-            return True, ui_click(ctx, rest)
+            event = rest.startswith("--event ")
+            return True, ui_click(ctx, rest[len("--event "):].strip() if event else rest, event)
+        if verb == "ui-key" or (verb == "key" and rest.startswith(("--slate ", "--game "))):
+            route = "slate" if verb == "ui-key" or rest.startswith("--slate ") else "game"
+            return True, press_key(ctx, rest.split(" ", 1)[1] if verb == "key" else rest, route)
         if verb in ("expect-ui", "ui-gone"):
             want = verb == "expect-ui"
             def check():
@@ -1667,12 +1756,20 @@ def pie_do(ctx, args):
                 return ok, "" if ok else ("still on screen" if not want else "not on screen")
             return poll(check, seconds or 3)
         if verb == "key" and re.search(r"\s(down|up|tap)\b", rest, re.I):
+            key, _, action = rest.partition(" ")
+            action = action.split()[0].lower() if action.split() else ""
+            if action == "down":  # released when the steps end, passed or failed
+                held_keys.add(key)
+            elif action == "up":
+                held_keys.discard(key)
             return tool(step)  # raw key input through the key mappings (the toolset's forced keys)
+        if verb == "stick" and len(rest.split()) == 2:  # no duration: held until `key <Key> up`
+            held_keys.add(rest.split()[0])
         if verb in ("type", "key"):
             import shlex
             parts = shlex.split(rest)
-            if verb == "key":  # the game's input, as `ue ui key` in PIE: Escape and chords reach its bindings
-                return True, f"pressed {game_key(ctx, rest)}"
+            if verb == "key":  # as `ue ui key` in PIE: the game's input, or Slate when a UMG widget has focus
+                return True, press_key(ctx, rest)
             nodes, slate = ui_nodes(ctx)
             if not slate or len(parts) < 2:
                 raise CliError('type needs SlateInspectorToolset and: type "<textbox label>" <text>')
@@ -1689,7 +1786,7 @@ def pie_do(ctx, args):
             return True, buf.getvalue().strip()
         return tool(step)
 
-    failures, held = [], set()
+    failures, held, held_keys = [], set(), set()
     film = start_film(ctx, args) if getattr(args, "film", None) else None
     try:
         for number, step in enumerate(steps, 1):
@@ -1714,6 +1811,11 @@ def pie_do(ctx, args):
                 ctx.tether("pie_step", step=f"release {name}")
             except CliError:
                 pass
+        for key in sorted(held_keys):  # a `key W down` the steps never let go would carry into the next run
+            with contextlib.suppress(CliError):
+                ctx.tether("pie_step", step=f"key {key} up")
+        if held_keys:
+            print(f"released {', '.join(sorted(held_keys))} (still down when the steps ended)")
         if film:
             finish_film(ctx, args, film)
         if not (args.keep or was_running):
@@ -2015,6 +2117,29 @@ def wait_idle(ctx, args):
     raise CliError(f"the editor is still busy after {args.max:g}s (ue status)", 4)
 
 
+def wait_lease(ctx, args):
+    """`ue wait lease`: until the editor lease is free or this session's (granted to it) and PIE has stopped, so a
+    session queued with `ue lease request` resumes without polling `ue lease` and `ue pie status` itself."""
+    started, deadline, why = time.time(), time.time() + args.max, ""
+    while True:
+        held = active_lease(ctx.project)
+        beacon = chosen_editor(ctx.project) or {}
+        pie = bool(beacon.get("pie")) and editor_process(beacon.get("pid"))
+        if held and held["session"] != session_id():
+            why = f"the editor is {describe_lease(ctx.project, held)}"
+        elif pie:
+            owner = pie_owner(ctx.project, beacon)
+            why = "PIE is running" + (f" ({owner})" if owner else "")
+        else:
+            waited = f" after {(time.time() - started) / 60:.0f} min" if time.time() - started > 60 else ""
+            print(f"the editor lease is yours{waited}: {held['what']} (until {time.strftime('%H:%M', time.localtime(held['until']))})"
+                  if held else f"the editor is free{waited}, PIE stopped (`ue lease take --for \"...\"` before you use it)")
+            return 0
+        if time.time() >= deadline:
+            raise CliError(f"still waiting after {args.max:g}s: {why}", 4)
+        time.sleep(2)
+
+
 def cmd_wait(ctx, args):
     """`ue wait N [game]`: N seconds, or N seconds of game time in the running PIE (`pie do "wait N game"`), for
     the pauses between `ue exec` or `ue pie do` calls. `ue wait compile`: until shaders and assets have compiled."""
@@ -2024,10 +2149,12 @@ def cmd_wait(ctx, args):
         return wait_grass(ctx, args)
     if args.what == "idle":
         return wait_idle(ctx, args)
+    if args.what == "lease":
+        return wait_lease(ctx, args)
     try:
         args.seconds = float(args.what)
     except ValueError:
-        raise CliError("ue wait <seconds> [game] | ue wait compile | ue wait grass | ue wait idle") from None
+        raise CliError("ue wait <seconds> [game] | ue wait compile | grass | idle | lease") from None
     if args.clock == "game":
         if not (ctx.beacon or {}).get("pie"):
             raise CliError("`ue wait N game` needs PIE running (ue pie start); `ue wait N` waits wall-clock seconds")

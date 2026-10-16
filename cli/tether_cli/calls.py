@@ -188,6 +188,8 @@ PYTHON_PROPERTY_NAMES = ("import re as _r, json as _j\n"
 PROTECTED_PROPERTY = re.compile(r"Property '(\w+)' for attribute '\w+' on '(\w+)' is protected and cannot be read")
 
 
+WORLD_SUBSYSTEM = re.compile(r"has no attribute '(?:SubsystemBlueprintLibrary|get_world_subsystem|"
+                             r"get_world_subsystem_by_class)'")
 MISSING_ATTRIBUTE = re.compile(r"AttributeError: '(\w+)' object has no attribute '(\w+)'")
 UFUNCTION_EXISTS = ("_c = getattr(unreal, {cls!r}, None)\n"
                     "_c = _c.static_class() if _c is not None and hasattr(_c, 'static_class') else None\n"
@@ -198,6 +200,10 @@ def property_name_hint(ctx, error):
     """For "Failed to find property": the class's Python property names closest to the one asked for. The
     pythonizer drops a bool's b prefix, then an In prefix (bInOrder is `order`), so the C++ name is no guide.
     For a protected one: `ue props` reads it (through the engine's own export)."""
+    if WORLD_SUBSYSTEM.search(error):
+        return ("5.8's Python has no SubsystemBlueprintLibrary or get_world_subsystem: "
+                "tether.world_subsystem(unreal.MyWorldSubsystem) returns the editor world's (or PIE's, while it runs; "
+                "pie=False for the editor's), then call its UFUNCTIONs on it")
     p = PROTECTED_PROPERTY.search(error)
     if p:
         return (f"{p.group(2)}.{p.group(1)} is protected from Python, but `ue props <object> --match {p.group(1)}` "

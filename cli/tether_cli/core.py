@@ -462,7 +462,7 @@ def filter_log(lines, level="Warning", category=None, pattern=None, ignore=True,
         cat, lvl, msg = m.group(1), m.group(2) or "Log", m.group(3)
         if cat in NOISE or (cat == "Cmd" and msg.strip() == "FLUSHLOG") or (cat == "LogJson" and NOISE_MESSAGE.match(msg)):
             continue
-        if cat == "LogConsoleManager" and "FindConsoleObject() for 'FLUSHLOG'" in msg:  # our own log flushes
+        if cat == "LogConsoleManager" and TOOL_LOOKUPS.search(msg):  # our own log flushes and screenshots
             continue
         if "BP_TetherDeferredExec" in msg:  # building Tether's helper for commands in multiplayer PIE
             continue
@@ -499,6 +499,41 @@ def filter_log(lines, level="Warning", category=None, pattern=None, ignore=True,
     result = LogLines(f"{l} {c}: {m}" + (f"  x{counts[(l, c, m)]}" if counts[(l, c, m)] > 1 else "") for l, c, m in order)
     result.hidden, result.folded = hidden, sum(counts.values()) - len(order)
     return result
+
+
+# Exec commands the engine first looks up as console variables (and counts the misses): the ones Tether sends.
+TOOL_LOOKUPS = re.compile(r"FindConsoleObject\(\) for '(?:FLUSHLOG|shot|HighResShot)'", re.I)
+
+
+def pending_deletes_path(project):
+    return os.path.join(state_dir(project), "pending-deletes.json")
+
+
+def queue_deletes(project, paths):
+    """Files a running editor keeps open (it loads every Input Action it discovers, for one): deleted when it has
+    closed (`ue close`, `ue open`)."""
+    rows = read_json(pending_deletes_path(project)) or []
+    write_json(pending_deletes_path(project), sorted(set(rows) | {os.path.abspath(p) for p in paths}))
+
+
+def flush_deletes(project):
+    """Delete the queued files, and the folders that leaves empty. ([deleted], [still locked])."""
+    rows = read_json(pending_deletes_path(project)) or []
+    done, left = [], []
+    for path in rows:
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+            done.append(path)
+        except OSError:
+            left.append(path)
+    for folder in sorted({os.path.dirname(p) for p in done}, key=len, reverse=True):
+        while folder and os.path.isdir(folder) and not os.listdir(folder) and os.path.basename(folder) != "Content":
+            os.rmdir(folder)
+            folder = os.path.dirname(folder)
+    if rows:
+        write_json(pending_deletes_path(project), left)
+    return done, left
 
 
 def boot_noise(line, cat, msg):
@@ -991,8 +1026,10 @@ def chosen_editor(project):
         return match
     if live:
         sticky = (read_json(targets_path(project)) or {}).get(session_id())
+        # another session's `ue open --second` editor is never a default
+        shared = [b for b in live if b.get("owner") in (None, session_id())] or live
         choice = next((b for b in live if b.get("pid") == sticky), None) or \
-            sorted(live, key=lambda b: (bool(b.get("launched_by_tether")), -b.get("started", 0)))[0]
+            sorted(shared, key=lambda b: (bool(b.get("launched_by_tether")), -b.get("started", 0)))[0]
         remember_target(project, choice)
         return choice
     return beacons[0] if beacons else None
@@ -1037,6 +1074,9 @@ def editor_label(beacon):
         parts.append("headless")
     parts.append("started by ue open" if beacon.get("launched_by_tether") else
                  "opened by hand" if "launched_by_tether" in beacon else "")
+    if beacon.get("owner"):
+        parts.append("this session's own (--second)" if beacon["owner"] == session_id()
+                     else f"session {beacon['owner']}'s own (--second)")
     return ", ".join(p for p in parts if p)
 
 

@@ -174,6 +174,7 @@ def _snapshot():
         "sound": _state["sound"],
         "unattended": _state.get("unattended"),  # so a restart reopens it the same way (None: started before 0.19.1)
         "launched_by_tether": _state["launched"],  # `ue open` marks its editors; the rest are the user's
+        "owner": _state.get("owner"),  # the session a `ue open --second` editor belongs to (others leave it alone)
         "tether": _plugin_version(),  # the plugin version this editor loaded (ue doctor compares it with the CLI)
         "started": _state["started"],
         "log": _state.get("log"),
@@ -260,6 +261,8 @@ def start():
     _state["unattended"] = bool(re.search(r"(^|\s)-unattended\b", _command_line(), re.I))
     # `ue open` adds -TetherLaunched; before 0.11 it was recognisable by -ModelContextProtocolStartServer alone
     _state["launched"] = any(flag in _command_line() for flag in ("-TetherLaunched", "-ModelContextProtocolStartServer"))
+    owner = re.search(r"-TetherOwner=(\S+)", _command_line())  # `ue open --second`: one session's own editor
+    _state["owner"] = owner.group(1) if owner else None
     _write_session()
     _state["port"] = _ensure_mcp_server()
     try:

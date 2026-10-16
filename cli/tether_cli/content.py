@@ -1391,10 +1391,9 @@ def map_footprints(ctx, args):
 COLLIDE = """import json
 w = tether.world() if {pie!r} else unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_editor_world()
 types = [getattr(unreal.ObjectTypeQuery, f"OBJECT_TYPE_QUERY{{i}}") for i in range(1, 7)]
-cx, cy, r, z, step, half = {x!r}, {y!r}, {r!r}, {z!r}, {step!r}, {half!r}
-n = int(2 * r // step)
-names, grid = {{}}, []
-for j in range(n):
+cx, cy, r, z, step, half, n = {x!r}, {y!r}, {r!r}, {z!r}, {step!r}, {half!r}, {n!r}
+keys, actors, grid = [], {{}}, []
+for j in range({j0!r}, {j1!r}):
     row = []
     for i in range(n):
         p = unreal.Vector(cx - r + (i + 0.5) * step, cy + r - (j + 0.5) * step, z)
@@ -1404,14 +1403,38 @@ for j in range(n):
             row.append(0)
             continue
         key = hit[0].get_class().get_name() + ("" if len(hit) == 1 else "+")
-        names.setdefault(key, {{"id": len(names) + 1, "cells": 0, "actors": set()}})
-        names[key]["cells"] += 1
-        names[key]["actors"].add(hit[0].get_actor_label())
-        row.append(names[key]["id"])
+        if key not in actors:
+            keys.append(key)
+            actors[key] = set()
+        if len(actors[key]) < 8:
+            actors[key].add(hit[0].get_actor_label())
+        row.append(keys.index(key) + 1)
     grid.append(row)
-print(json.dumps({{"n": n, "grid": grid, "classes": {{k: [v["id"], v["cells"], sorted(v["actors"])[:4]]
-                                                    for k, v in names.items()}}}}))
+print(json.dumps({{"keys": keys, "grid": grid, "actors": {{k: sorted(v) for k, v in actors.items()}}}}))
 """
+COLLIDE_CELLS = 2500  # overlap boxes per editor call (25,600 in one call ran past the reply)
+
+
+def collide_grid(ctx, pie, x, y, r, z, step, half):
+    """{"n", "grid", "classes": {class: [id, cells, [actors]]}} for an n x n grid of overlap boxes, a band of rows
+    per editor call."""
+    n = int(2 * r // step)
+    rows_per_call = max(1, COLLIDE_CELLS // max(n, 1))
+    grid, classes = [], {}
+    for j0 in range(0, n, rows_per_call):
+        part = py_json(ctx, COLLIDE.format(pie=pie, x=x, y=y, r=r, z=z, step=step, half=half, n=n, j0=j0,
+                                           j1=min(n, j0 + rows_per_call)))
+        metas = []  # this call's class numbers -> [id, cells, actors] across calls
+        for key in part["keys"]:
+            meta = classes.setdefault(key, [len(classes) + 1, 0, []])
+            meta[2] = sorted(set(meta[2]) | set(part["actors"].get(key, [])))[:4]
+            metas.append(meta)
+        for row in part["grid"]:
+            for v in row:
+                if v:
+                    metas[v - 1][1] += 1
+            grid.append([metas[v - 1][0] if v else 0 for v in row])
+    return {"n": n, "grid": grid, "classes": classes}
 
 
 def cmd_collide(ctx, args):
@@ -1428,7 +1451,7 @@ def cmd_collide(ctx, args):
     if args.pie and not (ctx.beacon or {}).get("pie"):
         raise CliError("--pie needs PIE running (ue pie start)")
     z = args.z if args.z is not None else 100.0
-    data = py_json(ctx, COLLIDE.format(pie=args.pie, x=x, y=y, r=r, z=z, step=step, half=args.half))
+    data = collide_grid(ctx, args.pie, x, y, r, z, step, args.half)
     n, grid, classes = data["n"], data["grid"], data["classes"]
     colours = {meta[0]: MAP_COLOURS[i % len(MAP_COLOURS)] for i, (_, meta) in
                enumerate(sorted(classes.items(), key=lambda kv: -kv[1][1]))}

@@ -11,6 +11,19 @@ def world():
     return game if game is not None else unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_editor_world()
 
 
+def world_subsystem(cls, pie=None):
+    """A UWorldSubsystem of a world, to call its UFUNCTIONs: 5.8's Python has no SubsystemBlueprintLibrary. pie=None
+    takes the world above (PIE when it runs), False the editor world, True the PIE world. None if it has none."""
+    if pie is False:
+        target = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_editor_world()
+    else:
+        target = world()
+        if pie and target == unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_editor_world():
+            raise RuntimeError("PIE is not running")
+    cls = getattr(unreal, cls) if isinstance(cls, str) else cls
+    return next((o for o in unreal.ObjectIterator(cls) if o.get_outer() == target), None)
+
+
 def controller(index=0):
     """That world's player controller (index for split-screen players)."""
     return unreal.GameplayStatics.get_player_controller(world(), index)

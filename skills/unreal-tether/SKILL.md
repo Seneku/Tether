@@ -19,8 +19,12 @@ Before anything that takes the editor away from them (a map rebuild, a long PIE 
 `ue close`), run `ue lease take --for "map rebuild + PIE"` and `ue lease release` when done; `ue status` shows the
 lease to everyone. While another session holds it, `build --restart`, `close` and `pie start` refuse with exit 5
 and say who holds it and for what: wait, or `ue lease request --for "why"` (the holder sees it on its next
-command and runs `ue lease grant` when done), rather than passing `--ignore-lease`. Asked for yours? Grant it
-when you reach a stopping point. A restart or
+command and runs `ue lease grant` when done), rather than passing `--ignore-lease`; `ue wait lease` then
+returns once it is yours or free and PIE has stopped. Asked for yours? Grant it when you reach a stopping point.
+A lease lasts at least 5 minutes past its holder's last `ue` command, so it does not run out mid-task. Work that
+needs another map or a throwaway import while others use the editor: `ue open --second` starts your own headless
+editor next to the shared one (its own port; your commands go there, others' do not; no lease needed; no
+pre-build, as the binaries are in use), and `ue close` closes it. A restart or
 close also asks for the lease when another session used the editor in the last 5 minutes. A build error in a file
 you did not touch says who last edited it ("edited by spire ... (not you)"): leave it to that session.
 `ue who --as NAME` gives your session a name the others see. Committing from a shared checkout: `ue git stage
@@ -71,6 +75,7 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
   review what you changed, then `ue save` (or tell the user what is unsaved and why), then `ue validate`:
   data validation on the changed and unsaved assets plus Map Check of the open level, one line per
   problem (`ue validate /Game/Some/Folder` for a folder). Fix errors it reports before calling the task done.
+  Without git, it takes the assets saved since the editor started instead of the changed ones.
 - In a Perforce (or other check-out) workspace, `ue save`/`mv`/`rm` check files out and mark new ones for add
   themselves; if one is checked out by someone else, or read-only without a connection, it says so and
   `ue save` exits 1: tell the user rather than making files writable yourself.
@@ -87,7 +92,10 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
   runtime are invisible to it). `ue unused --redirectors --fix` repoints references and deletes redirectors.
 - Needs an asset (a rock, a tree, a sky, a character)? Use what the user already has first: `ue fab library rock`
   lists downloaded Fab packs and Fab content in their other projects; `ue fab add "<name>" [--from <project>]
-  --dry-run`, then without --dry-run, copies it in. `ue fab` shows what this project already has from Fab. If
+  --dry-run`, then without --dry-run, copies it in. Fab marks each listing "Allows usage with AI: Yes/No" and
+  the vault does not record it: `fab add` prints the listing link; have the user check it before an AI-driven
+  project uses the pack. `ue fab remove "<name>"` deletes one again (through the editor, which lets go of the
+  files; refuses while other assets reference it). `ue fab` shows what this project already has from Fab. If
   nothing fits, suggest listings with `ue fab open "<search>"` (it prints a fab.com link) and let the user decide:
   claiming, buying and downloading are always theirs. Never click, type or press keys in the Fab tab or the store
   page, by any route (Tether refuses while a Fab tab is open; ask the user to close it if a step needs input).
@@ -143,7 +151,8 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
   `ue pie target 1` to act on the first client. `ue exec --pie` and `pie do` exec steps run on that world's next
   tick, so RPCs replicate; a `call` step or your own Python calling a function directly runs any RPC locally
   (editor Python makes every RPC local). `ue pie run` scripts run in a fresh namespace each time: `tether.world()`, `player()`,
-  `console("cmd")` follow the targeted world. `ue net MyCharacter` lists replicated properties and RPCs;
+  `console("cmd")` follow the targeted world. A UWorldSubsystem (5.8's Python has no SubsystemBlueprintLibrary):
+  `tether.world_subsystem(unreal.MySubsystem)` in `ue py` (PIE's while it runs; `pie=False` for the editor's). `ue net MyCharacter` lists replicated properties and RPCs;
   `ue net player --pie` shows role, owner and relevancy per world; `ue net compare player.Health` checks the
   server and clients agree.
 - Component layout: `ue tree BP_Door` (or an actor label, or `player` in PIE) shows the component hierarchy
@@ -232,8 +241,10 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
   Source/X/A.cpp Source/X/B.h` compiles just those files (a header: the .cpp files that include it), with no
   link and no lease needed, for checking your own work while another session holds the editor. New classes
   while another session's Live Coding builds? Keep them out of Source/ (its builds compile every changed file
-  there): stage them as staging/Source/<Module>/X.h and run `ue build --check --overlay staging/`, which
-  compiles a copy of the project with them on top (incremental after the first run). Do not
+  there): stage them in your own folder, Saved/Tether/staging/<session>/Source/<Module>/X.h, and run `ue build
+  --check --overlay` (no folder: that one), which compiles a copy of the project with them on top (incremental
+  after the first run). A folder another session compiled is refused (on Windows staging/ and Staging/ are one
+  folder). Do not
   compile the editor target with UBT `-Module=` while the editor runs: Live Coding breaks until a restart.
 - Live Coding patches live only in the editor that loaded them: `ue status` names other editors running
   without them, and `ue build --when-closed` queues the UBT build for when every editor has closed.
@@ -389,7 +400,10 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
   Re-record on purpose with `--baseline <file stem>`.
 - To see how values change during play (instead of adding print nodes): `ue pie watch player.Health
   BP_Enemy_C_1.State BP_Enemy_C_1 --seconds 10` (an actor alone = its location; `-f steps.txt` plays a step file
-  while watching). Prints each value's range, path or changes with times; the full samples go to a CSV.
+  while watching). Prints each value's range, path or changes with times; the full samples go to a CSV (rotators
+  as .pitch/.yaw/.roll). Getters work there and in `expect`/`until` steps alike: `until
+  player.Movement.GetSpeedKmh() > 100 within 15`, `expect player.GetActorRotation().yaw > 80`. Keys a step file
+  holds (`key W down`) are released when it ends, failed or not.
 - Soaks and repeated console commands: `ue pie loop "SD.SpawnWave 4; wait 30; stat unit; wait 30" --seconds 600
   --every 60 "memreport"` runs them from the game thread on a fixed schedule (no drift, no round trip each);
   it waits for the end, and a killed `ue` leaves it running (`ue pie loop status` / `stop`).
@@ -399,6 +413,12 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
 - Game UI in PIE: `ue ui` lists what is on screen (Slate and UMG texts, buttons, text boxes); `ue ui click
   "Close"`, `ue ui type "Name" hello`, `ue ui key Escape` (in PIE, keys and chords such as `Ctrl+G` go to the
   game's input, so Escape opens its pause menu instead of stopping PIE; `--slate` sends to the focused widget).
+  When a UMG widget has keyboard focus (a menu reading keys in NativeOnKeyDown), other single keys go to it
+  through Slate on their own (`--game` forces the game's input); step files take `key --slate Enter` or
+  `ui-key Enter`, and `click --event LABEL` (fires OnClicked, for a covered window). `ue ui --rects` prints each
+  widget's screen rectangle (what `ue ui at x,y` takes). A button with no text child (a transparent UButton over
+  a text row) is labelled by the text under it; better, give it an accessible name
+  (`SetAccessibleBehavior(EAccessibleBehavior::Custom, Text)`), which screen readers use too.
   One tap is one press, as on a keyboard, and taps in a row (two `key Down tap` steps) stay two presses. A legacy BindKey chord on a key an Enhanced Input mapping also uses
   (Ctrl+G with G mapped) usually never fires: the mapping consumes the key; `ue ui key` warns when it sees that.
   Several buttons with one label (nine ON/OFF toggles): `ue ui click "OFF" --near "DEBUG HUD: DIRECTOR"` (the one

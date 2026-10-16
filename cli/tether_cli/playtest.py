@@ -201,13 +201,18 @@ def watch_summary(result, max_changes=10):
     return lines, summary
 
 
+ROTATOR_SPEC = re.compile(r"rotation|rotator|\.control$", re.I)  # before the plugin said which (0.27)
+
+
 def write_watch_csv(path, result):
     header = ["real_s", "game_s"]
     vectors = set()
+    kinds = result.get("kinds") or [None] * len(result["targets"])
     for i, spec in enumerate(result["targets"]):
         if any(isinstance(row[2 + i], list) for row in result["samples"]):
             vectors.add(i)
-            header += [f"{spec}.x", f"{spec}.y", f"{spec}.z"]
+            rotator = kinds[i] == "rotator" or (kinds[i] is None and ROTATOR_SPEC.search(spec))
+            header += [f"{spec}.{axis}" for axis in (("pitch", "yaw", "roll") if rotator else ("x", "y", "z"))]
         else:
             header.append(spec)
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
@@ -347,6 +352,8 @@ def baseline_path(project, name):
 def watch_header(path):
     """The values a step file asks to watch (`# watch: player.Health BP_Enemy.State`), or []."""
     specs = []
+    if not os.path.isfile(path):
+        raise CliError(f"no step file {path}")
     with open(path, encoding="utf-8-sig") as f:
         for line in f:
             m = re.match(r"\s*#\s*watch:\s*(.+)$", line)
