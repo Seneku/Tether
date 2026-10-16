@@ -703,12 +703,29 @@ def lint_mpc(ctx, args):
     return 1 if stale and args.strict and not data["fixed"] else 0
 
 
+def lint_materials(ctx, args):
+    """`ue lint --materials [folder]`: materials with many nodes that reach no output (`ue mat graph M prune`)."""
+    data = ctx.tether("mat_unused_check", path=args.path, min_unused=args.min_unused)
+    data = json.loads(data) if isinstance(data, str) else data
+    rows = data["materials"]
+    print(f"{len(rows)} of {data['checked']} material(s) under {args.path} have {args.min_unused}+ nodes that reach no "
+          "output" + (":" if rows else ""))
+    for package, nodes, unused, kinds in rows[: args.limit]:
+        print(f"  {package}: {unused} of {nodes} nodes unused ({', '.join(kinds)})")
+    if rows:
+        print(f"`ue mat graph {rows[0][0]}` lists them; `ue mat graph {rows[0][0]} prune` deletes them (one undo step)")
+    ctx.data = data
+    return 1 if rows and args.strict else 0
+
+
 def cmd_lint(ctx, args):
     """Content rules beyond Epic's validators, from asset registry tags (nothing is loaded)."""
     if getattr(args, "cpp", False):
         return lint_cpp(ctx, args)
     if getattr(args, "mpc", False):
         return lint_mpc(ctx, args)
+    if getattr(args, "materials", False):
+        return lint_materials(ctx, args)
     config_path, config = lint_config(ctx)
     if args.ignore:
         config["ignore"] = config.get("ignore", []) + args.ignore

@@ -3354,8 +3354,16 @@ class UnrealRacingRound3(unittest.TestCase):
             self.assertIn("in the game", ue.press_key(None, "Escape"))  # Escape stays the game's
             self.assertIn("in the game", ue.press_key(None, "Enter", "game"))
         with unittest.mock.patch.object(ue.play, "ui_nodes", return_value=([], True)), \
+                unittest.mock.patch.object(ue.play, "umg_focus", return_value=None), \
                 unittest.mock.patch.object(ue.play, "game_key", side_effect=lambda ctx, t: t):
             self.assertEqual(ue.press_key(None, "Enter"), "pressed Enter in the game")
+        sent.clear()
+        with unittest.mock.patch.object(ue.play, "ui_nodes", return_value=([], True)), \
+                unittest.mock.patch.object(ue.play, "umg_focus", return_value="WBP_Title_C"), \
+                unittest.mock.patch.object(ue.play, "mcp_tool", side_effect=lambda *a: sent.append(a[3]["key"])):
+            # 0.28: a title screen holding focus itself is not in the snapshot; UMG says it has focus
+            self.assertIn("UMG widget WBP_Title_C has keyboard focus", ue.press_key(None, "Enter"))
+            self.assertEqual(sent, ["Enter"])
         args = ue.build_parser().parse_args(["ui", "key", "Enter", "--game"])
         self.assertTrue(args.game)
 
@@ -3464,3 +3472,65 @@ class UnrealRacingRound3(unittest.TestCase):
             self.assertEqual(ue.lease_messages(p, now=later + 120), [])  # extended again, said once
             self.assertAlmostEqual(ue.active_lease(p, later + 120)["until"], later + 420, delta=1)
         self.assertIsNone(ue.active_lease(p, later + 900))  # idle: it runs out
+
+
+class UnrealRacingRound4(unittest.TestCase):
+    """0.28: UnrealRacing's notes 160-164."""
+
+    def setUp(self):
+        self.project = Project()
+
+    def tearDown(self):
+        self.project.close()
+
+    def test_gpu_ab_alternates_and_compares(self):
+        ctx = FakeCtx()
+        ctx.project, ctx.beacon, ran, frames = self.project.uproject, {}, [], iter([6.76, 6.89, 6.74, 6.91])
+
+        def gpu(c, a):
+            ms = next(frames)
+            c.data = {"gpu_ms": ms, "kinds": {"base pass": ms - 4.0, "post": 1.0},
+                      "passes": [("BasePass", ms - 4.0), ("PostProcessing", 1.0)]}
+        args = ue.parse_command(ue.build_parser(), ["gpu", "--ab", "mat MI_X UseWindows=false",
+                                                    "mat MI_X UseWindows=true", "--restore", "mat MI_X --reset UseWindows"])
+        with unittest.mock.patch.object(ue.cli, "run_line", side_effect=lambda c, l: (ran.append(l), (0, ""))[1]), \
+                unittest.mock.patch.object(ue.cli, "wait_compile"), unittest.mock.patch.object(ue.cli, "cmd_gpu", side_effect=gpu), \
+                unittest.mock.patch.object(ue.cli, "py_json", side_effect=[[], ["/Game/MI_X"]]), \
+                unittest.mock.patch.object(ue.cli.time, "sleep"), contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(ue.gpu_command(ctx, args), 0)
+        self.assertEqual(ran, ["mat MI_X UseWindows=false", "mat MI_X UseWindows=true"] * 2 + ["mat MI_X --reset UseWindows"])
+        text = out.getvalue()
+        self.assertIn("A 6.75 ms, B 6.90 ms per frame: B is +0.15 ms", text)
+        self.assertIn("base pass +0.15 ms", text)
+        self.assertIn("+0.15 ms  BasePass", text)
+        self.assertIn("1 package(s) left unsaved by the switch: /Game/MI_X", text)
+        with self.assertRaisesRegex(ue.CliError, "--restore goes with --ab"):
+            ue.gpu_command(ctx, ue.parse_command(ue.build_parser(), ["gpu", "--restore", "x"]))
+
+    def test_run_line_captures_and_refuses_nesting(self):
+        code, out = ue.run_line(FakeCtx(), "ue gpu --ab a b")
+        self.assertNotEqual(code, 0)
+        self.assertIn("cannot run inside another command", out)
+
+    def test_lint_materials(self):
+        ctx = FakeCtx(json.dumps({"checked": 12, "materials": [["/Game/M/M_NR_Building", 43, 20, ["Multiply", "Lerp"]]]}))
+        args = argparse.Namespace(path="/Game", min_unused=5, limit=20, strict=True)
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(ue.lint_materials(ctx, args), 1)
+        self.assertIn("/Game/M/M_NR_Building: 20 of 43 nodes unused (Multiply, Lerp)", out.getvalue())
+        self.assertIn("prune", out.getvalue())
+        self.assertTrue(ue.build_parser().parse_args(["lint", "--materials"]).materials)
+
+    def test_link_errors_name_the_missing_symbol_and_its_module(self):
+        e = ('E LNK2019 unresolved external symbol "__declspec(dllimport) public: static struct FKey const EKeys::Enter" '
+             '(__imp_?Enter@EKeys@@2UFKey@@B) referenced in function "protected: virtual class FReply __cdecl '
+             'UTetherProbeTitle::NativeOnKeyDown(struct FGeometry const &,struct FKeyEvent const &)"')
+        mine = 'error LNK2019: unresolved external symbol "public: void __cdecl AFoo::Bar(int)" referenced in function "x"'
+        self.assertEqual(ue.unresolved_symbols([e, mine]), [("EKeys", "Enter", True), ("AFoo", "Bar", False)])
+        self.project.write("Source/Game/Foo.h", "class GAME_API AFoo : public AActor { void Bar(int); };")
+        with unittest.mock.patch.object(ue.build, "engine_module_of", return_value="InputCore"), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            ue.print_link_owners(self.project.uproject, [e, mine])
+        self.assertIn('EKeys::Enter: from another module\'s DLL: add "InputCore" to the Build.cs dependencies', out.getvalue())
+        self.assertIn("AFoo::Bar: declared in Foo.h", out.getvalue())
+        self.assertNotIn("NativeOnKeyDown", out.getvalue())

@@ -208,16 +208,22 @@ def ui_nodes(ctx):
 def label_buttons(nodes):
     """Name a button with no label of its own (no accessible text, no single text child: a transparent button over
     a sibling text row) after the text widgets inside its rectangle, so it can be clicked by that text. Flagged
-    "text under it" in `ue ui`."""
-    texts = [(n, box(n)) for n in nodes if n["role"] == "text" and n["label"] and visible(n)]
-    for n in nodes:
-        b = box(n)
-        if n["role"] != "button" or n["label"] or not b or not b[2] or not b[3]:
+    "text under it" in `ue ui`. Each text goes to the one button whose centre is nearest its own (menu rows can
+    overlap a little on screen, and a row's text and button share one rectangle)."""
+    buttons = [(n, box(n)) for n in nodes if n["role"] == "button" and not n["label"] and box(n) and box(n)[2] and box(n)[3]]
+    found = {}
+    for t in nodes:
+        tb = box(t)
+        if t["role"] != "text" or not t["label"] or not visible(t) or not tb:
             continue
-        inner = [t["label"] for t, tb in texts if tb and inside((tb[0] + tb[2] / 2, tb[1] + tb[3] / 2), b)]
-        if inner:
-            n["label"] = " ".join(dict.fromkeys(inner))[:80]
-            n["flags"] = n["flags"] + ["text under it"]
+        point = (tb[0] + tb[2] / 2, tb[1] + tb[3] / 2)
+        over = [(n, b) for n, b in buttons if inside(point, b)]
+        if over:
+            n, _ = min(over, key=lambda nb: (nb[1][0] + nb[1][2] / 2 - point[0]) ** 2 + (nb[1][1] + nb[1][3] / 2 - point[1]) ** 2)
+            found.setdefault(id(n), (n, []))[1].append(t["label"])
+    for n, labels in found.values():
+        n["label"] = " ".join(dict.fromkeys(labels))[:80]
+        n["flags"] = n["flags"] + ["text under it"]
     return nodes
 
 
@@ -445,6 +451,26 @@ def focused_widget(nodes):
     return None
 
 
+UMG_FOCUS = """import json
+w, hit = tether.world(), None
+if w is not None:
+    shown = [u for u in unreal.WidgetLibrary.get_all_widgets_of_class(w, unreal.UserWidget, False)]
+    hit = next((u for u in shown if u.has_keyboard_focus()), None)
+    if hit is None:
+        hit = next((u for u in shown if u.is_in_viewport() and u.has_focused_descendants()), None)
+print(json.dumps(hit and hit.get_class().get_name()))
+"""
+
+
+def umg_focus(ctx):
+    """The class of the game's UMG widget that holds keyboard focus (itself or inside it), or None: the inspector
+    snapshot leaves out containers with no role or label, so a focusable user widget never shows as focused."""
+    try:
+        return py_json(ctx, UMG_FOCUS)
+    except CliError:
+        return None
+
+
 def press_key(ctx, text, route="auto"):
     """A key in PIE: through the game's input (the player controller), or through Slate to the focused widget
     (UMG menus). auto: Slate when a game widget has keyboard focus, except Escape and chords (through Slate those
@@ -457,6 +483,10 @@ def press_key(ctx, text, route="auto"):
             route = "slate"
             why = (f'{focus["role"]} "{focus["label"]}"' if focus["label"] else f'a {focus["role"]} widget') + \
                 " has keyboard focus"
+        elif slate:  # a user widget holding focus itself (a title screen) is not in the snapshot: ask UMG
+            holder = umg_focus(ctx)
+            if holder:
+                route, why = "slate", f"UMG widget {holder} has keyboard focus"
     if route == "slate":
         key = KEY_NAMES.get(text.lower(), text)
         mcp_tool(ctx, "SlateInspectorToolset", "PressKey", {"key": key})
@@ -2055,7 +2085,8 @@ def wait_compile(ctx, args):
         totals[1] += workers
         peak = max(peak, now[2])
         last = now
-        busy = workers > 0.05 or editor > EDITOR_BUSY_CORES
+        # workers_only: while PIE runs the editor's own threads are never quiet; shader compiles show in the workers
+        busy = workers > 0.05 or (editor > EDITOR_BUSY_CORES and not getattr(args, "workers_only", False))
         quiet_since = None if busy else (quiet_since or time.time())
         if quiet_since and time.time() - quiet_since >= COMPILE_QUIET:
             print(f"compiled: quiet after {time.time() - started - COMPILE_QUIET:.0f}s (shader workers "

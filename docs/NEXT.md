@@ -100,6 +100,19 @@ its holder's last command. Also: the "several editors are open" note is said onc
 live: the Slate-focus key route and text-under-button labels (Sandbox has no UMG menu), and the OS-window click
 check (needs a covered windowed editor).
 
+**Done in 0.28.0** (UnrealRacing's notes 160-164, from its live test of 0.27): 160 a user widget holding keyboard
+focus itself (a title screen) is not in the inspector's snapshot, so `press_key` asks UMG (`HasKeyboardFocus` /
+`HasFocusedDescendants`) before sending a key to the game; 161 the plugin's UMG walk follows nested user widgets'
+own trees (rows inside a screen), so `click --event` finds C++-built buttons; 147's labels go to the button whose
+centre is nearest the text (overlapping rows took their neighbours' text); 162 `mat graph` reads each input's
+OutputIndex from the engine's export (`obj dump`) when two inputs share a source (`#1.R` and `#1.A`); 163 `mat
+graph M prune` (one undo step) and `ue lint --materials`; 164 `ue gpu --ab "A" "B" [--restore]`. Also: link errors
+name the missing symbol rather than the function that uses it, and for another module's symbol the module to add
+to Build.cs; Sandbox gained a menu fixture (`ShowProbeMenu`: a focusable title screen, then rows of text-less
+UButton subclasses in nested user widgets) and the selftest a check that drives it. All checked live in Sandbox;
+`prune` first crashed the editor by asking for every MaterialProperty value's input (MP_MAX among them), now only
+the real outputs.
+
 ---
 
 ## Priority 1: asked for, or blocking real work

@@ -539,7 +539,7 @@ def cmd_mat(ctx, args):
     reads or edits the node graph."""
     if args.target == "graph":
         if not args.assignments:
-            raise CliError("ue mat graph <material> [add|connect|set|delete ...]")
+            raise CliError("ue mat graph <material> [add|connect|set|delete|prune ...]")
         material, *rest = args.assignments
         out = ctx.tether("mat_graph", target=material, op=rest[0] if rest else "-", args=json.dumps(rest[1:]))
         print(out)

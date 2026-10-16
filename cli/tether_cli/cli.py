@@ -23,7 +23,8 @@ from .content import (
 )
 from .fab import cmd_fab
 from .jobs import cmd_game, cmd_job, cmd_package
-from .play import cmd_audio, cmd_gpu, cmd_mem, cmd_sound, cmd_soak, cmd_ui, cmd_wait, cmd_world
+from .play import DIRTY_PACKAGES, cmd_audio, cmd_gpu, cmd_mem, cmd_sound, cmd_soak, cmd_ui, cmd_wait, cmd_world, wait_compile
+from .transport import py_json
 from .playtest import bp_command, cmd_budget, cmd_input, package_command, perf_command, pie_command
 from .hooks import cmd_hook
 from .setup import cmd_doctor, cmd_init, cmd_reload, cmd_template, new_project, tether_version
@@ -48,6 +49,94 @@ def exec_command(ctx, args):
         return cmd_exec(ctx, args)
     shoot = lambda: cmd_shot(ctx, shot_args(output=args.shot or None, hud=args.hud))  # noqa: E731
     return cmd_exec(ctx, args, after=shoot)
+
+
+def run_line(ctx, line):
+    """Run one `ue` command line in this process, with its output captured: (exit code, output)."""
+    import contextlib
+    import io
+    import shlex
+    argv = shlex.split(line, posix=True)
+    argv = argv[1:] if argv and argv[0] == "ue" else argv
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+        try:
+            sub = parse_command(build_parser(), undo_msys_paths(argv))
+            if sub.fn in (cmd_batch, cmd_hook, gpu_command):
+                raise CliError(f"`ue {sub.cmd}` cannot run inside another command")
+            code = sub.fn(ctx, sub) or 0
+        except CliError as exc:
+            print(f"error: {exc}")
+            code = exc.code
+        except SystemExit as exc:
+            code = exc.code if isinstance(exc.code, int) else 2
+    return code, buf.getvalue()
+
+
+def gpu_ab(ctx, args):
+    """`ue gpu --ab "<ue command A>" "<ue command B>"`: the GPU frame at the same camera with each of two states,
+    alternating A, B, A, B so drift averages out; waits for shader compiles after each switch. --restore runs a
+    last command (the state to leave behind)."""
+    import contextlib
+    import io
+    dirty_before = set(py_json(ctx, DIRTY_PACKAGES) or [])
+    runs = {"A": [], "B": []}
+    profile = argparse.Namespace(**{k: v for k, v in vars(args).items() if k not in ("ab", "restore", "rounds")})
+    for _ in range(max(1, args.rounds)):
+        for label, line in (("A", args.ab[0]), ("B", args.ab[1])):
+            code, out = run_line(ctx, line)
+            if code:
+                raise CliError(f"{label} (`ue {line}`) failed: {out.strip().splitlines()[-1] if out.strip() else code}")
+            with contextlib.redirect_stdout(io.StringIO()):
+                with contextlib.suppress(CliError):  # not on Windows: no compile wait, just a pause
+                    wait_compile(ctx, argparse.Namespace(max=args.compile_max, workers_only=True))
+                time.sleep(1.0)  # the first frames after a switch reallocate and recompile
+                cmd_gpu(ctx, profile)
+            runs[label].append(ctx.data)
+    restored = ""
+    if args.restore:
+        code, out = run_line(ctx, args.restore)
+        restored = f"; restored with `ue {args.restore}`" if not code else f"; --restore failed: {out.strip()[-200:]}"
+    mean = lambda rows, f: sum(f(r) for r in rows) / len(rows)  # noqa: E731
+    a_ms, b_ms = mean(runs["A"], lambda r: r["gpu_ms"]), mean(runs["B"], lambda r: r["gpu_ms"])
+    spread = max(abs(runs[k][i]["gpu_ms"] - runs[k][0]["gpu_ms"]) for k in runs for i in range(len(runs[k])))
+    print(f"A {a_ms:.2f} ms, B {b_ms:.2f} ms per frame: B is {b_ms - a_ms:+.2f} ms ({100 * (b_ms - a_ms) / (a_ms or 1):+.1f}%)"
+          f"; {args.rounds} round(s) of {args.frames} frame(s) each, runs of one state within {spread:.2f} ms" + restored)
+    print(f"  A: ue {args.ab[0]}\n  B: ue {args.ab[1]}")
+    if not all(r.get("scene", True) for rows in runs.values() for r in rows):
+        print("note: no 3D scene was rendered in some of the frames, so they measured editor UI: start PIE (ue pie "
+              "start) or make a level viewport realtime, and put the camera where the difference shows")
+    kinds = sorted({k for r in runs["A"] + runs["B"] for k in r["kinds"]})
+    deltas = [(k, mean(runs["B"], lambda r: r["kinds"].get(k, 0.0)) - mean(runs["A"], lambda r: r["kinds"].get(k, 0.0)))
+              for k in kinds]
+    shown = [(k, d) for k, d in sorted(deltas, key=lambda kd: -abs(kd[1])) if abs(d) >= args.min][: args.top]
+    print("by kind (B - A): " + (", ".join(f"{k} {d:+.2f} ms" for k, d in shown) or f"nothing moved by {args.min} ms or more"))
+    passes = {}
+    for label in runs:
+        for r in runs[label]:
+            for name, ms in r["passes"]:
+                passes.setdefault(name, {"A": 0.0, "B": 0.0})[label] += ms / len(runs[label])
+    moved = sorted(((n, v["B"] - v["A"]) for n, v in passes.items()), key=lambda nd: -abs(nd[1]))
+    moved = [(n, d) for n, d in moved if abs(d) >= args.min][: args.top]
+    if moved:
+        print("passes (B - A):")
+        for name, d in moved:
+            print(f"  {d:+7.2f} ms  {name[:100]}")
+    left = sorted(set(py_json(ctx, DIRTY_PACKAGES) or []) - dirty_before)
+    if left:
+        print(f"note: {len(left)} package(s) left unsaved by the switch: {', '.join(left[:6])}"
+              + ("" if args.restore else " (--restore \"<command>\" puts a state back; ue changes)"))
+    ctx.data = {"A": a_ms, "B": b_ms, "delta": b_ms - a_ms, "kinds": dict(deltas), "runs": runs}
+    return 0
+
+
+def gpu_command(ctx, args):
+    """`ue gpu` (play.cmd_gpu), or with --ab an A/B comparison of two states."""
+    if args.ab:
+        return gpu_ab(ctx, args)
+    if args.restore:
+        raise CliError("--restore goes with --ab")
+    return cmd_gpu(ctx, args)
 
 
 def new_command(ctx, args):
@@ -252,7 +341,7 @@ def build_parser():
     s = add("wp", cmd_wp, "World Partition: info, actors [regex|x,y,r] (unloaded too), load|unload <x,y,r|regex>")
     s.add_argument("action", nargs="?", default="info", choices=["info", "actors", "load", "unload"])
     s.add_argument("where", nargs="?", help="a name/class regex, or an area x,y,radius")
-    s = add("gpu", cmd_gpu, "GPU time per pass (ProfileGPU): by kind (Lumen, shadows, base pass, post...) and the top passes")
+    s = add("gpu", gpu_command, "GPU time per pass (ProfileGPU): by kind (Lumen, shadows, base pass, post...) and the top passes")
     s.add_argument("--res", metavar="WxH", help="render the 3D scene with this resolution's pixel count (screen percentage "
                                                "on the small offscreen viewport), e.g. 2560x1440")
     s.add_argument("--frames", type=int, default=3, help="frames to profile and average (3)")
@@ -260,6 +349,13 @@ def build_parser():
     s.add_argument("--top", type=int, default=12, help="how many passes to list (12)")
     s.add_argument("--min", type=float, default=0.05, help="leave out passes under this many ms (0.05)")
     s.add_argument("--tree", type=int, nargs="?", const=6, metavar="DEPTH", help="also print the last frame's tree")
+    s.add_argument("--ab", nargs=2, metavar=("A", "B"), help="compare two states: two ue command lines run in turn "
+                   "(A, B, A, B), the GPU frame measured after each at the same camera, e.g. --ab "
+                   "\"mat MI_X UseWindows=false\" \"mat MI_X UseWindows=true\"")
+    s.add_argument("--restore", metavar="CMD", help="with --ab: a ue command line run at the end (the state to leave)")
+    s.add_argument("--rounds", type=int, default=2, help="with --ab: A/B rounds (2)")
+    s.add_argument("--compile-max", type=float, default=300, help="with --ab: longest wait for shader compiles per "
+                                                                 "switch, in seconds (300)")
     s = add("tex", cmd_tex, "textures: size, format, memory and issues under a folder (or one), or --streaming: the live pool")
     s.add_argument("path", nargs="?", help="a folder (default /Game) or one texture")
     s.add_argument("--streaming", action="store_true", help="what is in memory now: pool use, largest, ones wanting more mips")
@@ -704,6 +800,9 @@ def build_parser():
                                                      "(unity-build collisions)")
     s.add_argument("--mpc", action="store_true", help="material Collection Parameter nodes whose collection parameter "
                                                      "is gone or has a new ID (they read 0); --fix re-links by name")
+    s.add_argument("--materials", action="store_true", help="materials with many nodes that reach no output (loads "
+                                                           "them; `ue mat graph M prune` deletes those nodes)")
+    s.add_argument("--min-unused", type=int, default=5, help="with --materials: report from this many unused nodes (5)")
     s.add_argument("--fix", action="store_true", help="fix what has a safe fix (renames only with --rule naming|characters)")
     s.add_argument("--dry-run", action="store_true", help="with --fix: show the fixes only")
     s.add_argument("--save", action="store_true", help="with --fix: save the changed assets")

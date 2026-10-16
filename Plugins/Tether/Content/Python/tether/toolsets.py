@@ -2446,6 +2446,53 @@ def _png_rgba8(width, height, rgba):
             + chunk(b"IDAT", zlib.compress(rows)) + chunk(b"IEND", b""))
 
 
+_MAT_LINK = re.compile(r"Expression=[^,()]*?(\w+)'?\"?,OutputIndex=(\d+)")
+
+
+_MAT_OUTPUTS = ("BASE_COLOR", "METALLIC", "SPECULAR", "ROUGHNESS", "ANISOTROPY", "EMISSIVE_COLOR", "OPACITY",
+                "OPACITY_MASK", "NORMAL", "TANGENT", "WORLD_POSITION_OFFSET", "SUBSURFACE_COLOR", "AMBIENT_OCCLUSION",
+                "REFRACTION", "PIXEL_DEPTH_OFFSET", "SHADING_MODEL", "SURFACE_THICKNESS", "DISPLACEMENT",
+                "FRONT_MATERIAL")  # a material's outputs (MaterialProperty values with an input pin)
+
+
+def _mat_input_links(expr):
+    """[(source object name, output index)] of an expression's connected inputs, in property order. Python cannot
+    read FExpressionInput.OutputIndex, so this comes from the engine's own export (`obj dump`)."""
+    text = "\n".join(str(v) for _, _, v in _dump_props(expr))
+    return [(m.group(1), int(m.group(2))) for m in _MAT_LINK.finditer(text)]
+
+
+def _mat_output_names(expr):
+    """An expression's output names in order ('' for an unnamed one), from its export; [] if not exported."""
+    outputs = next((v for _, n, v in _dump_props(expr) if n == "Outputs"), "")
+    return re.findall(r'OutputName="?([^",)]*)"?', str(outputs))
+
+
+def _mat_unused(asset):
+    """(nodes, unused nodes) of a Material or MaterialFunction: unused ones reach no output (comments aside)."""
+    lib = unreal.MaterialEditingLibrary
+    is_fn = isinstance(asset, unreal.MaterialFunction)
+    nodes = list((lib.get_material_function_expressions if is_fn else lib.get_material_expressions)(asset))
+    getter = lib.get_inputs_for_material_function_expression if is_fn else lib.get_inputs_for_material_expression
+    used, todo = set(), []
+    if is_fn:
+        todo = [e for e in nodes if e.get_class().get_name() == "MaterialExpressionFunctionOutput"]
+    else:
+        for name in _MAT_OUTPUTS:  # not every MaterialProperty value: MP_MAX and the like crash the editor
+            prop = getattr(unreal.MaterialProperty, "MP_" + name, None)
+            node = _try(lambda: lib.get_material_property_input_node(asset, prop)) if prop is not None else None
+            if node:
+                todo.append(node)
+    while todo:
+        expr = todo.pop()
+        if expr.get_path_name() in used:
+            continue
+        used.add(expr.get_path_name())
+        todo += [i for i in (_try(lambda: list(getter(asset, expr)), []) or []) if i]
+    unused = [e for e in nodes if e.get_path_name() not in used and e.get_class().get_name() != "MaterialExpressionComment"]
+    return nodes, unused
+
+
 def _mat_node_text(expr, kind):
     """One material node in a few words: its kind, parameter name and the setting that matters."""
     name = _try(lambda: str(expr.get_editor_property("parameter_name")))
@@ -5671,6 +5718,77 @@ class TetherCore(_Base):
                 return by_class[0]
             raise RuntimeError(f"no single node '{ref}' (use #n from `ue mat graph`, a parameter name, or a class used once)")
 
+        def mat_graph_text():
+            nodes = exprs()
+            ids = {e.get_path_name(): i + 1 for i, e in enumerate(nodes)}
+            ref = lambda e, out="": f"#{ids.get(e.get_path_name(), '?')}" + (f".{out}" if out else "")  # noqa: E731
+            lines = []
+            if is_fn:
+                lines.append(f"{asset.get_name()} (MaterialFunction), {len(nodes)} node(s)")
+            else:
+                info = [str(_try(lambda: asset.get_editor_property(p), "")).split(".")[-1].split(":")[0]
+                        for p in ("material_domain", "blend_mode", "shading_model")]
+                two_sided = _try(lambda: asset.get_editor_property("two_sided"), False)
+                lines.append(f"{asset.get_name()} (Material: {', '.join(i.replace('MD_', '').replace('BLEND_', '').replace('MSM_', '') for i in info if i)}"
+                             + (", two-sided" if two_sided else "") + f"), {len(nodes)} node(s)")
+            used = set()
+
+            def walk(expr):
+                key = expr.get_path_name()
+                if key in used:
+                    return
+                used.add(key)
+                getter = lib.get_inputs_for_material_function_expression if is_fn else lib.get_inputs_for_material_expression
+                for inp in _try(lambda: list(getter(asset, expr)), []) or []:
+                    if inp:
+                        walk(inp)
+            if not is_fn:
+                outputs = []
+                for name in _MAT_OUTPUTS:
+                    prop = getattr(unreal.MaterialProperty, "MP_" + name, None)
+                    node = _try(lambda: lib.get_material_property_input_node(asset, prop)) if prop is not None else None
+                    if node:
+                        out = _try(lambda: lib.get_material_property_input_node_output_name(asset, prop), "") or ""
+                        outputs.append(f"  {name.title().replace('_', '')} <- {ref(node, out)} {_mat_node_text(node, short(node))}")
+                        walk(node)
+                lines.append("outputs:" if outputs else "outputs: none connected")
+                lines += outputs
+            else:
+                for expr in nodes:
+                    if short(expr) == "FunctionOutput":
+                        walk(expr)
+            lines.append("nodes:")
+            getter = lib.get_inputs_for_material_function_expression if is_fn else lib.get_inputs_for_material_expression
+            for i, expr in enumerate(nodes):
+                if expr.get_path_name() not in used:
+                    continue
+                names = list(_try(lambda: lib.get_material_expression_input_names(expr), []) or [])
+                inputs = list(_try(lambda: getter(asset, expr), []) or [])
+                wired = []
+                sources = [i.get_path_name() for i in inputs if i]
+                # Two inputs from one node: the library names the first link's output for both (FO <- #23.RGB and
+                # FOA <- #23.RGB for .RGB and .A), so read each input's own OutputIndex from the export.
+                links = _try(lambda: _mat_input_links(expr), []) if len(sources) != len(set(sources)) else []
+                outs = {}
+                for name, inp in zip(names, inputs):
+                    if inp:
+                        out = _try(lambda: lib.get_input_node_output_name_for_material_expression(expr, inp), "") or ""
+                        if sources.count(inp.get_path_name()) > 1:
+                            link = next((l for l in links if l[0] == inp.get_name()), None)
+                            if link:
+                                links.remove(link)
+                                key = inp.get_path_name()
+                                outs[key] = outs.get(key) or _try(lambda: _mat_output_names(inp), []) or []
+                                out = outs[key][link[1]] if link[1] < len(outs[key]) else f"output {link[1]}"
+                        wired.append(f"{name or 'In'} <- {ref(inp, out)}")
+                lines.append(f"  #{i + 1} {_mat_node_text(expr, short(expr))}" + (f" ({', '.join(wired)})" if wired else ""))
+            unused = [f"#{i + 1} {_mat_node_text(e, short(e))}" for i, e in enumerate(nodes)
+                      if e.get_path_name() not in used and short(e) != "Comment"]
+            if unused:
+                lines.append(f"not connected to an output ({len(unused)}; `ue mat graph {asset.get_name()} prune` deletes "
+                             "them): " + "; ".join(unused[:12]) + (f" +{len(unused) - 12}" if len(unused) > 12 else ""))
+            return "\n".join(lines)
+
         note = ""
         if op not in ("", "-"):
             _authorize(token)
@@ -5725,73 +5843,25 @@ class TetherCore(_Base):
                 expr = resolve(argv[0], nodes)
                 (lib.delete_material_expression_in_function if is_fn else lib.delete_material_expression)(asset, expr)
                 note = f"deleted {argv[0]} ({short(expr)})"
+            elif op == "prune":  # every node that reaches no output, in one undo step
+                _, unused = _mat_unused(asset)
+                if not unused:
+                    return "nothing to prune: every node reaches an output\n" + mat_graph_text()
+                with unreal.ScopedEditorTransaction(f"Prune {asset.get_name()}"):
+                    asset.modify()
+                    for expr in unused:
+                        (lib.delete_material_expression_in_function if is_fn else lib.delete_material_expression)(asset, expr)
+                note = f"pruned {len(unused)} node(s) that reached no output: " + ", ".join(
+                    sorted({short(e) for e in unused}))[:200] + " (`ue undo --editor` brings them back)"
             else:
-                raise RuntimeError("op: add, connect, set or delete")
+                raise RuntimeError("op: add, connect, set, delete or prune")
             if is_fn:
                 lib.update_material_function(asset, None)
             else:
                 lib.recompile_material(asset)
             _try(lambda: (lib.refresh_material_function_editor if is_fn else lib.refresh_material_editor)(asset))
 
-        nodes = exprs()
-        ids = {e.get_path_name(): i + 1 for i, e in enumerate(nodes)}
-        ref = lambda e, out="": f"#{ids.get(e.get_path_name(), '?')}" + (f".{out}" if out else "")  # noqa: E731
-        lines = []
-        if is_fn:
-            lines.append(f"{asset.get_name()} (MaterialFunction), {len(nodes)} node(s)")
-        else:
-            info = [str(_try(lambda: asset.get_editor_property(p), "")).split(".")[-1].split(":")[0]
-                    for p in ("material_domain", "blend_mode", "shading_model")]
-            two_sided = _try(lambda: asset.get_editor_property("two_sided"), False)
-            lines.append(f"{asset.get_name()} (Material: {', '.join(i.replace('MD_', '').replace('BLEND_', '').replace('MSM_', '') for i in info if i)}"
-                         + (", two-sided" if two_sided else "") + f"), {len(nodes)} node(s)")
-        used = set()
-
-        def walk(expr):
-            key = expr.get_path_name()
-            if key in used:
-                return
-            used.add(key)
-            getter = lib.get_inputs_for_material_function_expression if is_fn else lib.get_inputs_for_material_expression
-            for inp in _try(lambda: list(getter(asset, expr)), []) or []:
-                if inp:
-                    walk(inp)
-        if not is_fn:
-            outputs = []
-            for name in ("BASE_COLOR", "METALLIC", "SPECULAR", "ROUGHNESS", "ANISOTROPY", "EMISSIVE_COLOR", "OPACITY",
-                         "OPACITY_MASK", "NORMAL", "TANGENT", "WORLD_POSITION_OFFSET", "SUBSURFACE_COLOR",
-                         "AMBIENT_OCCLUSION", "REFRACTION", "PIXEL_DEPTH_OFFSET", "SHADING_MODEL", "SURFACE_THICKNESS",
-                         "DISPLACEMENT", "FRONT_MATERIAL"):
-                prop = getattr(unreal.MaterialProperty, "MP_" + name, None)
-                node = _try(lambda: lib.get_material_property_input_node(asset, prop)) if prop is not None else None
-                if node:
-                    out = _try(lambda: lib.get_material_property_input_node_output_name(asset, prop), "") or ""
-                    outputs.append(f"  {name.title().replace('_', '')} <- {ref(node, out)} {_mat_node_text(node, short(node))}")
-                    walk(node)
-            lines.append("outputs:" if outputs else "outputs: none connected")
-            lines += outputs
-        else:
-            for expr in nodes:
-                if short(expr) == "FunctionOutput":
-                    walk(expr)
-        lines.append("nodes:")
-        getter = lib.get_inputs_for_material_function_expression if is_fn else lib.get_inputs_for_material_expression
-        for i, expr in enumerate(nodes):
-            if expr.get_path_name() not in used:
-                continue
-            names = list(_try(lambda: lib.get_material_expression_input_names(expr), []) or [])
-            inputs = list(_try(lambda: getter(asset, expr), []) or [])
-            wired = []
-            for name, inp in zip(names, inputs):
-                if inp:
-                    out = _try(lambda: lib.get_input_node_output_name_for_material_expression(expr, inp), "") or ""
-                    wired.append(f"{name or 'In'} <- {ref(inp, out)}")
-            lines.append(f"  #{i + 1} {_mat_node_text(expr, short(expr))}" + (f" ({', '.join(wired)})" if wired else ""))
-        unused = [f"#{i + 1} {_mat_node_text(e, short(e))}" for i, e in enumerate(nodes)
-                  if e.get_path_name() not in used and short(e) != "Comment"]
-        if unused:
-            lines.append("not connected to an output: " + "; ".join(unused[:12]) + (f" +{len(unused) - 12}" if len(unused) > 12 else ""))
-        return (note + "\n" if note else "") + "\n".join(lines)
+        return (note + "\n" if note else "") + mat_graph_text()
 
     @_tool
     @staticmethod
@@ -7036,6 +7106,37 @@ class TetherCore(_Base):
 
     @_tool
     @staticmethod
+    def mat_unused_check(path: str = "/Game", min_unused: int = 5) -> str:
+        """Materials and material functions with nodes that reach no output (left behind by edits or by a
+        generator that rebuilds the graph): they cost nothing at runtime but make the graph hard to read.
+
+        Args:
+            path: Materials under this content folder.
+            min_unused: Report only those with at least this many unused nodes.
+
+        Returns:
+            JSON {checked, materials: [[path, nodes, unused, [classes]]]}, most unused first.
+        """
+        registry = unreal.AssetRegistryHelpers.get_asset_registry()
+        rows, checked = [], 0
+        for cls in ("Material", "MaterialFunction"):
+            for data in registry.get_assets_by_class(unreal.TopLevelAssetPath("/Script/Engine", cls), False):
+                package = str(data.package_name)
+                if not package.startswith(path.rstrip("/") + "/") and package != path:
+                    continue
+                asset = unreal.load_asset(package)
+                if not isinstance(asset, (unreal.Material, unreal.MaterialFunction)):
+                    continue
+                checked += 1
+                nodes, unused = _try(lambda: _mat_unused(asset), ([], []))
+                if len(unused) >= min_unused:
+                    kinds = sorted({e.get_class().get_name().replace("MaterialExpression", "") for e in unused})
+                    rows.append([package, len(nodes), len(unused), kinds[:8]])
+        rows.sort(key=lambda r: -r[2])
+        return json.dumps({"checked": checked, "materials": rows})
+
+    @_tool
+    @staticmethod
     def mpc_check(path: str = "/Game", fix: bool = False, token: str = "") -> str:
         """Collection Parameter nodes whose parameter their Material Parameter Collection no longer has. A node
         finds its parameter by ID; rewriting the collection's parameter arrays gives every parameter a new one,
@@ -7662,10 +7763,20 @@ class TetherCore(_Base):
                 if u.is_in_viewport() and u.is_visible()]
         lib = unreal.UserWidgetFunctionLibrary
         children, owners = {}, {}
-        for widget in unreal.ObjectIterator(unreal.Widget):
-            owner = _try(lambda: lib.get_outer_user_widget(widget))
-            if owner in tops:
-                children.setdefault(widget.get_parent(), []).append(widget)
+        everything = [(w, _try(lambda w=w: lib.get_outer_user_widget(w))) for w in unreal.ObjectIterator(unreal.Widget)]
+        shown, grew = set(tops), True  # the user widgets on screen: the tops and those nested in them (menu rows)
+        while grew:
+            grew = False
+            for widget, owner in everything:
+                if owner in shown and isinstance(widget, unreal.UserWidget) and widget not in shown:
+                    shown.add(widget)
+                    grew = True
+        for widget, owner in everything:
+            if owner in shown:
+                parent = widget.get_parent()
+                if parent is None and owner not in tops:  # the root of a nested user widget's own tree
+                    parent = owner
+                children.setdefault(parent, []).append(widget)
                 owners[widget] = owner
 
         def label(widget):
@@ -7720,14 +7831,15 @@ class TetherCore(_Base):
         if click:
             _authorize(token)
             key = click.lower()
-            match = [b for t, b in buttons if t.lower() == key or b.get_name().lower() == key] or \
-                [b for t, b in buttons if key in t.lower()]
+            match = [(t, b) for t, b in buttons if t.lower() == key or b.get_name().lower() == key] or \
+                [(t, b) for t, b in buttons if key in t.lower()]
             if not match:
                 raise RuntimeError(f"no visible button '{click}' (buttons: {', '.join(t or b.get_name() for t, b in buttons[:10])})")
-            if not match[0].get_is_enabled():
+            text, button = match[0]
+            if not button.get_is_enabled():
                 raise RuntimeError(f"'{click}' is disabled")
-            match[0].on_clicked.broadcast()
-            return f"clicked {match[0].get_name()}"
+            button.on_clicked.broadcast()
+            return f'clicked {button.get_name()}' + (f' "{text}"' if text else "") + " (its OnClicked)"
         return "\n".join(rows) if rows else "no UMG widgets on the viewport"
 
     @_tool

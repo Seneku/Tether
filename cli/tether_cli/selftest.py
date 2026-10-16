@@ -359,6 +359,15 @@ def cmd_selftest(ctx, args):
     check("ui click (Sandbox fixture)", ["pie", "do", "call /Script/Sandbox.Default__TetherProbeUILibrary ShowProbeUI",
                                          "expect-ui Tether probe panel", "click UMG Probe Button", "expect-ui UMG clicks: "],
           skip=None if fixture else "no UI fixture (Sandbox's TetherProbeUILibrary)", ok=lambda c, o: c == 0 and "PASS" in o)
+    menu = (ue("py", "hasattr(unreal.TetherProbeUILibrary, 'show_probe_menu')")[1].splitlines() or [""])[-1] == "True" \
+        if fixture else False
+    # a title screen holding focus itself, then rows of text-less buttons inside nested user widgets
+    check("ui menu keys and clicks (Sandbox fixture)",
+          ["pie", "do", "call /Script/Sandbox.Default__TetherProbeUILibrary ShowProbeMenu", "key Enter",
+           "expect-ui GARAGE", "key Down", "key Enter", "click --event QUIT", "click GARAGE",
+           "log TetherProbeMenu: FREE ROAM clicked", "log TetherProbeMenu: QUIT clicked",
+           "log TetherProbeMenu: GARAGE clicked"],
+          skip=None if menu else "no menu fixture (Sandbox's ShowProbeMenu)", ok=lambda c, o: c == 0 and "PASS" in o)
     check("shot --hud", ["shot", "--hud", "-o", os.path.join(tempfile.gettempdir(), "tether-selftest-hud.png")],
           skip="needs 5.8" if remote else None if rendering else "headless with -nullrhi",
           ok=lambda c, o: c == 0 and "(PIE, with HUD)" in o)

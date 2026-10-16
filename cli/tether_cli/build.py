@@ -99,13 +99,67 @@ def layout_patch_note(project, beacon):
             "(a HUD that draws nothing). `ue build --restart` makes it clean")
 
 
-UNRESOLVED = re.compile(r"unresolved external symbol.*?\b(\w+)::(~?\w+)\s*\(")
+UNRESOLVED = re.compile(r'unresolved external symbol "([^"]+)"|unresolved external symbol (\S+)')
+SYMBOL = re.compile(r"\b(\w+)::(~?\w+)\b(?!.*\w+::~?\w+)")  # the symbol's own Class::member: its last one
+
+
+def unresolved_symbols(errors):
+    """[(class, member, imported)] of the unresolved externals in link errors: the missing symbol itself (the quoted
+    one), not the function that references it; imported = __declspec(dllimport), so another module's."""
+    found = []
+    for error in errors:
+        m = UNRESOLVED.search(error)
+        if not m:
+            continue
+        symbol = m.group(1) or m.group(2)
+        name = SYMBOL.search(re.sub(r"\(.*$", "", symbol)) or SYMBOL.search(symbol)  # a function: before its params
+        if name:
+            row = (name.group(1), name.group(2), "dllimport" in symbol)
+            if row not in found:
+                found.append(row)
+    return found
+
+
+def engine_module_of(project, cls):
+    """The engine module that defines a class or struct ('InputCore' for EKeys), from its definition in the
+    engine's public headers (a few seconds the first time; kept in Saved/Tether/engine-modules.json), or None."""
+    cache_path = os.path.join(state_dir(project), "engine-modules.json")
+    cache = read_json(cache_path) or {}
+    if cls in cache:
+        return cache[cls]
+    try:
+        root = os.path.join(engine_root(project), "Engine", "Source")
+    except CliError:
+        return None
+    # its definition, not a friend or forward declaration (EKeys exports its members, not the struct)
+    rx = re.compile(rf"^\s*(?:class|struct)\s+(?:\w+_API\s+)?{re.escape(cls)}\b(?!\s*;)", re.M)
+    found = None
+    for group in ("Runtime", "Editor", "Developer"):
+        base = os.path.join(root, group)
+        for folder, dirs, files in os.walk(base):
+            dirs[:] = [d for d in dirs if d not in ("Private", "Internal", "ThirdParty", "Tests")]
+            for name in files:
+                if name.endswith(".h") and not found:
+                    try:
+                        with open(os.path.join(folder, name), encoding="utf-8", errors="replace") as f:
+                            if rx.search(f.read()):
+                                found = os.path.relpath(folder, base).split(os.sep)[0]
+                    except OSError:
+                        pass
+            if found:
+                break
+        if found:
+            break
+    cache[cls] = found
+    write_json(cache_path, cache)
+    return found
 
 
 def print_link_owners(project, errors, limit=4):
     """For unresolved externals, the header that declares the class and who last wrote it: a declaration with no
-    definition yet is usually another session's work in progress."""
-    wanted = list(dict.fromkeys(m.groups() for m in (UNRESOLVED.search(e) for e in errors) if m))
+    definition yet is usually another session's work in progress. A symbol imported from another module (an
+    engine type) means a module missing from Build.cs: name it."""
+    wanted = unresolved_symbols(errors)
     if not wanted:
         return
     headers = {}
@@ -120,15 +174,20 @@ def print_link_owners(project, errors, limit=4):
                     text = f.read()
             except OSError:
                 continue
-            for cls, _ in wanted:
+            for cls, _, _ in wanted:
                 if cls not in headers and re.search(rf"\b(?:class|struct)\s+(?:\w+_API\s+)?{cls}\b", text):
                     headers[cls] = path
-    for cls, function in wanted[:limit]:
+    for cls, member, imported in wanted[:limit]:
         path = headers.get(cls)
-        if path:
+        if path and not imported:
             owner = file_owner(project, path)
-            print(f"  {cls}::{function}: declared in {os.path.basename(path)}"
+            print(f"  {cls}::{member}: declared in {os.path.basename(path)}"
                   + (f" ({owner})" if owner else "") + ", no definition linked")
+        elif imported or not path:
+            module = engine_module_of(project, cls)
+            print(f"  {cls}::{member}: from another module's DLL"
+                  + (f": add \"{module}\" to the Build.cs dependencies" if module else
+                     ": add the module that defines it to the Build.cs dependencies"))
 
 
 def classify_changes(project):

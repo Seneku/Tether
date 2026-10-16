@@ -126,7 +126,8 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
   ground varies under it, so move it to flatter ground rather than letting a slope swallow one side.
 - Materials as text: `ue mat graph /Game/X/M_Rock` (outputs, nodes, wiring). Edit in small steps:
   `ue mat graph M add ScalarParameter Wetness 0.2`, `... connect Wetness Lerp.Alpha`, `... connect Lerp BaseColor`,
-  `... set #3 value=0.5`, `... delete #7`; each recompiles. Instances: `ue mat MI Name=value`.
+  `... set #3 value=0.5`, `... delete #7`; each recompiles. Instances: `ue mat MI Name=value`. Nodes that reach no
+  output: `ue mat graph M prune` (one undo step); `ue lint --materials` finds materials full of them.
 - Lighting and mood: `ue lights` lists lights, sky, fog and exposure with notes (e.g. auto exposure undoing a dark
   scene); check it before and after lighting changes, together with `ue shot`. It counts lights inside
   Blueprints (Ultra Dynamic Sky's sun and moon) and lists every unbound post process with its priority: a sky
@@ -345,7 +346,9 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
 ## Play testing
 - Performance: `ue perf` before and after a change; each run prints the difference from the previous one.
   GPU bound: `ue gpu` (needs a rendering editor) splits GPU time by kind (Lumen, shadows, base pass, post...)
-  and names the top passes; `ue perf --scalability` measures low/medium/high/epic in one table.
+  and names the top passes; `ue perf --scalability` measures low/medium/high/epic in one table. What a change
+  costs: `ue gpu --ab "mat MI_X UseWindows=false" "mat MI_X UseWindows=true" --restore "..."` (in PIE, at a
+  camera that shows it) alternates the two states and prints the difference by pass.
   Settings behind it: `ue cvar r.Shadow` lists console variables with who set them; `ue cvar --changed` shows
   everything the project and device profile changed; to try a value, `ue cvar r.X=1 --for "gpu"` sets it only
   for that one command.
@@ -413,7 +416,8 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
 - Game UI in PIE: `ue ui` lists what is on screen (Slate and UMG texts, buttons, text boxes); `ue ui click
   "Close"`, `ue ui type "Name" hello`, `ue ui key Escape` (in PIE, keys and chords such as `Ctrl+G` go to the
   game's input, so Escape opens its pause menu instead of stopping PIE; `--slate` sends to the focused widget).
-  When a UMG widget has keyboard focus (a menu reading keys in NativeOnKeyDown), other single keys go to it
+  When a UMG widget has keyboard focus (a menu reading keys in NativeOnKeyDown, or a title screen holding focus
+  itself), other single keys go to it
   through Slate on their own (`--game` forces the game's input); step files take `key --slate Enter` or
   `ui-key Enter`, and `click --event LABEL` (fires OnClicked, for a covered window). `ue ui --rects` prints each
   widget's screen rectangle (what `ue ui at x,y` takes). A button with no text child (a transparent UButton over

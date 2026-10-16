@@ -1,9 +1,14 @@
 #include "TetherProbeUI.h"
 
 #include "Blueprint/WidgetTree.h"
+#include "Components/Border.h"
 #include "Components/Button.h"
+#include "Components/Overlay.h"
+#include "Components/OverlaySlot.h"
 #include "Components/TextBlock.h"
 #include "Components/VerticalBox.h"
+#include "GameFramework/PlayerController.h"
+#include "InputCoreTypes.h"
 #include "Engine/Engine.h"
 #include "Engine/GameViewportClient.h"
 #include "Engine/World.h"
@@ -42,6 +47,128 @@ void UTetherProbeWidget::HandleClicked()
 	++GProbeUIClicks;
 	Status->SetText(FText::FromString(FString::Printf(TEXT("UMG clicks: %d"), GProbeUIClicks)));
 	UE_LOG(LogTemp, Display, TEXT("TetherProbeUI: UMG button clicked"));
+}
+
+void UTetherProbeMenuRow::NativeOnInitialized()
+{
+	Super::NativeOnInitialized();
+	UOverlay* Row = WidgetTree->ConstructWidget<UOverlay>(UOverlay::StaticClass(), TEXT("RowOverlay"));
+	UBorder* Background = WidgetTree->ConstructWidget<UBorder>(UBorder::StaticClass(), TEXT("RowBackground"));
+	Background->SetBrushColor(FLinearColor(0.05f, 0.05f, 0.1f, 0.8f));
+	RowText = WidgetTree->ConstructWidget<UTextBlock>(UTextBlock::StaticClass(), TEXT("RowLabel"));
+	RowButton = WidgetTree->ConstructWidget<UTetherProbeMenuButton>(UTetherProbeMenuButton::StaticClass(), TEXT("RowButton"));
+	RowButton->SetBackgroundColor(FLinearColor(1.f, 1.f, 1.f, 0.f));
+	RowButton->OnClicked.AddDynamic(this, &UTetherProbeMenuRow::HandleClicked);
+	Row->AddChild(Background);
+	Row->AddChild(RowText);
+	Row->AddChild(RowButton);
+	for (UPanelSlot* RowSlot : Row->GetSlots())
+	{
+		if (UOverlaySlot* OverlaySlot = Cast<UOverlaySlot>(RowSlot))
+		{
+			OverlaySlot->SetHorizontalAlignment(HAlign_Fill);
+			OverlaySlot->SetVerticalAlignment(VAlign_Fill);
+		}
+	}
+	WidgetTree->RootWidget = Row;
+}
+
+void UTetherProbeMenuRow::NativeConstruct()
+{
+	Super::NativeConstruct();
+	RowText->SetText(FText::FromString(Label));  // the label is set after CreateWidget has initialized the row
+}
+
+void UTetherProbeMenuRow::HandleClicked()
+{
+	++GProbeUIClicks;
+	UE_LOG(LogTemp, Display, TEXT("TetherProbeMenu: %s clicked"), *Label);
+}
+
+void UTetherProbeMenu::NativeOnInitialized()
+{
+	Super::NativeOnInitialized();
+	UVerticalBox* Column = WidgetTree->ConstructWidget<UVerticalBox>(UVerticalBox::StaticClass(), TEXT("MenuColumn"));
+	for (const TCHAR* Name : {TEXT("GARAGE"), TEXT("FREE ROAM"), TEXT("QUIT")})
+	{
+		UTetherProbeMenuRow* Row = CreateWidget<UTetherProbeMenuRow>(this, UTetherProbeMenuRow::StaticClass());
+		Row->Label = Name;
+		Column->AddChild(Row);
+	}
+	WidgetTree->RootWidget = Column;
+}
+
+void UTetherProbeMenu::NativeConstruct()
+{
+	Super::NativeConstruct();
+	TArray<UWidget*> All;
+	WidgetTree->GetAllWidgets(All);
+	for (UWidget* Widget : All)
+	{
+		UTetherProbeMenuRow* Row = Cast<UTetherProbeMenuRow>(Widget);
+		if (Row && Row->RowButton)
+		{
+			Row->RowButton->SetKeyboardFocus();  // the first row, as menus focus their first entry
+			break;
+		}
+	}
+}
+
+void UTetherProbeTitle::NativeOnInitialized()
+{
+	Super::NativeOnInitialized();
+	SetIsFocusable(true);
+	// Two lines, so the inspector does not fold the widget into one text: it then leaves the focused user widget out
+	UVerticalBox* Column = WidgetTree->ConstructWidget<UVerticalBox>(UVerticalBox::StaticClass(), TEXT("TitleColumn"));
+	UTextBlock* Name = WidgetTree->ConstructWidget<UTextBlock>(UTextBlock::StaticClass(), TEXT("TitleName"));
+	Name->SetText(FText::FromString(TEXT("TETHER PROBE")));
+	UTextBlock* Text = WidgetTree->ConstructWidget<UTextBlock>(UTextBlock::StaticClass(), TEXT("TitlePrompt"));
+	Text->SetText(FText::FromString(TEXT("PRESS ENTER")));
+	Column->AddChild(Name);
+	Column->AddChild(Text);
+	WidgetTree->RootWidget = Column;
+}
+
+void UTetherProbeTitle::NativeConstruct()
+{
+	Super::NativeConstruct();
+	SetKeyboardFocus();
+}
+
+FReply UTetherProbeTitle::NativeOnKeyDown(const FGeometry& Geometry, const FKeyEvent& KeyEvent)
+{
+	if (KeyEvent.GetKey() == EKeys::Enter)
+	{
+		UE_LOG(LogTemp, Display, TEXT("TetherProbeMenu: title dismissed"));
+		APlayerController* Controller = GetOwningPlayer();
+		RemoveFromParent();
+		if (UTetherProbeMenu* Menu = CreateWidget<UTetherProbeMenu>(Controller, UTetherProbeMenu::StaticClass(), TEXT("TetherProbeMenu")))
+		{
+			Menu->AddToViewport(30);
+		}
+		return FReply::Handled();
+	}
+	return Super::NativeOnKeyDown(Geometry, KeyEvent);
+}
+
+bool UTetherProbeUILibrary::ShowProbeMenu(UObject* WorldContextObject)
+{
+	UWorld* World = GEngine ? GEngine->GetWorldFromContextObject(WorldContextObject, EGetWorldErrorMode::LogAndReturnNull) : nullptr;
+	APlayerController* Controller = World ? UGameplayStatics::GetPlayerController(World, 0) : nullptr;
+	if (!Controller)
+	{
+		return false;
+	}
+	UTetherProbeTitle* Title = CreateWidget<UTetherProbeTitle>(Controller, UTetherProbeTitle::StaticClass(), TEXT("TetherProbeTitle"));
+	if (!Title)
+	{
+		return false;
+	}
+	Title->AddToViewport(30);
+	FInputModeUIOnly Mode;
+	Mode.SetWidgetToFocus(Title->TakeWidget());
+	Controller->SetInputMode(Mode);
+	return true;
 }
 
 bool UTetherProbeUILibrary::ShowProbeUI(UObject* WorldContextObject)
