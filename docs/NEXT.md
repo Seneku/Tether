@@ -129,6 +129,9 @@ code (ResetLoaders), so it stays a guard; 179 the boot report reads the new edit
 editor's errors meanwhile separately. All checked live in Sandbox except 165's stale check, 167 (unit-tested) and
 the `--wait-file` path.
 
+**Done in 0.29.1**: 180 a lease reads "until 20:58 (15 min left), held since 20:25" everywhere it is shown,
+so a renewal shows its new expiry.
+
 ---
 
 ## Priority 1: asked for, or blocking real work

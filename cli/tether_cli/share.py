@@ -103,9 +103,11 @@ def active_lease(project, now=None):
 
 def describe_lease(project, lease, now=None):
     now = time.time() if now is None else now
+    # The expiry first: after a renewal "since" is still the first take, and read alone it looked unextended
     return (f"leased by {session_label(project, lease['session'])}: {lease.get('what') or 'no reason given'}, "
-            f"{max(1, round((lease['until'] - now) / 60))} min left (since "
-            f"{time.strftime('%H:%M', time.localtime(lease['since']))})")
+            f"until {time.strftime('%H:%M', time.localtime(lease['until']))} "
+            f"({max(1, round((lease['until'] - now) / 60))} min left), held since "
+            f"{time.strftime('%H:%M', time.localtime(lease['since']))}")
 
 
 def take_lease(project, what, minutes, now=None):

@@ -3685,3 +3685,14 @@ class UnrealRacingRound5(unittest.TestCase):
         ue.write_json(os.path.join(ue.state_dir(ctx.project), "shots", "baselines", "street.json"),
                       {"pose": {"location": {"x": 1, "y": 2, "z": 3}, "rotation": {"pitch": -10, "yaw": 90, "roll": 0}}})
         self.assertEqual(ue.baseline_pose(ctx, "street"), ("1,2,3", "-10,90,0"))
+
+    def test_lease_renewal_shows_the_new_expiry(self):
+        p = self.project.uproject
+        with unittest.mock.patch.dict(os.environ, {"UE_SESSION": "tokyo"}):
+            first, _ = ue.take_lease(p, "final shots", 15, now=1000.0)
+            lease, renewed = ue.take_lease(p, "final shots", 15, now=1000.0 + 6 * 60)
+        self.assertTrue(renewed)
+        text = ue.describe_lease(p, lease, now=1000.0 + 6 * 60)
+        until = time.strftime("%H:%M", time.localtime(1000.0 + 21 * 60))
+        since = time.strftime("%H:%M", time.localtime(1000.0))
+        self.assertIn(f"until {until} (15 min left), held since {since}", text)
