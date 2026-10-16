@@ -39,6 +39,57 @@ def actors(cls=None):
     return list(unreal.GameplayStatics.get_all_actors_of_class(world(), cls or unreal.Actor))
 
 
+def spawn(what, location=(0, 0, 0), rotation=(0, 0, 0), label=None):
+    """An actor spawned in the PIE world, as `ue spawn --pie` does: a class (unreal.StaticMeshActor,
+    '/Script/Module.Class') or an asset (a StaticMesh, a Blueprint), through the cheat manager's `summon` (Python
+    cannot spawn into a game world), then placed. rotation is (pitch, yaw, roll). Returns the actor; not in
+    multiplayer PIE, where the summon runs a tick later."""
+    from tether import toolsets
+    game = world()
+    if toolsets._networked(game):
+        raise RuntimeError("tether.spawn: in multiplayer PIE the summon runs a tick later; use `ue spawn --pie`")
+    mesh = None
+    if isinstance(what, str) and what.startswith("/") and not what.startswith("/Script/"):
+        asset = unreal.load_asset(what)
+        if isinstance(asset, unreal.StaticMesh):
+            cls, mesh = unreal.StaticMeshActor.static_class(), asset
+        elif isinstance(asset, unreal.Blueprint):
+            cls = asset.generated_class()
+        else:
+            raise RuntimeError(f"tether.spawn: {what} is not a StaticMesh, a Blueprint or a class")
+    elif isinstance(what, str):
+        cls = unreal.load_class(None, what) if what.startswith("/Script/") else getattr(unreal, what, None)
+    else:
+        cls = what
+    if isinstance(cls, type):
+        cls = cls.static_class()
+    if cls is None:
+        raise RuntimeError(f"tether.spawn: no class '{what}'")
+    before = {a.get_name() for a in unreal.GameplayStatics.get_all_actors_of_class(game, cls)}
+    unreal.SystemLibrary.execute_console_command(game, f"summon {cls.get_path_name()}")
+    new = [a for a in unreal.GameplayStatics.get_all_actors_of_class(game, cls) if a.get_name() not in before]
+    if not new:
+        raise RuntimeError(f"tether.spawn: summon {cls.get_path_name()} spawned nothing (the player needs a cheat manager)")
+    actor = new[0]
+    if mesh is not None:
+        actor.static_mesh_component.set_mobility(unreal.ComponentMobility.MOVABLE)
+        actor.static_mesh_component.set_static_mesh(mesh)
+    loc = location if isinstance(location, unreal.Vector) else unreal.Vector(*location)
+    rot = rotation if isinstance(rotation, unreal.Rotator) else \
+        unreal.Rotator(pitch=rotation[0], yaw=rotation[1], roll=rotation[2])
+    actor.set_actor_location_and_rotation(loc, rot, False, True)
+    if label:
+        actor.set_actor_label(label)
+    return actor
+
+
+def finish(value=None):
+    """End a `ue pie run --wait` script that runs on over ticks (a tick callback driving a test): the CLI waits for
+    this call and prints `value` (JSON-able) as the result."""
+    import sys
+    sys._tether_run_result = {"done": True, "value": value}
+
+
 def console(command):
     """Run a console command in that world as its player typed it. In multiplayer PIE it runs on the world's next
     tick, because a command run straight from Python makes every RPC local (a client's Server RPC would never

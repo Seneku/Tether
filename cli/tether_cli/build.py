@@ -11,7 +11,7 @@ from .core import (
     log_path, logged_dialogs, read_json,
     read_new_log, state_dir, subprocess, uat_command, ubt_command, write_json,
 )
-from .share import file_owner
+from .share import file_owner, session_names
 
 
 # ---------------------------------------------------------------- builds
@@ -391,14 +391,19 @@ def shadow_project(project, overlay, sid):
     import hashlib
     shadow = os.path.join(state_dir(project), "shadow", sid)
     wanted = code_files(project)
-    overlaid = []
+    overlaid, ignored = [], []
     for here, _, files in os.walk(overlay):
         for f in files:
             rel = os.path.relpath(os.path.join(here, f), overlay).replace("\\", "/")
+            if rel.split("/", 1)[0].lower() not in OVERLAY_ROOTS:  # notes, checksums, scripts beside the code
+                ignored.append(rel)
+                continue
             wanted[rel] = os.path.join(here, f)
             overlaid.append(rel)
     if not overlaid:
-        raise CliError(f"nothing under {overlay}: lay files out as in the project (Source/<Module>/File.h)")
+        raise CliError(f"nothing under {overlay}/Source, /Config or /Plugins: lay files out as in the project "
+                       "(Source/<Module>/File.h)" + (f"; ignored {', '.join(ignored[:4])}" if ignored else ""))
+    shadow_project.ignored = sorted(ignored)
     manifest_path = os.path.join(shadow, ".tether-shadow.json")
     manifest = read_json(manifest_path) or {}
     fresh = {}
@@ -432,10 +437,21 @@ def shadow_project(project, overlay, sid):
 
 
 OVERLAY_HOURS = 12  # a staging folder another session compiled within this long is that session's
+OVERLAY_ROOTS = ("source", "config", "plugins")  # what an overlay may put on the project's code
 
 
 def default_overlay(project, sid):
-    return os.path.join(state_dir(project), "staging", sid or "user")
+    """This session's staging folder under Saved/Tether/staging: an existing one named after it (<id>, <name>-<id>
+    or <name>, with `ue who --as` naming it), else where a new one would go (<name>-<id>, or <id>)."""
+    root = os.path.join(state_dir(project), "staging")
+    sid = sid or "user"
+    name = session_names(project).get(sid)
+    candidates = ([f"{name}-{sid}", name] if name and name != sid else []) + [sid]
+    existing = {d.lower(): d for d in (os.listdir(root) if os.path.isdir(root) else [])}
+    for candidate in candidates:
+        if candidate.lower() in existing:
+            return os.path.join(root, existing[candidate.lower()])
+    return os.path.join(root, candidates[0])
 
 
 def claim_overlay(project, overlay, sid, now=None):
@@ -445,7 +461,9 @@ def claim_overlay(project, overlay, sid, now=None):
     now = time.time() if now is None else now
     if overlay in (None, "", "-"):
         overlay = default_overlay(project, sid)
-        os.makedirs(os.path.join(overlay, "Source"), exist_ok=True)
+        if not os.path.isdir(overlay):  # a check creates nothing: say where the files go
+            raise CliError(f"no staging folder for this session: put the files at {overlay}/Source/<Module>/... "
+                           "(laid out like the project), or name a folder: --overlay <dir>")
     overlay = os.path.abspath(overlay)
     if not os.path.isdir(overlay):
         raise CliError(f"no folder {overlay}")
@@ -472,8 +490,16 @@ def compile_overlay(ctx, overlay, limit, sid):
         raise CliError("--overlay compiles the game target, and this project has none (Source/<Project>.Target.cs)")
     overlay = claim_overlay(ctx.project, overlay, sid)
     shadow, overlaid = shadow_project(ctx.project, overlay, sid)
-    print(f"overlay: {len(overlaid)} staged file(s) on a copy of the project's code "
+    print(f"overlay: {len(overlaid)} staged file(s) from {overlay} on a copy of the project's code "
           f"({os.path.relpath(os.path.dirname(shadow), os.path.dirname(ctx.project))}); the real Source/ is untouched")
+    for rel in overlaid[:12]:
+        print(f"  {rel}")
+    if len(overlaid) > 12:
+        print(f"  ... +{len(overlaid) - 12} more")
+    ignored = getattr(shadow_project, "ignored", [])
+    if ignored:
+        print(f"  (left out, not under Source/, Config/ or Plugins/: {', '.join(ignored[:5])}"
+              + (f" +{len(ignored) - 5}" if len(ignored) > 5 else "") + ")")
     code = ubt_build(argparse.Namespace(project=shadow), argparse.Namespace(target=target, config="Development",
                                                                             limit=limit), check=True)
     if code:

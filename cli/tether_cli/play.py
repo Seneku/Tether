@@ -1521,12 +1521,34 @@ def pie_run(ctx, args):
     path = os.path.abspath(args.script[0]) if args.script and not inline else "<pie run -c>"
     code = (f"exec(compile({code!r}, '<ue py>', 'exec'), "
             f"{{'unreal': unreal, 'tether': globals().get('tether'), '__name__': '__pie_run__', '__file__': {path!r}}})")
+    waiting = getattr(args, "wait", None) is not None
+    if waiting:  # tether.finish(value) ends the run; clear an earlier run's result first
+        code = "import sys\nsys._tether_run_result = None\n" + code
+    if POSIX_DRIVE.search(code):
+        print("note: a path like /d/Projects/... in the script means C:\\d\\Projects\\... to the editor's Python: "
+              "write D:/Projects/...", file=sys.stderr)
     try:
         out = ctx.tether("py", code=code)
+        if out is not None and not isinstance(out, str):  # the script printed a JSON document: `ue py` parsed it
+            out = json.dumps(out)
         if out:
             print("script: " + out.rstrip("\n").replace("\n", "\nscript: "))
     except CliError as exc:
         failures.append(f"script raised: {exc}")
+    if waiting and not failures:
+        result = wait_run_result(ctx, args.wait)
+        if result is None:
+            failures.append(f"the script did not call tether.finish() within {args.wait:g}s")
+        else:
+            print("result: " + json.dumps(result.get("value")))
+            ctx.data = {"result": result.get("value")}
+    wait_file = getattr(args, "wait_file", None)
+    if wait_file and not failures:
+        text = wait_for_file(wait_file, started, args.seconds or 60)
+        if text is None:
+            failures.append(f"{wait_file} was not written within {args.seconds or 60:g}s")
+        else:
+            print(f"{wait_file}: " + (text if len(text) < 2000 else text[:2000] + " ..."))
     found, rejected = {}, []
     seconds = args.seconds or 5
     deadline = time.time() + seconds
@@ -1560,6 +1582,39 @@ def pie_run(ctx, args):
 
 
 WITHIN = re.compile(r"\s+within\s+([\d.]+)\s*s?\s*$", re.I)
+POSIX_DRIVE = re.compile(r"""['"]/[a-zA-Z]/[A-Za-z]""")  # '/d/Projects/...': Git Bash's path, not Windows'
+RUN_RESULT = "import json, sys\nprint(json.dumps(getattr(sys, '_tether_run_result', None)))"
+
+
+def wait_run_result(ctx, seconds):
+    """Wait for a `pie run --wait` script's tether.finish(value): {"done", "value"}, or None after `seconds`."""
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        try:
+            result = py_json(ctx, RUN_RESULT)
+        except CliError:
+            result = None
+        if isinstance(result, dict) and result.get("done"):
+            return result
+        time.sleep(0.5)
+    return None
+
+
+def wait_for_file(path, since, seconds):
+    """The text of a file written after `since`, once it stops growing, or None after `seconds`."""
+    deadline, last = time.time() + seconds, None
+    while time.time() < deadline:
+        try:
+            stat = os.stat(path)
+        except OSError:
+            stat = None
+        if stat and stat.st_mtime >= since - 1:
+            if last == stat.st_size:
+                with open(path, encoding="utf-8", errors="replace") as f:
+                    return f.read().strip()
+            last = stat.st_size
+        time.sleep(0.5)
+    return None
 
 
 def start_film(ctx, args):
@@ -2003,14 +2058,17 @@ def cmd_pie(ctx, args):
             net = pie_net(ctx, "status")
             if net.count(": ") > 1:  # several PIE worlds: multiplayer
                 print(net)
+            ctx.data = {"running": True, "fps": round(fps, 1) if fps else None}
             return 0
         # Say why the last session ended if it died rather than being stopped.
         with open(log_path(ctx.project), "rb") as f:
             text = f.read().decode("utf-8", "replace")
         last = text.rfind("Creating play world package")
         fatal = filter_log(text[last:].splitlines(), level="Error", pattern="Fatal error detected") if last >= 0 else []
-        print("pie: not running" + (f" (last session ended by: {fatal[0][2:]})" if fatal else ""))
-        return 0
+        # "stopped", not "not running": a script's `grep running` would find the latter (exit 1 says it too)
+        print("pie: stopped" + (f" (last session ended by: {fatal[0][2:]})" if fatal else ""))
+        ctx.data = {"running": False}
+        return 1
     if is_error:
         raise CliError(compact_error(text))
     flush_editor_log(ctx)

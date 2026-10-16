@@ -8,7 +8,8 @@ from .core import (
     forget_beacon,
     editor_live, editor_process,
     decline_package_restore, editor_label, engine_root, filter_log, live_coding_available, live_editors, logged_dialogs,
-    pick_port, pid_alive, port_open, read_json, read_new_log, recent_crash, remember_target, run_git, startup_dialogs,
+    log_file_lines, newest_log, pick_port, pid_alive, port_open, read_json, read_new_log, recent_crash, remember_target,
+    run_git, startup_dialogs, startup_failure,
     state_dir,
     subprocess, write_json,
 )
@@ -199,20 +200,23 @@ def reopen_editor(ctx, args, how):
              ("offscreen render", how.get("headless") and how.get("render")),
              ("sound", how.get("headless") and how.get("sound")), ("unattended", how.get("unattended")))
     print("reopening the editor as it ran: " + ", ".join(name for name, on in flags if on))
-    code = cmd_open(ctx, argparse.Namespace(map=how.get("map"), headless=how.get("headless", False),
-                                            render=how.get("render", False), sound=how.get("sound", False),
-                                            unattended=how.get("unattended"), no_build=True,
-                                            limit=args.limit, wait=600, no_wait=False))
+    try:
+        code = cmd_open(ctx, argparse.Namespace(map=how.get("map"), headless=how.get("headless", False),
+                                                render=how.get("render", False), sound=how.get("sound", False),
+                                                unattended=how.get("unattended"), no_build=True,
+                                                limit=args.limit, wait=600, no_wait=False))
+    except CliError as exc:  # the build went through; the editor did not start
+        code = exc.code or 2
     # The last line says whether the editor is really back: a restart that ends on the build's line with no
     # editor running sends every session sharing it looking for what happened
     back = editor_live(ctx.project)
     total = time.time() - how.get("started", time.time())
     if code or not back:
-        crash = recent_crash(ctx.project, how.get("started", time.time()) - 5)
-        errors = filter_log(read_new_log(ctx.project, from_start=True), level="Error")[-3:]
-        raise CliError(f"the editor did not come back after the build ({total:.0f}s): "
-                       + (f"it crashed: {crash_summary(crash, 140)} (ue crash)" if crash else
-                          "; ".join(errors) if errors else "no crash report and no errors in its log")
+        why = startup_failure(ctx.project, how.get("started", time.time()) - 5)
+        log = newest_log(ctx.project, how.get("started", time.time()))
+        errors = filter_log(log_file_lines(log), level="Error")[-3:] if log else []
+        raise CliError(f"the build succeeded, but the editor did not come back ({total:.0f}s): "
+                       + (why if why else "; ".join(errors) if errors else "no crash report and no errors in its log")
                        + ". `ue open` starts it again", 2)
     print(f"restart cycle: {total:.1f}s total; editor pid {back.get('pid')} ready on {back.get('map')}")
     return code
@@ -231,6 +235,24 @@ def cmd_open(ctx, args):
                  " (another session's private editor: `ue open --second` starts your own)"))
         return cmd_status(ctx, args)
     if second:
+        # While it runs, Windows keeps the files of every package it loaded open, so the shared editor cannot save
+        # those packages ("Error moving file"): not while that editor holds someone's unsaved work
+        dirty = 0
+        try:
+            dirty = int(str(ctx.tether("py", code="U = unreal.EditorLoadingAndSavingUtils\n"
+                                                   "len(U.get_dirty_content_packages()) + len(U.get_dirty_map_packages())"))
+                        .strip().splitlines()[-1])
+        except (CliError, ValueError, IndexError):
+            pass
+        held = active_lease(ctx.project)
+        busy = [f"{dirty} unsaved package(s)"] if dirty else []
+        busy += [f"it is {describe_lease(ctx.project, held)}"] if held and held["session"] != session_id() else []
+        if busy and not getattr(args, "force", False):
+            raise CliError(f"the shared editor has {' and '.join(busy)}: while a second editor runs, the shared one "
+                           "cannot save the packages the second one loaded (Windows keeps their files open), so its "
+                           "saves fail. Wait until that work is saved, or pass --force")
+        print("note: while this editor runs, the shared editor cannot save packages it has loaded (their files stay "
+              "open); close it (`ue close`) as soon as you are done")
         # Its own MCP port, beacon and log; nobody else's default; outside the shared editor's lease. Headless:
         # a second window of the same project on the user's screen would only confuse.
         args.headless, args.no_build = True, True  # the binaries are the open editor's: nothing can be rebuilt
@@ -256,8 +278,11 @@ def cmd_open(ctx, args):
     cmd = [exe, ctx.project] + ([args.map] if args.map else []) + [
         "-nosplash", "-ModelContextProtocolStartServer", f"-ModelContextProtocolPort={port}",
         "-TetherLaunched"]  # marks the editors the CLI started, so it never closes one the user opened
+    shared_log = None
     if second:
         cmd += [f"-TetherOwner={session_id()}"]
+        shared_log = (beacon or {}).get("log")
+        shared_log = (shared_log, os.path.getsize(shared_log)) if shared_log and os.path.isfile(shared_log) else None
     # UnrealSharp disables C# hot reload under -unattended, so headless UnrealSharp editors stay
     # attended; the bridge suppresses dialogs per operation instead.
     unattended = args.unattended if args.unattended is not None else bool(args.headless and not has_csharp)
@@ -301,7 +326,9 @@ def cmd_open(ctx, args):
         beacon = next((b for b in editor_beacons(ctx.project) if b.get("pid") == proc.pid), None)
         if beacon and beacon.get("pid") == proc.pid and beacon.get("heartbeat", 0) > started and (
                 remote or port_open(port)):
-            boot = read_new_log(ctx.project, from_start=True)
+            # this editor's own log: a second editor on the project writes <Project>_2.log
+            own = beacon.get("log") if beacon.get("log") and os.path.isfile(beacon["log"]) else newest_log(ctx.project, started)
+            boot = log_file_lines(own) if own else read_new_log(ctx.project, from_start=True)
             errors = filter_log(boot, level="Error")
             print(f"ready in {time.time() - started:.1f}s | map {beacon.get('map')} | "
                   f"{len(errors)} errors at boot" + (" (ue log --since start --level Error)" if errors else ""))
@@ -313,10 +340,18 @@ def cmd_open(ctx, args):
                 print("  " + line)
             for title, text in logged_dialogs(boot):
                 print(f"  dialog answered by default: {title}: {text.splitlines()[0] if text else ''}")
+            if shared_log:  # what the shared editor ran into meanwhile (saves failing on files this one loaded)
+                meanwhile = filter_log(log_file_lines(*shared_log), level="Error")
+                if meanwhile:
+                    print(f"meanwhile the shared editor logged {len(meanwhile)} error(s):")
+                    for line in meanwhile[:3]:
+                        print("  " + line)
             return 0
         if proc.poll() is not None:
-            tail = filter_log(read_new_log(ctx.project, from_start=True), level="Error")[-5:]
-            raise CliError(f"editor exited during startup (code {proc.returncode})"
+            why = startup_failure(ctx.project, started - 5)
+            own = newest_log(ctx.project, started)
+            tail = [] if why else filter_log(log_file_lines(own) if own else [], level="Error")[-5:]
+            raise CliError(f"editor exited during startup (code {proc.returncode})" + (f": {why}" if why else "")
                            + "".join("\n  " + l for l in tail))
         dialogs = startup_dialogs(proc.pid)
         first_seen = (first_seen or time.time()) if dialogs else None

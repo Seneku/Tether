@@ -24,7 +24,9 @@ returns once it is yours or free and PIE has stopped. Asked for yours? Grant it 
 A lease lasts at least 5 minutes past its holder's last `ue` command, so it does not run out mid-task. Work that
 needs another map or a throwaway import while others use the editor: `ue open --second` starts your own headless
 editor next to the shared one (its own port; your commands go there, others' do not; no lease needed; no
-pre-build, as the binaries are in use), and `ue close` closes it. A restart or
+pre-build, as the binaries are in use), and `ue close` closes it as soon as you are done: while it runs, the shared
+editor cannot save the packages it loaded (Windows keeps their files open), so it refuses to start while the shared
+one holds unsaved work. A restart or
 close also asks for the lease when another session used the editor in the last 5 minutes. A build error in a file
 you did not touch says who last edited it ("edited by spire ... (not you)"): leave it to that session.
 `ue who --as NAME` gives your session a name the others see. Committing from a shared checkout: `ue git stage
@@ -348,7 +350,8 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
   GPU bound: `ue gpu` (needs a rendering editor) splits GPU time by kind (Lumen, shadows, base pass, post...)
   and names the top passes; `ue perf --scalability` measures low/medium/high/epic in one table. What a change
   costs: `ue gpu --ab "mat MI_X UseWindows=false" "mat MI_X UseWindows=true" --restore "..."` (in PIE, at a
-  camera that shows it) alternates the two states and prints the difference by pass.
+  camera that shows it) alternates the two states and prints the difference by pass. A fixed view for timings:
+  `ue gpu --at x,y,z --look-at x,y,z` (or `--camera <shot baseline>`; `ue perf` takes the same).
   Settings behind it: `ue cvar r.Shadow` lists console variables with who set them; `ue cvar --changed` shows
   everything the project and device profile changed; to try a value, `ue cvar r.X=1 --for "gpu"` sets it only
   for that one command.
@@ -436,6 +439,12 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
   e.g. `SDPlayerCharacter_0.CharacterMovement.MovementBase`); `ue props X --match Name --pie` reads properties
   Python calls protected. After Live Coding patched class layouts, `ue pie start` warns: UMG and replication
   can misbehave (a HUD drawing nothing) until `ue build --restart`.
+- Long PIE-side tests (a tick callback driving inputs for 10-30 s): end the script's work with
+  `tether.finish({"result": ...})` and run it with `ue pie run test.py --wait 60`, which prints the value; no
+  polling for files. `tether.spawn(cls_or_asset, (x, y, z), (pitch, yaw, roll), label="Pad")` puts an actor in the
+  PIE world from a script; `ue spawn --pie --label Pad --replace` / `ue delete --pie Pad` from the shell. Paths in
+  editor Python are Windows paths: `D:/Projects/...`, not Git Bash's `/d/Projects/...` (that lands in `C:\d\...`).
+  For scripts: `ue pie status` exits 0 running / 1 stopped, `ue actors <re>` and `ue find <re>` exit 1 on no match.
 - Prefer `ue pie run check.py --expect '<log regex>' --reject 'Error|no subsystem'` (or `-c "<code>"`) for verifying gameplay:
   it starts PIE, runs the script in the PIE world, waits for the log lines, stops PIE and exits 0/1.
   Write the script once and rerun it after every change.

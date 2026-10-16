@@ -441,6 +441,54 @@ def _point(ref, pie):
 
 
 _DOC_PROPERTY = re.compile(r"^- ``(\w+)`` \(([^)]*)\)", re.M)
+_DOC_ARG = re.compile(r"^\s+(\w+) \(([\w.]+)\):", re.M)  # 'Args:' lines of a method's docstring
+_STRUCT_ORDER = {"Rotator": ("pitch", "yaw", "roll"), "Vector": ("x", "y", "z"), "Vector2D": ("x", "y"),
+                 "Vector4": ("x", "y", "z", "w"), "LinearColor": ("r", "g", "b", "a"), "Color": ("r", "g", "b", "a")}
+
+
+def _struct_arg(kind, value, param):
+    """A JSON value as the struct a parameter takes: a dict with C++ field names (Yaw, X, bSweep) or Python ones,
+    or a list in UE order ([pitch, yaw, roll], [x, y, z]). A field the struct does not have is an error: Python's
+    own conversion drops it silently and passes zeros."""
+    cls = getattr(unreal, kind, None)
+    if not (isinstance(cls, type) and issubclass(cls, unreal.StructBase)) or isinstance(value, cls):
+        return value
+    fields = [n for n, _ in _DOC_PROPERTY.findall(cls.__doc__ or "")]
+    if isinstance(value, (list, tuple)):
+        order = _STRUCT_ORDER.get(kind)
+        if not order or len(value) != len(order):
+            raise RuntimeError(f"{param} is a {kind}: give " + (f"[{', '.join(order)}]" if order else
+                               "an object with its fields (" + ", ".join(fields) + ")"))
+        value = dict(zip(order, value))
+    if not isinstance(value, dict):
+        return value
+    lookup = {n.replace("_", "").lower(): n for n in fields}
+    struct = cls()
+    for key, v in value.items():
+        flat = key.replace("_", "").lower()
+        name = lookup.get(flat) or (lookup.get(flat[1:]) if flat.startswith("b") else None)  # bSweep -> sweep
+        if name is None:
+            raise RuntimeError(f"{param} ({kind}) has no field '{key}' (fields: {', '.join(fields)})")
+        struct.set_editor_property(name, v)
+    return struct
+
+
+def _call_args(obj, function, args):
+    """`call` arguments converted to the function's parameter types, read from its Python docstring."""
+    method = None
+    for name in (_snake(function), _snake(re.sub(r"^K2_", "", function))):
+        method = _try(lambda n=name: getattr(obj, n))
+        if callable(method):
+            break
+    params = _DOC_ARG.findall(getattr(method, "__doc__", "") or "") if callable(method) else []
+    out = []
+    for i, value in enumerate(args):
+        if i < len(params) and isinstance(value, (dict, list)):
+            value = _struct_arg(params[i][1].split(".")[-1], value, params[i][0])
+        elif isinstance(value, dict):  # no signature to go by: at least the Python field names
+            value = {_snake(k).lower(): v for k, v in value.items()}
+        out.append(value)
+    return tuple(out)
 
 
 def _legacy_props(obj, match, limit):
@@ -7418,6 +7466,7 @@ class TetherCore(_Base):
             obj = _pie_object(parts[0], pawn, controller)
             args = json.loads(parts[2]) if len(parts) > 2 else []
             args = tuple(args) if isinstance(args, list) else (args,)
+            args = _call_args(obj, parts[1], args)
             try:
                 result = obj.call_method(parts[1], args)
             except TypeError as exc:  # a library function's WorldContext parameter: pass the PIE world

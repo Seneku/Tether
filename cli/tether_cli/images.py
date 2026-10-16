@@ -560,6 +560,57 @@ def shot_args(**given):
     return argparse.Namespace(**dict(defaults, **given))
 
 
+def baseline_pose(ctx, name):
+    """(at, rot) text of a `ue shot --baseline NAME` camera."""
+    baselines = os.path.join(state_dir(ctx.project), "shots", "baselines")
+    meta = read_json(os.path.join(baselines, f"{name}.json"))
+    if not meta:
+        names = sorted(f[:-5] for f in os.listdir(baselines) if f.endswith(".json")) if os.path.isdir(baselines) else []
+        raise CliError(f"no shot baseline '{name}'" + (f" (have: {', '.join(names)})" if names else
+                                                       " (save one with ue shot ... --baseline NAME)"))
+    loc, rot = meta["pose"]["location"], meta["pose"]["rotation"]
+    return f"{loc['x']},{loc['y']},{loc['z']}", f"{rot['pitch']},{rot['yaw']},{rot['roll']}"
+
+
+@contextlib.contextmanager
+def camera_at(ctx, args):
+    """The view `ue gpu` / `ue perf` measure, put where --at/--look-at/--rot/--actor or --camera (a shot baseline's
+    camera) say for the measurement, then back: the player's view in PIE (a spectator camera), else the level
+    viewport's camera. Nothing to do without those options."""
+    at, look_at, rot, actor = (getattr(args, k, None) for k in ("at", "look_at", "rot", "actor"))
+    if getattr(args, "camera", None):
+        at, rot = baseline_pose(ctx, args.camera)
+        look_at = actor = None
+    if not (at or look_at or rot or actor):
+        yield None
+        return
+    pose = ctx.tether("shot_pose", actor=actor or "", at=at or "", look_at=look_at or "", rot=rot or "")
+    pie, simulate = pose.pop("pie", False), pose.pop("simulate", False)
+    loc, r = pose["location"], pose["rotation"]
+    if pie and not simulate:
+        ctx.tether("pie_view", pose=json.dumps({"location": loc, "rotation": r}))
+        try:
+            time.sleep(0.3)  # a few frames from there before measuring
+            yield pose
+        finally:
+            ctx.tether("pie_view", pose="")
+        return
+    camera = ctx.tether("py", code="c = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem)."
+                                   "get_level_viewport_camera_info()\nimport json\n"
+                                   "v = next(x for x in c if isinstance(x, unreal.Vector))\n"
+                                   "r = next(x for x in c if isinstance(x, unreal.Rotator))\n"
+                                   "json.dumps([[v.x, v.y, v.z], [r.pitch, r.yaw, r.roll]])")
+    camera = json.loads(camera) if isinstance(camera, str) else camera
+    place = ("unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).set_level_viewport_camera_info("
+             "unreal.Vector({0}, {1}, {2}), unreal.Rotator(pitch={3}, yaw={4}, roll={5}))")
+    ctx.tether("py", code=place.format(loc["x"], loc["y"], loc["z"], r["pitch"], r["yaw"], r["roll"]))
+    try:
+        time.sleep(0.3)
+        yield pose
+    finally:
+        ctx.tether("py", code=place.format(*camera[0], *camera[1]))
+
+
 def cmd_shot(ctx, args):
     """Capture the viewport (or the player's view during PIE) to a PNG and print its path."""
     launch = editor_mode(ctx.project, ctx.beacon)

@@ -311,7 +311,7 @@ def cmd_selftest(ctx, args):
     check("budget", ["budget"], timeout=900, skip=None if has_budget else "no Config/Tether/budget.json",
           ok=lambda c, o: c in (0, 1) and ("within budget" in o or "over budget" in o))
     check("pie start", ["pie", "start"], ok=lambda c, o: c == 0 and "OK" in o, timeout=300)
-    check("pie status", ["pie", "status"], ok=lambda c, o: c == 0 and "running" in o)
+    check("pie status", ["pie", "status"], ok=lambda c, o: c == 0 and "pie: running" in o)
     check("actors --pie", ["actors", "--pie", "--limit", "1"])
     check("pie do", ["pie", "do", "at 100,200,300", "near 100,200,300 50", "expect player.location ~ ."],
           ok=lambda c, o: c == 0 and "PASS" in o)

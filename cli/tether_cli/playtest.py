@@ -15,7 +15,7 @@ from .core import CliError, editor_mode, filter_log, log_end, log_path, read_jso
 from .calls import flush_editor_log, scoped_cvars
 from .assets import cmd_bp, cmd_size, code_usages, folder_packages, package_bytes
 from .content import cmd_tex
-from .images import cmd_shot, shot_args
+from .images import camera_at, cmd_shot, shot_args
 from .jobs import cmd_package, package_staleness, packaged_executable
 from .play import frame_stats, read_profile_csv
 from .play import (
@@ -751,9 +751,17 @@ def bp_command(ctx, args):
 
 
 def perf_command(ctx, args):
-    """`ue perf`: load and --scalability live here; the frame-time capture is play.cmd_perf."""
+    """`ue perf`: load and --scalability live here; the frame-time capture is play.cmd_perf. --at/--camera measure
+    from a camera of your choosing (in PIE, start it first: the camera is the player's view)."""
     if getattr(args, "action", None) == "load":
         return perf_load(ctx, args)
+    if any(getattr(args, k, None) for k in ("at", "look_at", "rot", "actor", "camera")):
+        if not args.editor and not (ctx.beacon or {}).get("pie"):
+            raise CliError("--at/--camera move the player's view in PIE: start it first (ue pie start), or measure "
+                           "the editor's viewport with --editor")
+        with camera_at(ctx, args):
+            return perf_command(ctx, argparse.Namespace(**dict(vars(args), at=None, look_at=None, rot=None, actor=None,
+                                                               camera=None)))
     if getattr(args, "scalability", None):
         return perf_scalability(ctx, args)
     if getattr(args, "res", None):
@@ -845,6 +853,12 @@ def perf_scalability(ctx, args):
 
 def pie_command(ctx, args):
     """`ue pie`: watch and record live here; everything else is play.cmd_pie."""
+    if getattr(args, "file", None) == "-":  # steps from stdin (`-f - <<EOF`), kept as a file like any step file
+        path = os.path.join(state_dir(ctx.project), "steps", "stdin-steps.txt")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(sys.stdin.read())
+        args.file = path
     every = getattr(args, "every", None) or []  # --every N, and with loop --every N "cmd; cmd"
     try:
         args.every, args.every_cmd = (float(every[0]) if every else None), " ".join(every[1:])

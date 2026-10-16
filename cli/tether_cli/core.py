@@ -443,6 +443,18 @@ class LogLines(list):
     folded = 0
 
 
+def continuation(lines, index, most=2):
+    """' | '-joined indented lines that follow a log entry and are not entries themselves: a material compile
+    failure's '(Node Custom) ... missing input 1' reason comes on a tab-indented line of its own."""
+    out = []
+    for line in lines[index + 1:index + 1 + most]:
+        if not line[:1] in (" ", "\t") or not line.strip() or LOG_LINE.match(line.strip()) \
+                or line.strip().startswith("at "):  # a stack frame: user_frame reads those
+            break
+        out.append(line.strip())
+    return "".join(f" | {l}" for l in out)
+
+
 def filter_log(lines, level="Warning", category=None, pattern=None, ignore=True, consecutive=False):
     max_level = LEVELS.get(level.capitalize() if level.lower() != "veryverbose" else "VeryVerbose", 2)
     rx = re.compile(pattern, re.I) if pattern else None
@@ -473,6 +485,8 @@ def filter_log(lines, level="Warning", category=None, pattern=None, ignore=True,
             continue
         if ensure_frames and cat in ("LogOutputDevice", "EnsureFailed", "LogStats") and frame(line) in ensure_frames:
             continue
+        if lvl in ("Error", "Fatal", "Warning"):  # an indented line under it is part of it (often the reason)
+            msg += continuation(lines, index)
         if lvl in ("Error", "Fatal"):
             msg += user_frame(lines, index)
         if LEVELS[lvl] > max_level or (category and cat.lower() != category.lower()):
@@ -751,6 +765,57 @@ def crash_summary(report, width=120):
     """One line: the error without the engine-source '[File:...] [Line: N]' noise."""
     text = re.sub(r"\s*\[File:[^\]]*\]\s*\[Line:\s*\d+\]\s*", " ", report["error"]).strip()
     return text[:width]
+
+
+def crash_signature(report):
+    """What makes two crashes the same one: the error text and the innermost modules of the stack."""
+    modules = []
+    for frame in report.get("stack") or []:
+        module = frame.strip()
+        if module and module not in modules:
+            modules.append(module)
+    return crash_summary(report, 200), tuple(modules[:4])
+
+
+def earlier_crash(project, report):
+    """The oldest earlier crash with the same signature as this one, or None: "seen before" tells a startup crash
+    that predates the change at hand from one it caused."""
+    same = [r for r in crash_reports(project) if r["time"] < report["time"] - 1
+            and crash_signature(r) == crash_signature(report)]
+    return same[-1] if same else None
+
+
+def startup_failure(project, since, code=None):
+    """Why an editor did not finish starting: its crash (and whether that crash was seen before), or None."""
+    crash = recent_crash(project, since)
+    if not crash:
+        return None
+    seen = earlier_crash(project, crash)
+    return (f"it crashed at startup: {crash_summary(crash, 140)} (ue crash)"
+            + (f"; the same crash happened at {time.strftime('%H:%M', time.localtime(seen['time']))}"
+               + (" on " + time.strftime('%Y-%m-%d', time.localtime(seen['time']))
+                  if time.time() - seen["time"] > 20 * 3600 else "") + ", before this run" if seen else ""))
+
+
+def log_file_lines(path, start=0):
+    """The lines of one log file from a byte offset (no cursor), or []."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(start)
+            return f.read().decode("utf-8", "replace").lstrip("\ufeff").splitlines()
+    except OSError:
+        return []
+
+
+def newest_log(project, since):
+    """The project log an editor started after `since` writes (<Project>.log, or <Project>_2.log next to another
+    editor), or None."""
+    folder = os.path.join(os.path.dirname(project), "Saved", "Logs")
+    stem = os.path.splitext(os.path.basename(project))[0]
+    logs = [os.path.join(folder, n) for n in (os.listdir(folder) if os.path.isdir(folder) else [])
+            if re.fullmatch(re.escape(stem) + r"(_\d+)?\.log", n, re.I)]
+    logs = [p for p in logs if os.path.getmtime(p) >= since - 1]
+    return max(logs, key=os.path.getmtime) if logs else None
 
 
 def recent_crash(project, since):

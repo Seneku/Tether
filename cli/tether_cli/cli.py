@@ -15,7 +15,7 @@ from .calls import (
     cmd_duplicate, cmd_exec, cmd_find, cmd_log, cmd_mat, cmd_mv, cmd_nav, cmd_new, cmd_props, cmd_py, cmd_refs,
     cmd_class, cmd_collision, cmd_cvar, cmd_tree, cmd_lights, cmd_wp, cmd_level, cmd_rm, cmd_statetree, cmd_trace, cmd_save, cmd_savegame, cmd_scatter, cmd_set, cmd_spawn, cmd_tools, cmd_undo, cmd_watch,
 )
-from .images import cmd_look, cmd_shot, shot_args
+from .images import camera_at, cmd_look, cmd_shot, shot_args
 from .testing import cmd_test
 from .assets import cmd_data, cmd_diff, cmd_fx, cmd_net, cmd_overview, cmd_pcg, cmd_skel, cmd_size, cmd_table, cmd_usages, cmd_validate
 from .content import (
@@ -131,12 +131,15 @@ def gpu_ab(ctx, args):
 
 
 def gpu_command(ctx, args):
-    """`ue gpu` (play.cmd_gpu), or with --ab an A/B comparison of two states."""
-    if args.ab:
-        return gpu_ab(ctx, args)
-    if args.restore:
+    """`ue gpu` (play.cmd_gpu), or with --ab an A/B comparison of two states; --at/--camera measure from a
+    camera of your choosing."""
+    if args.restore and not args.ab:
         raise CliError("--restore goes with --ab")
-    return cmd_gpu(ctx, args)
+    with camera_at(ctx, args) as pose:
+        if pose:
+            loc = pose["location"]
+            print(f"camera at ({loc['x']:.0f}, {loc['y']:.0f}, {loc['z']:.0f}) for the measurement")
+        return gpu_ab(ctx, args) if args.ab else cmd_gpu(ctx, args)
 
 
 def new_command(ctx, args):
@@ -212,6 +215,8 @@ def build_parser():
                    help="force -unattended (default for headless, except UnrealSharp projects)")
     s.add_argument("--attended", dest="unattended", action="store_false", help="never pass -unattended")
     s.add_argument("--no-build", action="store_true", help="skip the C++/C# pre-build")
+    s.add_argument("--force", action="store_true", help="with --second: start it even while the shared editor has "
+                                                        "unsaved packages or another session's lease")
     s.add_argument("--second", action="store_true", help="a private headless editor next to the open one (own MCP "
                                                          "port; this session's from now on, no lease needed; other "
                                                          "sessions keep the shared one). No pre-build")
@@ -310,6 +315,8 @@ def build_parser():
     s.add_argument("--ground", action="store_true", help="drop it onto the surface below --at")
     s.add_argument("--align", action="store_true", help="with --ground: tilt it to the surface")
     s.add_argument("--pie", action="store_true", help="spawn into the running PIE world instead (gone when PIE stops)")
+    s.add_argument("--replace", action="store_true", help="with --pie --label: remove the PIE actors with that label "
+                                                          "first, so repeated test runs do not stack copies")
     s = add("scatter", cmd_scatter, "place many copies on the ground in an area or along a line (one undo step)")
     s.add_argument("what", help="asset (/Game/...) or class")
     s.add_argument("--count", type=int, default=10)
@@ -341,7 +348,7 @@ def build_parser():
     s = add("wp", cmd_wp, "World Partition: info, actors [regex|x,y,r] (unloaded too), load|unload <x,y,r|regex>")
     s.add_argument("action", nargs="?", default="info", choices=["info", "actors", "load", "unload"])
     s.add_argument("where", nargs="?", help="a name/class regex, or an area x,y,radius")
-    s = add("gpu", gpu_command, "GPU time per pass (ProfileGPU): by kind (Lumen, shadows, base pass, post...) and the top passes")
+    s = gpu_parser = add("gpu", gpu_command, "GPU time per pass (ProfileGPU): by kind (Lumen, shadows, base pass, post...) and the top passes")
     s.add_argument("--res", metavar="WxH", help="render the 3D scene with this resolution's pixel count (screen percentage "
                                                "on the small offscreen viewport), e.g. 2560x1440")
     s.add_argument("--frames", type=int, default=3, help="frames to profile and average (3)")
@@ -459,6 +466,7 @@ def build_parser():
                    help="with --group: rest on the lowest (default: nothing floats), highest or mean ground under it")
     s = add("delete", cmd_delete, "delete actors from the level (undoable)")
     s.add_argument("actors", nargs="+", help="actor labels or names")
+    s.add_argument("--pie", action="store_true", help="from the running PIE world instead (they come back with PIE)")
     s = add("duplicate", cmd_duplicate, "duplicate an actor (undoable)")
     s.add_argument("actor")
     s.add_argument("--offset", default="100,0,0", help="shift per copy x,y,z (100,0,0)")
@@ -545,7 +553,8 @@ def build_parser():
                                              "with do: steps; "
                                              "with loop: \"cmd; wait N; cmd\", or status/stop; "
                                              "with watch: Actor.Property ... (an actor alone: its location)")
-    s.add_argument("-f", "--file", help="with do: a file of steps, one per line (# comments); with watch: run it while sampling")
+    s.add_argument("-f", "--file", help="with do: a file of steps, one per line (# comments; - reads them from stdin); "
+                                        "with watch: run it while sampling")
     s.add_argument("--keep-going", action="store_true", help="with do: run every step even after a failure")
     s.add_argument("--film", type=float, metavar="SECONDS", help="with do: capture the view every N seconds into a "
                                                                   "timestamped contact sheet")
@@ -571,6 +580,10 @@ def build_parser():
     s.add_argument("-o", "--output", help="with watch: CSV path (default Saved/Tether/watch/); with record: step file "
                                                "(default Saved/Tether/recordings/)")
     s.add_argument("--keep", action="store_true", help="with run/do: leave PIE running afterwards")
+    s.add_argument("--wait", type=float, nargs="?", const=120, metavar="SECONDS", help="with run: the script goes on "
+                   "over ticks (a tick callback); wait for it to call tether.finish(value) and print that (120)")
+    s.add_argument("--wait-file", metavar="PATH", help="with run: wait until the script has written this file (within "
+                                                       "--seconds, default 60) and print it")
     s.add_argument("--ignore-lease", action="store_true", help="with start/run/do: start PIE although another session "
                                                                "holds the editor lease")
     s.add_argument("--simulate", action="store_true", help="Simulate-In-Editor (no player pawn)")
@@ -601,7 +614,7 @@ def build_parser():
     s.add_argument("--prune", action="store_true", help="with --import: remove rows missing from FILE")
     s.add_argument("--dry-run", action="store_true", help="with --import: show the diff only")
     s.add_argument("--save", action="store_true", help="save the DataTable afterwards")
-    s = add("perf", perf_command, "frame-time capture in PIE: frame/game/render/GPU ms, hitches, change vs last "
+    s = perf_parser = add("perf", perf_command, "frame-time capture in PIE: frame/game/render/GPU ms, hitches, change vs last "
                                    "capture; `perf load [map]`: PIE start, streaming, hitches and the loads in them")
     s.add_argument("action", nargs="?", choices=["load"], help="load: map load and streaming hitches")
     s.add_argument("map", nargs="?", help="with load: the map to open first (default: the open one)")
@@ -618,6 +631,13 @@ def build_parser():
                    help="one capture per scalability level (low,medium,high,epic[,cinematic]; 5 s each), then restore")
     s.add_argument("--shots", action="store_true", help="with --scalability: a screenshot at each level")
     add("budget", cmd_budget, "measure what Config/Tether/budget.json limits (frame time, memory, sizes, load) and compare")
+    for s in (gpu_parser, perf_parser):
+        s.add_argument("--at", metavar="X,Y,Z", help="measure from a camera here (the player's view moves there in PIE, "
+                                                     "the level viewport's camera otherwise; put back afterwards)")
+        s.add_argument("--look-at", metavar="X,Y,Z|ACTOR", help="with --at: aim the camera at this")
+        s.add_argument("--rot", metavar="P,Y,R", help="with --at: the camera's rotation")
+        s.add_argument("--actor", help="measure from a camera framing this actor")
+        s.add_argument("--camera", metavar="NAME", help="measure from a `ue shot --baseline NAME` camera")
     s = add("mesh", cmd_mesh, "mesh check <mesh|folder>...: size and units, pivot, UVs/lightmap UV, inward faces, "
                               "collision, sockets, empty material slots")
     s.add_argument("action", choices=["check"])

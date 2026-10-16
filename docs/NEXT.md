@@ -113,6 +113,22 @@ UButton subclasses in nested user widgets) and the selftest a check that drives 
 `prune` first crashed the editor by asking for every MaterialProperty value's input (MP_MAX among them), now only
 the real outputs.
 
+**Done in 0.29.0** (UnrealRacing's notes 165-179): 165 `ue log` keeps an indented reason line with its entry and
+marks "Failed to compile Material" stale when the material compiles clean now; 166 `gpu`/`perf --at --look-at
+--rot --actor --camera`; 167 a startup crash after a good build says so, with "the same crash happened at 09:45"
+when it did; 168 overlays take only Source/, Config/ and Plugins/ and list what they staged; 169 `actors`/`find`
+exit 1 on no match (and `actors` no longer echoes the pattern); 170 `delete --pie`, `spawn --pie --replace`; 171
+`tether.spawn()`; 172 `pie status` prints `stopped` and exits 1; 173 `pie run --wait` with `tether.finish(value)`,
+`--wait-file`, and a note on Git Bash paths in scripts; 174 `call` builds struct arguments from C++ or Python field
+names or UE-order lists and fails on unknown fields (types from the method's docstring); 175 the default overlay
+folder is found by `<name>-<id>`, `<name>` or `<id>` and never created by a check; 176 `pie run` prints a JSON
+result; 177 `pie do -f -`; 178 `--second` refuses while the shared editor has unsaved work or another session's
+lease (`--force`), and a failed `ue save` names the editor holding the files (reproduced live: the shared editor
+could not save the map the second one had loaded); releasing the second editor's file handles would need engine
+code (ResetLoaders), so it stays a guard; 179 the boot report reads the new editor's own log and lists the shared
+editor's errors meanwhile separately. All checked live in Sandbox except 165's stale check, 167 (unit-tested) and
+the `--wait-file` path.
+
 ---
 
 ## Priority 1: asked for, or blocking real work

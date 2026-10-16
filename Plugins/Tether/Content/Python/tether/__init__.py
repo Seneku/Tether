@@ -2,4 +2,4 @@
 
 Scripts run in PIE can `import tether` and use tether.world(), player(), controller(), actors(), console() and
 world_subsystem(cls): they follow `ue pie target` in multiplayer PIE (see tether.scripting)."""
-from .scripting import actors, console, controller, player, world, world_subsystem  # noqa: F401
+from .scripting import actors, console, controller, finish, player, spawn, world, world_subsystem  # noqa: F401

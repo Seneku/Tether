@@ -10,7 +10,7 @@ import time
 
 from .core import (
     CliError, GATED, LEVELS, TETHER, UE_SCRIPT, compact_error, editor_process, editor_token, emit, filter_log, human_bytes, log_end, log_ignore_entries,
-    log_ignore_path, log_path, pid_alive, PY_OUTPUT, summarize_log, write_json,
+    live_editors, log_ignore_path, log_path, pid_alive, PY_OUTPUT, summarize_log, write_json,
     port_open,
     read_json, read_new_log, short, state_dir, unwrap,
 )
@@ -322,7 +322,13 @@ def cmd_set(ctx, args):
 
 
 def cmd_spawn(ctx, args):
+    if getattr(args, "replace", False) and not (args.pie and args.label):
+        raise CliError("--replace goes with --pie --label NAME (it removes the PIE actors with that label first)")
     if args.pie:
+        if getattr(args, "replace", False):
+            gone = delete_in_pie(ctx, [args.label], quiet=True)
+            if gone:
+                print(f"replaced {len(gone)} earlier {args.label}")
         return spawn_in_pie(ctx, args)
     print(ctx.tether("spawn", what=args.what, at=args.at, rot=args.rot or "", label=args.label or "",
                      ground=args.ground, align=args.align))
@@ -432,7 +438,34 @@ def cmd_drop(ctx, args):
     return 0
 
 
+PIE_DELETE = """import json
+w, names, gone = tether.world(), {names!r}, []
+for a in unreal.GameplayStatics.get_all_actors_of_class(w, unreal.Actor):
+    if a.get_actor_label() in names or a.get_name() in names:
+        gone.append(a.get_actor_label() or a.get_name())
+        a.destroy_actor()
+print(json.dumps(gone))
+"""
+
+
+def delete_in_pie(ctx, names, quiet=False):
+    """Destroy actors in the PIE world by label or object name (they come back when PIE restarts). [labels]."""
+    if not (ctx.beacon or {}).get("pie"):
+        raise CliError("--pie needs PIE running (ue pie start)")
+    gone = py_json(ctx, PIE_DELETE.format(names=list(names)))
+    missing = [n for n in names if n not in gone]
+    if not quiet:
+        if missing and not gone:
+            raise CliError(f"no actor {', '.join(missing)} in the PIE world (ue actors --pie)")
+        print(f"deleted {len(gone)} actor(s) from the PIE world: {', '.join(gone)}"
+              + (f"; not found: {', '.join(missing)}" if missing else ""))
+    return gone
+
+
 def cmd_delete(ctx, args):
+    if getattr(args, "pie", False):
+        delete_in_pie(ctx, args.actors)
+        return 0
     print(ctx.tether("delete", targets=",".join(args.actors)))
     return 0
 
@@ -457,10 +490,43 @@ def cmd_changes(ctx, args):
     return 0
 
 
+MOVE_FAILED = re.compile(r"Error moving file '([^']+)'")
+
+
+def held_by_other_editor(ctx, start):
+    """A note when saves failed because another editor on the project holds the package files open (Windows keeps
+    a loaded package's file open for lazy loading, so SavePackage cannot move the original aside), else None."""
+    flush_editor_log(ctx)
+    lines = [l for l in read_log_from(ctx, start) if MOVE_FAILED.search(l)]
+    others = [b for b in live_editors(ctx.project) if b.get("pid") != (ctx.beacon or {}).get("pid")]
+    if not lines or not others:
+        return None
+    files = sorted({os.path.basename(MOVE_FAILED.search(l).group(1)) for l in lines})
+    second = [b for b in others if b.get("owner")]
+    who = ", ".join(f"pid {b['pid']}" + (f" (session {b['owner']}'s --second editor)" if b.get("owner") else "")
+                    for b in (second or others))
+    return (f"{', '.join(files[:4])} could not be moved aside: another editor on this project has them loaded ({who}). "
+            "Saves of those packages work again once it closes (`ue --pid N close`)")
+
+
+def read_log_from(ctx, start):
+    try:
+        with open(log_path(ctx.project), "rb") as f:
+            f.seek(start)
+            return f.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return []
+
+
 def cmd_save(ctx, args):
+    start = log_end(ctx.project)
     out = ctx.tether("save", paths=",".join(args.paths))
     print(out)
     failed = out.startswith("save failed") or any(line.startswith("not saved (") for line in out.splitlines())
+    if failed:
+        note = held_by_other_editor(ctx, start)
+        if note:
+            print("note: " + note)
     return 1 if failed else 0
 
 
@@ -661,12 +727,14 @@ def cmd_find(ctx, args):
     (/Game/X/Presets/*, /Game/*/M_Neon*), matched on the whole package path."""
     query = args.query or ""
     if not query.startswith("/"):
-        print(ctx.tether("find", query=query, cls=args.cls or "", under=args.under, limit=args.limit))
-        return 0
+        out = str(ctx.tether("find", query=query, cls=args.cls or "", under=args.under, limit=args.limit))
+        print(out)
+        return 1 if out.startswith("0 assets") else 0  # nothing found: exit 1, for scripts
     pattern = query.rstrip("/")
     if not any(c in pattern for c in "*?["):  # a folder: everything under it
-        print(ctx.tether("find", query="", cls=args.cls or "", under=pattern, limit=args.limit))
-        return 0
+        out = str(ctx.tether("find", query="", cls=args.cls or "", under=pattern, limit=args.limit))
+        print(out)
+        return 1 if out.startswith("0 assets") else 0
     parts = pattern.split("/")
     fixed = parts[: next(i for i, p in enumerate(parts) if any(c in p for c in "*?["))]
     under = "/".join(fixed) or "/Game"
@@ -680,7 +748,7 @@ def cmd_find(ctx, args):
     if len(keep) > args.limit:
         print(f"... +{len(keep) - args.limit} more (--limit)")
     ctx.data = [r.split("  ")[0] for r in keep]
-    return 0
+    return 0 if keep else 1
 
 
 def cmd_refs(ctx, args):
@@ -694,7 +762,11 @@ def cmd_api(ctx, args):
 
 
 def cmd_actors(ctx, args):
-    print(ctx.tether("actors", match=args.match or "", limit=args.limit, pie=args.pie))
+    out = str(ctx.tether("actors", match=args.match or "", limit=args.limit, pie=args.pie))
+    if args.match and out.startswith("0 actors"):  # exit 1, and no pattern in the text for a `grep -q` to find
+        print("no actor matches" + (" in the PIE world" if args.pie else ""))
+        return 1
+    print(out)
     return 0
 
 
@@ -838,11 +910,37 @@ def cmd_log(ctx, args):
     print(f"{len(shown)} entries ({', '.join(filters)}) of {len(lines)} lines {where}"
           + (f"; {shown.hidden} known noise hidden (--all)" if shown.hidden else "")
           + ("" if shown or level in ("Log", "Verbose", "VeryVerbose") else f" (--level Log shows info lines too)"))
-    for line in shown[-args.limit:] if args.since != "last" else shown[: args.limit]:
-        print(line)
+    listed = shown[-args.limit:] if args.since != "last" else shown[: args.limit]
+    stale = stale_material_failures(ctx, listed)
+    for line in listed:
+        print(line + (f"  [stale: {stale[line]} compiles with no errors now]" if line in stale else ""))
     if len(shown) > args.limit:
         print(f"... +{len(shown) - args.limit} more (--limit)")
     return 0
+
+
+MATERIAL_FAILED = re.compile(r"([\w./\\:-]+?)\.uasset: Failed to compile Material")
+
+
+def stale_material_failures(ctx, lines, most=3):
+    """{log line: material} for "Failed to compile Material" lines whose material compiles clean now (a generator
+    wiring a Custom node input by input logs one for each half-wired state), checked through the editor."""
+    found = {}
+    for line in lines:
+        m = MATERIAL_FAILED.search(line)
+        if not m or "/Content/" not in m.group(1).replace("\\", "/"):
+            continue
+        package = "/Game/" + m.group(1).replace("\\", "/").split("/Content/", 1)[1]
+        found.setdefault(package, []).append(line)
+    stale = {}
+    for package, hits in list(found.items())[:most]:
+        try:
+            text = str(ctx.tether("material", target=package, compile=True, limit=0))
+        except CliError:
+            continue
+        if text.rstrip().endswith(": no errors"):
+            stale.update({line: package.rsplit("/", 1)[-1] for line in hits})
+    return stale
 
 
 def add_log_ignore(ctx, pattern, why=None):

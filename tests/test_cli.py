@@ -3451,8 +3451,12 @@ class UnrealRacingRound3(unittest.TestCase):
 
     def test_overlay_folders_are_per_session(self):
         p = self.project.uproject
-        mine = ue.claim_overlay(p, None, "handling")
-        self.assertTrue(mine.endswith(os.path.join("staging", "handling")))
+        with self.assertRaisesRegex(ue.CliError, "no staging folder for this session"):
+            ue.claim_overlay(p, None, "handling")  # a check creates nothing
+        ue.set_session_name(p, "signals", "handling")
+        os.makedirs(os.path.join(ue.state_dir(p), "staging", "signals-handling", "Source"))
+        mine = ue.claim_overlay(p, None, "handling")  # `ue who --as signals`: <name>-<id>
+        self.assertTrue(mine.endswith(os.path.join("staging", "signals-handling")))
         shared = os.path.join(self.project.root, "staging")
         os.makedirs(shared)
         self.assertEqual(ue.claim_overlay(p, shared, "menus"), shared)
@@ -3534,3 +3538,150 @@ class UnrealRacingRound4(unittest.TestCase):
         self.assertIn('EKeys::Enter: from another module\'s DLL: add "InputCore" to the Build.cs dependencies', out.getvalue())
         self.assertIn("AFoo::Bar: declared in Foo.h", out.getvalue())
         self.assertNotIn("NativeOnKeyDown", out.getvalue())
+
+
+class UnrealRacingRound5(unittest.TestCase):
+    """0.29: UnrealRacing's notes 165-179."""
+
+    def setUp(self):
+        self.project = Project()
+
+    def tearDown(self):
+        self.project.close()
+
+    def test_log_keeps_the_indented_reason_line(self):
+        lines = [stamped("LogMaterial: Warning: [AssetLog] D:/P/UnrealRacing/Content/NR/M_NR_SignPanel.uasset: "
+                         "Failed to compile Material for platform PCD3D_SM6, Default Material will be used in game."),
+                 "\t(Node Custom) Custom material NR missing input 1 (WP)",
+                 stamped("LogMaterial: Display: next")]
+        shown = ue.filter_log(lines)
+        self.assertEqual(len(shown), 1)
+        self.assertIn("| (Node Custom) Custom material NR missing input 1 (WP)", shown[0])
+        ctx = FakeCtx("M_NR_SignPanel (Material)\ncompiled /Game/NR/M_NR_SignPanel: no errors")
+        stale = ue.stale_material_failures(ctx, list(shown))
+        self.assertEqual(stale, {shown[0]: "M_NR_SignPanel"})
+        self.assertEqual(ctx.calls[0][1]["target"], "/Game/NR/M_NR_SignPanel")
+
+    def test_startup_crash_seen_before(self):
+        reports = [{"time": 2000.0, "type": "Crash", "error": "Unhandled Exception: EXCEPTION_ACCESS_VIOLATION",
+                    "stack": ["ProceduralMeshComponent", "Renderer"], "folder": "b"},
+                   {"time": 1000.0, "type": "Crash", "error": "Unhandled Exception: EXCEPTION_ACCESS_VIOLATION",
+                    "stack": ["ProceduralMeshComponent", "Renderer"], "folder": "a"}]
+        with unittest.mock.patch.object(ue.core, "crash_reports", return_value=reports):
+            why = ue.startup_failure(self.project.uproject, 1500)
+        self.assertIn("it crashed at startup: Unhandled Exception", why)
+        self.assertIn("the same crash happened at " + time.strftime("%H:%M", time.localtime(1000)), why)
+
+    def test_second_editor_boot_reads_its_own_log(self):
+        logs = os.path.join(self.project.root, "Saved", "Logs")
+        with open(os.path.join(logs, "Game.log"), "w") as f:
+            f.write("old\n")
+        old = time.time() - 100
+        os.utime(os.path.join(logs, "Game.log"), (old, old))
+        own = self.project.write("Saved/Logs/Game_2.log", stamped("LogInit: Display: hi") + "\n")
+        self.assertEqual(ue.newest_log(self.project.uproject, time.time() - 5), own)
+        self.assertEqual(ue.log_file_lines(own), [stamped("LogInit: Display: hi")])
+
+    def test_save_names_the_editor_holding_files(self):
+        ctx = FakeCtx()
+        ctx.project, ctx.beacon = self.project.uproject, {"pid": 1}
+        log = self.project.write("Saved/Logs/Game.log", stamped(
+            "LogFileManager: Error: Error moving file 'D:/P/Content/M_NR_LandmarkSign.uasset' to 'Saved/x.tmp'") + "\n")
+        with unittest.mock.patch.object(ue.calls, "flush_editor_log"), \
+                unittest.mock.patch.object(ue.calls, "log_path", return_value=log), \
+                unittest.mock.patch.object(ue.calls, "live_editors", return_value=[{"pid": 1}, {"pid": 7, "owner": "caps"}]):
+            note = ue.held_by_other_editor(ctx, 0)
+        self.assertIn("M_NR_LandmarkSign.uasset could not be moved aside", note)
+        self.assertIn("pid 7 (session caps's --second editor)", note)
+
+    def test_overlay_takes_only_code_folders(self):
+        p = self.project.uproject
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump({"FileVersion": 3}, f)
+        self.project.write("Source/Game/A.cpp", "int a;\n")
+        stage = os.path.join(self.project.root, "stage")
+        for rel in ("Source/Game/New.h", "Source/Game/New.cpp", "checksums.txt", "notes/plan.md"):
+            path = os.path.join(stage, *rel.split("/"))
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as f:
+                f.write("x")
+        shadow, overlaid = ue.shadow_project(p, stage, "me")
+        self.assertEqual(overlaid, ["Source/Game/New.cpp", "Source/Game/New.h"])
+        self.assertEqual(ue.shadow_project.ignored, ["checksums.txt", "notes/plan.md"])
+
+    def test_actors_exit_1_without_echoing_the_pattern(self):
+        ctx = FakeCtx("0 actors matching /^SkidPad$/")
+        args = argparse.Namespace(match="^SkidPad$", limit=60, pie=True)
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(ue.cmd_actors(ctx, args), 1)
+        self.assertNotIn("SkidPad", out.getvalue())
+        ctx = FakeCtx("0 assets under /Game matching /NoSuch/")
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(ue.cmd_find(ctx, argparse.Namespace(query="NoSuch", cls=None, under="/Game", limit=30)), 1)
+
+    def test_pie_delete_and_spawn_replace(self):
+        ctx = FakeCtx()
+        ctx.beacon = {"pie": True}
+        with unittest.mock.patch.object(ue.calls, "py_json", return_value=["CrashWall"]) as run, \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(ue.cmd_delete(ctx, argparse.Namespace(actors=["CrashWall", "Ghost"], pie=True)), 0)
+        self.assertIn("['CrashWall', 'Ghost']", run.call_args[0][1])
+        self.assertIn("not found: Ghost", out.getvalue())
+        with self.assertRaisesRegex(ue.CliError, "--replace goes with --pie --label"):
+            ue.cmd_spawn(ctx, argparse.Namespace(what="X", pie=True, label=None, replace=True))
+        args = ue.build_parser().parse_args(["spawn", "/Game/W", "--pie", "--label", "CrashWall", "--replace"])
+        self.assertTrue(args.replace)
+        self.assertTrue(ue.build_parser().parse_args(["delete", "A", "--pie"]).pie)
+
+    def test_pie_run_prints_a_json_result_and_waits_for_finish(self):
+        calls = []
+
+        class Ctx:
+            project, transport, beacon = self.project.uproject, "mcp", {"pie": True}
+
+            def tether(self, tool, **kw):
+                calls.append(kw.get("code", ""))
+                return {"passes": 3} if "exec(compile" in kw.get("code", "") else "running"
+        self.project.write("Saved/Logs/Game.log", "")
+        script = self.project.write("checks.py", "import json\nprint(json.dumps({'passes': 3}))\nopen('/d/x.json')")
+        args = argparse.Namespace(script=[script], code=None, expect=None, reject=None, seconds=0.1, keep=True,
+                                  warmup=0, wait=5, wait_file=None)
+        with unittest.mock.patch.object(ue.play, "wait_run_result", return_value={"done": True, "value": {"ok": 1}}), \
+                unittest.mock.patch.object(ue.play, "flush_editor_log"), \
+                unittest.mock.patch.object(ue.play, "unwrap", return_value=True), \
+                unittest.mock.patch.object(Ctx, "mcp", create=True, new=types.SimpleNamespace(call=lambda *a: ("true", False))), \
+                unittest.mock.patch.object(ue.play, "resolve_toolset", return_value="x"), \
+                contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(ue.pie_run(Ctx(), args), 0)
+        self.assertIn('script: {"passes": 3}', out.getvalue())
+        self.assertIn('result: {"ok": 1}', out.getvalue())
+        self.assertIn("sys._tether_run_result = None", calls[0])
+        self.assertIn("/d/Projects/... in the script means", err.getvalue())
+
+    def test_pie_status_says_stopped(self):
+        self.assertTrue(ue.POSIX_DRIVE.search("open('/d/Projects/x')"))
+        self.assertFalse(ue.POSIX_DRIVE.search("load('/Game/Maps/L')"))
+
+    def test_steps_from_stdin(self):
+        ctx = FakeCtx()
+        ctx.project = self.project.uproject
+        seen = {}
+        args = ue.parse_command(ue.build_parser(), ["pie", "do", "-f", "-", "--keep"])
+        with unittest.mock.patch.object(ue.playtest, "cmd_pie", side_effect=lambda c, a: seen.update(file=a.file) or 0), \
+                unittest.mock.patch("sys.stdin", io.StringIO("exec NRFreeRoam\nwait 3 game\n")):
+            ue.pie_command(ctx, args)
+        with open(seen["file"], encoding="utf-8") as f:
+            self.assertEqual(f.read(), "exec NRFreeRoam\nwait 3 game\n")
+
+    def test_camera_options_on_gpu_and_perf(self):
+        p = ue.build_parser()
+        self.assertEqual(p.parse_args(["gpu", "--at", "1,2,3", "--look-at", "Pole_1"]).look_at, "Pole_1")
+        self.assertEqual(p.parse_args(["perf", "--camera", "street"]).camera, "street")
+        ctx = FakeCtx()
+        ctx.project = self.project.uproject
+        with ue.camera_at(ctx, argparse.Namespace(at=None, look_at=None, rot=None, actor=None, camera=None)) as pose:
+            self.assertIsNone(pose)
+        self.assertEqual(ctx.calls, [])
+        ue.write_json(os.path.join(ue.state_dir(ctx.project), "shots", "baselines", "street.json"),
+                      {"pose": {"location": {"x": 1, "y": 2, "z": 3}, "rotation": {"pitch": -10, "yaw": 90, "roll": 0}}})
+        self.assertEqual(ue.baseline_pose(ctx, "street"), ("1,2,3", "-10,90,0"))
