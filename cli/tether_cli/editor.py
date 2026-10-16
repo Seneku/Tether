@@ -17,6 +17,7 @@ from .share import (
 )
 from .build import (
     classify_changes, compile_check, csharp_changes, csharp_layout, csharp_reload_build, editor_env, live_coding_build,
+    live_patches,
     uat_user_solution, ubt_build,
 )
 
@@ -344,6 +345,11 @@ def close_editor(ctx, args, explicit):
             print("declined the restore of the discarded packages' autosaves")
     else:
         print("closed")
+    patches = live_patches(ctx.project)
+    if patches:
+        print(f"note: {patches} Live Coding patch(es) since the last UBT build lived only in that editor: `ue open` "
+              "builds them first, but an editor opened from the launcher or the .uproject loads the older binaries. "
+              "Handing the project over? Run `ue build` now")
     return 0
 
 
@@ -402,8 +408,9 @@ def cmd_who(ctx, args):
 
 def cmd_git(ctx, args):
     """`ue git stage --mine [--dry-run]`: stage the changed files this session last wrote (the post-edit hook's
-    record), and name the rest: the ones another session also wrote since their last commit, the ones another
-    session wrote, and the ones nothing recorded (editor saves, scripts, shell commands)."""
+    record, else the sessions' transcripts: its Edit/Write calls, and its commands running when a file was
+    written), and name the rest: the ones another session also wrote since their last commit, the ones another
+    session wrote, the ones several sessions could have written, and the ones nothing explains."""
     if not args.mine:
         raise CliError("ue git stage --mine [--dry-run]: stage what this session wrote (plain git for the rest)")
     rows = changed_files(ctx.project)
@@ -417,9 +424,13 @@ def cmd_git(ctx, args):
         for i in range(0, len(split["mine"]), 50):
             run_git(ctx.project, "add", "--", *split["mine"][i:i + 50])
     verb = "would stage" if args.dry_run else "staged"
-    print(f"{verb} {len(split['mine'])} file(s) {me} wrote last" + (":" if split["mine"] else ""))
-    for path in split["mine"]:
+    via = ", ".join(f"{n} from the {how}" for how, n in split.get("via", {}).items())
+    print(f"{verb} {len(split['mine'])} file(s) {me} wrote last" + (f" ({via})" if via else "")
+          + (":" if split["mine"] else ""))
+    for path in split["mine"][: max(args.limit, 200)]:
         print(f"  {rel(path)}")
+    if len(split["mine"]) > max(args.limit, 200):
+        print(f"  ... +{len(split['mine']) - max(args.limit, 200)} more")
     if split["shared"]:
         print(f"not staged, also written by another session since the last commit ({len(split['shared'])}): "
               "`git add -p PATH` takes your hunks only")
@@ -429,9 +440,14 @@ def cmd_git(ctx, args):
         print(f"not staged, another session wrote them last ({len(split['theirs'])}):")
         for path, sid in split["theirs"][: args.limit]:
             print(f"  {rel(path)}  ({session_label(ctx.project, sid)})")
-    if split["unknown"]:
-        print(f"not staged, no edit record ({len(split['unknown'])}): editor saves, scripts, shell commands; "
+    if split.get("unsure"):
+        print(f"not staged, written while several sessions were running commands ({len(split['unsure'])}): "
               "stage the ones you made yourself")
+        for path, sids in split["unsure"][: args.limit]:
+            print(f"  {rel(path)}  ({', '.join(session_label(ctx.project, s) for s in sids)})")
+    if split["unknown"]:
+        print(f"not staged, written when no session was running a command ({len(split['unknown'])}): the editor "
+              "(autosave, a hand edit), a background job, or the user; stage the ones you made yourself")
         for path in split["unknown"][: args.limit]:
             print(f"  {rel(path)}")
         if len(split["unknown"]) > args.limit:

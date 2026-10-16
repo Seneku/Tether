@@ -9,9 +9,11 @@ import sys
 import time
 
 from .core import (
-    CliError, compact_error, compile_cpu, crash_summary, editor_executable, editor_live, editor_process, engine_root,
+    CliError, chosen_editor, compact_error, compile_cpu, crash_summary, editor_executable, editor_live, editor_process,
+    engine_root,
     filter_log, host_platform, parse_res,
-    human_bytes, log_end, log_path, read_json, recent_crash, short, state_dir, subprocess, unwrap, write_json,
+    human_bytes, log_end, log_path, read_json, recent_crash, short, stamped_name, state_dir, subprocess, unwrap,
+    write_json,
 )
 from .transport import catalog, py_json, resolve_toolset
 from .build import csharp_changes, csharp_layout, csharp_reload_build, layout_patch_note
@@ -1486,8 +1488,8 @@ def finish_film(ctx, args, state):
     for i, (t, _) in enumerate(tiles):  # each tile's time, top left
         x0, y0 = 4 + (i % columns) * 324 + 4, 4 + (i // columns) * (tile_h + 4) + tile_h - 14  # bottom left
         draw_text(sheet, width, x0, y0, f"{t:.1f}")
-    path = getattr(args, "film_output", None) or os.path.join(state_dir(ctx.project), "shots",
-                                                             time.strftime("film-%Y%m%d-%H%M%S.png"))
+    path = getattr(args, "film_output", None) or stamped_name(os.path.join(state_dir(ctx.project), "shots"),
+                                                                          "film", ".png")
     os.makedirs(os.path.dirname(path), exist_ok=True)
     png_write(path, width, height, bytes(sheet))
     taken = state["frames"]
@@ -1930,6 +1932,22 @@ def wait_grass(ctx, args):
         ctx.tether("console", command="log LogGrass Log", pie=pie)
 
 
+def wait_idle(ctx, args):
+    """`ue wait idle`: until the editor ticks again, e.g. after a `ue py` call timed out while its script kept
+    running (Python holds the game thread, so the beacon's heartbeat stops until the script ends)."""
+    started, deadline, busy = time.time(), time.time() + args.max, False
+    while time.time() < deadline:
+        beacon = chosen_editor(ctx.project) or {}
+        if not editor_process(beacon.get("pid")):
+            raise CliError("the editor is not running (ue status; ue crash)", 2)
+        if time.time() - beacon.get("heartbeat", 0) < 2.5:
+            print(f"editor idle (ticking) after {time.time() - started:.0f}s" if busy else "editor idle (ticking)")
+            return 0
+        busy = True
+        time.sleep(0.5)
+    raise CliError(f"the editor is still busy after {args.max:g}s (ue status)", 4)
+
+
 def cmd_wait(ctx, args):
     """`ue wait N [game]`: N seconds, or N seconds of game time in the running PIE (`pie do "wait N game"`), for
     the pauses between `ue exec` or `ue pie do` calls. `ue wait compile`: until shaders and assets have compiled."""
@@ -1937,10 +1955,12 @@ def cmd_wait(ctx, args):
         return wait_compile(ctx, args)
     if args.what == "grass":
         return wait_grass(ctx, args)
+    if args.what == "idle":
+        return wait_idle(ctx, args)
     try:
         args.seconds = float(args.what)
     except ValueError:
-        raise CliError("ue wait <seconds> [game] | ue wait compile | ue wait grass") from None
+        raise CliError("ue wait <seconds> [game] | ue wait compile | ue wait grass | ue wait idle") from None
     if args.clock == "game":
         if not (ctx.beacon or {}).get("pie"):
             raise CliError("`ue wait N game` needs PIE running (ue pie start); `ue wait N` waits wall-clock seconds")

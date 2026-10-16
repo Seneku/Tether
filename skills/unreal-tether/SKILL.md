@@ -22,8 +22,13 @@ and say who holds it and for what: wait, or ask that session, rather than passin
 close also asks for the lease when another session used the editor in the last 5 minutes. A build error in a file
 you did not touch says who last edited it ("edited by spire ... (not you)"): leave it to that session.
 `ue who --as NAME` gives your session a name the others see. Committing from a shared checkout: `ue git stage
---mine` stages only the files your session wrote last (Edit/Write), and names the ones another session also
-wrote since their last commit (stage your hunks with `git add -p`), the ones it wrote, and the unrecorded ones.
+--mine` stages only the files your session wrote last (Edit/Write, and files your Python scripts or `ue py`
+builders wrote, read from the session transcripts), and names the ones another session also wrote since their
+last commit (stage your hunks with `git add -p`), the ones it wrote, and the ones it cannot place.
+Starting from nothing: `ue new project Folder/Name --cpp [--template VehicleAdv]` makes a project from an engine
+template (Build.cs ready for 5.8, a game mode) and runs `ue init`; `ue template add Vehicles` copies template
+content (cars, LevelPrototyping, mannequins) to the /Game path its packages expect. `ue init --claude-plugin`
+makes later sessions in that folder load Tether (no plugin there: no `ue` on PATH, no edit hooks).
 
 Several reads or edits in a row? Put them in one `ue batch` (one command per line, from stdin or a file):
 one process and one editor session for all of them.
@@ -49,7 +54,8 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
 ## Doing things
 - `ue py "<code>"`, `ue py -f script.py [args]` or `ue py -` (stdin): unrestricted editor Python. `unreal` is
   pre-imported, the namespace persists between calls, and a trailing expression is printed. Words after the
-  script file arrive as `sys.argv[1:]`.
+  script file arrive as `sys.argv[1:]`. A call that times out (default 120 s) leaves the script running in the
+  editor: do not run it again; `ue wait idle` returns when it has finished (or pass `--timeout 600`).
 - `ue set <target> name=value [name+=delta ...]`: write properties as one undoable transaction, and
   print `old -> new` for each. Values: numbers, true/false, enum names, object paths, JSON, or tuples
   for structs (`location+=0,0,200`, `lightColor=1,0.5,0.2`; missing trailing fields keep their values).
@@ -107,7 +113,10 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
   `ue mat graph M add ScalarParameter Wetness 0.2`, `... connect Wetness Lerp.Alpha`, `... connect Lerp BaseColor`,
   `... set #3 value=0.5`, `... delete #7`; each recompiles. Instances: `ue mat MI Name=value`.
 - Lighting and mood: `ue lights` lists lights, sky, fog and exposure with notes (e.g. auto exposure undoing a dark
-  scene); check it before and after lighting changes, together with `ue shot`.
+  scene); check it before and after lighting changes, together with `ue shot`. It counts lights inside
+  Blueprints (Ultra Dynamic Sky's sun and moon) and lists every unbound post process with its priority: a sky
+  Blueprint's own post process (priority 1) beats a level volume at 0, so an exposure change there does nothing.
+  A mesh kilometres across (a 5 x 12 km water slab) gets no Lumen reflections: tile it (~1 km).
 - World Partition levels: other commands only see loaded actors. `ue wp` says how many are loaded; `ue wp actors
   Door` finds unloaded ones; `ue wp load x,y,r` (or `ue wp load <regex>`) loads them before you work on them.
 - After placing or scattering things: `ue level check` finds floating or buried props, stacked duplicates,
@@ -291,7 +300,10 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
 
 ## Visual checks
 - To see what an asset looks like before using or changing it: `ue look /Game/Path/SM_Rock` (mesh, Blueprint or
-  material) writes one PNG with six views; open it only if you need to.
+  material) writes one PNG with six views; open it only if you need to. In a night level the level's light
+  makes materials unreadable: `--studio` lights it neutrally instead.
+- In dense maps a `--at` camera can land inside a building: `ue shot --at ... --look-at ... --clear` moves it
+  along the view line to just in front of whatever blocks the view.
 - Before a change that should not alter a view (refactors, optimisations), `ue shot --at ... --look-at ... --baseline
   NAME`; after it, `ue shot --compare NAME` reports what changed and where (diff image in red). Animated things
   (clouds, water, particles) show up as separate areas; judge by the largest.
@@ -373,7 +385,7 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
 - Game UI in PIE: `ue ui` lists what is on screen (Slate and UMG texts, buttons, text boxes); `ue ui click
   "Close"`, `ue ui type "Name" hello`, `ue ui key Escape` (in PIE, keys and chords such as `Ctrl+G` go to the
   game's input, so Escape opens its pause menu instead of stopping PIE; `--slate` sends to the focused widget).
-  One tap is one press, as on a keyboard. A legacy BindKey chord on a key an Enhanced Input mapping also uses
+  One tap is one press, as on a keyboard, and taps in a row (two `key Down tap` steps) stay two presses. A legacy BindKey chord on a key an Enhanced Input mapping also uses
   (Ctrl+G with G mapped) usually never fires: the mapping consumes the key; `ue ui key` warns when it sees that.
   Several buttons with one label (nine ON/OFF toggles): `ue ui click "OFF" --near "DEBUG HUD: DIRECTOR"` (the one
   closest to that text) or `ue ui click "OFF#3"` (the third, in `ue ui`'s order).
@@ -445,6 +457,16 @@ editor lease (`ue lease`).
   note saying whether `ue build` (Live Coding) or `ue build --restart` will be needed.
 
 ## Python gotchas (UE 5.8)
+- Material Parameter Collections: never rewrite `scalar_parameters`/`vector_parameters` with new structs. Each
+  parameter gets a new ID and every material's Collection Parameter node keeps the old one, reading 0 with no
+  warning. Edit values in place; `ue lint --mpc` finds stale nodes and `--fix` re-links them by name.
+  `CollectionScalarParameter.parameter_name` raises: use `get_editor_property('parameter_name')`.
+- `unreal.MaterialProperty` has no `MP_CUSTOM_DATA0/1`: clear coat needs a Make Material Attributes node and
+  `use_material_attributes`. A FontSampleParameter compiles only with a default `font` set.
+- GeometryScript `create_new_static_mesh_asset_from_mesh` puts every triangle in one section whatever the
+  material IDs; `copy_mesh_to_static_mesh` with `replace_materials` splits them (`ue mesh check` flags it).
+- `player`, `pawn` and `controller` in `ue props`, `pie watch` and `pie do` mean the PIE player's (the pawn
+  possessed now; a watch follows it when it changes), never an editor actor named "Player...".
 - `unreal.Rotator(roll, pitch, yaw)` positional order: always pass keywords.
 - `set_editor_property` names drop the bool `b` prefix (`bLocked` -> `locked`); JSON property names
   from Epic tools keep it, in camelCase. Blueprint variables with spaces resolve only by their own name:
@@ -457,7 +479,8 @@ editor lease (`ue lease`).
   'NoCollision')`) instead, then check with `ue world probe x,y,z`.
 - Components marked editor-only (`bIsEditorOnly`) exist in PIE but are null in `-game` and packaged runs: null-check
   them outside `WITH_EDITOR` code, and try a `ue game start --server none` run before a package.
-- Live Coding locks UBT for every project on the same engine install: another project's open editor blocks your
-  `ue build` with the editor closed (`ue doctor` names it).
+- Another project's editor with Live Coding on (same engine install) does not block `ue build`: it passes
+  `-NoHotReloadFromIDE` when this project's editor is closed. It does block an IDE or hand-run Build.bat build
+  ("Unable to build while Live Coding is active"); add that flag there too.
 - Wrap edits in `with unreal.ScopedEditorTransaction("Agent: ...")` so the user can undo them.
 - Tool calls run on the game thread. Keep each call short and split long jobs into steps.

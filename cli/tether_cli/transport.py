@@ -248,6 +248,11 @@ class Ctx:
             value = self._rex.tether(tool, kwargs)
             return unwrap(json.dumps({"returnValue": value}))
         text, is_error = self.mcp.call(TETHER, tool, kwargs)
+        if is_error and tool in GATED and "unauthorized" in text:
+            # a token read while the beacon rewrote it (a reload): read it again and retry once
+            time.sleep(0.2)
+            kwargs["token"] = editor_token(self.project, self.beacon)
+            text, is_error = self.mcp.call(TETHER, tool, kwargs)
         if is_error:
             raise CliError(compact_error(text))
         return unwrap(text)

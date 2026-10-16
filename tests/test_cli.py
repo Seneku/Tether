@@ -356,7 +356,8 @@ class Init(unittest.TestCase):
     def run_init(self, **kw):
         out = []
         with unittest.mock.patch("builtins.print", side_effect=lambda *a: out.append(" ".join(map(str, a)))):
-            ue.cmd_init(self.ctx, argparse.Namespace(**dict({"unrealsharp": False, "dry_run": False}, **kw)))
+            ue.cmd_init(self.ctx, argparse.Namespace(**dict({"unrealsharp": False, "dry_run": False,
+                                                            "plugin_check": False}, **kw)))
         return out
 
     def raw(self):
@@ -2904,3 +2905,173 @@ class ShooterDominationRound2(unittest.TestCase):
         with self.assertRaises(ue.CliError):
             ue.cmd_build(types.SimpleNamespace(project=self.project.uproject),
                          parser.parse_args(["build", "--files", "Source/A.cpp"]))
+
+
+def transcript_line(kind, stamp, **block):
+    """One Claude Code transcript record holding a tool_use or tool_result block."""
+    return json.dumps({"type": "assistant" if kind == "tool_use" else "user", "timestamp": stamp,
+                       "message": {"content": [dict(type=kind, **block)]}}) + "\n"
+
+
+class UnrealRacingRound(unittest.TestCase):
+    """0.25: UnrealRacing's notes and ShooterDomination's rainy-night pass."""
+
+    def setUp(self):
+        self.project = Project()
+
+    def tearDown(self):
+        self.project.close()
+
+    def test_stamped_names_do_not_collide(self):
+        folder = os.path.join(self.project.root, "shots")
+        os.makedirs(folder)
+        first = ue.stamped_name(folder, "shot", ".png")
+        open(first, "w").close()
+        second = ue.stamped_name(folder, "shot", ".png")
+        self.assertNotEqual(first, second)
+        self.assertRegex(os.path.basename(first), r"^shot-\d{8}-\d{6}-\d{3}")
+
+    def test_log_noise_shapes(self):
+        lines = [stamped('LogJson: Warning: Property "Cloud Coverage" type FMulticastDelegateProperty unhandled during '
+                         'Json schema generation'),
+                 "[2026.10.12-10.13.00:858][  0]LogAutomationTest: Error: Condition failed",
+                 stamped("LogAutomationTest: Error: Condition failed"),
+                 stamped("LogSD: Warning: real")]
+        shown = ue.filter_log(lines, "Warning")
+        self.assertEqual(len(shown), 2)  # the frame-0 boot test is gone; one later in the session stays
+        self.assertTrue(any("real" in l for l in shown))
+
+    def test_py_pitfalls_round(self):
+        kept = ("arr = []\nfor slot in mesh.get_editor_property('static_materials'):\n"
+                "    slot.set_editor_property('x', m)\n    arr.append(slot)\n")
+        self.assertFalse(any("copies" in n for n in ue.py_pitfalls(kept)))  # the edited copy is written back
+        notes = " ".join(ue.py_pitfalls("mpc = unreal.MaterialParameterCollection\nmpc.set_editor_property("
+                                        "'scalar_parameters', [p])\nunreal.MaterialProperty.MP_CUSTOM_DATA0"))
+        self.assertIn("new IDs", notes)
+        self.assertIn("clear coat", notes)
+
+    def test_live_coding_patches_counted_until_ubt(self):
+        p = self.project.uproject
+        ue.mark_green(p, live=True)
+        ue.mark_green(p, live=True)
+        self.assertEqual(ue.live_patches(p), 2)
+        ue.mark_green(p, "cs_time")
+        self.assertEqual(ue.live_patches(p), 2)  # a C# reload is not a UBT build
+        ue.mark_green(p)
+        self.assertEqual(ue.live_patches(p), 0)
+
+    def test_transcript_attribution(self):
+        path = os.path.join(self.project.root, "t.jsonl")
+        target = self.project.write("Source/Game/A.cpp", "x")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(transcript_line("tool_use", "2026-10-16T08:00:00.000Z", id="w1", name="Write",
+                                    input={"file_path": target}))
+            f.write(transcript_line("tool_result", "2026-10-16T08:00:01.500Z", tool_use_id="w1", content="ok"))
+            f.write(transcript_line("tool_use", "2026-10-16T08:01:00.000Z", id="b1", name="Bash",
+                                    input={"command": "python build.py"}))
+            f.write(transcript_line("tool_result", "2026-10-16T08:02:00.000Z", tool_use_id="b1", content="done"))
+            f.write(transcript_line("tool_use", "2026-10-16T08:03:00.000Z", id="r1", name="Read",
+                                    input={"file_path": target}))
+            f.write(transcript_line("tool_result", "2026-10-16T08:03:30.000Z", tool_use_id="r1", content="x"))
+        writes, spans = ue.transcript_events(path, 0)
+        base = ue.stamp_time(ue.STAMP.search('"timestamp":"2026-10-16T08:00:00.000Z"'))
+        self.assertEqual(len(writes), 1)
+        self.assertEqual(spans, [(base + 60, base + 120)])  # the Read is not a span
+        sessions = {"aaaa1111": (writes, spans), "bbbb2222": ([], [(base + 100, base + 130)])}
+        self.assertEqual(ue.transcript_owners(target, base + 1.5, sessions), {"aaaa1111"})
+        self.assertEqual(ue.transcript_owners(target, base + 110, sessions), {"aaaa1111", "bbbb2222"})
+        self.assertEqual(ue.transcript_owners(target, base + 125, sessions), {"bbbb2222"})
+        os.utime(target, (base + 1.5, base + 1.5))
+        with unittest.mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "aaaa1111-full", "UE_SESSION": ""}):
+            split = ue.sort_changes(self.project.uproject, [(" M", target)], committed=lambda p: 0.0,
+                                    sessions=sessions)
+        self.assertEqual(split["mine"], [target])
+        self.assertEqual(split["via"], {"transcripts": 1})
+
+    def test_claude_plugin_setting(self):
+        home = os.path.join(self.project.root, "home")
+        with unittest.mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": home}):
+            self.assertIsNone(ue.claude_plugin_enabled(self.project.uproject))
+            path = ue.enable_claude_plugin(self.project.uproject)
+            self.assertEqual(ue.claude_plugin_enabled(self.project.uproject), path)
+            settings = ue.read_json(path)
+            ref, market, root = ue.claude_plugin()
+            self.assertTrue(settings["enabledPlugins"][ref])
+            self.assertEqual(settings["extraKnownMarketplaces"][market]["source"]["path"], root)
+
+    def fake_engine(self):
+        engine = os.path.join(self.project.root, "UE")
+        blank = os.path.join(engine, "Templates", "TP_Blank")
+        files = {"TP_Blank.uproject": json.dumps({"FileVersion": 3, "Modules": [{"Name": "TP_Blank", "Type": "Runtime"}]}),
+                 "Config/DefaultEngine.ini": "[/Script/EngineSettings.GameMapsSettings]\nGameDefaultMap=/Engine/M\n",
+                 "Config/DefaultGame.ini": "", "Config/TemplateDefs.ini":
+                 'SharedContentPacks=(MountName="Vehicles",DetailLevels=("Standard"))\n',
+                 "Source/TP_Blank.Target.cs": "public class TP_BlankTarget : TargetRules {}\n",
+                 "Source/TP_Blank/TP_Blank.Build.cs": "public class TP_Blank : ModuleRules\n{\n\tpublic TP_Blank("
+                                                      "ReadOnlyTargetRules Target) : base(Target)\n\t{\n\t\tPCHUsage = "
+                                                      "PCHUsageMode.UseExplicitOrSharedPCHs;\n\t}\n}\n",
+                 "Source/TP_Blank/TP_Blank.cpp": 'IMPLEMENT_PRIMARY_GAME_MODULE(FDefaultGameModuleImpl, TP_Blank, '
+                                                 '"TP_Blank");\n', "Media/x.png": "png"}
+        for rel, text in files.items():
+            full = os.path.join(blank, rel)
+            os.makedirs(os.path.dirname(full), exist_ok=True)
+            with open(full, "w", encoding="utf-8") as f:
+                f.write(text)
+        pack = os.path.join(engine, "Templates", "TemplateResources", "Standard", "Vehicles")
+        os.makedirs(os.path.join(pack, "Content", "SportsCar"))
+        with open(os.path.join(pack, "Content", "SportsCar", "SKM_Car.uasset"), "wb") as f:
+            f.write(b"\x00/Game/Vehicles/SportsCar/SKM_Car\x00/Game/Input/IA_Go\x00")
+        os.makedirs(os.path.join(pack, "__ExternalActors__", "Maps"))
+        open(os.path.join(pack, "__ExternalActors__", "Maps", "A.uasset"), "w").close()
+        os.makedirs(os.path.join(engine, "Templates", "TemplateResources", "High", "Input", "Content"))
+        return engine
+
+    def test_new_project_from_template(self):
+        engine = self.fake_engine()
+        folder = os.path.join(self.project.root, "made", "Racer")
+        args = ue.build_parser().parse_args(["new", "project", folder, "--cpp"])
+        ctx = types.SimpleNamespace(_project=None)
+        with unittest.mock.patch.dict(os.environ, {"UE_ROOT": engine}), \
+                unittest.mock.patch.object(ue.setup, "cmd_init", return_value=0), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(ue.new_project(ctx, args), 0)
+        self.assertIn("-> /Game/Vehicles", out.getvalue())
+        descriptor = ue.read_json(os.path.join(folder, "Racer.uproject"))
+        self.assertEqual(descriptor["Modules"][0]["Name"], "Racer")
+        with open(os.path.join(folder, "Source", "Racer", "Racer.Build.cs"), encoding="utf-8") as f:
+            build = f.read()
+        self.assertIn("public class Racer : ModuleRules", build)
+        self.assertIn("PublicIncludePaths.Add(ModuleDirectory);", build)
+        self.assertTrue(os.path.isfile(os.path.join(folder, "Source", "Racer", "RacerGameMode.h")))
+        with open(os.path.join(folder, "Config", "DefaultEngine.ini"), encoding="utf-8") as f:
+            self.assertIn("GlobalDefaultGameMode=/Script/Racer.RacerGameMode", f.read())
+        self.assertFalse(os.path.exists(os.path.join(folder, "Media")))
+        self.assertTrue(os.path.isfile(os.path.join(folder, "Content", "Vehicles", "SportsCar", "SKM_Car.uasset")))
+        self.assertTrue(os.path.isfile(os.path.join(folder, "Content", "__ExternalActors__", "Vehicles", "Maps", "A.uasset")))
+        self.assertEqual(ctx._project, os.path.join(folder, "Racer.uproject"))
+        with self.assertRaises(ue.CliError):
+            ue.new_project(ctx, ue.build_parser().parse_args(["new", "project", folder]))  # not empty
+
+    def test_template_pack_needs(self):
+        engine = self.fake_engine()
+        mount, level, files, needs = ue.add_template_pack(self.project.uproject, engine, "vehicles", dry_run=True)
+        self.assertEqual((mount, level, files), ("Vehicles", "Standard", 2))
+        self.assertEqual(needs, ["Input"])  # a pack it refers to that the project lacks
+        with self.assertRaises(ue.CliError):
+            ue.add_template_pack(self.project.uproject, engine, "Nope")
+
+    def test_lint_mpc_and_clear_view(self):
+        ctx = FakeCtx(json.dumps({"collections": 1, "materials": 2, "fixed": 0, "stale": [
+            {"material": "/Game/M_Neon", "parameter": "Glow", "collection": "/Game/MPC_City", "why": "new ID"}]}))
+        args = argparse.Namespace(path="/Game", fix=False, dry_run=False, limit=30, strict=True)
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(ue.lint_mpc(ctx, args), 1)
+        self.assertIn("/Game/M_Neon: Glow (MPC_City)", out.getvalue())
+        pose = {"location": {"x": 0, "y": 0, "z": 500}}
+        with unittest.mock.patch.object(ue.images, "py_json", return_value=[560, 0, 500, 560, "Tower"]), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            ue.clear_view(FakeCtx(), pose, "3000,0,500", False)
+        self.assertEqual(pose["location"]["x"], 560)
+        self.assertIn("in front of Tower", out.getvalue())
+        with self.assertRaises(ue.CliError):
+            ue.clear_view(FakeCtx(), pose, None, False)

@@ -50,7 +50,7 @@ def cmd_doctor(ctx, args):
     out = io.StringIO()
     try:
         with contextlib.redirect_stdout(out):
-            cmd_init(ctx, argparse.Namespace(dry_run=True, unrealsharp=False))
+            cmd_init(ctx, argparse.Namespace(dry_run=True, unrealsharp=False, plugin_check=False))
         text = out.getvalue().strip()
         if text.startswith("already set up"):
             report("ok", "plugins enabled and the Tether plugin current")
@@ -59,6 +59,10 @@ def cmd_doctor(ctx, args):
                    "ue init")
     except (CliError, OSError, ValueError) as exc:
         report("WARN", f"could not check the project setup: {exc}", "")
+    where = claude_plugin_enabled(project)
+    report("ok" if where else "WARN", f"Claude Code plugin {claude_plugin()[0]} "
+           + (f"enabled ({where})" if where else "not enabled for this folder: sessions here get no edit hooks"),
+           "" if where else "ue init --claude-plugin")
     beacon = editor_live(ctx.project)
     loaded, mine = (beacon or {}).get("tether"), tether_version()
     if beacon and loaded and loaded != mine:
@@ -95,17 +99,18 @@ def cmd_doctor(ctx, args):
     holders = live_coding_holders(engine) if engine else []
     mine = os.path.splitext(os.path.basename(project))[0]
     for console, name, editor in holders:
-        if name != mine:  # UBT's Live Coding mutex is per engine install: it blocks this project's editor builds too
-            report("WARN", f"Live Coding is active for {name} (LiveCodingConsole pid {console}"
-                           + (f", editor pid {editor}" if editor else "") + ") on this engine install",
-                   "UBT builds of this project's editor fail while it runs: close that editor, or build in it")
+        if name != mine:  # UBT's Live Coding mutex is named after the engine's shared UnrealEditor.exe
+            report("ok", f"Live Coding is active for {name} (LiveCodingConsole pid {console}"
+                         + (f", editor pid {editor}" if editor else "") + ") on this engine install: `ue build` "
+                         "passes -NoHotReloadFromIDE, so it is not blocked; an IDE or Build.bat build of this "
+                         "project's editor would be", "")
     if engine and others:
         same = [(p, c) for p, c in others if os.path.normcase(engine) in os.path.normcase(c)
                 and p not in {editor for _, _, editor in holders}]  # those already have their Live Coding line
         for p, c in same[:3]:
             name = next((os.path.basename(t.strip('"')) for t in c.split() if t.strip('"').endswith(".uproject")), "?")
-            report("WARN", f"another editor on this engine: pid {p} ({name})",
-                   "C++ builds (UBT) fail while an editor on the same engine holds Live Coding; close it, or build there")
+            report("ok", f"another editor on this engine: pid {p} ({name}); `ue build` is not blocked by it, an IDE "
+                         "build of this project would be once it turns Live Coding on", "")
     if ctx.transport == "remote":
         ini = os.path.join(os.path.dirname(project), "Config", "DefaultEngine.ini")
         enabled = os.path.isfile(ini) and re.search(r"^bRemoteExecution\s*=\s*True", open(ini, encoding="utf-8-sig",
@@ -251,9 +256,272 @@ def project_skill_update(project):
     return path, text.replace("\n", newline)
 
 
+# ---------------------------------------------------------------- new projects and template content
+
+TEMPLATE_SKIP = {"Media", "Binaries", "Intermediate", "Saved", "Build", "DerivedDataCache"}
+TEXT_EXTS = (".cpp", ".h", ".ini", ".cs")
+
+
+def template_packs(engine):
+    """{pack name: {detail level: Content folder}} of the engine's shared template content."""
+    packs = {}
+    base = os.path.join(engine, "Templates", "TemplateResources")
+    for level in ("High", "Standard"):
+        folder = os.path.join(base, level)
+        for name in sorted(os.listdir(folder)) if os.path.isdir(folder) else []:
+            content = os.path.join(folder, name, "Content")
+            if os.path.isdir(content):
+                packs.setdefault(name, {})[level] = content
+    return packs
+
+
+def pack_mount(content, fallback):
+    """The /Game folder a pack's packages expect, read from the packages themselves ("Vehicles": /Game/Vehicles)."""
+    seen = {}
+    for here, _, files in os.walk(content):
+        for name in files:
+            if name.endswith((".uasset", ".umap")):
+                with open(os.path.join(here, name), "rb") as f:
+                    for m in re.finditer(rb"/Game/([A-Za-z0-9][A-Za-z0-9_]*)/", f.read(1 << 20)):
+                        seen[m.group(1).decode()] = seen.get(m.group(1).decode(), 0) + 1
+            if sum(seen.values()) > 50:
+                break
+    own = next((s for s in seen if s.lower() == fallback.lower()), None)
+    return own or (max(seen, key=seen.get) if seen else fallback)
+
+
+def pack_references(content, mount):
+    """Other /Game folders a pack's packages refer to (other packs it needs)."""
+    found = set()
+    for here, _, files in os.walk(content):
+        for name in files:
+            if name.endswith((".uasset", ".umap")):
+                with open(os.path.join(here, name), "rb") as f:
+                    found.update(m.group(1).decode() for m in re.finditer(rb"/Game/([A-Za-z0-9_]+)/", f.read(1 << 20)))
+    return sorted(found - {mount})
+
+
+def add_template_pack(project, engine, pack, level=None, dry_run=False):
+    """Copy an engine template pack into Content/<its mount>; returns (mount, files, other folders it needs)."""
+    import shutil
+    packs = template_packs(engine)
+    match = next((p for p in packs if p.lower() == pack.lower()), None)
+    if not match:
+        raise CliError(f"no template pack '{pack}' in {engine} (ue template list)")
+    levels = packs[match]
+    level = next((l for l in levels if level and l.lower() == level.lower()), None) or levels.get("High") and "High" \
+        or "Standard"
+    if level not in levels:
+        raise CliError(f"{match} comes in {', '.join(levels)} only")
+    source = levels[level]
+    mount = pack_mount(source, match)
+    content = os.path.join(os.path.dirname(project), "Content")
+    target = os.path.join(content, mount)
+    # World Partition maps keep their actors beside the pack's Content; in a project they sit under
+    # Content/__ExternalActors__/<mount>/ (and __ExternalObjects__)
+    extras = [(os.path.join(os.path.dirname(source), d), os.path.join(content, d, mount))
+              for d in ("__ExternalActors__", "__ExternalObjects__") if os.path.isdir(os.path.join(os.path.dirname(source), d))]
+    files = sum(len(f) for folder in [source] + [s for s, _ in extras] for _, _, f in os.walk(folder))
+    names = {p.lower() for p in packs}  # other packs it uses; other /Game names in its packages are often stale
+    needs = [m for m in pack_references(source, mount) if m.lower() in names and not os.path.isdir(os.path.join(content, m))]
+    if os.path.exists(target):
+        raise CliError(f"Content/{mount} already exists: remove it first to copy {match} again")
+    if not dry_run:
+        shutil.copytree(source, target)
+        for extra, into in extras:
+            shutil.copytree(extra, into, dirs_exist_ok=True)
+    return mount, level, files, needs
+
+
+def cmd_template(ctx, args):
+    """`ue template list` / `ue template add <Pack> [--level High|Standard]`: the engine's template content (the
+    cars of the Vehicle template, the level prototyping meshes, the mannequins...) copied into the project at the
+    /Game path its packages expect, as the new-project wizard does."""
+    engine = engine_root(ctx.project)
+    packs = template_packs(engine)
+    if args.action == "list" or not args.pack:
+        print(f"{len(packs)} template content pack(s) in {engine} (ue template add <Pack>):")
+        for name, levels in packs.items():
+            files = sum(len(f) for _, _, f in os.walk(levels.get("High") or levels["Standard"]))
+            print(f"  {name:<22} {'/'.join(levels)}  {files} files")
+        return 0
+    mount, level, files, needs = add_template_pack(ctx.project, engine, args.pack, args.level, args.dry_run)
+    print(("would copy " if args.dry_run else "copied ") + f"{args.pack} ({level}, {files} files) to /Game/{mount}"
+          + ("" if args.dry_run else "; a running editor picks the new files up on its own"))
+    source = next(v for k, v in packs.items() if k.lower() == args.pack.lower())[level]
+    for folder in sorted(os.listdir(source)):
+        if os.path.isdir(os.path.join(source, folder)):
+            names = [f for _, _, fs in os.walk(os.path.join(source, folder)) for f in fs if f.endswith((".uasset", ".umap"))]
+            print(f"  /Game/{mount}/{folder}: {len(names)} asset(s)" + (f", e.g. {', '.join(n[:-7] for n in names[:4])}"
+                                                                       if names else ""))
+    if needs:
+        print(f"note: its packages also refer to /Game/{', /Game/'.join(needs)}, which this project lacks"
+              + "".join(f" (ue template add {n})" for n in needs if any(p.lower() == n.lower() for p in packs)))
+    return 0
+
+
+def new_project(ctx, args):
+    """`ue new project <Folder/Name> [--cpp] [--template ThirdPerson] [--engine 5.8]`: a project from one of the
+    engine's templates as the wizard makes it (names replaced, its shared content packs copied), plus what a
+    session would otherwise discover by failing: the module root on the include path, a C++ game mode set as
+    the default, then `ue init`."""
+    import shutil
+    import uuid
+    folder = os.path.abspath(args.path)
+    name = os.path.basename(folder.rstrip("\\/"))
+    if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,19}", name):
+        raise CliError(f"'{name}': a project name is a letter then letters, digits or _ (20 at most)")
+    if os.path.isdir(folder) and os.listdir(folder):
+        raise CliError(f"{folder} exists and is not empty")
+    template = "TP_" + (args.template or "Blank") + ("" if args.cpp else "BP")
+    probe = os.path.join(folder, f"{name}.uproject")
+    os.makedirs(folder, exist_ok=True)
+    with open(probe, "w", encoding="utf-8") as f:  # engine_root reads the association from it
+        json.dump({"FileVersion": 3, "EngineAssociation": args.engine}, f)
+    try:
+        engine = engine_root(probe)
+    except CliError:
+        os.remove(probe)
+        raise
+    source = os.path.join(engine, "Templates", template)
+    if not os.path.isdir(source):
+        os.remove(probe)
+        have = sorted(d[3:] for d in os.listdir(os.path.join(engine, "Templates")) if d.startswith("TP_"))
+        raise CliError(f"no template {template} in {engine} (have: {', '.join(have)})")
+    old = template
+
+    def renamed(text):
+        text = text.replace(old.upper(), name.upper()).replace(old.lower(), name.lower())
+        return re.sub(re.escape(old), name, text, flags=re.I)
+    for here, dirs, files in os.walk(source):
+        dirs[:] = [d for d in dirs if d not in TEMPLATE_SKIP]
+        rel = os.path.relpath(here, source)
+        for f in files:
+            if f in ("TemplateDefs.ini", "config.ini") or f.endswith((".uproject", ".png", ".sln")):
+                continue
+            target = os.path.join(folder, renamed(rel) if rel != "." else "", renamed(f))
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            if f.endswith(TEXT_EXTS):
+                with open(os.path.join(here, f), encoding="utf-8-sig", errors="replace") as fh:
+                    text = renamed(fh.read())
+                with open(target, "w", encoding="utf-8") as fh:
+                    fh.write(text)
+            else:
+                shutil.copy2(os.path.join(here, f), target)
+    descriptor = read_json(os.path.join(source, f"{template}.uproject")) or {"FileVersion": 3}
+    descriptor["EngineAssociation"] = args.engine
+    for module in descriptor.get("Modules", []):
+        module["Name"] = renamed(module["Name"])
+    module_dir = os.path.join(folder, "Source", name)
+    if args.cpp and os.path.isdir(module_dir):
+        build = os.path.join(module_dir, f"{name}.Build.cs")
+        with open(build, encoding="utf-8") as f:
+            text = f.read()
+        if "PublicIncludePaths.Add(ModuleDirectory)" not in text:  # 5.8 no longer puts the module root on the path
+            text = re.sub(r"(PCHUsage = [^;]+;\n)", r"\1\n\t\tPublicIncludePaths.Add(ModuleDirectory);\n", text, count=1)
+        with open(build, "w", encoding="utf-8") as f:
+            f.write(text)
+        mode = os.path.join(module_dir, f"{name}GameMode.h")
+        if not any(f.endswith("GameMode.h") for f in os.listdir(module_dir)):
+            with open(mode, "w", encoding="utf-8") as f:
+                f.write(f'#pragma once\n\n#include "CoreMinimal.h"\n#include "GameFramework/GameModeBase.h"\n'
+                        f'#include "{name}GameMode.generated.h"\n\nUCLASS()\nclass {name.upper()}_API A{name}GameMode '
+                        f": public AGameModeBase\n{{\n\tGENERATED_BODY()\n}};\n")
+            with open(mode[:-2] + ".cpp", "w", encoding="utf-8") as f:
+                f.write(f'#include "{name}GameMode.h"\n')
+            ini = os.path.join(folder, "Config", "DefaultEngine.ini")
+            with open(ini, encoding="utf-8") as f:
+                text = f.read()
+            line = f"GlobalDefaultGameMode=/Script/{name}.{name}GameMode"
+            section = "[/Script/EngineSettings.GameMapsSettings]"
+            text = text.replace(section, f"{section}\n{line}", 1) if section in text else \
+                text.rstrip("\n") + f"\n\n{section}\n{line}\n"
+            with open(ini, "w", encoding="utf-8") as f:
+                f.write(text)
+    game_ini = os.path.join(folder, "Config", "DefaultGame.ini")
+    with open(game_ini, "a", encoding="utf-8") as f:
+        f.write(f"\n[/Script/EngineSettings.GeneralProjectSettings]\nProjectID={uuid.uuid4().hex.upper()}\n"
+                f"ProjectName={name}\n")
+    with open(probe, "w", encoding="utf-8") as f:
+        json.dump(descriptor, f, indent="\t")
+        f.write("\n")
+    print(f"created {folder} from {template} (engine {args.engine})")
+    defs = os.path.join(source, "Config", "TemplateDefs.ini")
+    with open(defs, encoding="utf-8-sig", errors="replace") as f:
+        wanted = re.findall(r'^SharedContentPacks=\(MountName="(\w+)",DetailLevels=\("?(\w+)', f.read(), re.M)
+    for pack, level in wanted:
+        mount, level, files, _ = add_template_pack(probe, engine, pack, level)
+        print(f"  template content {pack} ({level}, {files} files) -> /Game/{mount}")
+    ctx._project = probe
+    cmd_init(ctx, argparse.Namespace(unrealsharp=False, dry_run=False, claude_plugin=args.claude_plugin))
+    where = folder if os.path.splitdrive(folder)[0].lower() != os.path.splitdrive(os.getcwd())[0].lower() \
+        else os.path.relpath(folder)  # relpath cannot cross drives
+    print(f"next: cd {where}; " + ("`ue build` compiles the module, then " if args.cpp else "")
+          + "`ue open --headless`")
+    return 0
+
+
+def claude_plugin():
+    """('tether@tether', marketplace name, this checkout's folder): the Claude Code plugin this CLI belongs to."""
+    root = os.path.dirname(CLI_DIR)
+    market = read_json(os.path.join(root, ".claude-plugin", "marketplace.json")) or {}
+    plugin = read_json(os.path.join(root, ".claude-plugin", "plugin.json")) or {}
+    name = market.get("name", "tether")
+    return f"{plugin.get('name', 'tether')}@{name}", name, root
+
+
+def claude_plugin_enabled(project):
+    """The settings file that enables Tether's Claude Code plugin for sessions in this project, or None. Without
+    it a session has no `ue` on PATH, no session-start note and no edit hooks (edit records, guards)."""
+    ref = claude_plugin()[0]
+    home = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(os.path.expanduser("~"), ".claude")
+    folders = [os.path.dirname(project)]
+    top = (run_git(project, "rev-parse", "--show-toplevel", check=False) or "").strip()
+    if top:
+        folders.append(os.path.normpath(top))
+    files = [os.path.join(home, "settings.json")] + [os.path.join(d, ".claude", f) for d in folders
+                                                     for f in ("settings.json", "settings.local.json")]
+    return next((f for f in files if ((read_json(f) or {}).get("enabledPlugins") or {}).get(ref)), None)
+
+
+def enable_claude_plugin(project):
+    """Enable the plugin for this folder in .claude/settings.local.json (machine-local: the marketplace is this
+    checkout's path), keeping what the file already holds."""
+    ref, market, root = claude_plugin()
+    path = os.path.join(os.path.dirname(project), ".claude", "settings.local.json")
+    settings = read_json(path) or {}
+    settings.setdefault("extraKnownMarketplaces", {})[market] = {"source": {"source": "directory", "path": root}}
+    settings.setdefault("enabledPlugins", {})[ref] = True
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(settings, f, indent=2)
+        f.write("\n")
+    return path
+
+
 def cmd_init(ctx, args):
-    """Set up a project for Tether: enable the engine plugins it needs in the .uproject and copy the Tether
-    editor plugin(s) into the project's Plugins/ unless the project already reaches them."""
+    """Set up a project for Tether: enable the engine plugins it needs in the .uproject, copy the Tether editor
+    plugin(s) into the project's Plugins/ unless the project already reaches them, and check that Claude Code
+    sessions here load Tether's plugin (`--claude-plugin` enables it)."""
+    code = init_project(ctx, args)
+    if not getattr(args, "plugin_check", True):  # ue doctor reports it on its own line
+        return code
+    where = claude_plugin_enabled(ctx.project)
+    ref = claude_plugin()[0]
+    if where:
+        return code
+    if getattr(args, "claude_plugin", False) and not args.dry_run:
+        path = enable_claude_plugin(ctx.project)
+        print(f"enabled the Claude Code plugin {ref} in {os.path.relpath(path, os.path.dirname(ctx.project))}: new "
+              "sessions in this folder get `ue` on PATH, the session-start note and the edit hooks (Claude Code "
+              "may ask once to trust it)")
+    else:
+        print(f"note: Claude Code sessions here do not load the plugin {ref}: no `ue` on PATH, no session-start "
+              "note, no edit hooks. `ue init --claude-plugin` enables it for this folder (.claude/settings.local.json)")
+    return code
+
+
+def init_project(ctx, args):
     import shutil
     project = ctx.project
     with open(project, encoding="utf-8-sig", newline="") as f:  # newline="": keep CRLF files CRLF

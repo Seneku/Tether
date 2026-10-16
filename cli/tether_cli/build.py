@@ -149,11 +149,20 @@ def classify_changes(project):
     return changed, module, reflected
 
 
-def mark_green(project, key="time"):
+def mark_green(project, key="time", live=False):
+    """A green build. Live Coding patches exist only in the editor process that loaded them: count them until a
+    UBT build makes them real, so `ue close` can say the code a launcher start would load is older."""
     path = os.path.join(state_dir(project), "last-build.json")
     marker = read_json(path) or {}
     marker[key] = time.time()
+    if key == "time":
+        marker["live_patches"] = marker.get("live_patches", 0) + 1 if live else 0
     write_json(path, marker)
+
+
+def live_patches(project):
+    """Live Coding builds since the last UBT build of the editor target."""
+    return (read_json(os.path.join(state_dir(project), "last-build.json")) or {}).get("live_patches", 0)
 
 
 def csharp_layout(project):
@@ -436,5 +445,5 @@ def live_coding_build(ctx, args, changes):
         write_json(layout_marker(ctx.project), {"pid": editor.get("pid"), "time": time.time(),
                                                 "headers": list(dict.fromkeys(headers + [os.path.basename(p) for p in changes[2]]))})
     if ok:
-        mark_green(ctx.project)
+        mark_green(ctx.project, live=True)
     return 0 if ok else 1

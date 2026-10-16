@@ -89,6 +89,18 @@ PY_PITFALLS = [  # (pattern in `ue py` code, what goes wrong): engine behaviour 
      "set_editor_properties (plural) on an AnimSequence posts a change event without the property, so the "
      "sequence is not recompressed: marking it additive keeps the non-additive compressed data until a restart. "
      "Use set_editor_property (singular) for each additive setting"),
+    (re.compile(r"MP_CUSTOM_DATA[01]"),
+     "unreal.MaterialProperty has no MP_CUSTOM_DATA0/1 (clear coat) in Python: build clear coat through a Make "
+     "Material Attributes node and set the material's use_material_attributes"),
+    (re.compile(r"(?s)Collection(?:Scalar|Vector)Parameter.*\.parameter_name\b(?!\s*\()"),
+     "CollectionScalarParameter/CollectionVectorParameter.parameter_name raises; read and write it with "
+     "get_editor_property('parameter_name') / set_editor_property(...)"),
+    (re.compile(r"(?s)MaterialParameterCollection.*['\"](?:scalar|vector)_parameters['\"]"),
+     "rewriting a Material Parameter Collection's parameter array gives the parameters new IDs: every material "
+     "compiled against the old ones reads 0 for them, silently. Edit the existing entries' values in place, or "
+     "recompile and check the materials that use the collection (ue lint --mpc)"),
+    (re.compile(r"MaterialExpressionFontSampleParameter"),
+     "a FontSampleParameter compiles only with a default font set (set_editor_property('font', ...))"),
 ]
 STRUCT_LOOP = re.compile(r"for\s+(\w+)\s+in\s+[^\n]*get_editor_property\([^\n]*:\s*\n((?:[ \t]+[^\n]*\n?)+)")
 
@@ -97,7 +109,10 @@ def py_pitfalls(code):
     """Warnings for known engine traps in code about to run in the editor."""
     notes = [message for rx, message in PY_PITFALLS if rx.search(code)]
     for m in STRUCT_LOOP.finditer(code):
-        if re.search(r"\b" + re.escape(m.group(1)) + r"\.set_editor_property\(", m.group(2)):
+        name, body = re.escape(m.group(1)), m.group(2)
+        # the edited copy is lost only when nothing uses it afterwards (appended, assigned back, passed on)
+        used = re.search(r"\b" + name + r"\b(?!\s*\.)", body)
+        if re.search(r"\b" + name + r"\.set_editor_property\(", body) and not used:
             notes.append(f"'{m.group(1)}' comes from iterating an unreal.Array: elements of struct arrays are copies, "
                          "so set_editor_property on them changes nothing; set the edited element back by index "
                          "(arr[i] = item) and write the array back")
@@ -125,6 +140,10 @@ def cmd_py(ctx, args):
     try:
         out = ctx.tether("py", code=code.lstrip("﻿"))  # PowerShell pipes a BOM
     except CliError as exc:
+        if exc.code == 4 and str(exc).startswith("timed out"):
+            raise CliError(f"`ue py` stopped waiting after {ctx.args.timeout:g}s, but the script is still running in "
+                           "the editor (Python holds its game thread until it ends): do not run it again. `ue wait "
+                           "idle` returns when it has finished; `ue py --timeout 600 ...` waits longer", 4) from None
         error, marker, printed = str(exc).partition(f"\n{PY_OUTPUT}\n")
         if marker:  # what the script printed before it raised, with its newlines, then the error
             print(printed.rstrip("\n"))

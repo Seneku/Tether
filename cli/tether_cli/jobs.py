@@ -7,7 +7,7 @@ import time
 
 from .core import (
     CliError, UE_SCRIPT, describe_crash, editor_executable, engine_root, filter_log, host_platform, pid_alive, process_tree,
-    read_json, recent_crash, state_dir, subprocess, uat_command, write_json,
+    read_json, recent_crash, stamped_name, state_dir, subprocess, uat_command, write_json,
 )
 from .images import window_png
 from .build import compact_diagnostics, editor_env, print_diagnostics
@@ -515,8 +515,8 @@ def cmd_game(ctx, args):
         if shot is None:
             raise CliError(f"{inst['role']} {index} has no window (started headless? ue game start --windowed)")
         title, png = shot
-        path = os.path.abspath(args.output) if args.output else os.path.join(
-            state_dir(ctx.project), "shots", time.strftime(f"game{index}-%Y%m%d-%H%M%S.png"))
+        path = os.path.abspath(args.output) if args.output else stamped_name(
+            os.path.join(state_dir(ctx.project), "shots"), f"game{index}", ".png")
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "wb") as f:
             f.write(png)

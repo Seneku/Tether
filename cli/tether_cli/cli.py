@@ -24,8 +24,17 @@ from .jobs import cmd_game, cmd_job, cmd_package
 from .play import cmd_audio, cmd_gpu, cmd_mem, cmd_sound, cmd_soak, cmd_ui, cmd_wait, cmd_world
 from .playtest import bp_command, cmd_budget, cmd_input, package_command, perf_command, pie_command
 from .hooks import cmd_hook
-from .setup import cmd_doctor, cmd_init, cmd_reload, tether_version
+from .setup import cmd_doctor, cmd_init, cmd_reload, cmd_template, new_project, tether_version
 from .selftest import cmd_ci, cmd_selftest
+
+
+def new_command(ctx, args):
+    """`ue new project` makes a project (no editor needed); every other kind is an asset in the running editor."""
+    if args.kind == "project":
+        return new_project(ctx, args)
+    if args.cpp or args.template:
+        raise CliError("--cpp and --template are for `ue new project`")
+    return cmd_new(ctx, args)
 
 
 UNREAL_ROOTS = ("Game", "Script", "Engine", "Temp", "Memory")
@@ -125,7 +134,8 @@ def build_parser():
     s.add_argument("--force", action="store_true", help="with release: release another session's lease")
     s = add("wait", cmd_wait, "wait N seconds, N seconds of game time in PIE (ue wait 4 game), or until shaders and "
                               "assets have compiled (ue wait compile)")
-    s.add_argument("what", help="seconds, compile, or grass (until landscape grass for the view has been built)")
+    s.add_argument("what", help="seconds, compile, grass (until landscape grass for the view has been built), or idle "
+                                "(until the editor ticks again: a timed-out `ue py` script finished)")
     s.add_argument("clock", nargs="?", choices=["game", "real"], default="real", help="game: PIE game time")
     s.add_argument("--max", type=float, default=900, help="with compile or grass: give up after this many seconds (900)")
     s = add("who", cmd_who, "sessions that used this editor recently, their last command, the lease, who started PIE")
@@ -350,8 +360,12 @@ def build_parser():
     s.add_argument("--interval", type=float, default=0.25, help="with --frames: seconds between captures, game time in "
                                                                 "PIE (0.25)")
     s.add_argument("--after", metavar="CMD", help="with --frames: a console command run just before the first capture")
-    s = add("look",cmd_look, "render an asset (mesh, Blueprint, material) from six angles into one contact sheet")
+    s.add_argument("--clear", action="store_true", help="with --look-at or --actor: if something blocks the view (the "
+                                                       "camera is inside a building), move it in front of that")
+    s = add("look", cmd_look, "render an asset (mesh, Blueprint, material) from six angles into one contact sheet")
     s.add_argument("asset", help="/Game/... asset path")
+    s.add_argument("--studio", action="store_true", help="neutral studio light (HDRI sky light, key light, auto "
+                                                        "exposure) instead of the level's, e.g. in a night level")
     s.add_argument("--tile", type=int, default=400, help="width of each view in pixels (400)")
     s.add_argument("--distance", type=float, default=2.6, help="camera distance in bounds radii (2.6)")
     s.add_argument("-o", "--output", help="PNG path (default Saved/Tether/shots/look-<asset>-<time>.png)")
@@ -536,11 +550,22 @@ def build_parser():
     s.add_argument("--pie", action="store_true", help="the PIE world's StateTree components, with tree and run status")
     s = add("ai", cmd_ai, "AI in PIE: movement/path, focus, perception, brain, blackboard, project getters")
     s.add_argument("target", nargs="?", help="a pawn or controller (default: one line per AI)")
-    s = add("new", cmd_new, "create an asset: blueprint, material, mi, datatable, dataasset, level, folder")
-    s.add_argument("kind", choices=["blueprint", "bp", "material", "mi", "datatable", "dataasset", "level", "folder"])
-    s.add_argument("path", help="/Game/Folder/Name")
+    s = add("new", new_command, "create an asset: blueprint, material, mi, datatable, dataasset, level, folder; or a "
+                                "project from an engine template")
+    s.add_argument("kind", choices=["blueprint", "bp", "material", "mi", "datatable", "dataasset", "level", "folder",
+                                    "project"])
+    s.add_argument("path", help="/Game/Folder/Name; with project: the new project's folder (its name is the last part)")
     s.add_argument("--parent", help="blueprint: parent class; mi: parent material; datatable: row struct; dataasset: class")
     s.add_argument("--save", action="store_true", help="save it right away")
+    s.add_argument("--cpp", action="store_true", help="with project: a C++ module (Build.cs ready for 5.8, a game mode)")
+    s.add_argument("--template", help="with project: an engine template, e.g. ThirdPerson, VehicleAdv (default Blank)")
+    s.add_argument("--engine", default="5.8", help="with project: engine version to associate (5.8)")
+    s.add_argument("--claude-plugin", action="store_true", help="with project: enable Tether's Claude Code plugin there")
+    s = add("template", cmd_template, "the engine's template content: list, or add <Pack> into /Game at its mount path")
+    s.add_argument("action", choices=["list", "add"])
+    s.add_argument("pack", nargs="?", help="with add: Vehicles, LevelPrototyping, Characters, ...")
+    s.add_argument("--level", choices=["High", "Standard"], help="with add: detail level when a pack has both")
+    s.add_argument("--dry-run", action="store_true", help="with add: say what would be copied")
     s = add("usages", cmd_usages, "where a C++ function/property/class or an asset is used: code, Blueprints, assets")
     s.add_argument("symbol", help="e.g. TryAttack, AEnemyCharacter, Health, or /Game/Path/Asset")
     s.add_argument("--max-mb", type=float, default=32, help="skip asset files bigger than this (32)")
@@ -621,6 +646,8 @@ def build_parser():
     s.add_argument("--strict", action="store_true", help="exit 1 when anything is reported")
     s.add_argument("--cpp", action="store_true", help="C++: file-private names in several .cpp files of a module "
                                                      "(unity-build collisions)")
+    s.add_argument("--mpc", action="store_true", help="material Collection Parameter nodes whose collection parameter "
+                                                     "is gone or has a new ID (they read 0); --fix re-links by name")
     s.add_argument("--fix", action="store_true", help="fix what has a safe fix (renames only with --rule naming|characters)")
     s.add_argument("--dry-run", action="store_true", help="with --fix: show the fixes only")
     s.add_argument("--save", action="store_true", help="with --fix: save the changed assets")
@@ -698,7 +725,9 @@ def build_parser():
     s = add("init", cmd_init, "set up this project: enable the needed plugins, copy the Tether editor plugin in")
     s.add_argument("--unrealsharp", action="store_true", help="also install TetherUnrealSharp (auto if Script/ exists)")
     s.add_argument("--dry-run", action="store_true", help="show what would change")
-    s = add("batch", cmd_batch, "run many ue commands in one process and editor session (one per line)")
+    s.add_argument("--claude-plugin", action="store_true", help="also enable Tether's Claude Code plugin for this "
+                                                                "folder (.claude/settings.local.json)")
+    s = add("batch",cmd_batch, "run many ue commands in one process and editor session (one per line)")
     s.add_argument("file", nargs="?", help="file of ue command lines (default: stdin); # comments")
     s.add_argument("--stop-on-error", action="store_true", help="stop at the first failing command")
     add("reload", cmd_reload, "hot-reload the Tether Python package in the editor")

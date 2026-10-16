@@ -22,11 +22,12 @@ socket, subprocess, zlib = _Lazy("socket"), _Lazy("subprocess"), _Lazy("zlib")
 CLI_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # cli/
 UE_SCRIPT = os.path.join(CLI_DIR, "ue.py")  # the entry point, for the CLI's own child processes
 TETHER = "tether.toolsets.TetherCore"
-GATED = {"py", "console", "set_props", "undo", "save", "spawn", "delete", "duplicate", "mv", "rm", "set_material", "pie_step", "set_config", "umg", "new_asset", "drop", "pie_net", "look_stage", "scatter", "bp_component", "set_savegame", "import_files", "reimport_assets", "fix_redirectors", "foliage", "landscape_edit", "mat_graph", "editor_undo", "lint_fix", "set_assets", "wp", "set_cvars", "set_niagara", "pcg", "pie_view", "pie_loop"}  # tools that need the session token (see beacon.session_token)
+GATED = {"py", "console", "set_props", "undo", "save", "spawn", "delete", "duplicate", "mv", "rm", "set_material", "pie_step", "set_config", "umg", "new_asset", "drop", "pie_net", "look_stage", "scatter", "bp_component", "set_savegame", "import_files", "reimport_assets", "fix_redirectors", "foliage", "landscape_edit", "mat_graph", "editor_undo", "lint_fix", "set_assets", "wp", "set_cvars", "set_niagara", "pcg", "pie_view", "pie_loop", "mpc_check"}  # tools that need the session token (see beacon.session_token)
 LEVELS = {"Fatal": 0, "Error": 1, "Warning": 2, "Display": 3, "Log": 4, "Verbose": 5, "VeryVerbose": 6}
 NOISE = {"LogModelContextProtocol", "LogToolsetRegistry"}  # our own transport chatter
-# Epic logs this whenever a schema is generated for a class with delegates (props, set, describe_toolset).
-NOISE_MESSAGE = re.compile(r"^Property \"\w+\" type \w+ unhandled during Json schema generation")
+# Epic logs this whenever a schema is generated for a class with delegates (props, set, describe_toolset, class).
+# Blueprint variable names can hold spaces and punctuation ("Cloud Coverage", Ultra Dynamic Sky has ~80 of them).
+NOISE_MESSAGE = re.compile(r"^Property \".+?\" type .+? unhandled during Json schema generation")
 LOG_FRAME = re.compile(r"^\[[^\]]*\]\[\s*(\d+)\]")
 TETHER_COPY = re.compile(r"[/\\]Tether[/\\]diff[/\\]")  # Saved/Tether/diff, mounted as /Temp/Tether/diff
 TOOL_ENSURE = re.compile(r"Ensure condition failed: false \|\| !HasAnyFlags\(RF_ClassDefaultObject\).*NavigationSystem\.h")
@@ -62,6 +63,16 @@ def find_project(explicit):
 
 def state_dir(project):
     return os.path.join(os.path.dirname(project), "Saved", "Tether")
+
+
+def stamped_name(folder, prefix, ext):
+    """folder/prefix-YYYYmmdd-HHMMSS-mmm.ext, made unique: two shots in one second must not overwrite each other."""
+    now = time.time()
+    base = f"{prefix}-{time.strftime('%Y%m%d-%H%M%S', time.localtime(now))}-{int(now * 1000) % 1000:03d}"
+    path, n = os.path.join(folder, base + ext), 2
+    while os.path.exists(path):
+        path, n = os.path.join(folder, f"{base}-{n}{ext}"), n + 1
+    return path
 
 
 def read_json(path):
@@ -434,6 +445,8 @@ def filter_log(lines, level="Warning", category=None, pattern=None, ignore=True,
             continue
         if "BP_TetherDeferredExec" in msg:  # building Tether's helper for commands in multiplayer PIE
             continue
+        if boot_noise(line, cat, msg):
+            continue
         if copy_frames and (TETHER_COPY.search(line) or (cat in ("BlueprintLog", "LogBlueprint", "LogK2Compiler")
                                                           and frame(line) in copy_frames)):
             continue
@@ -467,6 +480,13 @@ def filter_log(lines, level="Warning", category=None, pattern=None, ignore=True,
     return result
 
 
+def boot_noise(line, cat, msg):
+    """Errors every 5.8 editor logs while starting: the engine's own UnifiedErrorTest ends in two
+    "LogAutomationTest: Error: Condition failed" lines at frame 0. Real automation failures come later."""
+    return cat == "LogAutomationTest" and msg.strip() == "Condition failed" and \
+        (LOG_FRAME.match(line) or [None, None])[1] == "0"
+
+
 LOG_SHAPE = [  # what varies between otherwise identical messages, for `ue log --summary`
     (re.compile(r"(?:[A-Za-z]:)?[/\\](?:[\w .+-]+[/\\])+[\w .+-]*"), "<path>"),
     (re.compile(r"/(?:Game|Engine|Script|Temp|Memory)/[\w/.:-]*"), "<asset>"),
@@ -494,7 +514,8 @@ def summarize_log(lines, level="Warning", ignore=True):
         if not m:
             continue
         cat, lvl, msg = m.group(1), m.group(2) or "Log", m.group(3).strip()
-        if LEVELS[lvl] > max_level or cat in NOISE or (cat == "LogJson" and NOISE_MESSAGE.match(msg)):
+        if LEVELS[lvl] > max_level or cat in NOISE or (cat == "LogJson" and NOISE_MESSAGE.match(msg)) or \
+                boot_noise(line, cat, msg):
             continue
         if known and noise_match(known, cat, lvl, msg):
             hidden += 1
@@ -951,7 +972,13 @@ def chosen_editor(project):
 def editor_token(project, beacon):
     """The session token of the editor this beacon belongs to."""
     pid = (beacon or {}).get("pid")
-    token = read_json(os.path.join(state_dir(project), "editors", f"{pid}.token")) or {}
+    path = os.path.join(state_dir(project), "editors", f"{pid}.token")
+    token = {}
+    for attempt in range(5):  # the beacon replaces the file on every (re)start: a read can land mid-replace
+        token = read_json(path) or {}
+        if token or not os.path.exists(path):
+            break
+        time.sleep(0.05)
     if not token:  # Tether before 0.11: one session.json per project
         token = read_json(os.path.join(state_dir(project), "session.json")) or {}
         if token.get("pid") not in (None, pid):

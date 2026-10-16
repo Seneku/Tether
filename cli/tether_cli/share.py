@@ -6,6 +6,7 @@ nothing stops a person or a script that goes around it. A session is a Claude Co
 """
 import json
 import os
+import re
 import time
 
 from .core import CliError, read_json, run_git, state_dir, write_json
@@ -234,34 +235,147 @@ def changed_files(project):
     return rows
 
 
-def sort_changes(project, rows, now=None, committed=None):
-    """Split changed files by who last wrote them, from the post-edit hook's record: {"mine": [...], "shared":
-    [(path, [other sessions])], "theirs": [(path, session)], "unknown": [...]}. Shared: mine, but another session
-    also wrote it since its last commit (`committed(path)` gives that time; 0 when never committed)."""
+# ---------------------------------------------------------------- who wrote a file, from session transcripts
+
+WRITE_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
+# Tools that cannot write project files: their calls say nothing about who wrote what
+READ_ONLY_TOOLS = {"Read", "Grep", "Glob", "LS", "WebFetch", "WebSearch", "ToolSearch", "Skill", "TodoWrite",
+                   "TaskCreate", "TaskUpdate", "TaskList", "TaskGet", "AskUserQuestion", "ExitPlanMode",
+                   "EnterPlanMode", "SendMessage", "ListAgents", "ReadNotifications", "SendUserFile"}
+STAMP = re.compile(r'"timestamp":\s*"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d+))?Z?"')
+
+
+def transcript_files(project, since):
+    """{short session id: transcript path} of Claude Code sessions that worked in this project folder (or below
+    it) and wrote their transcript after `since`."""
+    root = os.path.normcase(os.path.abspath(os.path.dirname(project)))
+    slugify = lambda folder: re.sub(r"[^A-Za-z0-9]", "-", folder)
+    slug = slugify(os.path.abspath(os.path.dirname(project)))
+    # sessions working in a parent folder inside the same repository write here too (a repo with the project in it)
+    top = os.path.normcase(os.path.abspath((run_git(project, "rev-parse", "--show-toplevel", check=False) or "").strip()
+                                           or os.path.dirname(project)))
+    parents, here = set(), os.path.abspath(os.path.dirname(project))
+    while os.path.dirname(here) != here and os.path.normcase(os.path.dirname(here)).startswith(top):
+        here = os.path.dirname(here)
+        parents.add(slugify(here))
+    base = os.path.join(os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(os.path.expanduser("~"), ".claude"),
+                        "projects")
+    found = {}
+    for folder in os.listdir(base) if os.path.isdir(base) else []:
+        if folder != slug and folder not in parents and not folder.startswith(slug + "-"):
+            continue
+        for name in os.listdir(os.path.join(base, folder)):
+            path = os.path.join(base, folder, name)
+            if not name.endswith(".jsonl") or os.path.getmtime(path) < since:
+                continue
+            if folder != slug and folder not in parents:  # Tether-Sandbox is under Tether, Tether-dev is not
+                with open(path, encoding="utf-8", errors="replace") as f:
+                    head = f.read(65536)
+                cwd = re.search(r'"cwd":\s*"((?:[^"\\]|\\.)*)"', head)
+                cwd = os.path.normcase(json.loads(f'"{cwd.group(1)}"')) if cwd else ""
+                if not (cwd + os.sep).startswith(root + os.sep):
+                    continue
+            found[name[:8]] = path
+    return found
+
+
+def stamp_time(match):
+    import calendar
+    seconds = calendar.timegm(time.strptime(match.group(1), "%Y-%m-%dT%H:%M:%S"))
+    return seconds + (float("0." + match.group(2)) if match.group(2) else 0.0)
+
+
+def transcript_events(path, since):
+    """(writes [(time, normcased path)], spans [(start, end)]) from one transcript: the files its Edit/Write calls
+    wrote, and when its other tool calls (Bash, `ue py`, MCP tools...) were running. Calls before `since` are
+    skipped without parsing their JSON."""
+    pending, writes, spans = {}, [], []
+    with open(path, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            if '"tool_use"' not in line and '"tool_result"' not in line:
+                continue
+            stamp = STAMP.search(line)
+            if not stamp:
+                continue
+            t = stamp_time(stamp)
+            if t < since:
+                continue
+            try:
+                content = (json.loads(line).get("message") or {}).get("content")
+            except ValueError:
+                continue
+            for block in content if isinstance(content, list) else []:
+                if block.get("type") == "tool_use":
+                    pending[block.get("id")] = (t, block.get("name"), block.get("input") or {})
+                elif block.get("type") == "tool_result" and block.get("tool_use_id") in pending:
+                    start, name, given = pending.pop(block["tool_use_id"])
+                    if name in WRITE_TOOLS:
+                        target = given.get("file_path") or given.get("notebook_path")
+                        if target:
+                            writes.append((t, os.path.normcase(os.path.abspath(target))))
+                    elif name not in READ_ONLY_TOOLS:
+                        spans.append((start, t))
+    return writes, spans
+
+
+def transcript_owners(path, mtime, sessions):
+    """The sessions that wrote `path` at `mtime`: those whose Edit/Write named it then, else those with a
+    command running then."""
+    key = os.path.normcase(os.path.abspath(path))
+    writers = {sid for sid, (writes, _) in sessions.items() if any(p == key and abs(t - mtime) <= 5 for t, p in writes)}
+    if writers:
+        return writers
+    return {sid for sid, (_, spans) in sessions.items() if any(s - 1 <= mtime <= e + 2 for s, e in spans)}
+
+
+def sort_changes(project, rows, now=None, committed=None, sessions=None):
+    """Split changed files by who last wrote them: {"mine": [...], "shared": [(path, [other sessions])], "theirs":
+    [(path, session)], "unsure": [(path, [sessions])], "unknown": [...], "via": {how: count}}. First the
+    post-edit hook's record; for files it does not know, the Claude Code transcripts of the sessions working in
+    this folder (`sessions`: {short id: (writes, spans)}): a file goes to the session whose Edit/Write named it,
+    or whose command was running when it was written. Shared: mine, but another session also wrote it since its
+    last commit (`committed(path)` gives that time; 0 when never committed)."""
     now = time.time() if now is None else now
     edits, me = read_json(edits_path(project)) or {}, session_id()
+    claude = (os.environ.get("CLAUDE_CODE_SESSION_ID") or "")[:8]
     if committed is None:
         def committed(path):
             out = run_git(project, "log", "-1", "--format=%ct", "--", path, check=False)
             return float(out.strip()) if out and out.strip() else 0.0
-    out = {"mine": [], "shared": [], "theirs": [], "unknown": []}
+    mtimes = {}
+    for _, path in rows:
+        with __import__("contextlib").suppress(OSError):
+            mtimes[path] = os.path.getmtime(path)
+    if sessions is None:
+        since = min(mtimes.values(), default=now) - 3600
+        sessions = {sid: transcript_events(path, since) for sid, path in transcript_files(project, since).items()}
+    label = lambda sid: me if sid == claude else sid
+    out = {"mine": [], "shared": [], "theirs": [], "unsure": [], "unknown": [], "via": {}}
     for status, path in rows:
-        record = edits.get(edit_key(project, path))
-        try:
-            mtime = os.path.getmtime(path)
-        except OSError:
-            mtime = None  # deleted: no edit tool deletes, so the record cannot say who
-        if not record or mtime is None or record["time"] < mtime - 2:
-            out["unknown"].append(path)
-        elif record["session"] != me:
-            out["theirs"].append((path, record["session"]))
+        record, mtime = edits.get(edit_key(project, path)), mtimes.get(path)
+        others = set()
+        if record and mtime is not None and record["time"] >= mtime - 2:
+            owner, how = record["session"], "edit hook"
+            others = {s for s, t in (record.get("by") or {}).items() if s != me}
         else:
-            since = committed(path)
-            others = sorted(s for s, t in (record.get("by") or {}).items() if s != me and t > since)
-            if others:
-                out["shared"].append((path, others))
-            else:
-                out["mine"].append(path)
+            owners = {label(s) for s in transcript_owners(path, mtime, sessions)} if mtime is not None else set()
+            if len(owners) != 1:
+                out["unsure" if owners else "unknown"].append((path, sorted(owners)) if owners else path)
+                continue
+            owner, how = owners.pop(), "transcripts"
+        if owner != me:
+            out["theirs"].append((path, owner))
+            continue
+        since = committed(path)
+        key = os.path.normcase(os.path.abspath(path))
+        others = {s for s in others if (record.get("by") or {}).get(s, 0) > since} | {
+            label(sid) for sid, (writes, _) in sessions.items() if label(sid) != me
+            and any(p == key and t > since for t, p in writes)}
+        if others:
+            out["shared"].append((path, sorted(others)))
+        else:
+            out["mine"].append(path)
+            out["via"][how] = out["via"].get(how, 0) + 1
     return out
 
 

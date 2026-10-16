@@ -752,6 +752,29 @@ def _pie_object(ref, pawn, controller):
     return _resolve(ref, pie=True)
 
 
+def _simulating(game):
+    """Simulate-In-Editor (the level viewport shows the simulation) rather than Play. Both have a player
+    controller; Simulate's possesses a SpectatorPawn that is also its view target. A Play session whose
+    controller spectates while a camera actor is the view target (a title screen, a showroom) is Play."""
+    controller = unreal.GameplayStatics.get_player_controller(game, 0)
+    if controller is None or unreal.GameplayStatics.get_player_camera_manager(game, 0) is None:
+        return True
+    pawn = unreal.GameplayStatics.get_player_pawn(game, 0)
+    view = _try(lambda: controller.get_view_target())
+    return isinstance(pawn, unreal.SpectatorPawn) and view in (None, pawn)
+
+
+def _player_target(ref):
+    """'player', 'pawn', 'controller' (and 'player.Component') mean the PIE player's, whatever --pie says: not
+    the editor actors whose label happens to contain 'player'. None for any other reference."""
+    if ref.split(".", 1)[0].lower() not in ("player", "pawn", "controller"):
+        return None
+    if _game_world() is None:
+        raise RuntimeError(f"'{ref}' is the PIE player's: PIE is not running (ue pie start)")
+    _, pawn, controller = _pie_player()
+    return _pie_object(ref, pawn, controller)
+
+
 def _pie_point(ref, pawn, controller):
     nums = _numbers(ref)
     if nums is not None:
@@ -774,16 +797,26 @@ def _input_action(name, pawn):
              if str(a.asset_name).lower() == name.lower()]
     if found:
         return unreal.load_asset(str(found[0].package_name))
-    # Actions can also be created in C++ as subobjects of the character, e.g. CreateDefaultSubobject<UInputAction>.
-    action = _try(lambda: pawn.get_editor_property(name))
-    if isinstance(action, unreal.InputAction):
-        return action
-    action = unreal.find_object(pawn, name)
-    if isinstance(action, unreal.InputAction):
-        return action
+    # Actions can also be created in C++ as subobjects of the character or its controller
+    # (CreateDefaultSubobject<UInputAction>), or at runtime with NewObject (a player controller building its own
+    # mapping context): look on both, then at every live InputAction.
+    controller = _try(lambda: pawn.get_controller()) if pawn else None
+    for owner in (o for o in (pawn, controller) if o is not None):
+        action = _try(lambda: owner.get_editor_property(name))
+        if isinstance(action, unreal.InputAction):
+            return action
+        action = _try(lambda: unreal.find_object(owner, name))
+        if isinstance(action, unreal.InputAction):
+            return action
+    live = [a for a in unreal.ObjectIterator(unreal.InputAction) if a.get_name().lower() == name.lower()]
+    if live:  # one inside the PIE world (UEDPIE_...) first: others may be left from an earlier run
+        return sorted(live, key=lambda a: "UEDPIE" not in a.get_path_name())[0]
     names = sorted(str(a.asset_name) for a in
                    registry.get_assets_by_class(unreal.TopLevelAssetPath("/Script/EnhancedInput", "InputAction")))
-    raise RuntimeError(f"no InputAction '{name}' (assets: {', '.join(names[:12])}; or a property/subobject of the pawn)")
+    runtime = sorted({a.get_name() for a in unreal.ObjectIterator(unreal.InputAction)} - set(names))
+    raise RuntimeError(f"no InputAction '{name}' (assets: {', '.join(names[:12])}"
+                       + (f"; created at runtime: {', '.join(runtime[:12])}" if runtime else "")
+                       + "; or a property/subobject of the pawn or its controller)")
 
 
 def _input_subsystem(game):
@@ -1038,6 +1071,15 @@ def _watch_tick(_delta):
     if now - state["last"] < state["every"] or len(state["samples"]) >= _WATCH_LIMIT:
         return
     state["last"] = now
+    if now - state.get("rebind", 0) > 1.0:  # 'player...' follows the possessed pawn (spawned or swapped later)
+        state["rebind"] = now
+        pawn = _try(lambda: unreal.GameplayStatics.get_player_pawn(game, 0))
+        controller = _try(lambda: unreal.GameplayStatics.get_player_controller(game, 0))
+        for i, spec in enumerate(state["specs"]):
+            head = spec.split(".", 1)[0].lower()
+            if head in ("player", "pawn", "controller") and pawn is not None and state["bound"][i] is not pawn:
+                state["readers"][i] = _try(lambda: _watch_reader(spec, pawn, controller))
+                state["bound"][i] = pawn
     row = [round(now - state["start"], 3), round(unreal.GameplayStatics.get_time_seconds(game), 3)]
     for i, spec in enumerate(state["specs"]):
         reader = state["readers"][i]
@@ -3051,6 +3093,26 @@ _MODIFIERS = {"ctrl": "LeftControl", "control": "LeftControl", "shift": "LeftShi
               "cmd": "LeftCommand", "win": "LeftCommand"}
 
 
+# Queued `_tap` plans, run one after another from the Slate post-tick. Stashed on sys like _HELD.
+_TAPS = getattr(sys, "_tether_taps", None) or {"queue": [], "handle": None}
+sys._tether_taps = _TAPS
+
+
+def _tap_tick(_delta):
+    if not _TAPS["queue"]:
+        unreal.unregister_slate_post_tick_callback(_TAPS["handle"])
+        _TAPS["handle"] = None
+        return
+    world, plan = _TAPS["queue"][0]
+    _TAPS["frame"] += 1
+    for when, command in plan:
+        if when == _TAPS["frame"] and command:
+            _try(lambda: unreal.SystemLibrary.execute_console_command(world, command))
+    if _TAPS["frame"] >= plan[-1][0]:
+        _TAPS["queue"].pop(0)
+        _TAPS["frame"] = -1
+
+
 def _tap(world, chord, value=""):
     """Tap a key or chord ("G", "Ctrl+G") in whole engine frames. A forced key sends a new IE_Pressed on every frame
     it is held, so a legacy BindKey(IE_Pressed) fires once per frame: force it for exactly one frame (two when an
@@ -3074,16 +3136,13 @@ def _tap(world, chord, value=""):
     plan.append((frame, f"Input.-key {key}"))
     for mod in mods:
         plan.append((frame + 1, f"Input.-key {mod}"))
-    state = {"frame": -1}
-
-    def tick(_delta):
-        state["frame"] += 1
-        for when, command in plan:
-            if when == state["frame"]:
-                unreal.SystemLibrary.execute_console_command(world, command)
-        if state["frame"] >= plan[-1][0]:
-            unreal.unregister_slate_post_tick_callback(state["handle"])
-    state["handle"] = unreal.register_slate_post_tick_callback(tick)
+    plan.append((plan[-1][0] + 1, ""))  # a frame with everything up, so a tap queued next is a new press
+    # Taps queue behind each other: two `key Down tap` steps sent in one frame would otherwise overlap and
+    # read as a single press
+    _TAPS["queue"].append((world, plan))
+    if _TAPS.get("handle") is None:
+        _TAPS["frame"] = -1
+        _TAPS["handle"] = unreal.register_slate_post_tick_callback(_tap_tick)
     if mods and mapped:
         return (f"{key} is also mapped in Enhanced Input: its mapping usually consumes the key, so a legacy BindKey chord "
                 f"on {chord} may never fire (the engine's input stack, not this tap)")
@@ -3214,7 +3273,7 @@ class TetherCore(_Base):
         Returns:
             A header naming the resolved object, then one line per property.
         """
-        obj = _resolve(target, pie)
+        obj = _player_target(target) or _resolve(target, pie)
         if _LEGACY:
             return _legacy_props(obj, match, limit)
         cls = obj if isinstance(obj, unreal.Struct) else obj.get_class()
@@ -3414,8 +3473,7 @@ class TetherCore(_Base):
         game = _game_world()
         pie = game is not None
         cam = unreal.GameplayStatics.get_player_camera_manager(game, 0) if pie else None
-        # Simulate-In-Editor possesses a SpectatorPawn and shows the simulation in the level viewport
-        simulate = pie and (cam is None or isinstance(unreal.GameplayStatics.get_player_pawn(game, 0), unreal.SpectatorPawn))
+        simulate = pie and _simulating(game)
         if pie and not simulate:
             loc, rotation = cam.get_camera_location(), cam.get_camera_rotation()
         else:
@@ -3923,22 +3981,22 @@ class TetherCore(_Base):
             return f"({c.r:.2f}, {c.g:.2f}, {c.b:.2f})"
         rows, notes, counts = [], [], {}
         movable_shadows = 0
+        # Light components on any actor: Blueprints such as Ultra Dynamic Sky carry their sun, moon and sky light
+        found = []
         for actor in actors:
-            comp = None
-            if isinstance(actor, unreal.Light):
-                comp = get(actor, "light_component")
-            elif isinstance(actor, unreal.SkyLight):
-                comp = get(actor, "light_component")
-            if comp is None:
-                continue
+            for comp in _try(lambda: actor.get_components_by_class(unreal.LightComponentBase), []) or []:
+                found.append((actor, comp))
+        for actor, comp in found:
+            own = isinstance(actor, (unreal.Light, unreal.SkyLight))
+            name = _label(actor) if own else f"{_label(actor)}.{comp.get_name()}"
             kind = comp.get_class().get_name().replace("Component", "").replace("Light", " light").strip().lower()
             mobility = _enum_name(get(comp, "mobility", "?"))
             counts[mobility] = counts.get(mobility, 0) + 1
             visible = get(comp, "visible", True) and not get(actor, "hidden", False)
             shadows = get(comp, "cast_shadows", False)
-            if shadows and mobility == "movable" and not isinstance(actor, unreal.SkyLight):
+            if shadows and mobility == "movable" and not isinstance(comp, unreal.SkyLightComponent):
                 movable_shadows += 1
-            parts = [f"{kind:<15} {_label(actor):<24} {mobility}"]
+            parts = [f"{kind:<15} {name:<24} {mobility}"]
             intensity = get(comp, "intensity")
             units = _enum_name(get(comp, "intensity_units", "")) if not isinstance(comp, (unreal.DirectionalLightComponent,
                                                                                           unreal.SkyLightComponent)) else ""
@@ -3956,7 +4014,7 @@ class TetherCore(_Base):
             if radius is not None:
                 parts.append(f"radius {radius / 100:g} m")
                 if radius > 5000:
-                    notes.append(f"{_label(actor)}: {radius / 100:g} m radius (cost grows with what it reaches)")
+                    notes.append(f"{name}: {radius / 100:g} m radius (cost grows with what it reaches)")
             if isinstance(comp, unreal.SpotLightComponent):
                 parts.append(f"cone {get(comp, 'outer_cone_angle', 0):g} deg")
             parts.append("shadows" if shadows else "no shadows")
@@ -3983,11 +4041,21 @@ class TetherCore(_Base):
                              f"{get(comp, 'fog_height_falloff', 0):g}, inscattering {colour(get(comp, 'fog_inscattering_luminance') or get(comp, 'fog_inscattering_color'))}"
                              + (", volumetric fog" if get(comp, "volumetric_fog", False) else ""))
         auto_exposure = None
-        for volume in [a for a in actors if isinstance(a, unreal.PostProcessVolume)]:
+        # Post process volumes and post process components (a sky Blueprint's own): the highest priority among
+        # the unbound ones wins for each setting it overrides
+        sources = [(a, _label(a)) for a in actors if isinstance(a, unreal.PostProcessVolume)]
+        for actor in actors:
+            for comp in _try(lambda: actor.get_components_by_class(unreal.PostProcessComponent), []) or []:
+                sources.append((comp, f"{_label(actor)}.{comp.get_name()}"))
+        exposure_owners = []
+        for volume, name in sources:
             settings = get(volume, "settings")
             if settings is None:
                 continue
             bits = []
+            if (get(settings, "override_auto_exposure_method", False) or get(settings, "override_auto_exposure_bias", False)) \
+                    and get(volume, "unbound", False) and get(volume, "enabled", True) is not False:
+                exposure_owners.append((get(volume, "priority", 0), name))
             if get(settings, "override_auto_exposure_method", False):
                 method = _enum_name(get(settings, "auto_exposure_method", "")).replace("aem", "")
                 bits.append(f"exposure {method}")
@@ -3999,8 +4067,27 @@ class TetherCore(_Base):
             if get(settings, "override_bloom_intensity", False):
                 bits.append(f"bloom {get(settings, 'bloom_intensity', 0):g}")
             scope = "unbound" if get(volume, "unbound", False) else "bounded"
-            lines.append(f"post process {_label(volume)} ({scope}, priority {get(volume, 'priority', 0):g}): "
+            lines.append(f"post process {name} ({scope}, priority {get(volume, 'priority', 0):g}): "
                          + (", ".join(bits) if bits else "no exposure overrides"))
+        if len(exposure_owners) > 1:
+            exposure_owners.sort(reverse=True)
+            notes.append(f"exposure set by {len(exposure_owners)} unbound post processes; {exposure_owners[0][1]} "
+                         f"(priority {exposure_owners[0][0]:g}) wins over "
+                         + ", ".join(f"{n} ({p:g})" for p, n in exposure_owners[1:])
+                         + ": give the one you edit a higher priority")
+        # Lumen gives primitives kilometres across no reflections (nor surface-cache lighting)
+        for actor in actors:
+            if isinstance(actor, unreal.Landscape) or re.search(r"sky|dome|atmos|cloud", _label(actor), re.I):
+                continue
+            if not _try(lambda: actor.get_components_by_class(unreal.StaticMeshComponent)):
+                continue
+            extent = _try(lambda: actor.get_actor_bounds(False)[1])
+            if extent is None:
+                continue
+            size = sorted((extent.x * 2, extent.y * 2, extent.z * 2), reverse=True)
+            if size[1] > 200000:  # two axes over 2 km: a slab or a wall (sky spheres are skipped above)
+                notes.append(f"{_label(actor)}: {size[0] / 100000:.1f} x {size[1] / 100000:.1f} km; Lumen gives "
+                             "primitives this large no reflections: split it into tiles of ~1 km")
         project_auto = True
         config = os.path.join(unreal.Paths.convert_relative_path_to_full(unreal.Paths.project_config_dir()), "DefaultEngine.ini")
         try:
@@ -4696,6 +4783,11 @@ class TetherCore(_Base):
             sockets = [str(s.get_editor_property("socket_name")) for s in get("sockets", []) or []]
             slots = [(str(m.get_editor_property("material_slot_name")), m.get_editor_property("material_interface"))
                      for m in get("static_materials", []) or []]
+            sections = _try(lambda: mesh.get_num_sections(0))
+            if sections == 1 and len(slots) > 1:
+                issues.append(f"1 section in LOD 0 but {len(slots)} material slots: every triangle draws with "
+                              f"'{slots[0][0]}'. GeometryScript's create_new_static_mesh_asset_from_mesh ignores material "
+                              "IDs; copy_mesh_to_static_mesh with replace_materials splits them")
             # Faces turned inward: the signed volume of a closed mesh (Unreal's winding gives a negative one).
             desc = _try(lambda: mesh.get_static_mesh_description(0))
             if desc is not None:
@@ -6735,6 +6827,81 @@ class TetherCore(_Base):
 
     @_tool
     @staticmethod
+    def mpc_check(path: str = "/Game", fix: bool = False, token: str = "") -> str:
+        """Collection Parameter nodes whose parameter their Material Parameter Collection no longer has. A node
+        finds its parameter by ID; rewriting the collection's parameter arrays gives every parameter a new one,
+        and those nodes then read 0 (no warning in the editor session). With fix, set each stale node's
+        parameter name again (which takes the collection's current ID for that name) and recompile.
+
+        Args:
+            path: Collections under this content folder.
+            fix: Re-link stale nodes by name and recompile their materials.
+            token: Session token from Saved/Tether/editors/<pid>.token (needed with fix).
+
+        Returns:
+            JSON {collections, materials, stale: [{material, parameter, collection, why}], fixed}.
+        """
+        if fix:
+            _authorize(token)
+        registry = unreal.AssetRegistryHelpers.get_asset_registry()
+        lib = unreal.MaterialEditingLibrary
+        hard = unreal.AssetRegistryDependencyOptions(include_soft_package_references=False,
+                                                     include_hard_package_references=True,
+                                                     include_searchable_names=False, include_soft_management_references=False,
+                                                     include_hard_management_references=False)
+        found, stale, fixed, checked = 0, [], 0, set()
+        for data in registry.get_assets_by_class(unreal.TopLevelAssetPath("/Script/Engine", "MaterialParameterCollection"), True):
+            if not str(data.package_name).startswith(path.rstrip("/")):
+                continue
+            mpc = unreal.load_asset(str(data.package_name))
+            if mpc is None:
+                continue
+            found += 1
+            ids = {}
+            for param in list(mpc.get_editor_property("scalar_parameters")) + list(mpc.get_editor_property("vector_parameters")):
+                guid = re.search(r"Id=([0-9A-Fa-f]{8}-?[0-9A-Fa-f]{4}-?[0-9A-Fa-f]{4}-?[0-9A-Fa-f]{4}-?[0-9A-Fa-f]{12}|"
+                                 r"[0-9A-Fa-f]{32})", param.export_text())
+                ids[re.sub(r"[^0-9A-F]", "", guid.group(1).upper()) if guid else ""] = \
+                    str(param.get_editor_property("parameter_name"))
+            names = set(ids.values())
+            for user in registry.get_referencers(data.package_name, hard) or []:
+                asset = unreal.load_asset(str(user))
+                if not isinstance(asset, (unreal.Material, unreal.MaterialFunction)):
+                    continue
+                checked.add(str(user))
+                getter = lib.get_material_function_expressions if isinstance(asset, unreal.MaterialFunction) \
+                    else lib.get_material_expressions
+                broken = False
+                for expr in getter(asset) or []:
+                    if not isinstance(expr, unreal.MaterialExpressionCollectionParameter) or \
+                            expr.get_editor_property("collection") != mpc:
+                        continue
+                    name = str(expr.get_editor_property("parameter_name"))
+                    own = next((v for _, n, v in _try(lambda: _dump_props(expr), []) or [] if n == "ParameterId"), "")
+                    own = re.sub(r"[^0-9A-F]", "", str(own).upper())
+                    if name not in names:
+                        why = f"no parameter '{name}' in the collection (renamed or removed)"
+                    elif own and own not in ids:
+                        why = "its parameter ID is not the collection's any more (the parameter arrays were rewritten)"
+                    else:
+                        continue
+                    stale.append({"material": str(user), "parameter": name, "collection": str(data.package_name),
+                                  "why": why})
+                    if fix and name in names:
+                        # the same name again, with the change event forced: PostEditChange takes the current ID
+                        expr.set_editor_property("parameter_name", unreal.Name(name),
+                                                 unreal.PropertyAccessChangeNotifyMode.ALWAYS)
+                        broken = True
+                if broken:
+                    if isinstance(asset, unreal.Material):
+                        lib.recompile_material(asset)
+                    else:
+                        lib.update_material_function(asset)
+                    fixed += 1  # left unsaved, as lint --fix does without --save
+        return json.dumps({"collections": found, "materials": len(checked), "stale": stale, "fixed": fixed})
+
+    @_tool
+    @staticmethod
     def material(target: str, compile: bool = False, limit: int = 80) -> str:
         """A material's or material instance's parameters with their values and where each value comes from,
         or, for an actor, the materials on each of its components' slots.
@@ -7696,19 +7863,26 @@ class TetherCore(_Base):
             specs = json.loads(targets) if targets.strip().startswith("[") else [t for t in targets.split(",") if t]
             if not specs:
                 raise RuntimeError("give properties to watch, e.g. player.Health BP_Enemy_C_1.State")
-            game, pawn, controller = _pie_player()
+            game = _game_world()
+            if game is None:
+                raise RuntimeError("PIE is not running (ue pie start)")
+            pawn = unreal.GameplayStatics.get_player_pawn(game, 0)  # may come later: bound on the tick then
+            controller = unreal.GameplayStatics.get_player_controller(game, 0)
             readers, missing = [], []
             for spec in specs:
                 try:
+                    if pawn is None and spec.split(".", 1)[0].lower() in ("player", "pawn", "controller"):
+                        raise RuntimeError("no player pawn yet")
                     readers.append(_watch_reader(spec, pawn, controller))
                 except RuntimeError as exc:
                     if "has no property" in str(exc) or "not readable" in str(exc):
                         raise
-                    readers.append(None)  # an actor that may spawn later
+                    readers.append(None)  # an actor (or the pawn) that may spawn later
                     missing.append(f"{spec}: {exc}")
             now = time.time()
             state.update(world=game, specs=specs, readers=readers, retry=[now] * len(specs), every=max(0.0, every),
-                         samples=[], start=now, last=0.0, ended=None, missing=missing)
+                         samples=[], start=now, last=0.0, ended=None, missing=missing, rebind=now,
+                         bound=[pawn if r is not None else None for r in readers])
             state["handle"] = unreal.register_slate_post_tick_callback(_watch_tick)
             return f"watching {len(specs)} value(s) every {every:g}s" + (f"; not found yet: {'; '.join(missing)}"
                                                                         if missing else "")

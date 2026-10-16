@@ -61,6 +61,14 @@ missing-HUD note on `pie start`. 101 (`ui key --viewport`) is still open.
 **Done in 0.24.1**: `ue init` updating a plugin copy whose only changes are its Python (and version fields) says
 `ue reload` instead of `ue build --restart`.
 
+**Done in 0.25.0** (UnrealRacing's notes, ShooterDomination's rainy night): 103-125. `ue new project` (from the
+engine's templates, checked by building the Vehicle and Blank C++ ones), `ue template add`; 105: Tether's UBT
+builds already pass `-NoHotReloadFromIDE`, so another project's Live Coding only blocks IDE builds (doctor and
+docs say so now); `lint --mpc [--fix]`, `look --studio`, `shot --clear`, `wait idle`; `git stage --mine` reads
+session transcripts when the edit hook has no record (108: ShooterDomination's sessions do not load the plugin,
+so it had none; `init --claude-plugin` enables it). Plugin changes (111-115, 117, 119, mpc_check) need the
+projects' plugin copies updated (`ue init`, then `ue reload`).
+
 ---
 
 ## Priority 1: asked for, or blocking real work
@@ -261,6 +269,7 @@ nav, hero-placing cliffs, tuning scatter and turning scattered rocks into foliag
 | 122 | **Boot-error noise in `ue build --restart`**: "LogAutomationTest: Condition failed x2" from the engine's own UnifiedErrorTest appears on every 5.8 boot; ignore it by default | [field] | S |
 | 123 | **The struct-array copy hint fires on correct code**: `ue py` printed "elements of struct arrays are copies..." for a loop that appended each edited copy to a new array that was then written back; only warn when the edited element is never used | [field] | S |
 | 124 | **Live Coding patches do not survive a restart**: `ue close` could warn "N Live Coding builds since the last UBT build; run `ue build` now", so a project handed over (opened from the launcher) loads the code that was tested | [field] the hand-over needed a final UBT build after a dozen Live Coding fixes | S |
+| 125 | **`ue git stage --mine` from the session's own transcript**: in ShooterDomination (no hooks there, see 108) it staged nothing of 91 files the session wrote with Claude's file tools, Python scripts and `ue py` builders. Attribute a changed file to the session whose Edit/Write named it, or whose command (Bash, `ue py`) was running when it was written; when several sessions were, say so | [field] ShooterDomination's rainy-night pass | S |
 
 ### 2G. Code (C++ and C#)
 | # | Addition | Why | Effort |

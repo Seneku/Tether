@@ -7,8 +7,10 @@ import sys
 import time
 
 from .core import (
-    CliError, compact_error, editor_mode, log_end, log_path, parse_res, read_json, state_dir, unwrap, write_json, zlib,
+    CliError, compact_error, editor_mode, log_end, log_path, parse_res, read_json, stamped_name, state_dir, unwrap,
+    write_json, zlib,
 )
+from .transport import py_json
 from .calls import flush_editor_log
 
 
@@ -344,6 +346,44 @@ LOOK_VIEWS = (("front", 180, -10), ("right", 270, -10), ("back", 0, -10), ("left
               ("3/4", 225, -25))
 
 
+# `ue look --studio`: light the staged asset like the material editor's preview, whatever the level's lighting.
+# Transient actors (labelled TetherStudio_*, the level stays clean), removed after the shots.
+STUDIO = """sub = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
+c = unreal.Vector({cx}, {cy}, {cz})
+sky = sub.spawn_actor_from_class(unreal.SkyLight, c, unreal.Rotator(), transient=True)
+sky.set_actor_label('TetherStudio_Sky')
+comp = sky.get_component_by_class(unreal.SkyLightComponent)
+comp.set_mobility(unreal.ComponentMobility.MOVABLE)
+comp.set_editor_property('source_type', unreal.SkyLightSourceType.SLS_SPECIFIED_CUBEMAP)
+comp.set_editor_property('cubemap', unreal.load_asset('/Engine/EditorMaterials/AssetViewer/EpicQuadPanorama_CC+EV1'))
+comp.set_editor_property('intensity', 1.0)
+comp.recapture_sky()
+key = sub.spawn_actor_from_class(unreal.DirectionalLight, c, unreal.Rotator(roll=0, pitch=-40, yaw=135), transient=True)
+key.set_actor_label('TetherStudio_Key')
+light = key.get_component_by_class(unreal.DirectionalLightComponent)
+light.set_mobility(unreal.ComponentMobility.MOVABLE)
+light.set_editor_property('intensity', 4.0)
+light.set_editor_property('forward_shading_priority', 10)
+pp = sub.spawn_actor_from_class(unreal.PostProcessVolume, c - unreal.Vector(0, 0, 1e6), unreal.Rotator(),
+                                transient=True)  # unbound, so anywhere: far below, where its box draws in no shot
+pp.set_actor_label('TetherStudio_Exposure')
+pp.set_editor_property('unbound', True)
+pp.set_editor_property('priority', 100000.0)
+s = pp.get_editor_property('settings')
+for name, value in (('auto_exposure_method', unreal.AutoExposureMethod.AEM_HISTOGRAM),
+                    ('auto_exposure_min_brightness', -10.0), ('auto_exposure_max_brightness', 20.0),
+                    ('auto_exposure_bias', 0.0)):
+    s.set_editor_property('override_' + name, True)
+    s.set_editor_property(name, value)
+pp.set_editor_property('settings', s)
+"""
+STUDIO_REMOVE = ("sub = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)\n"  # transient: not in level lists
+                 "w = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_editor_world()\n"
+                 "for a in unreal.GameplayStatics.get_all_actors_of_class(w, unreal.Actor):\n"
+                 "    if a.get_actor_label().startswith('TetherStudio_'):\n"
+                 "        sub.destroy_actor(a)\n")
+
+
 def cmd_look(ctx, args):
     """Render an asset from six angles into one contact sheet (front, right, back / left, top, three-quarter)."""
     import math
@@ -358,6 +398,9 @@ def cmd_look(ctx, args):
     tiles = []
     try:
         cx, cy, cz = stage["center"]
+        if getattr(args, "studio", False):
+            ctx.tether("py", code=STUDIO.format(cx=cx, cy=cy, cz=cz))
+            time.sleep(1.0)  # the sky light capture and the exposure settle over a few frames
         distance = stage["radius"] * args.distance
         for name, yaw, pitch in LOOK_VIEWS:
             yr, pr = math.radians(yaw), math.radians(pitch)
@@ -369,14 +412,16 @@ def cmd_look(ctx, args):
     finally:
         with __import__("contextlib").suppress(CliError):
             ctx.tether("look_stage", asset=args.asset, action="remove")
+        if getattr(args, "studio", False):
+            with __import__("contextlib").suppress(CliError):
+                ctx.tether("py", code=STUDIO_REMOVE)
     width, height, rgb = contact_sheet(tiles, columns=3, tile_width=args.tile)
     if args.output:
         path = os.path.abspath(args.output)
     else:
         folder = os.path.join(state_dir(ctx.project), "shots")
         os.makedirs(folder, exist_ok=True)
-        path = os.path.join(folder, f"look-{args.asset.rstrip('/').rsplit('/', 1)[-1].split('.')[0]}-"
-                                    f"{time.strftime('%Y%m%d-%H%M%S')}.png")
+        path = stamped_name(folder, f"look-{args.asset.rstrip('/').rsplit('/', 1)[-1].split('.')[0]}", ".png")
     png_write(path, width, height, rgb)
     print(f"{path}  {width}x{height}")
     print(f"{args.asset} ({stage.get('class')}, about {stage['radius'] * 2 / 100:.1f} m across): "
@@ -456,7 +501,7 @@ def shot_frames(ctx, args, pie, capture):
     else:
         folder = os.path.join(state_dir(ctx.project), "shots")
         os.makedirs(folder, exist_ok=True)
-        path = os.path.join(folder, time.strftime("frames-%Y%m%d-%H%M%S.png"))
+        path = stamped_name(folder, "frames", ".png")
     png_write(path, width, height, bytes(rgb))
     print(f"{path}  {width}x{height}  {n} frames, {columns} per row")
     print(f"at +" + ", +".join(f"{s:.2f}" for s in stamps) + f" s; {note}")
@@ -464,12 +509,52 @@ def shot_frames(ctx, args, pie, capture):
     return 0
 
 
+CLEAR_VIEW = """import json, re
+s = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem)
+w = (s.get_game_world() if {pie} else None) or s.get_editor_world()
+cam = unreal.Vector({cx}, {cy}, {cz})
+spec, ignore = {target!r}, []
+nums = re.findall(r'-?[\\d.]+', spec)
+if len(nums) == 3 and re.fullmatch(r'[-\\d.,\\s]+', spec):
+    target = unreal.Vector(*map(float, nums))
+else:
+    hit = [a for a in unreal.GameplayStatics.get_all_actors_of_class(w, unreal.Actor)
+           if a.get_actor_label() == spec or a.get_name() == spec]
+    if not hit:
+        raise RuntimeError('--clear: no actor ' + spec)
+    target, ignore = hit[0].get_actor_bounds(False)[0], [hit[0]]
+r = unreal.SystemLibrary.line_trace_single(w, target, cam, unreal.TraceTypeQuery.TRACE_TYPE_QUERY1, True, ignore,
+                                           unreal.DrawDebugTrace.NONE, True)
+t = r.to_dict() if r is not None else {{}}  # HitResult's fields are protected; to_dict reads them
+out = None
+if t.get('blocking_hit'):
+    p, d = t['location'], (target - cam)
+    d = d / max(d.length(), 1.0)
+    p = p + d * 60.0
+    out = [p.x, p.y, p.z, (cam - p).length(), (t['hit_actor'].get_actor_label() if t.get('hit_actor') else '')]
+print(json.dumps(out))
+"""
+
+
+def clear_view(ctx, pose, target, pie):
+    """`ue shot --clear`: when something stands between the camera and what it looks at (the camera ended up
+    inside a building), move the camera along the view line to just in front of it."""
+    if not target:
+        raise CliError("--clear needs --look-at or --actor: the point the camera must see")
+    loc = pose["location"]
+    moved = py_json(ctx, CLEAR_VIEW.format(pie=bool(pie), cx=loc["x"], cy=loc["y"], cz=loc["z"], target=target))
+    if moved:
+        pose["location"] = {"x": moved[0], "y": moved[1], "z": moved[2]}
+        print(f"note: --clear moved the camera {moved[3] / 100:.1f} m along the view line, in front of "
+              f"{moved[4] or 'what blocked it'}")
+
+
 def shot_args(**given):
     """Arguments for calling cmd_shot from other commands: every option at its default, then `given`. A unit
     test keeps these in step with the `shot` parser, so a new option cannot break the callers again."""
     defaults = dict(actor=None, at=None, look_at=None, rot=None, annotate=False, grid_z=0, ui=False, hud=False,
                     output=None, baseline=None, compare=None, tolerance=0.5, threshold=32, res=None, frames=None,
-                    interval=0.25, after=None)
+                    interval=0.25, after=None, clear=False)
     import argparse
     return argparse.Namespace(**dict(defaults, **given))
 
@@ -493,6 +578,8 @@ def cmd_shot(ctx, args):
     pose = ctx.tether("shot_pose", actor=args.actor or "", at=args.at or "", look_at=args.look_at or "",
                       rot=args.rot or "")
     pie, simulate = pose.pop("pie", False), pose.pop("simulate", False)
+    if getattr(args, "clear", False):
+        clear_view(ctx, pose, args.look_at or args.actor, pie)
     if getattr(args, "hud", False) and not (pie and not simulate):
         raise CliError("--hud needs PIE (ue pie start): it shows the game's UMG HUD over the player's view")
     if getattr(args, "res", None):
@@ -557,7 +644,7 @@ def cmd_shot(ctx, args):
         old = sorted(f for f in os.listdir(shots) if f.endswith(".png"))
         for name in old[:-49]:  # keep the 50 newest
             os.remove(os.path.join(shots, name))
-        path = os.path.join(shots, time.strftime("shot-%Y%m%d-%H%M%S.png"))
+        path = stamped_name(shots, "shot", ".png")
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with open(path, "wb") as f:
         f.write(raw)

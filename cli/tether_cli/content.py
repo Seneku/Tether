@@ -6,7 +6,7 @@ import re
 import sys
 import time
 
-from .core import CliError, editor_live, filter_log, human_bytes, log_end, log_path, state_dir
+from .core import CliError, editor_live, filter_log, human_bytes, log_end, log_path, stamped_name, state_dir
 from .share import file_owner
 from .transport import py_json
 from .calls import flush_editor_log
@@ -686,10 +686,29 @@ def cmd_tex(ctx, args):
     return 1 if issues and args.strict else 0
 
 
+def lint_mpc(ctx, args):
+    """`ue lint --mpc [--fix]`: Collection Parameter nodes that lost their Material Parameter Collection parameter."""
+    data = ctx.tether("mpc_check", path=args.path, fix=bool(args.fix and not args.dry_run))
+    data = json.loads(data) if isinstance(data, str) else data
+    stale = data["stale"]
+    print(f"{len(stale)} stale Collection Parameter node(s) in {data['materials']} material(s) using "
+          f"{data['collections']} collection(s) under {args.path}" + (": they read 0 for these parameters" if stale else ""))
+    for row in stale[: args.limit]:
+        print(f"  {row['material']}: {row['parameter']} ({row['collection'].rsplit('/', 1)[-1]}): {row['why']}")
+    if data["fixed"]:
+        print(f"re-linked by name and recompiled {data['fixed']} material(s); unsaved (ue save, or ue changes)")
+    elif stale and not args.fix:
+        print("--fix re-links the ones whose name the collection still has, and recompiles")
+    ctx.data = data
+    return 1 if stale and args.strict and not data["fixed"] else 0
+
+
 def cmd_lint(ctx, args):
     """Content rules beyond Epic's validators, from asset registry tags (nothing is loaded)."""
     if getattr(args, "cpp", False):
         return lint_cpp(ctx, args)
+    if getattr(args, "mpc", False):
+        return lint_mpc(ctx, args)
     config_path, config = lint_config(ctx)
     if args.ignore:
         config["ignore"] = config.get("ignore", []) + args.ignore
@@ -1143,7 +1162,7 @@ def cmd_landscape(ctx, args):
         x, y, size = nums if nums else (0.0, 0.0, 0.0)
         grid = ctx.tether("landscape", action="grid", x=x, y=y, size=size, px=args.px)
         grid = json.loads(grid) if isinstance(grid, str) else grid
-        path = args.output or os.path.join(state_dir(ctx.project), "shots", time.strftime("landscape-%Y%m%d-%H%M%S.png"))
+        path = args.output or stamped_name(os.path.join(state_dir(ctx.project), "shots"), "landscape", ".png")
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
         lo, hi = landscape_png(grid, path)
         legend = ", ".join(f"{name} {LAYER_COLOURS[i % len(LAYER_COLOURS)]}" for i, name in enumerate(grid["layers"]))
@@ -1408,7 +1427,7 @@ def cmd_map(ctx, args):
             grid = None
     markers = [a for a in actors if a[2] == "marker"]
     canvas, legend, numbered = map_picture(data, args.px, centre, half, grid, numbers=len(markers) <= args.numbers)
-    path = args.output or os.path.join(state_dir(ctx.project), "shots", time.strftime("map-%Y%m%d-%H%M%S.png"))
+    path = args.output or stamped_name(os.path.join(state_dir(ctx.project), "shots"), "map", ".png")
     os.makedirs(os.path.dirname(path), exist_ok=True)
     png_write(path, args.px, args.px, bytes(canvas.px))
     geometry = len(actors) - len(markers)
