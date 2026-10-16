@@ -81,6 +81,25 @@ mismatch in `level check`), 91 (`ue game smoke`). 18 was already done (`mat --co
 9 (`ui click --at` inside a widget) needs a C++ helper: Epic's Slate inspector clicks widgets only by ref, and
 Python cannot send Slate mouse events (see 65). 101 stays open.
 
+**Done in 0.27.0** (UnrealRacing's notes 142-159): 142 `ue open --second` (a private headless editor: the
+beacon names its owner session, other sessions never pick it by default, and work in it needs no lease); 143
+`fab add` prints the listing link to check "Allows usage with AI" (the vault does not record it, and fab.com's
+listing data sits behind a bot check, so Tether does not read it); 144 `ue fab remove` (deletes through the editor;
+files it still holds are deleted at `ue close`/`ue open`); 145 keys go through Slate when a UMG widget has
+keyboard focus, plus `key --slate`/`--game` and `ui-key` steps; 146 clicks check the OS window under the point
+(another program's window) and fire `OnClicked` instead, and step files take `click --event`; 147 unlabeled
+buttons take the text under them (and the plugin's UMG list takes accessible or sibling text); 148 requests said
+once (again on change or every 10 min); 149 `ue ui --rects` and rects in `--json`; 150 `collide` reads a band of
+rows per call (160x160 with hits in ~4 s), and non-JSON replies are reported in one line; 151 `ue wait lease`;
+152 `tether.world_subsystem()` and a `ue py` hint; 153 `validate` without git takes what the editor saved since
+it started; 154 Tether's own `shot`/`HighResShot` console lookups leave `ue log`; 155 `expect`/`until` read
+values as `pie watch` does (getters, hidden properties, `.z`/`.yaw` parts); 156 keys a step file left down are
+released at its end; 157 watch CSVs name rotator columns `.pitch/.yaw/.roll`; 158 `--overlay` with no folder uses
+`Saved/Tether/staging/<session>/`, and a folder another session compiled is refused; 159 a lease lasts 5 min past
+its holder's last command. Also: the "several editors are open" note is said once per set of editors. Not tested
+live: the Slate-focus key route and text-under-button labels (Sandbox has no UMG menu), and the OS-window click
+check (needs a covered windowed editor).
+
 ---
 
 ## Priority 1: asked for, or blocking real work
