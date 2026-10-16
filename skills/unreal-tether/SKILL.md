@@ -18,7 +18,9 @@ Other Claude sessions may share this editor (`ue who` lists who ran what in the 
 Before anything that takes the editor away from them (a map rebuild, a long PIE run, `ue build --restart`,
 `ue close`), run `ue lease take --for "map rebuild + PIE"` and `ue lease release` when done; `ue status` shows the
 lease to everyone. While another session holds it, `build --restart`, `close` and `pie start` refuse with exit 5
-and say who holds it and for what: wait, or ask that session, rather than passing `--ignore-lease`. A restart or
+and say who holds it and for what: wait, or `ue lease request --for "why"` (the holder sees it on its next
+command and runs `ue lease grant` when done), rather than passing `--ignore-lease`. Asked for yours? Grant it
+when you reach a stopping point. A restart or
 close also asks for the lease when another session used the editor in the last 5 minutes. A build error in a file
 you did not touch says who last edited it ("edited by spire ... (not you)"): leave it to that session.
 `ue who --as NAME` gives your session a name the others see. Committing from a shared checkout: `ue git stage
@@ -29,6 +31,9 @@ Starting from nothing: `ue new project Folder/Name --cpp [--template VehicleAdv]
 template (Build.cs ready for 5.8, a game mode) and runs `ue init`; `ue template add Vehicles` copies template
 content (cars, LevelPrototyping, mannequins) to the /Game path its packages expect. `ue init --claude-plugin`
 makes later sessions in that folder load Tether (no plugin there: no `ue` on PATH, no edit hooks).
+
+With several editors open, each session keeps talking to the one it opened or used last (`--pid` changes
+that), so an editor the user opens mid-session does not take your commands.
 
 Several reads or edits in a row? Put them in one `ue batch` (one command per line, from stdin or a file):
 one process and one editor session for all of them.
@@ -105,6 +110,8 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
   `ue map --footprints` writes the collidable geometry as data (each mesh's turned outline, top and bottom) for
   minimaps and layout checks. `ue map open /Game/Maps/X` switches the editor's map (`--save`/`--discard` when the
   current one has unsaved edits).
+- Why AI (or players) get stuck somewhere: `ue collide x,y,r --z 100` draws what blocks at that height around the
+  point, coloured by class, from overlap tests: generated roads, junction walls and raised medians show up.
 - On terrain, never guess heights: `ue spawn /Game/X/SM_Rock --at 1200,-300,0 --ground` (or `ue drop Rock1 Rock2`,
   `--align` to follow the slope) puts things on the surface below. A structure built of separate pieces (walls,
   roof) goes down as one: `ue drop Wall1 Wall2 Roof --group` (attached actors come along); it says how much the
@@ -146,6 +153,8 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
   reads a PCG graph; `ue pcg` lists the level's PCG components; `ue pcg generate ForestVolume --seed 3`.
 - Before changing a class or Blueprint: `ue class AEnemyCharacter` (or `ue class BP_Door`) shows its parents, own
   properties and functions, a Blueprint's components/variables/events, what derives from it and what uses it.
+  A big one (Ultra Dynamic Sky: 900 variables): `ue class X --functions --grep cloud` (parameters and types,
+  what `call_method` needs), `--vars`, `--components`, `--events`.
 - "Can't interact with / pick up / shoot X": `ue pie start`, aim with `ue pie do "look X"`, then `ue trace --channel
   <the channel the code traces on>` (what blocks first, and each component's response); `ue collision X` shows its
   profiles and per-channel responses.
@@ -221,8 +230,13 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
   for everyone sharing it. `ue build --check` runs the same check alone, with the editor up and Live
   Coding untouched (it misses editor-only modules and WITH_EDITOR code). `ue build --check --files
   Source/X/A.cpp Source/X/B.h` compiles just those files (a header: the .cpp files that include it), with no
-  link and no lease needed, for checking your own work while another session holds the editor. Do not
+  link and no lease needed, for checking your own work while another session holds the editor. New classes
+  while another session's Live Coding builds? Keep them out of Source/ (its builds compile every changed file
+  there): stage them as staging/Source/<Module>/X.h and run `ue build --check --overlay staging/`, which
+  compiles a copy of the project with them on top (incremental after the first run). Do not
   compile the editor target with UBT `-Module=` while the editor runs: Live Coding breaks until a restart.
+- Live Coding patches live only in the editor that loaded them: `ue status` names other editors running
+  without them, and `ue build --when-closed` queues the UBT build for when every editor has closed.
 
 ## C# changes (UnrealSharp projects: a `Script/` folder plus `Plugins/UnrealSharp`)
 - Edit `.cs` files under `Script/`, then run `ue build`. It hot-reloads in ~1 s, covering function
@@ -262,7 +276,7 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
   compared with the editor's current version) or between two (`--to rev2`): Blueprint variables, components,
   defaults and graph text, DataTable rows, map actors. Use it to review your own asset edits before
   committing, and to understand someone else's commit (`ue diff X <sha>~1 --to <sha>`).
-- `ue find <regex> [--class StaticMesh] [--under /Game/x]` to locate assets; `ue refs <asset>` before deleting
+- `ue find <regex> [--class StaticMesh] [--under /Game/x]` (or a path: `ue find "/Game/X/Presets/*"`) to locate assets; `ue refs <asset>` before deleting
   or renaming one (what uses it), `--deps` for what it uses.
 - `ue api <Class> [regex]` before writing editor Python: real method signatures and property names in a
   few lines (`ue api Actor.set_actor_location` for one member). Cheaper than guessing.
@@ -392,6 +406,8 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
   In `ue pie do`: `click <label>`, `expect-ui <text>`,
   `ui-gone <text>`. Clicks are real mouse clicks at the widget, so whatever is on top receives them; labels are
   stable, refs (b12) change between reads. Canvas-drawn HUD text is not a widget: check it with `ue shot`.
+  Step files also take `log <regex> count >= 6` and `log in order: lap 1, lap 2, finished`, and `shot` with
+  `ue shot`'s options (`shot --at x,y,z --rot -89,0,0`).
 - `ue pie watch Actor.Component.Property` samples a component's property (the component by its property name,
   e.g. `SDPlayerCharacter_0.CharacterMovement.MovementBase`); `ue props X --match Name --pie` reads properties
   Python calls protected. After Live Coding patched class layouts, `ue pie start` warns: UMG and replication
@@ -420,7 +436,11 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
   path stops; exit 1 if any pair is not a full path; `--m` for metres, `--agent <pawn>`); add `--pie` for
   runtime-generated navmeshes. Run the pairs for new routes after every `world build nav`.
 - Spawn points, pickups, teleports: `ue world probe x,y,z|actor ...` says whether each point is inside geometry,
-  what is within `--radius`, and whether the navmesh reaches it (exit 1 if any is inside or off the navmesh).
+  what is within `--radius` (distance to the nearest collision), and whether the navmesh reaches it (exit 1 if
+  any is inside or off the navmesh).
+- Before a package or a hand-over: `ue game smoke` opens each map in a headless `-game` process for a few seconds
+  and reports errors, Accessed None and crashes that PIE hides (editor-only components are null there).
+- A short effect from a console command: `ue exec "SD.Flash" --shot` captures the frame right after it.
 - `ue wait 4 game` waits 4 s of game time in PIE between `ue exec` calls (`ue wait 4`: wall-clock seconds).
 - Leaks and rare failures: `ue soak --minutes 10 -f tests/play/x.txt` loops a step file (or wanders) and
   reports the memory trend, frame rate and errors. Run it in the background (it blocks for the duration).
@@ -457,6 +477,11 @@ editor lease (`ue lease`).
   note saying whether `ue build` (Live Coding) or `ue build --restart` will be needed.
 
 ## Python gotchas (UE 5.8)
+- A UFUNCTION that is CallInEditor but not BlueprintCallable has no Python name (`obj.rebuild_junction()` raises
+  AttributeError): `obj.call_method('RebuildJunction')`; `ue py` says so when it sees that error. The same for
+  Actor.AddComponentByClass: `actor.call_method('AddComponentByClass', (cls, False, unreal.Transform(), False))`.
+- During PIE, Editor Scripting (EditorActorSubsystem, EditorLevelLibrary) acts on the edited level, not the
+  game: `ue pie run -c` for the game world (`ue py` notes it).
 - Material Parameter Collections: never rewrite `scalar_parameters`/`vector_parameters` with new structs. Each
   parameter gets a new ID and every material's Collection Parameter node keeps the old one, reading 0 with no
   warning. Edit values in place; `ue lint --mpc` finds stale nodes and `--fix` re-links them by name.

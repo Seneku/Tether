@@ -1,6 +1,7 @@
 """Thin commands over one editor tool each: tools, call, py, props, set, spawn and friends."""
 import contextlib
 import difflib
+import fnmatch
 import json
 import os
 import re
@@ -102,6 +103,11 @@ PY_PITFALLS = [  # (pattern in `ue py` code, what goes wrong): engine behaviour 
     (re.compile(r"MaterialExpressionFontSampleParameter"),
      "a FontSampleParameter compiles only with a default font set (set_editor_property('font', ...))"),
 ]
+EDITOR_WORLD_API = re.compile(r"EditorActorSubsystem|EditorLevelLibrary|LevelEditorSubsystem|get_editor_world|"
+                              r"get_all_level_actors|spawn_actor_from_(?:class|object)|ScopedEditorTransaction")
+PIE_PY_NOTE = ("PIE is running: Editor Scripting calls act on the edited level, not the game (and some refuse during "
+               "PIE), so a script can take the wrong branch. For the game world: `ue pie run -c \"...\"` "
+               "(tether.world(), tether.player()); or `ue pie stop` first")
 STRUCT_LOOP = re.compile(r"for\s+(\w+)\s+in\s+[^\n]*get_editor_property\([^\n]*:\s*\n((?:[ \t]+[^\n]*\n?)+)")
 
 
@@ -133,7 +139,8 @@ def cmd_py(ctx, args):
         code = sys.stdin.read()
     else:
         code = " ".join(args.code)
-    for note in py_pitfalls(code) + [lease_note(ctx.project)]:
+    in_pie = (ctx.beacon or {}).get("pie") and EDITOR_WORLD_API.search(code)
+    for note in py_pitfalls(code) + [lease_note(ctx.project)] + ([PIE_PY_NOTE] if in_pie else []):
         if note:
             print(note if note.startswith("note: ") else f"note: {note}", file=sys.stderr)
     start = log_end(ctx.project)
@@ -181,6 +188,12 @@ PYTHON_PROPERTY_NAMES = ("import re as _r, json as _j\n"
 PROTECTED_PROPERTY = re.compile(r"Property '(\w+)' for attribute '\w+' on '(\w+)' is protected and cannot be read")
 
 
+MISSING_ATTRIBUTE = re.compile(r"AttributeError: '(\w+)' object has no attribute '(\w+)'")
+UFUNCTION_EXISTS = ("_c = getattr(unreal, {cls!r}, None)\n"
+                    "_c = _c.static_class() if _c is not None and hasattr(_c, 'static_class') else None\n"
+                    "print(bool(_c and unreal.find_object(_c, {fn!r})))")
+
+
 def property_name_hint(ctx, error):
     """For "Failed to find property": the class's Python property names closest to the one asked for. The
     pythonizer drops a bool's b prefix, then an In prefix (bInOrder is `order`), so the C++ name is no guide.
@@ -189,6 +202,17 @@ def property_name_hint(ctx, error):
     if p:
         return (f"{p.group(2)}.{p.group(1)} is protected from Python, but `ue props <object> --match {p.group(1)}` "
                 "(--pie in PIE) reads it, and `ue pie watch Actor.{0}` samples it".format(p.group(1)))
+    a = MISSING_ATTRIBUTE.search(error)
+    if a:  # a UFUNCTION Python has no name for (CallInEditor without BlueprintCallable)
+        cls, attr = a.groups()
+        camel = "".join(part[:1].upper() + part[1:] for part in attr.split("_"))
+        try:
+            found = str(ctx.tether("py", code=UFUNCTION_EXISTS.format(cls=cls, fn=camel))).strip().endswith("True")
+        except CliError:
+            found = False
+        if found:
+            return (f"{cls}.{camel} is a UFUNCTION Python has no name for (CallInEditor or not BlueprintCallable): "
+                    f"call it with obj.call_method('{camel}') (arguments as a tuple: call_method('{camel}', (a, b)))")
     m = MISSING_PROPERTY.search(error)
     if not m:
         return None
@@ -627,7 +651,29 @@ def cmd_savegame(ctx, args):
 
 
 def cmd_find(ctx, args):
-    print(ctx.tether("find", query=args.query or "", cls=args.cls or "", under=args.under, limit=args.limit))
+    """`ue find <regex on names>`, or a package path: a folder (/Game/X/Presets: what is in it) or a glob
+    (/Game/X/Presets/*, /Game/*/M_Neon*), matched on the whole package path."""
+    query = args.query or ""
+    if not query.startswith("/"):
+        print(ctx.tether("find", query=query, cls=args.cls or "", under=args.under, limit=args.limit))
+        return 0
+    pattern = query.rstrip("/")
+    if not any(c in pattern for c in "*?["):  # a folder: everything under it
+        print(ctx.tether("find", query="", cls=args.cls or "", under=pattern, limit=args.limit))
+        return 0
+    parts = pattern.split("/")
+    fixed = parts[: next(i for i, p in enumerate(parts) if any(c in p for c in "*?["))]
+    under = "/".join(fixed) or "/Game"
+    found = ctx.tether("find", query="", cls=args.cls or "", under=under, limit=1000000)
+    rows = [line for line in str(found).splitlines()[1:] if line.startswith("/")]
+    keep = [r for r in rows if fnmatch.fnmatch(r.split("  ")[0].lower(), pattern.lower())]
+    print(f"{len(keep)} assets matching {pattern}" + (f" (class /{args.cls}/)" if args.cls else "")
+          + ("" if keep else f"; {len(rows)} under {under}"))
+    for row in keep[: args.limit]:
+        print(row)
+    if len(keep) > args.limit:
+        print(f"... +{len(keep) - args.limit} more (--limit)")
+    ctx.data = [r.split("  ")[0] for r in keep]
     return 0
 
 
@@ -646,13 +692,17 @@ def cmd_actors(ctx, args):
     return 0
 
 
-def cmd_exec(ctx, args):
+def cmd_exec(ctx, args, after=None):
+    """A console command and the log lines it produced. `after` runs right after the command (before waiting for
+    its output): `ue exec ... --shot` captures a short-lived effect on the next frame."""
     note = lease_note(ctx.project)
     if note:
         print(note, file=sys.stderr)
     start = log_end(ctx.project)
     command = " ".join(args.command)
     world = ctx.tether("console", command=command, pie=args.pie)
+    if after:
+        after()
     # In multiplayer PIE the command runs on the world's next tick (so RPCs replicate), and what it causes on the
     # other side lands a frame or two later: wait for it to run, then a little longer.
     deadline = time.time() + (8 if "queued" in str(world) else 0)
@@ -810,7 +860,8 @@ def add_log_ignore(ctx, pattern, why=None):
     return 0
 
 
-LEVEL_KINDS = ("floating", "buried", "stacked", "invisible blocker", "below kill z", "outside", "stationary lights")
+LEVEL_KINDS = ("floating", "buried", "stacked", "invisible blocker", "below kill z", "outside", "stationary lights",
+               "collision profile")
 
 
 def level_lines(data, per_kind=10):
@@ -878,7 +929,9 @@ def cmd_tree(ctx, args):
 
 
 def cmd_class(ctx, args):
-    print(ctx.tether("class_info", name=args.name, limit=args.limit))
+    section, grep = getattr(args, "section", None), getattr(args, "grep", None)
+    limit = args.limit if not section or args.limit != 30 else 500  # one list: show it whole unless told
+    print(ctx.tether("class_info", name=args.name, limit=limit, section=section or "-", grep=grep or "-"))
     return 0
 
 

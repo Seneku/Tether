@@ -1,4 +1,5 @@
 """Shared plumbing: project and beacon files, engine discovery, ports, dialogs, crash reports, git, rendering, logs."""
+import contextlib
 import importlib
 import json
 import os
@@ -81,6 +82,26 @@ def read_json(path):
             return json.load(f)
     except (OSError, ValueError):
         return None
+
+
+def read_json_retry(path, tries=5):
+    """read_json for a file another process replaces all the time (an editor's beacon, every heartbeat): on
+    Windows a read that lands on the replace fails, so try again before calling it gone."""
+    for attempt in range(tries):
+        data = read_json(path)
+        if data is not None or not os.path.exists(path):
+            return data
+        time.sleep(0.02 * (attempt + 1))
+    return None
+
+
+def session_id():
+    """This process's session: UE_SESSION, else the Claude Code session (short id), else "user"."""
+    explicit = os.environ.get("UE_SESSION")
+    if explicit:
+        return explicit
+    claude = os.environ.get("CLAUDE_CODE_SESSION_ID")
+    return claude[:8] if claude else "user"
 
 
 def write_json(path, data):
@@ -913,7 +934,7 @@ def editor_beacons(project):
     found = {}
     for name in os.listdir(folder) if os.path.isdir(folder) else []:
         if name.endswith(".json"):
-            beacon = read_json(os.path.join(folder, name))
+            beacon = read_json_retry(os.path.join(folder, name))
             if beacon and beacon.get("pid"):
                 found[beacon["pid"]] = beacon
     legacy = read_json(os.path.join(state_dir(project), "editor.json"))
@@ -953,20 +974,41 @@ def live_editors(project):
 
 def chosen_editor(project):
     """The editor the CLI talks to, or the last one seen when none is running (for status and crash
-    reports). With several open: --pid / UE_EDITOR_PID if given, else the one the user opened rather
-    than one `ue open` launched, else the most recently started."""
+    reports). With several open: --pid / UE_EDITOR_PID if given, else the one this session used last (sticky,
+    so an editor the user opens mid-session does not take over its commands), else the one the user opened
+    rather than one `ue open` launched, else the most recently started."""
     wanted = os.environ.get("UE_EDITOR_PID")
     beacons = editor_beacons(project)
     live = [b for b in beacons if editor_process(b.get("pid"))]
     if wanted:
         match = next((b for b in beacons if str(b.get("pid")) == wanted), None)
         if match is None or match not in live:
+            match = next((b for b in editor_beacons(project) if str(b.get("pid")) == wanted), None)  # a read race
+        if match is None or not editor_process(match.get("pid")):
             running = ", ".join(str(b["pid"]) for b in live) or "none"
             raise CliError(f"no editor with pid {wanted} is open on this project (running: {running})", 2)
+        remember_target(project, match)
         return match
     if live:
-        return sorted(live, key=lambda b: (bool(b.get("launched_by_tether")), -b.get("started", 0)))[0]
+        sticky = (read_json(targets_path(project)) or {}).get(session_id())
+        choice = next((b for b in live if b.get("pid") == sticky), None) or \
+            sorted(live, key=lambda b: (bool(b.get("launched_by_tether")), -b.get("started", 0)))[0]
+        remember_target(project, choice)
+        return choice
     return beacons[0] if beacons else None
+
+
+def targets_path(project):
+    return os.path.join(state_dir(project), "targets.json")
+
+
+def remember_target(project, beacon):
+    """The editor this session talks to, kept so it stays this session's default while it runs."""
+    targets = read_json(targets_path(project)) or {}
+    if targets.get(session_id()) != beacon.get("pid"):
+        targets[session_id()] = beacon.get("pid")
+        with contextlib.suppress(OSError):
+            write_json(targets_path(project), targets)
 
 
 def editor_token(project, beacon):

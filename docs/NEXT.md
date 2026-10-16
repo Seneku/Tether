@@ -69,6 +69,18 @@ session transcripts when the edit hook has no record (108: ShooterDomination's s
 so it had none; `init --claude-plugin` enables it). Plugin changes (111-115, 117, 119, mpc_check) need the
 projects' plugin copies updated (`ue init`, then `ue reload`).
 
+**Done in 0.26.0** (UnrealRacing's notes 126-141, plus older open items): 126 `build --check --overlay` (a
+shadow copy of the project's code under Saved/Tether/shadow, ~30 s incremental on Sandbox); 127 `lease request`/
+`grant`; 128 `find` path globs; 129 `class --functions|--vars|... --grep` with Blueprint function signatures
+(from the function graph's pins: a UFunction's parameters are not readable from Python); 130, 131 (each session's
+editor is sticky), 132, 133 (`status` names editors without the Live Coding patches; `build --when-closed`), 134
+(`ue collide`; footprints per procedural component and instance), 135, 136 (`obj dump` prints arrays one element
+per line, `Name(i)=`, which the hidden-property reader skipped; empty arrays print nothing), 137-141; and from
+older lists 3 (`ue py` in PIE), 5 (`exec --shot`), 9b (`pie watch Actor.Mesh@bone`), 90 (collision profile
+mismatch in `level check`), 91 (`ue game smoke`). 18 was already done (`mat --compile` compiles a clean copy).
+9 (`ui click --at` inside a widget) needs a C++ helper: Epic's Slate inspector clicks widgets only by ref, and
+Python cannot send Slate mouse events (see 65). 101 stays open.
+
 ---
 
 ## Priority 1: asked for, or blocking real work

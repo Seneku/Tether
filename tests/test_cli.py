@@ -619,7 +619,11 @@ class Editors(unittest.TestCase):
             with unittest.mock.patch.dict(os.environ, {"UE_EDITOR_PID": "999999"}):
                 with self.assertRaises(ue.CliError):
                     ue.chosen_editor(project.uproject)
-            self.assertEqual(ue.editor_label(ue.chosen_editor(project.uproject)), f"pid {os.getppid()}, opened by hand")
+            # the editor a session used last stays its default (an editor opened by hand later does not take over)
+            self.assertEqual(ue.chosen_editor(project.uproject)["pid"], os.getpid())
+            with unittest.mock.patch.dict(os.environ, {"UE_SESSION": "another"}):  # a fresh session: the user's
+                self.assertEqual(ue.editor_label(ue.chosen_editor(project.uproject)),
+                                 f"pid {os.getppid()}, opened by hand")
         finally:
             project.close()
 
@@ -3075,3 +3079,147 @@ class UnrealRacingRound(unittest.TestCase):
         self.assertIn("in front of Tower", out.getvalue())
         with self.assertRaises(ue.CliError):
             ue.clear_view(FakeCtx(), pose, None, False)
+
+
+class UnrealRacingRound2(unittest.TestCase):
+    """0.26: UnrealRacing's notes 126-141, and older open items."""
+
+    def setUp(self):
+        self.project = Project()
+
+    def tearDown(self):
+        self.project.close()
+
+    def test_shadow_project_overlays_and_stays_incremental(self):
+        p = self.project.uproject
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump({"FileVersion": 3, "AdditionalPluginDirectories": ["../Plugins"]}, f)
+        self.project.write("Source/Game/A.cpp", "int a;\n")
+        self.project.write("Plugins/Kit/Kit.uplugin", "{}")
+        self.project.write("Plugins/Kit/Build/Scripts/Kit.csproj", "<x/>")
+        self.project.write("Plugins/Kit/Binaries/Win64/Kit.dll", "bin")
+        stage = os.path.join(self.project.root, "stage")
+        os.makedirs(os.path.join(stage, "Source", "Game"))
+        with open(os.path.join(stage, "Source", "Game", "New.h"), "w") as f:
+            f.write("#pragma once\n")
+        shadow, overlaid = ue.shadow_project(p, stage, "me")
+        root = os.path.dirname(shadow)
+        self.assertEqual(overlaid, ["Source/Game/New.h"])
+        for rel in ("Source/Game/A.cpp", "Source/Game/New.h", "Plugins/Kit/Build/Scripts/Kit.csproj"):
+            self.assertTrue(os.path.isfile(os.path.join(root, rel)), rel)
+        self.assertFalse(os.path.exists(os.path.join(root, "Plugins", "Kit", "Binaries")))
+        descriptor = ue.read_json(shadow)
+        self.assertTrue(os.path.isabs(descriptor["AdditionalPluginDirectories"][0]))
+        before = os.path.getmtime(os.path.join(root, "Source", "Game", "A.cpp"))
+        time.sleep(0.05)
+        os.remove(os.path.join(stage, "Source", "Game", "New.h"))
+        with open(os.path.join(stage, "Source", "Game", "Other.h"), "w") as f:
+            f.write("#pragma once\n")
+        ue.shadow_project(p, stage, "me")
+        self.assertEqual(os.path.getmtime(os.path.join(root, "Source", "Game", "A.cpp")), before)  # untouched
+        self.assertFalse(os.path.exists(os.path.join(root, "Source", "Game", "New.h")))  # gone from the overlay
+        with self.assertRaises(ue.CliError):
+            ue.shadow_project(p, os.path.join(self.project.root, "empty"), "me")
+
+    def test_lease_request_and_grant(self):
+        p = self.project.uproject
+        with unittest.mock.patch.dict(os.environ, {"UE_SESSION": "holder"}):
+            ue.take_lease(p, "map rebuild", 15)
+        with unittest.mock.patch.dict(os.environ, {"UE_SESSION": "asker"}):
+            self.assertEqual(ue.request_lease(p, "build --restart", 10)["session"], "holder")
+            with self.assertRaises(ue.CliError):
+                ue.grant_lease(p)  # not the holder
+        with unittest.mock.patch.dict(os.environ, {"UE_SESSION": "holder"}):
+            self.assertIn("asker asks for the editor", ue.lease_messages(p)[0])
+            lease = ue.grant_lease(p)
+        self.assertEqual((lease["session"], lease["what"]), ("asker", "build --restart"))
+        self.assertEqual(ue.lease_requests(p), [])
+        with unittest.mock.patch.dict(os.environ, {"UE_SESSION": "asker"}):
+            self.assertIn("granted by holder", ue.lease_messages(p)[0])
+            self.assertEqual(ue.lease_messages(p), [])  # said once
+
+    def test_find_with_a_path_glob(self):
+        ctx = FakeCtx("9 assets under /Game/UDS\n/Game/UDS/Presets/P_Rain  DataAsset\n/Game/UDS/Presets/P_Snow  "
+                      "DataAsset\n/Game/UDS/Blueprints/BP_Sky  Blueprint")
+        args = argparse.Namespace(query="/Game/UDS/Presets/*", cls=None, under="/Game", limit=30)
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            ue.cmd_find(ctx, args)
+        self.assertEqual(ctx.calls[0][1]["under"], "/Game/UDS/Presets")
+        self.assertIn("2 assets matching /Game/UDS/Presets/*", out.getvalue())
+        self.assertNotIn("BP_Sky", out.getvalue())
+        with contextlib.redirect_stdout(io.StringIO()):
+            ue.cmd_find(ctx, argparse.Namespace(query="/Game/UDS/Presets", cls=None, under="/Game", limit=30))
+        self.assertEqual(ctx.calls[-1][1]["under"], "/Game/UDS/Presets")  # a folder: what is in it
+
+    def test_step_file_shot_and_log_counts(self):
+        args = ue.shot_step_args("--at 90000,55500,3800 --rot -89,0,0", False)
+        self.assertEqual((args.at, args.rot, args.output), ("90000,55500,3800", "-89,0,0", None))
+        self.assertEqual(ue.shot_step_args("out.png --hud", False).output, "out.png")
+        with self.assertRaises(ue.CliError):
+            ue.shot_step_args("--zoom 3", False)
+        lines = [stamped("LogRace: gate 1"), stamped("LogRace: finished A"), stamped("LogRace: finished B")]
+        self.assertEqual(ue.log_check("finished count >= 2", lambda: lines)()[0], True)
+        self.assertEqual(ue.log_check("finished count == 3", lambda: lines)()[0], False)
+        self.assertTrue(ue.log_check("in order: gate 1, finished A, finished B", lambda: lines)()[0])
+        ok, detail = ue.log_check("in order: finished B, gate", lambda: lines)()
+        self.assertFalse(ok)
+        self.assertIn("missing /gate/", detail)
+
+    def test_sticky_target_and_beacon_retry(self):
+        path = self.project.write("Saved/Tether/x.json", "{bad")
+        self.assertIsNone(ue.read_json_retry(path, tries=2))
+        self.assertIsNone(ue.read_json_retry(os.path.join(self.project.root, "missing.json")))
+        with open(path, "w") as f:
+            f.write('{"pid": 3}')
+        self.assertEqual(ue.read_json_retry(path), {"pid": 3})
+
+    def test_stale_code_note(self):
+        p = self.project.uproject
+        ue.mark_green(p, live=True, pid=111)
+        self.assertIsNone(ue.stale_code_note(p, {"pid": 111}))
+        self.assertIn("without the 1 Live Coding patch(es) made in pid 111", ue.stale_code_note(p, {"pid": 222}))
+        ue.mark_green(p)
+        self.assertIsNone(ue.stale_code_note(p, {"pid": 222}))
+
+    def test_smoke_maps_and_parsers(self):
+        self.project.write("Content/Maps/L_A.umap", "")
+        self.project.write("Content/Developers/me/L_Test.umap", "")
+        self.project.write("Content/__ExternalActors__/Maps/L_A/x.uasset", "")
+        maps, skipped = ue.smoke_maps(self.project.uproject, None)
+        self.assertEqual((maps, skipped), (["/Game/Maps/L_A"], 0))
+        self.assertEqual(ue.smoke_maps(self.project.uproject, "/Game/A, /Game/B")[0], ["/Game/A", "/Game/B"])
+        parser = ue.build_parser()
+        self.assertEqual(parser.parse_args(["class", "BP_Sky", "--functions", "--grep", "cloud"]).section, "functions")
+        self.assertEqual(parser.parse_args(["build", "--check", "--overlay", "stage"]).overlay, "stage")
+        self.assertTrue(parser.parse_args(["build", "--when-closed"]).when_closed)
+        self.assertEqual(parser.parse_args(["exec", "stat", "unit", "--shot"]).shot, "")
+        self.assertEqual(parser.parse_args(["lease", "grant", "asker"]).to, "asker")
+
+    def test_exec_shot_runs_after_the_command(self):
+        order = []
+        args = ue.build_parser().parse_args(["exec", "SD.Flash", "--shot", "a.png"])
+        with unittest.mock.patch.object(ue.cli, "cmd_exec", side_effect=lambda ctx, a, after=None: (
+                order.append("exec"), after())), \
+                unittest.mock.patch.object(ue.cli, "cmd_shot", side_effect=lambda ctx, a: order.append(a.output)):
+            ue.exec_command(FakeCtx(), args)
+        self.assertEqual(order, ["exec", "a.png"])
+
+    def test_py_hints_round(self):
+        self.assertTrue(ue.EDITOR_WORLD_API.search("unreal.get_editor_subsystem(unreal.EditorActorSubsystem)"))
+        self.assertFalse(ue.EDITOR_WORLD_API.search("tether.world()"))
+        ctx = FakeCtx("True")
+        hint = ue.property_name_hint(ctx, "AttributeError: 'NRRoadNode' object has no attribute 'rebuild_junction'")
+        self.assertIn("call_method('RebuildJunction')", hint)
+
+    def test_collide_picture(self):
+        ctx = FakeCtx()
+        ctx.project, ctx.beacon = self.project.uproject, {}
+        data = {"n": 2, "grid": [[1, 0], [0, 2]], "classes": {"NRRoadNode": [1, 1, ["J_1"]], "Wall": [2, 1, ["W"]]}}
+        args = argparse.Namespace(where="0,0,100", m=False, step=100.0, z=None, half=40.0, pie=False,
+                                  output=os.path.join(self.project.root, "c.png"))
+        with unittest.mock.patch.object(ue.content, "py_json", return_value=data), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(ue.cmd_collide(ctx, args), 0)
+        self.assertTrue(os.path.isfile(args.output))
+        self.assertIn("50% blocked", out.getvalue())
+        self.assertIn("NRRoadNode: 1 cell(s), e.g. J_1", out.getvalue())

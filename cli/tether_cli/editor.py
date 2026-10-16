@@ -11,13 +11,14 @@ from .core import (
     subprocess, write_json,
 )
 from .share import (
-    ACTIVE_MINUTES, active_lease, ago, changed_files, check_shared, describe_lease, duration, lease_note, others_edits,
-    pie_owner, recent_sessions, release_lease, session_id, session_label, session_names, set_session_name,
-    sort_changes, take_lease,
+    ACTIVE_MINUTES, active_lease, ago, changed_files, check_shared, describe_lease, drop_request, duration,
+    grant_lease, lease_note, lease_requests, others_edits, pie_owner, recent_sessions, release_lease, request_lease,
+    session_id, session_label, session_names, set_session_name, sort_changes, take_lease,
 )
 from .build import (
-    classify_changes, compile_check, csharp_changes, csharp_layout, csharp_reload_build, editor_env, live_coding_build,
-    live_patches,
+    classify_changes, compile_check, compile_overlay, csharp_changes, csharp_layout, csharp_reload_build, editor_env,
+    live_coding_build,
+    live_patches, stale_code_note,
     uat_user_solution, ubt_build,
 )
 
@@ -66,6 +67,8 @@ def cmd_status(ctx, args):
           + (f" | {dirty} unsaved (ue changes)" if dirty else "")
           + (f" | revision control {beacon['vcs']}" if alive and beacon.get("vcs") else "")
           + (f" | {describe_lease(ctx.project, lease)}" if lease else ""))
+    for r in lease_requests(ctx.project) if lease else []:
+        print(f"  lease requested by {session_label(ctx.project, r['session'])}: {r['what']} (ue lease grant)")
     if alive and not port and ctx.transport != "remote":
         print("  no MCP server in this editor: run `ue reload` (Tether starts one), or in the editor's console: "
               "ModelContextProtocol.StartServer")
@@ -73,6 +76,10 @@ def cmd_status(ctx, args):
         print(f"  also open on this project: {editor_label(other)}, map {other.get('map')}. Saving the same assets "
               f"from two editors loses work; `ue --pid {other.get('pid')} ...` talks to that one"
               + (f", `ue close --pid {other.get('pid')}` closes it" if other.get("launched_by_tether") else ""))
+    for b in ([beacon] if alive else []) + others:
+        stale = stale_code_note(ctx.project, b)
+        if stale:
+            print(f"  pid {b.get('pid')} {stale}")
     return 0 if alive and age <= 10 else 2
 
 
@@ -80,8 +87,19 @@ OTHERS_MINUTES = 15  # another session's edits this recent may be half-written
 
 
 def cmd_build(ctx, args):
-    if getattr(args, "files", None) and not args.check:
-        raise CliError("--files goes with --check: ue build --check --files Source/X/A.cpp Source/X/B.h")
+    if getattr(args, "after_close", False):  # the job `ue build --when-closed` starts: wait, then a normal build
+        print("waiting for every editor on this project to close")
+        deadline = time.time() + 24 * 3600
+        while live_editors(ctx.project):
+            if time.time() > deadline:
+                raise CliError("editors still open after 24 h; nothing built", 4)
+            time.sleep(10)
+        print(f"no editor open ({time.strftime('%H:%M')}): building")
+    if (getattr(args, "files", None) or getattr(args, "overlay", None)) and not args.check:
+        raise CliError("--files and --overlay go with --check: ue build --check --files Source/X/A.cpp | "
+                       "ue build --check --overlay staging/")
+    if args.check and getattr(args, "overlay", None):
+        return compile_overlay(ctx, args.overlay, args.limit, session_id())
     if args.check:
         code = compile_check(ctx, args.limit, getattr(args, "files", None))
         if code is None:
@@ -373,10 +391,31 @@ def cmd_lease(ctx, args):
         held = release_lease(ctx.project, force=args.force)
         print(f"released ({held.get('what')}, held {duration(time.time() - held['since'])})" if held
               else "no lease was held")
+        waiting = lease_requests(ctx.project)
+        if waiting:
+            print(f"  {session_label(ctx.project, waiting[0]['session'])} asked for it ({waiting[0]['what']}): "
+                  "`ue lease grant` hands it over in their name")
+        return 0
+    if args.action == "request":
+        if not args.what:
+            raise CliError('say what you need the editor for: ue lease request --for "new UCLASSes: build --restart"')
+        held = request_lease(ctx.project, args.what, args.minutes)
+        if not held:
+            drop_request(ctx.project, session_id())
+            raise CliError("nobody holds the lease: take it (ue lease take --for ...)")
+        print(f"asked: the editor is {describe_lease(ctx.project, held)}. That session sees your request on its next "
+              "`ue` command; once it grants it, the lease is yours (ue status shows it)")
+        return 0
+    if args.action == "grant":
+        lease = grant_lease(ctx.project, args.to)
+        print(f"granted to {session_label(ctx.project, lease['session'])}: {lease['what']} "
+              f"({max(1, round((lease['until'] - lease['since']) / 60))} min); they see it on their next `ue` command")
         return 0
     lease = active_lease(ctx.project)
-    ctx.data = lease
+    ctx.data = {"lease": lease, "requests": lease_requests(ctx.project)}
     print(describe_lease(ctx.project, lease) if lease else "no lease: the editor is free (ue lease take --for ...)")
+    for r in ctx.data["requests"]:
+        print(f"  requested by {session_label(ctx.project, r['session'])} {ago(time.time() - r['time'])}: {r['what']}")
     return 0
 
 
@@ -398,6 +437,8 @@ def cmd_who(ctx, args):
         print(f"  {session_label(ctx.project, me, names)} (you): no commands in that time")
     lease = ctx.data["lease"]
     print("lease: " + (describe_lease(ctx.project, lease) if lease else "none"))
+    for r in lease_requests(ctx.project, now):
+        print(f"  requested by {session_label(ctx.project, r['session'], names)} {ago(now - r['time'])}: {r['what']}")
     owner = pie_owner(ctx.project, ctx.beacon)
     if owner:
         print(f"pie: {owner}")

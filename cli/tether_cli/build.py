@@ -1,5 +1,7 @@
 """Compiling: UBT, Live Coding, the UnrealSharp C# build, and compiler diagnostics."""
 import argparse
+import contextlib
+import json
 import os
 import re
 import time
@@ -149,15 +151,27 @@ def classify_changes(project):
     return changed, module, reflected
 
 
-def mark_green(project, key="time", live=False):
-    """A green build. Live Coding patches exist only in the editor process that loaded them: count them until a
-    UBT build makes them real, so `ue close` can say the code a launcher start would load is older."""
+def mark_green(project, key="time", live=False, pid=None):
+    """A green build. Live Coding patches exist only in the editor process that loaded them (`pid`): count them
+    until a UBT build makes them real, so `ue close` can say the code a launcher start would load is older, and
+    `ue status` which other editors run without them."""
     path = os.path.join(state_dir(project), "last-build.json")
     marker = read_json(path) or {}
     marker[key] = time.time()
     if key == "time":
         marker["live_patches"] = marker.get("live_patches", 0) + 1 if live else 0
+        marker["live_pid"] = pid if live else None
     write_json(path, marker)
+
+
+def stale_code_note(project, beacon):
+    """For an editor that runs without this project's Live Coding patches (another editor got them): a note."""
+    marker = read_json(os.path.join(state_dir(project), "last-build.json")) or {}
+    patched = marker.get("live_pid")
+    if not marker.get("live_patches") or not patched or beacon.get("pid") == patched:
+        return None
+    return (f"runs the last UBT build, without the {marker['live_patches']} Live Coding patch(es) made in pid "
+            f"{patched}: `ue build` once every editor is closed (`ue build --when-closed` waits for that)")
 
 
 def live_patches(project):
@@ -285,6 +299,96 @@ def game_target(project):
     """The project's game target name, if it has one (Source/<Project>.Target.cs)."""
     name = os.path.splitext(os.path.basename(project))[0]
     return name if os.path.isfile(os.path.join(os.path.dirname(project), "Source", f"{name}.Target.cs")) else None
+
+
+SHADOW_SKIP = ("Binaries", "Intermediate", "Saved", "DerivedDataCache", "Content", ".git", ".vs")
+
+
+def code_files(project):
+    """{relative path: absolute path} of what a UBT build of the project reads: the .uproject, Source/, Config/,
+    and each project plugin's folder (UBT plugins and C# build scripts included), build output and content left
+    out."""
+    root = os.path.dirname(project)
+    found = {os.path.basename(project): project}
+
+    def take(folder):
+        for here, dirs, files in os.walk(folder):
+            dirs[:] = [d for d in dirs if d not in SHADOW_SKIP]
+            for f in files:
+                full = os.path.join(here, f)
+                found[os.path.relpath(full, root).replace("\\", "/")] = full
+    for part in ("Source", "Config", "Plugins"):
+        take(os.path.join(root, part))
+    return found
+
+
+def shadow_project(project, overlay, sid):
+    """The project's code copied to Saved/Tether/shadow/<session>, with the files under `overlay` (laid out like
+    the project: overlay/Source/Game/X.h) on top, for compiling work that may not be written into Source/ yet
+    (another session's Live Coding compiles every changed file there). Kept between runs, so UBT builds it
+    incrementally: a file is rewritten only when its content changed (and is then newer than any object file
+    built from the old content); unchanged sizes and times are not even read again.
+    Returns (shadow .uproject, [overlaid relative paths])."""
+    import hashlib
+    shadow = os.path.join(state_dir(project), "shadow", sid)
+    wanted = code_files(project)
+    overlaid = []
+    for here, _, files in os.walk(overlay):
+        for f in files:
+            rel = os.path.relpath(os.path.join(here, f), overlay).replace("\\", "/")
+            wanted[rel] = os.path.join(here, f)
+            overlaid.append(rel)
+    if not overlaid:
+        raise CliError(f"nothing under {overlay}: lay files out as in the project (Source/<Module>/File.h)")
+    manifest_path = os.path.join(shadow, ".tether-shadow.json")
+    manifest = read_json(manifest_path) or {}
+    fresh = {}
+    for rel, source in wanted.items():
+        stat = os.stat(source)
+        stamp = [source, stat.st_size, stat.st_mtime]
+        old = manifest.get(rel) or {}
+        target = os.path.join(shadow, rel)
+        if old.get("stamp") == stamp and os.path.isfile(target):
+            fresh[rel] = old
+            continue
+        with open(source, "rb") as f:
+            data = f.read()
+        if rel.endswith(".uproject"):  # plugin folders outside the project, relative to it, must still resolve
+            descriptor = json.loads(data.decode("utf-8-sig"))
+            descriptor["AdditionalPluginDirectories"] = [
+                os.path.normpath(os.path.join(os.path.dirname(project), d))
+                for d in descriptor.get("AdditionalPluginDirectories", [])]
+            data = json.dumps(descriptor, indent="\t").encode()
+        digest = hashlib.sha1(data).hexdigest()
+        fresh[rel] = {"stamp": stamp, "digest": digest}
+        if old.get("digest") != digest or not os.path.isfile(target):
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            with open(target, "wb") as f:
+                f.write(data)
+    for rel in set(manifest) - set(fresh):  # gone from the project (or the overlay): gone from the copy
+        with contextlib.suppress(OSError):
+            os.remove(os.path.join(shadow, rel))
+    write_json(manifest_path, fresh)
+    return os.path.join(shadow, os.path.basename(project)), sorted(overlaid)
+
+
+def compile_overlay(ctx, overlay, limit, sid):
+    """`ue build --check --overlay DIR`: compile the game target of a copy of the project with DIR's files on top,
+    so work staged outside Source/ is checked without another session's Live Coding picking it up. Errors in
+    overlaid files name the staged file."""
+    target = game_target(ctx.project)
+    if not target:
+        raise CliError("--overlay compiles the game target, and this project has none (Source/<Project>.Target.cs)")
+    if not os.path.isdir(overlay):
+        raise CliError(f"no folder {overlay}")
+    shadow, overlaid = shadow_project(ctx.project, os.path.abspath(overlay), sid)
+    print(f"overlay: {len(overlaid)} staged file(s) on a copy of the project's code "
+          f"({os.path.relpath(os.path.dirname(shadow), os.path.dirname(ctx.project))}); the real Source/ is untouched")
+    code = ubt_build(argparse.Namespace(project=shadow), argparse.Namespace(target=target, config="Development",
+                                                                            limit=limit), check=True)
+    if code:
+        print("errors in " + ", ".join(overlaid[:6]) + " are in the staged copies under " + overlay)
+    return code
 
 
 def compile_check(ctx, limit, files=None):
@@ -445,5 +549,5 @@ def live_coding_build(ctx, args, changes):
         write_json(layout_marker(ctx.project), {"pid": editor.get("pid"), "time": time.time(),
                                                 "headers": list(dict.fromkeys(headers + [os.path.basename(p) for p in changes[2]]))})
     if ok:
-        mark_green(ctx.project, live=True)
+        mark_green(ctx.project, live=True, pid=(chosen_editor(ctx.project) or {}).get("pid"))
     return 0 if ok else 1

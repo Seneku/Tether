@@ -540,9 +540,21 @@ for ref in {refs!r}:
             out.append({{"ref": ref, "error": "no such actor"}})
             continue
         p = a.get_actor_location()
+    def distance(x):
+        # to the nearest collision, not the pivot: a road or builder actor spans kilometres from its origin
+        best = None
+        for c in x.get_components_by_class(unreal.PrimitiveComponent) or []:
+            try:
+                d = c.get_closest_point_on_collision(p)
+                d = d[0] if isinstance(d, tuple) else d
+            except Exception:
+                continue
+            if d is not None and d >= 0 and (best is None or d < best):
+                best = d
+        return best if best is not None else x.get_actor_location().distance(p)
     def hits(radius):
         found = unreal.SystemLibrary.sphere_overlap_actors(w, p, radius, types, None, [])  # None: no overlaps
-        return [(x.get_actor_label(), x.get_class().get_name(), x.get_actor_location().distance(p)) for x in (found or [])]
+        return [(x.get_actor_label(), x.get_class().get_name(), distance(x)) for x in (found or [])]
     on = nav.project_point_to_navigation(w, p, None, None, unreal.Vector(50, 50, 250))
     near = None if on is not None else nav.project_point_to_navigation(w, p, None, None, unreal.Vector(1000, 1000, 1000))
     out.append({{"ref": ref, "point": [p.x, p.y, p.z], "inside": hits(1.0), "near": hits({radius!r}),
@@ -1501,6 +1513,65 @@ def finish_film(ctx, args, state):
           + f" -> {path}" + note)
 
 
+def shot_step_args(rest, hud):
+    """`shot [PNG] [--at x,y,z] [--look-at ...] [--rot p,y,r] [--actor A] [--res WxH] [--hud] [--clear]` in a step
+    file: `ue shot`'s options, not a file name made of them."""
+    import shlex
+    parser = argparse.ArgumentParser(prog="shot", add_help=False, exit_on_error=False)
+    parser.add_argument("output", nargs="?")
+    for flag in ("--at", "--look-at", "--rot", "--actor", "--res"):
+        parser.add_argument(flag)
+    parser.add_argument("-o", "--out", dest="out")
+    parser.add_argument("--hud", action="store_true")
+    parser.add_argument("--clear", action="store_true")
+    try:
+        given, unknown = parser.parse_known_args(shlex.split(rest, posix=False))
+    except (argparse.ArgumentError, ValueError) as exc:
+        raise CliError(f"shot step: {exc}") from None
+    if unknown or (given.output or "").startswith("-"):
+        raise CliError(f"shot step: unknown option(s) {' '.join(unknown) or given.output} (shot [PNG] [--at x,y,z] "
+                       "[--look-at x,y,z|actor] [--rot p,y,r] [--actor A] [--res WxH] [--hud] [--clear])")
+    return shot_args(output=given.out or given.output, actor=given.actor, at=given.at, look_at=given.look_at,
+                     rot=given.rot, res=given.res, hud=hud or given.hud, clear=given.clear)
+
+
+LOG_COUNT = re.compile(r"^(.*?)\s+count\s*(>=|<=|==|=|>|<)\s*(\d+)$", re.I)
+LOG_ORDER = re.compile(r"^in order:\s*(.+)$", re.I)
+
+
+def log_check(rest, log_lines):
+    """The check behind a `log` step: `log <regex>` (a line matches), `log <regex> count >= 6` (how many lines
+    match), `log in order: re1, re2, re3` (lines matching each, in that order)."""
+    clean = lambda line: short(re.sub(r"^\[[^\]]*\]\[[^\]]*\]", "", line), 120)  # noqa: E731
+    order, counted = LOG_ORDER.match(rest), LOG_COUNT.match(rest)
+    if order:
+        patterns = [re.compile(p.strip(), re.I) for p in order.group(1).split(",") if p.strip()]
+
+        def in_order():
+            at = 0
+            for line in log_lines():
+                if at < len(patterns) and patterns[at].search(line):
+                    at += 1
+            return at == len(patterns), (f"all {len(patterns)} in order" if at == len(patterns) else
+                                         f"{at} of {len(patterns)} in order; missing /{patterns[at].pattern}/ after them")
+        return in_order
+    if counted:
+        rx, op, want = re.compile(counted.group(1).strip(), re.I), counted.group(2), int(counted.group(3))
+        compare = {">=": want.__le__, "<=": want.__ge__, "==": want.__eq__, "=": want.__eq__, ">": want.__lt__,
+                   "<": want.__gt__}[op]
+
+        def count():
+            n = sum(1 for line in log_lines() if rx.search(line))
+            return compare(n), f"{n} matching line(s) (want {op} {want})"
+        return count
+    rx = re.compile(rest, re.I)
+
+    def matched():
+        hit = next((line for line in log_lines() if rx.search(line)), None)
+        return bool(hit), clean(hit) if hit else "no matching log line"
+    return matched
+
+
 def pie_do(ctx, args):
     """Drive the player through a list of steps in PIE and check the results. Exit 0/1."""
     steps, wanted_map = list(args.script or []), None
@@ -1564,12 +1635,7 @@ def pie_do(ctx, args):
         if verb == "until":
             return poll(lambda: tool("expect " + rest), seconds or 5)
         if verb == "log":
-            rx = re.compile(rest, re.I)
-
-            def matched():
-                hit = next((l for l in log_lines() if rx.search(l)), None)
-                return bool(hit), short(re.sub(r"^\[[^\]]*\]\[[^\]]*\]", "", hit), 120) if hit else "no matching log line"
-            return poll(matched, seconds or 5)
+            return poll(log_check(rest, log_lines), seconds or 5)
         if verb == "move":
             tool("move " + rest)
             return poll(lambda: tool(f"near {rest} 120"), seconds or 15)
@@ -1616,9 +1682,10 @@ def pie_do(ctx, args):
         if verb == "shot-check":
             return shot_check(ctx, rest)
         if verb == "shot":
+            options = shot_step_args(rest, bool(getattr(args, "hud", False)))
             buf = __import__("io").StringIO()
             with __import__("contextlib").redirect_stdout(buf):
-                cmd_shot(ctx, shot_args(output=rest or None, hud=bool(getattr(args, "hud", False))))
+                cmd_shot(ctx, options)
             return True, buf.getvalue().strip()
         return tool(step)
 

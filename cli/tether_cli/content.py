@@ -1386,6 +1386,81 @@ def map_footprints(ctx, args):
     return 0
 
 
+# `ue collide`: one overlap box per grid cell at a height, in a single editor call. Overlaps see what traces and
+# characters collide with, procedural meshes and instanced buildings included (which footprints miss).
+COLLIDE = """import json
+w = tether.world() if {pie!r} else unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_editor_world()
+types = [getattr(unreal.ObjectTypeQuery, f"OBJECT_TYPE_QUERY{{i}}") for i in range(1, 7)]
+cx, cy, r, z, step, half = {x!r}, {y!r}, {r!r}, {z!r}, {step!r}, {half!r}
+n = int(2 * r // step)
+names, grid = {{}}, []
+for j in range(n):
+    row = []
+    for i in range(n):
+        p = unreal.Vector(cx - r + (i + 0.5) * step, cy + r - (j + 0.5) * step, z)
+        hit = unreal.SystemLibrary.box_overlap_actors(w, p, unreal.Vector(step / 2, step / 2, half), types, None, [])
+        hit = [a for a in (hit or []) if not isinstance(a, unreal.Pawn)]
+        if not hit:
+            row.append(0)
+            continue
+        key = hit[0].get_class().get_name() + ("" if len(hit) == 1 else "+")
+        names.setdefault(key, {{"id": len(names) + 1, "cells": 0, "actors": set()}})
+        names[key]["cells"] += 1
+        names[key]["actors"].add(hit[0].get_actor_label())
+        row.append(names[key]["id"])
+    grid.append(row)
+print(json.dumps({{"n": n, "grid": grid, "classes": {{k: [v["id"], v["cells"], sorted(v["actors"])[:4]]
+                                                    for k, v in names.items()}}}}))
+"""
+
+
+def cmd_collide(ctx, args):
+    """`ue collide x,y,r [--z cm] [--step cm]`: what blocks at one height around a point, as a picture coloured by
+    class (one overlap box per cell), with the classes and actors it found. For "why do the AI cars stop here":
+    a wall ring across a junction, a raised median."""
+    try:
+        x, y, r = (float(v) * (100 if args.m else 1) for v in args.where.split(","))
+    except ValueError:
+        raise CliError("ue collide x,y,radius [--z cm] [--step cm] (in cm; --m for metres)") from None
+    step = args.step or max(25.0, 2 * r / 160)
+    if 2 * r / step > 400:
+        raise CliError(f"{int(2 * r / step)} cells across is too many: raise --step (or shrink the radius)")
+    if args.pie and not (ctx.beacon or {}).get("pie"):
+        raise CliError("--pie needs PIE running (ue pie start)")
+    z = args.z if args.z is not None else 100.0
+    data = py_json(ctx, COLLIDE.format(pie=args.pie, x=x, y=y, r=r, z=z, step=step, half=args.half))
+    n, grid, classes = data["n"], data["grid"], data["classes"]
+    colours = {meta[0]: MAP_COLOURS[i % len(MAP_COLOURS)] for i, (_, meta) in
+               enumerate(sorted(classes.items(), key=lambda kv: -kv[1][1]))}
+    cell = max(2, 640 // max(n, 1))
+    size = n * cell
+    rgb = bytearray([24, 24, 24] * size * size)
+    for j, row in enumerate(grid):
+        for i, value in enumerate(row):
+            if value:
+                colour = bytes(colours[value][0])
+                for yy in range(j * cell, (j + 1) * cell):
+                    start = (yy * size + i * cell) * 3
+                    rgb[start:start + cell * 3] = colour * cell
+    mid = size // 2  # the centre point: a white cross
+    for k in range(-cell * 2, cell * 2 + 1):
+        for px, py in ((mid + k, mid), (mid, mid + k)):
+            if 0 <= px < size and 0 <= py < size:
+                rgb[(py * size + px) * 3:(py * size + px) * 3 + 3] = b"\xff\xff\xff"
+    path = os.path.abspath(args.output) if args.output else stamped_name(
+        os.path.join(state_dir(ctx.project), "shots"), "collide", ".png")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    png_write(path, size, size, bytes(rgb))
+    blocked = sum(1 for row in grid for v in row if v)
+    print(f"{path}  {size}x{size}: {n}x{n} cells of {step:g} cm at z {z:g} (box half-height {args.half:g} cm), "
+          f"north up, centre ({x:.0f}, {y:.0f}) marked; {100 * blocked / max(1, n * n):.0f}% blocked")
+    for name, (cid, cells, actors) in sorted(classes.items(), key=lambda kv: -kv[1][1]):
+        print(f"  {colours[cid][1]:<9} {name}: {cells} cell(s), e.g. {', '.join(actors)}"
+              + (" (+ more actors in the same cells)" if name.endswith("+") else ""))
+    ctx.data = {"path": path, "classes": classes, "blocked": blocked, "cells": n * n}
+    return 0
+
+
 def cmd_map(ctx, args):
     """`ue map`: the level (or an area) from above as a picture, with gameplay actors marked by class."""
     import math

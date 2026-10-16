@@ -11,6 +11,7 @@ import ast
 import contextlib
 import io
 import json
+import math
 import os
 import re
 import sys
@@ -957,19 +958,42 @@ def _watch_value(value):
     return _short(_compact(value) if isinstance(value, (dict, list, tuple)) else str(value), 80)
 
 
+_SCHEMAS = {}  # (class path, visible only) -> (time, schema text), for reads repeated during PIE
+
+
+def _pie_schema(cls, visible_only=True):
+    """Epic's property schema for a class, kept for a minute: `pie watch` and `expect` read the same classes
+    many times, and each schema build logs a warning per delegate property (LogJson ... unhandled)."""
+    key, now = (cls.get_path_name(), visible_only), time.time()
+    cached = _SCHEMAS.get(key)
+    if cached and now - cached[0] < 60:
+        return cached[1]
+    library = unreal.ToolsetLibrary
+    text = library.list_struct_properties(cls) if visible_only else library.list_struct_properties(cls, False)
+    _SCHEMAS[key] = (now, text)
+    return text
+
+
 def _dump_props(obj):
     """[(class, name, value text)] for every UPROPERTY of an object, Blueprint-visible or not, as the engine
     exports them (`obj dump`): Python and Epic's reflection only reach the visible ones."""
-    rows, owner = [], ""
+    rows, owner, arrays = [], "", {}
     for line in _console_output(None, [f"obj dump {obj.get_path_name()}"]):
         head = re.match(r"^=== (\w+) properties ===", line)
         if head:
             owner = head.group(1)
             continue
-        m = re.match(r"^  (\w+)=(.*)$", line)
+        m = re.match(r"^  (\w+)(?:\((\d+)\))?=(.*)$", line)  # arrays come one element per line: Racers(0)=(...)
         if m and owner:
-            rows.append((owner, m.group(1), m.group(2)))
-    return rows
+            if m.group(2) is None:
+                rows.append((owner, m.group(1), m.group(3)))
+            else:
+                if m.group(1) not in arrays:
+                    arrays[m.group(1)] = []
+                    rows.append((owner, m.group(1), arrays[m.group(1)]))
+                arrays[m.group(1)].append(m.group(3))
+    # an array reads as '[3] (first), (second), ...' (what fits), so `ue props` and `expect` can see it
+    return [(o, n, f"[{len(v)}] " + ", ".join(v) if isinstance(v, list) else v) for o, n, v in rows]
 
 
 def _text_value(text):
@@ -1015,6 +1039,23 @@ def _watch_reader(spec, pawn, controller):
             raise RuntimeError(f"no input action {spec} (ue input)")
         size = {"boolean": 1, "axis1d": 1, "axis2d": 2}.get(action.value_type.lower(), 3)
         return lambda: (lambda v: v[0][0] if size == 1 else v[0][:size])(action())
+    if "@" in spec:  # 'player.Mesh@hand_r', 'BP_Robot_C_1@Hips': a bone or socket's world location
+        target, bone = spec.split("@", 1)
+        try:
+            obj = _pie_object(target, pawn, controller)
+        except RuntimeError:  # 'player.Mesh': the component by its property name (CharacterMesh0)
+            owner, _, prop = target.rpartition(".")
+            obj = _try(lambda: _pie_object(owner, pawn, controller).get_editor_property(prop)) if owner else None
+            if obj is None:
+                raise
+        mesh = obj if isinstance(obj, unreal.SceneComponent) else \
+            (_try(lambda: obj.get_components_by_class(unreal.SkeletalMeshComponent), []) or [None])[0]
+        if mesh is None:
+            raise RuntimeError(f"{target} has no skeletal mesh for @{bone}")
+        if not mesh.does_socket_exist(bone):
+            names = [str(n) for n in _try(lambda: mesh.get_all_socket_names(), []) or []][:12]
+            raise RuntimeError(f"{target} has no bone or socket '{bone}' (some: {', '.join(names)})")
+        return lambda: mesh.get_socket_location(bone)
     target, _, prop = spec.rpartition(".")
     if not target:
         target, prop = spec, "location"
@@ -1036,7 +1077,7 @@ def _watch_reader(spec, pawn, controller):
     library = getattr(unreal, "ToolsetLibrary", None)
     name = prop
     if library:
-        schema = _reflect(library.list_struct_properties(obj.get_class(), False), obj)  # every UPROPERTY, hidden too
+        schema = _reflect(_pie_schema(obj.get_class(), False), obj)  # every UPROPERTY, hidden too
         name = {n.lower(): n for n in schema}.get(key)
         if name is None:
             getter = _try(lambda: getattr(obj, "get_" + _snake(prop)))
@@ -1046,7 +1087,7 @@ def _watch_reader(spec, pawn, controller):
     if _try(lambda: obj.get_editor_property(name), _WATCH) is not _WATCH:
         return lambda: obj.get_editor_property(name)
     # Epic's reflection reads the visible ones (asking it for a hidden one logs a script error that fails the call).
-    visible = {n.lower() for n in _reflect(library.list_struct_properties(obj.get_class()), obj)} if library else set()
+    visible = {n.lower() for n in _reflect(_pie_schema(obj.get_class()), obj)} if library else set()
     if library and name.lower() in visible:
         return lambda: _reflect(library.get_object_properties(obj, [name]), obj).get(name)
     # Not Blueprint-visible: neither Python nor Epic's reflection reads it, the engine's own export does.
@@ -1559,7 +1600,7 @@ def _pie_expect(expr, pawn, controller):
     if prop.lower() in ("location", "rotation"):
         value = _actor_pose(obj if isinstance(obj, unreal.Actor) else obj.get_owner())[prop.lower()]
     else:
-        schema = _reflect(unreal.ToolsetLibrary.list_struct_properties(obj.get_class()), obj)
+        schema = _reflect(_pie_schema(obj.get_class()), obj)
         name = {n.lower(): n for n in schema}.get(prop.lower())
         if name is None:
             raise RuntimeError(f"{_label(obj)} has no property '{prop}'")
@@ -2528,6 +2569,108 @@ def _node_title(node):
     return re.sub(r"\s+", " ", title).strip()
 
 
+def _box_row(label, cls, corners):
+    """A `map --footprints` geometry row from a box's 8 world corners: label, class, kind, centre x/y, top z,
+    half extents x/y, bottom z, and the outline (the 4 bottom corners)."""
+    xs, ys, zs = [c.x for c in corners], [c.y for c in corners], [c.z for c in corners]
+    low = sorted(corners, key=lambda c: c.z)[:4]
+    centre = (sum(c.x for c in low) / 4, sum(c.y for c in low) / 4)
+    low.sort(key=lambda c: math.atan2(c.y - centre[1], c.x - centre[0]))  # around the centre, in order
+    return [label, cls, "geometry", round((min(xs) + max(xs)) / 2, 1), round((min(ys) + max(ys)) / 2, 1),
+            round(max(zs), 1), round((max(xs) - min(xs)) / 2, 1), round((max(ys) - min(ys)) / 2, 1), round(min(zs), 1),
+            [[round(c.x, 1), round(c.y, 1)] for c in low]]
+
+
+def _built_parts(actor, want=None, cap=4000):
+    """Footprint rows for an actor built from procedural meshes or instanced meshes (a city builder's roads and
+    junctions, HISM buildings): one per procedural section's component and one per instance, each the
+    transformed box of its mesh, within `want` (x, y, radius) when given. [] for other actors."""
+    rows, label = [], _label(actor)
+
+    def corners(lo, hi, transform):
+        return [unreal.MathLibrary.transform_location(transform, unreal.Vector(x, y, z))
+                for x in (lo.x, hi.x) for y in (lo.y, hi.y) for z in (lo.z, hi.z)]
+
+    def near(row):
+        return not want or len(want) != 3 or \
+            max(abs(row[3] - want[0]) - row[6], 0) ** 2 + max(abs(row[4] - want[1]) - row[7], 0) ** 2 <= want[2] ** 2
+    for comp in _try(lambda: actor.get_components_by_class(unreal.PrimitiveComponent), []) or []:
+        if len(rows) >= cap:
+            break
+        name = comp.get_class().get_name()
+        if isinstance(comp, unreal.InstancedStaticMeshComponent) and not isinstance(comp, unreal.FoliageInstancedStaticMeshComponent):
+            mesh = _try(lambda: comp.get_editor_property("static_mesh"))
+            box = _try(lambda: mesh.get_bounding_box()) if mesh else None
+            if box is None:
+                continue
+            for i in range(min(_try(lambda: comp.get_instance_count(), 0) or 0, cap - len(rows))):
+                transform = _try(lambda: comp.get_instance_transform(i, True))
+                if transform is not None:
+                    row = _box_row(f"{label}#{i}", mesh.get_name(), corners(box.min, box.max, transform))
+                    if near(row):
+                        rows.append(row)
+        elif name == "ProceduralMeshComponent" or isinstance(comp, unreal.DynamicMeshComponent if hasattr(
+                unreal, "DynamicMeshComponent") else ()):
+            local = _try(lambda: comp.get_local_bounds())
+            if local:
+                row = _box_row(f"{label}.{comp.get_name()}", name, corners(local[0], local[1], comp.get_world_transform()))
+                if near(row):
+                    rows.append(row)
+    return rows
+
+
+def _collision_profiles():
+    """{profile name: collision enabled, lower case without separators ('queryandphysics')} from the engine's and
+    the project's config (+Profiles=(Name="BlockAll",CollisionEnabled=QueryAndPhysics,...))."""
+    out = {}
+    for folder, name in ((unreal.Paths.engine_config_dir(), "BaseEngine.ini"),
+                         (unreal.Paths.project_config_dir(), "DefaultEngine.ini")):
+        path = os.path.join(unreal.Paths.convert_relative_path_to_full(folder), name)
+        try:
+            with open(path, encoding="utf-8-sig", errors="replace") as f:
+                text = f.read()
+        except OSError:
+            continue
+        for m in re.finditer(r'^\+Profiles=\(Name="([^"]+)",\s*CollisionEnabled=(\w+)', text, re.M):
+            out[m.group(1)] = m.group(2).lower().replace("_", "")
+    return out
+
+
+def _pin_type(pin):
+    """A pin's type from its exported text: 'float', 'Vector', 'Actor', 'array of Name'..."""
+    category = (re.search(r'PinType\.PinCategory="(\w*)"', pin) or [None, ""])[1]
+    sub = re.search(r"PinType\.PinSubCategoryObject=[^']*'\"?[^\"']*\.(\w+)", pin)
+    name = sub.group(1) if sub else {"real": "float", "int": "int", "bool": "bool", "name": "Name", "string": "String",
+                                     "text": "Text", "byte": "byte", "int64": "int64"}.get(category, category or "?")
+    container = (re.search(r"PinType\.ContainerType=(\w+)", pin) or [None, ""])[1]
+    if container in ("Array", "Set"):
+        name = f"{container.lower()} of {name}"
+    elif container == "Map":
+        name = f"map of {name}"
+    return name + (" (by ref)" if "PinType.bIsReference=True" in pin and not container else "")
+
+
+def _bp_signature(bp, name):
+    """'Name(Speed: float, Target: Actor) -> (Hit: bool)' for a Blueprint function: its entry node's outputs are
+    the parameters, its result node's inputs the return values (read from the function graph's text export).
+    Just the name when the graph cannot be read."""
+    graph = next((g for g in unreal.BlueprintEditorLibrary.list_graphs(bp) if g.get_name() == name), None)
+    nodes = _try(lambda: _t3d_graph_nodes(graph)) if graph is not None else None
+    if not nodes:
+        return name
+    params, results = [], []
+    for node in nodes.values():
+        if node["class"] == "K2Node_FunctionEntry":
+            params = [f"{p['name']}: {p['type']}" for p in node["pins"] if p["output"] and p["type"] != "exec"]
+        elif node["class"] == "K2Node_FunctionResult" and not results:
+            results = [f"{p['name']}: {p['type']}" for p in node["pins"] if not p["output"] and p["type"] != "exec"]
+        elif node["class"] == "K2Node_Tunnel":  # a macro: the entry tunnel's outputs, the exit tunnel's inputs
+            outs = [f"{p['name']}: {p['type']}" for p in node["pins"] if p["output"] and p["type"] != "exec"]
+            ins = [f"{p['name']}: {p['type']}" for p in node["pins"] if not p["output"] and p["type"] != "exec"]
+            params, results = (params or outs), (results or ins)
+    return f"{name}({', '.join(params)})" + (f" -> ({', '.join(results)})" if results else "")
+
+
 def _t3d_graph_nodes(graph):
     """{node name: {class, props, pins: [{name, output, links: [node name]}]}} for a graph's own nodes, from a
     text export. State machine nodes have no pins in Python, but their copy-paste text has every link."""
@@ -2552,7 +2695,8 @@ def _t3d_graph_nodes(graph):
             pin_name = re.search(r'PinName="([^"]*)"', pin)
             links = re.search(r"LinkedTo=\(([^)]*)\)", pin)
             pins.append({"name": pin_name.group(1) if pin_name else "", "output": 'Direction="EGPD_Output"' in pin,
-                         "links": [l.split()[0] for l in links.group(1).split(",") if l.strip()] if links else []})
+                         "links": [l.split()[0] for l in links.group(1).split(",") if l.strip()] if links else [],
+                         "type": _pin_type(pin)})
         nodes[name] = {"class": classes.get(name, "").rsplit(".", 1)[-1], "props": props, "pins": pins}
     return nodes
 
@@ -3515,11 +3659,13 @@ class TetherCore(_Base):
         rx = re.compile(match, re.I) if match else None
         rows = []
         for actor in _actors(pie):
-            label, cls = _actor_label(actor), actor.get_class().get_name()
-            if rx and not (rx.search(label) or rx.search(cls)):
+            label, cls, name = _actor_label(actor), actor.get_class().get_name(), actor.get_name()
+            # log lines name actors by object name (NRRoadNode_1031), the outliner by label (N_X_2_4): match both
+            if rx and not (rx.search(label) or rx.search(cls) or rx.search(name)):
                 continue
             loc = actor.get_actor_location()
-            rows.append(f"{label}  {cls}  ({loc.x:.0f}, {loc.y:.0f}, {loc.z:.0f})")
+            rows.append(f"{label}" + (f" ({name})" if name != label else "")
+                        + f"  {cls}  ({loc.x:.0f}, {loc.y:.0f}, {loc.z:.0f})")
         return _capped(f"{len(rows)} actors" + (f" matching /{match}/" if match else ""), rows, limit)
 
     @_tool
@@ -4111,7 +4257,7 @@ class TetherCore(_Base):
 
     @_tool
     @staticmethod
-    def class_info(name: str, limit: int = 40) -> str:
+    def class_info(name: str, limit: int = 40, section: str = "-", grep: str = "-") -> str:
         """A class at a glance, C++ or Blueprint: parent chain, its own properties (with Blueprint access) and
         functions, a Blueprint's variables, components, functions and events, the classes and Blueprints that
         derive from it, and (for a Blueprint) what references it.
@@ -4120,10 +4266,15 @@ class TetherCore(_Base):
             name: A class name (Character, AMyEnemy, UMyComponent), /Script/Module.Class, a Blueprint asset path,
                 or a Blueprint's name (BP_Door).
             limit: Maximum rows per list.
+            section: '-' for the overview; props, functions, vars, components, events, derived or refs for that
+                list alone, one item per line (functions with their parameters and types).
+            grep: Regex the listed items must match ('-' for all).
 
         Returns:
             Text.
         """
+        want = section.lower() if section not in ("", "-") else "all"
+        rx = re.compile(grep, re.I) if grep not in ("", "-") else None
         registry = unreal.AssetRegistryHelpers.get_asset_registry()
         bp, cls = None, None
         if name.startswith("/Script/"):
@@ -4174,33 +4325,48 @@ class TetherCore(_Base):
         lines = [f"{bp.get_name() if bp else cls.get_name()} ({'Blueprint ' + where if bp else 'C++, ' + where})"
                  + (" : " + " : ".join(chain) if chain else "")]
         native = None if bp else py_type_of(cls)
+        def emit(key, title, items):
+            """One list: in the overview a comma-joined line; with section=key, one item per line."""
+            if want not in ("all", key):
+                return
+            items = [i for i in items if not rx or rx.search(i)]
+            if not items:
+                if want == key:
+                    lines.append(f"{title}: none" + (" matching" if rx else ""))
+                return
+            more = len(items) - limit
+            if want == "all":
+                lines.append(f"{title} ({len(items)}): " + ", ".join(items[:limit]) + (f" +{more}" if more > 0 else ""))
+            else:
+                lines.append(f"{title} ({len(items)}):")
+                lines.extend("  " + i for i in items[:limit])
+                if more > 0:
+                    lines.append(f"  ... +{more} more (--limit)")
         if native is not None:
             summary = (native.__doc__ or "").strip().splitlines()
-            if summary:
+            if summary and want == "all":
                 lines.append("  " + summary[0][:200])
             own = doc_props(native)
             for base in native.__mro__[1:2]:
                 for key in doc_props(base):
                     own.pop(key, None)
-            if own:
-                lines.append(f"own properties ({len(own)}): " + ", ".join(f"{k} ({v})" for k, v in list(own.items())[:limit]))
+            emit("props", "own properties", [f"{k} ({v})" for k, v in own.items()])
             methods = sorted(k for k, v in vars(native).items() if callable(v) and not k.startswith("_")
                              and k not in ("static_class", "cast", "get_default_object"))
-            if methods:
-                lines.append(f"own functions ({len(methods)}): " + ", ".join(methods[:limit])
-                             + (f" +{len(methods) - limit}" if len(methods) > limit else ""))
+            if want == "functions":  # the Python signature: the doc line that shows the call
+                methods = [next((l.strip() for l in (getattr(native, m).__doc__ or "").splitlines()
+                                 if re.match(r"\s*\w+\.\w+\(", l)), m)[:200] for m in methods]
+            emit("functions", "own functions", methods)
         if bp is not None:
             parts = _bp_parts(bp)
             comps = [k.split(" ", 1)[1] + f" ({v.get_class().get_name()})" for k, v in parts.items() if k.startswith("component ")]
-            if comps:
-                lines.append(f"components ({len(comps)}): " + ", ".join(comps[:limit]))
+            emit("components", "components", comps)
             mine = _try(lambda: _reflect(unreal.ToolsetLibrary.list_struct_properties(cls), None), {}) or {}
             types = {k.lower(): _type_name(v) for k, v in mine.items()}
             comp_names = {k.split(" ", 1)[1].lower() for k in parts if k.startswith("component ")}
             names = _try(lambda: list(unreal.BlueprintEditorLibrary.list_member_variable_names(bp, False)), []) or []
             variables = [f"{n} ({types.get(str(n).lower(), '?')})" for n in map(str, names) if n.lower() not in comp_names]
-            if variables:
-                lines.append(f"variables ({len(variables)}): " + ", ".join(variables[:limit]))
+            emit("vars", "variables", variables)
             graphs = list(unreal.BlueprintEditorLibrary.list_graphs(bp))
             functions = [g.get_name() for g in graphs if g.get_class().get_name() == "EdGraph"
                          and g.get_name() not in ("EventGraph", "UserConstructionScript")]
@@ -4211,21 +4377,19 @@ class TetherCore(_Base):
                         if node.get_class().get_name() in ("K2Node_Event", "K2Node_CustomEvent", "K2Node_ComponentBoundEvent",
                                                            "K2Node_InputAction", "K2Node_EnhancedInputAction"):
                             events.append(_node_title(node))
-            if functions:
-                lines.append(f"functions ({len(functions)}): " + ", ".join(functions[:limit]))
-            if events:
-                lines.append(f"events ({len(events)}): " + ", ".join(events[:limit]))
+            if want == "functions":  # what a call by reflection needs: each parameter with its type
+                picked = [f for f in functions if not rx or rx.search(f)]
+                functions = [_bp_signature(bp, f) for f in picked[:limit]] + picked[limit:]
+            emit("functions", "functions", functions)
+            emit("events", "events", events)
         derived = {(str(p.package_name), str(p.asset_name)) for p in _try(lambda: list(registry.get_derived_class_names(
             [unreal.TopLevelAssetPath(cls.get_path_name())], [])), []) or []}
         own_path = cls.get_path_name()
         derived_native = [n for pkg, n in derived if pkg.startswith("/Script/") and f"{pkg}.{n}" != own_path]
         derived_bp = sorted(pkg for pkg, n in derived if not pkg.startswith("/Script/") and pkg != where)
-        if derived_native:
-            lines.append(f"derived C++ classes ({len(derived_native)}): " + ", ".join(sorted(derived_native)[:limit]))
-        if derived_bp:
-            lines.append(f"derived Blueprints ({len(derived_bp)}): " + ", ".join(derived_bp[:limit])
-                         + (f" +{len(derived_bp) - limit}" if len(derived_bp) > limit else ""))
-        if bp is not None:
+        emit("derived", "derived C++ classes", sorted(derived_native))
+        emit("derived", "derived Blueprints", derived_bp)
+        if bp is not None and want in ("all", "refs"):
             refs = sorted({str(n) for n in registry.get_referencers(where, _dependency_options()) or []} - {where})
             maps = [r for r in refs if "/__ExternalActors__/" in r or r.endswith(("Map", "Lvl")) or "/Maps/" in r]
             if refs:
@@ -5147,6 +5311,13 @@ class TetherCore(_Base):
             if cls.startswith(("Landscape",)):
                 landscape = True
                 continue
+            if footprints and not isinstance(actor, unreal.StaticMeshActor) and cls != "InstancedFoliageActor":
+                parts = _built_parts(actor, want)  # a builder's roads and buildings, one row per piece
+                if parts:
+                    rows.extend(parts[: max(0, limit - len(rows))])
+                    if len(rows) >= limit:
+                        break
+                    continue
             if any(cls == s or (cls.endswith(s) and s not in ("Brush",)) for s in skip) or cls in ("Brush",) and not \
                     isinstance(actor, unreal.BlockingVolume):
                 continue
@@ -5694,6 +5865,20 @@ class TetherCore(_Base):
             if len(overlapping) >= 4:
                 report("stationary lights", light, f"overlaps {len(overlapping)} other shadowing stationary lights "
                                                    "(only 4 get shadow channels; the rest lose shadows)")
+        # A component whose Collision Enabled disagrees with its (non-Custom) profile: the next property change
+        # re-applies the profile (Python's set_collision_enabled is undone by the following PostEditChange)
+        profiles = _collision_profiles()
+        for actor in actors:
+            for comp in _try(lambda: actor.get_components_by_class(unreal.PrimitiveComponent), []) or []:
+                profile = str(_try(lambda: comp.get_collision_profile_name(), "") or "")
+                expected = profiles.get(profile)
+                if not expected or profile == "Custom":
+                    continue
+                actual = _enum_name(_try(lambda: comp.get_collision_enabled(), "")).replace("_", "")
+                if actual and actual != expected:
+                    report("collision profile", actor,
+                           f"{comp.get_name()}: Collision Enabled {actual} but profile {profile} says {expected}; the "
+                           "next edit re-applies the profile (set the profile to Custom, or pick one that fits)")
         return json.dumps({"actors": len(actors), "issues": issues, "capped": len(issues) >= limit})
 
     @_tool

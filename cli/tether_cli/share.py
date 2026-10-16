@@ -9,21 +9,12 @@ import os
 import re
 import time
 
-from .core import CliError, read_json, run_git, state_dir, write_json
+from .core import CliError, read_json, run_git, session_id, state_dir, write_json
 
 LEASE_MINUTES = 15      # default length of `ue lease take`
 ACTIVE_MINUTES = 5      # other sessions' commands this recent make a restart or close ask for the lease
 ACTIVITY_KEEP = 3600    # seconds of activity kept in activity.jsonl
 LEASED = 5              # exit code: another session holds the editor lease
-
-
-def session_id():
-    """This process's session: UE_SESSION, else the Claude Code session (short id), else "user"."""
-    explicit = os.environ.get("UE_SESSION")
-    if explicit:
-        return explicit
-    claude = os.environ.get("CLAUDE_CODE_SESSION_ID")
-    return claude[:8] if claude else "user"
 
 
 def session_names(project):
@@ -127,6 +118,7 @@ def take_lease(project, what, minutes, now=None):
                        "`ue lease release`", LEASED)
     lease = {"session": me, "what": what, "since": held["since"] if held else now, "until": now + minutes * 60}
     write_json(lease_path(project), lease)
+    drop_request(project, me)  # asked for it earlier: answered
     return lease, bool(held)
 
 
@@ -174,6 +166,76 @@ def lease_note(project):
     if held and held["session"] != session_id():
         return f"note: the editor is {describe_lease(project, held)}"
     return None
+
+
+# ---------------------------------------------------------------- asking for the lease
+
+REQUEST_HOURS = 2  # a request nobody granted is dropped after this
+
+
+def requests_path(project):
+    return os.path.join(state_dir(project), "lease-requests.json")
+
+
+def lease_requests(project, now=None):
+    """Open requests for the editor, oldest first: [{session, what, minutes, time}]."""
+    now = time.time() if now is None else now
+    rows = read_json(requests_path(project)) or []
+    return [r for r in rows if isinstance(r, dict) and now - r.get("time", 0) < REQUEST_HOURS * 3600]
+
+
+def request_lease(project, what, minutes, now=None):
+    """Ask the session holding the lease for the editor next (one request per session; asking again updates it).
+    Returns the lease it is waiting on, or None when the editor is free (take it instead)."""
+    now = time.time() if now is None else now
+    me = session_id()
+    rows = [r for r in lease_requests(project, now) if r["session"] != me]
+    rows.append({"session": me, "what": what, "minutes": minutes, "time": now})
+    write_json(requests_path(project), rows)
+    return active_lease(project, now)
+
+
+def drop_request(project, sid):
+    rows = lease_requests(project)
+    if any(r["session"] == sid for r in rows):
+        write_json(requests_path(project), [r for r in rows if r["session"] != sid])
+
+
+def grant_lease(project, to=None, now=None):
+    """Hand this session's lease (or a free editor) to the oldest request, or to session `to`: the lease is
+    written in its name for what it asked. Returns the new lease."""
+    now = time.time() if now is None else now
+    held, me = active_lease(project, now), session_id()
+    if held and held["session"] != me:
+        raise CliError(f"the lease is not yours to grant: the editor is {describe_lease(project, held, now)}", LEASED)
+    rows = lease_requests(project, now)
+    pick = next((r for r in rows if r["session"] == to or (to and session_names(project).get(r["session"]) == to)),
+                None) if to else (rows[0] if rows else None)
+    if not pick:
+        raise CliError("no request for the editor" + (f" from {to}" if to else "")
+                       + (" (open: " + ", ".join(session_label(project, r["session"]) for r in rows) + ")" if rows else ""))
+    lease = {"session": pick["session"], "what": pick["what"], "since": now, "until": now + pick["minutes"] * 60,
+             "granted_by": me}
+    write_json(lease_path(project), lease)
+    drop_request(project, pick["session"])
+    return lease
+
+
+def lease_messages(project, now=None):
+    """Lines for this session at the start of any `ue` command: requests waiting on its lease, or a lease just
+    granted to it (said once)."""
+    now = time.time() if now is None else now
+    me, held, out = session_id(), active_lease(project, now), []
+    if held and held["session"] == me:
+        if held.get("granted_by") and not held.get("told"):
+            out.append(f"note: the editor lease is yours now, granted by {session_label(project, held['granted_by'])} "
+                       f"({max(1, round((held['until'] - now) / 60))} min; `ue lease release` when done)")
+            write_json(lease_path(project), dict(held, told=True))
+        for r in lease_requests(project, now):
+            if r["session"] != me:
+                out.append(f"note: {session_label(project, r['session'])} asks for the editor "
+                           f"({ago(now - r['time'])}): {r['what']}. `ue lease grant` hands it over when you are done")
+    return out
 
 
 # ---------------------------------------------------------------- who wrote a source file

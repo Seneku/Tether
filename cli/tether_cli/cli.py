@@ -6,19 +6,21 @@ import re
 import sys
 import time
 
-from .core import CliError, crash_summary, find_project, recent_crash, stall_report
+from .core import UE_SCRIPT, CliError, crash_summary, find_project, live_editors, recent_crash, stall_report
 from .transport import Ctx
-from .share import LEASE_MINUTES, record_activity
+from .share import LEASE_MINUTES, lease_messages, record_activity
 from .editor import cmd_build, cmd_close, cmd_crash, cmd_git, cmd_lease, cmd_open, cmd_status, cmd_who
 from .calls import (
     cmd_actors, cmd_ai, cmd_anim, cmd_api, cmd_asset, cmd_call, cmd_changes, cmd_config, cmd_delete, cmd_drop,
     cmd_duplicate, cmd_exec, cmd_find, cmd_log, cmd_mat, cmd_mv, cmd_nav, cmd_new, cmd_props, cmd_py, cmd_refs,
     cmd_class, cmd_collision, cmd_cvar, cmd_tree, cmd_lights, cmd_wp, cmd_level, cmd_rm, cmd_statetree, cmd_trace, cmd_save, cmd_savegame, cmd_scatter, cmd_set, cmd_spawn, cmd_tools, cmd_undo, cmd_watch,
 )
-from .images import cmd_look, cmd_shot
+from .images import cmd_look, cmd_shot, shot_args
 from .testing import cmd_test
 from .assets import cmd_data, cmd_diff, cmd_fx, cmd_net, cmd_overview, cmd_pcg, cmd_skel, cmd_size, cmd_table, cmd_usages, cmd_validate
-from .content import cmd_foliage, cmd_import, cmd_landscape, cmd_lint, cmd_map, cmd_mesh, cmd_tex, cmd_unused, cmd_water
+from .content import (
+    cmd_collide, cmd_foliage, cmd_import, cmd_landscape, cmd_lint, cmd_map, cmd_mesh, cmd_tex, cmd_unused, cmd_water,
+)
 from .fab import cmd_fab
 from .jobs import cmd_game, cmd_job, cmd_package
 from .play import cmd_audio, cmd_gpu, cmd_mem, cmd_sound, cmd_soak, cmd_ui, cmd_wait, cmd_world
@@ -26,6 +28,26 @@ from .playtest import bp_command, cmd_budget, cmd_input, package_command, perf_c
 from .hooks import cmd_hook
 from .setup import cmd_doctor, cmd_init, cmd_reload, cmd_template, new_project, tether_version
 from .selftest import cmd_ci, cmd_selftest
+
+
+def build_command(ctx, args):
+    """`ue build` (editor.cmd_build); --when-closed hands it to a background job that waits for the editors."""
+    if args.when_closed and live_editors(ctx.project):
+        pids = ", ".join(str(b.get("pid")) for b in live_editors(ctx.project))
+        code = cmd_job(ctx, argparse.Namespace(
+            action="start", name="build when the editors close", platform=None,
+            job_command=[sys.executable, UE_SCRIPT, "--project", ctx.project, "build", "--after-close"]))
+        print(f"it waits for editor(s) {pids} to close, then runs `ue build` (UBT)")
+        return code
+    return cmd_build(ctx, args)
+
+
+def exec_command(ctx, args):
+    """`ue exec` (calls.cmd_exec); with --shot, `ue shot` runs right after the command, before its log is read."""
+    if args.shot is None:
+        return cmd_exec(ctx, args)
+    shoot = lambda: cmd_shot(ctx, shot_args(output=args.shot or None, hud=args.hud))  # noqa: E731
+    return cmd_exec(ctx, args, after=shoot)
 
 
 def new_command(ctx, args):
@@ -103,7 +125,7 @@ def build_parser():
     s.add_argument("--no-build", action="store_true", help="skip the C++/C# pre-build")
     s.add_argument("--wait", type=float, default=600, help="seconds to wait for ready (600)")
     s.add_argument("--no-wait", action="store_true")
-    s = add("build", cmd_build, "compile: Live Coding if the editor is up, UBT if not; --restart for reflection changes")
+    s = add("build", build_command, "compile: Live Coding if the editor is up, UBT if not; --restart for reflection changes")
     s.add_argument("--restart", action="store_true", help="save/close editor, UBT build, reopen same map")
     s.add_argument("--save", action="store_true", help="with --restart: save dirty packages first")
     s.add_argument("--discard", action="store_true", help="with --restart: drop unsaved changes")
@@ -112,6 +134,13 @@ def build_parser():
     s.add_argument("--no-check", action="store_true", help="with --restart: skip the compile check made before closing")
     s.add_argument("--files", nargs="+", metavar="PATH", help="with --check: compile only these files (a header: the "
                                                               ".cpp files including it), no link; needs no lease")
+    s.add_argument("--when-closed", action="store_true", help="build with UBT once every editor on the project has "
+                                                             "closed (a background job: ue job status), so the code a "
+                                                             "launcher start loads has the Live Coding patches")
+    s.add_argument("--after-close", action="store_true", help=argparse.SUPPRESS)
+    s.add_argument("--overlay", metavar="DIR", help="with --check: compile a copy of the project's code with DIR's files "
+                                                    "on top (DIR/Source/<Module>/...), for work kept out of Source/ "
+                                                    "while another session's Live Coding builds")
     s.add_argument("--include-others", action="store_true", help="Live Coding: compile even files another session edited "
                                                                  "in the last 15 min (it refuses otherwise)")
     s.add_argument("--ignore-lease", action="store_true", help="with --restart: go ahead although another session holds "
@@ -125,9 +154,11 @@ def build_parser():
     s.add_argument("--force", action="store_true", help="terminate immediately")
     s.add_argument("--ignore-lease", action="store_true", help="close although another session holds the lease or "
                                                                "used the editor in the last few minutes")
-    s = add("lease", cmd_lease, "share the editor between sessions: take --for WHAT [--minutes N] | release | (show)")
-    s.add_argument("action", nargs="?", choices=["take", "release"])
-    s.add_argument("--for", "--reason", dest="what", help="with take: what the editor is for, as the other sessions will see it")
+    s = add("lease", cmd_lease, "share the editor between sessions: take --for WHAT [--minutes N] | release | request "
+                                    "--for WHAT | grant [SESSION] | (show)")
+    s.add_argument("action", nargs="?", choices=["take", "release", "request", "grant"])
+    s.add_argument("to", nargs="?", help="with grant: the session to hand the lease to (default: the oldest request)")
+    s.add_argument("--for", "--reason", dest="what", help="with take/request: what the editor is for, as the other sessions will see it")
     s.add_argument("--minutes", type=float, default=LEASE_MINUTES, help=f"with take: how long ({LEASE_MINUTES}); "
                                                                          "take again to renew")
     s.add_argument("--as", dest="name", help="a name for this session that the others see (kept)")
@@ -229,6 +260,15 @@ def build_parser():
     s.add_argument("--top", type=int, default=10, help="how many of the largest to list (10)")
     s.add_argument("--max", type=int, help="flag textures over this many pixels a side (lint.json max_texture_size, 4096)")
     s.add_argument("--strict", action="store_true", help="exit 1 when any issue is found")
+    s = add("collide", cmd_collide, "what blocks at one height around a point, as a picture coloured by class (overlap "
+                                    "boxes on a grid: procedural roads and instanced buildings included)")
+    s.add_argument("where", metavar="x,y,radius", help="centre and radius, cm (--m: metres)")
+    s.add_argument("--z", type=float, help="height of the boxes' centres (100)")
+    s.add_argument("--step", type=float, help="cell size, cm (default: 160 cells across, at least 25 cm)")
+    s.add_argument("--half", type=float, default=40, help="box half-height, cm (40)")
+    s.add_argument("--m", action="store_true", help="x,y,radius in metres")
+    s.add_argument("--pie", action="store_true", help="the PIE world")
+    s.add_argument("-o", "--output", help="PNG path (default Saved/Tether/shots/collide-<time>.png)")
     s = add("map", cmd_map, "the level from above as a picture: mesh footprints, landscape height, gameplay actors by "
                             "class; `map open <path>` loads another map into the editor")
     s.add_argument("area", nargs="?", help="x,y,radius (default: the whole level), or open")
@@ -376,9 +416,12 @@ def build_parser():
     s = add("actors", cmd_actors, "actors in the editor level")
     s.add_argument("match", nargs="?")
     s.add_argument("--pie", action="store_true", help="list the PIE world's actors instead")
-    s = add("exec", cmd_exec, "console command; prints the log lines it produced")
+    s = add("exec", exec_command, "console command; prints the log lines it produced")
     s.add_argument("command", nargs="+")
     s.add_argument("--pie", action="store_true", help="run in the PIE world")
+    s.add_argument("--shot", nargs="?", const="", metavar="PNG", help="take a shot right after the command (a short "
+                                                                     "effect is caught before it fades)")
+    s.add_argument("--hud", action="store_true", help="with --shot in PIE: with the game's UMG HUD")
     s = add("log", cmd_log, "new log entries since the last call; --summary: the session grouped; --ignore: known noise")
     s.add_argument("--since", default="last",
                    help="last: new since the previous ue log (default); start: this editor session; pie: the last PIE "
@@ -652,7 +695,8 @@ def build_parser():
     s.add_argument("--dry-run", action="store_true", help="with --fix: show the fixes only")
     s.add_argument("--save", action="store_true", help="with --fix: save the changed assets")
     s = add("find", cmd_find, "search assets by name and/or class (asset registry)")
-    s.add_argument("query", nargs="?", help="regex on the asset name")
+    s.add_argument("query", nargs="?", help="regex on the asset name, or a package path: a folder or a glob "
+                                           "(/Game/X/Presets/*)")
     s.add_argument("--class", dest="cls", help="regex on the class name, e.g. StaticMesh or 'Material$'")
     s.add_argument("--under", default="/Game", help="content folder to search (default /Game)")
     s = add("refs", cmd_refs, "what references an asset (--deps: what it depends on)")
@@ -660,11 +704,21 @@ def build_parser():
     s.add_argument("--deps", action="store_true", help="list dependencies instead of referencers")
     s = add("class", cmd_class, "a class at a glance: parents, own properties/functions, Blueprint parts, subclasses, references")
     s.add_argument("name", help="Character, AMyEnemy, /Script/Module.Class, BP_Door or /Game/.../BP_Door")
+    for flag, key, text in (("--functions", "functions", "functions alone, one per line with parameters and types"),
+                            ("--vars", "vars", "variables alone, one per line"),
+                            ("--components", "components", "components alone"), ("--events", "events", "events alone"),
+                            ("--props", "props", "C++ properties alone"), ("--derived", "derived", "subclasses alone")):
+        s.add_argument(flag, dest="section", action="store_const", const=key, help=text)
+    s.add_argument("--grep", metavar="REGEX", help="only the items matching (names and types)")
     s = add("api", cmd_api, "the unreal Python API: a class's methods and properties, or one member's doc")
     s.add_argument("name", help="class or class.member, e.g. EditorActorSubsystem or Actor.set_actor_location")
     s.add_argument("match", nargs="?", help="regex filter on member names")
-    s = add("game", cmd_game, "multiplayer outside PIE: server + clients as game processes (start|status|log|shot|stop)")
-    s.add_argument("action", nargs="?", choices=["start", "status", "log", "shot", "stop"])
+    s = add("game", cmd_game, "outside PIE: server + clients as game processes (start|status|log|shot|stop), or smoke: "
+                              "each map in -game for a few seconds")
+    s.add_argument("action", nargs="?", choices=["start", "status", "log", "shot", "stop", "smoke"])
+    s.add_argument("--maps", help="with smoke: comma-separated maps (default: the game map and every map in Content/, "
+                                  "up to 12)")
+    s.add_argument("--seconds", type=float, help="with smoke: seconds to play each map after it loads (15)")
     s.add_argument("index", nargs="?", type=int, help="with log/shot: which process (0 = the server)")
     s.add_argument("-o", "--output", help="with shot: PNG path (default Saved/Tether/shots/)")
     s.add_argument("--clients", type=int, default=1, help="with start: how many clients (1)")
@@ -681,7 +735,8 @@ def build_parser():
     s.add_argument("--game-port", type=int, help="with start: the server's port (17777)")
     s.add_argument("--server-args", default="", help="with start: extra command-line arguments for the server")
     s.add_argument("--client-args", default="", help="with start: extra command-line arguments for each client")
-    s.add_argument("--wait", type=float, default=120, help="with start: seconds to wait for the clients to join (120)")
+    s.add_argument("--wait", type=float, default=120, help="with start: seconds to wait for the clients to join; with "
+                                                          "smoke: for each map to load (120)")
     s.add_argument("--server-delay", type=float, default=3, help="with start: seconds between server and clients (3)")
     s.add_argument("--level", help="with log: Error, Warning (default), Display, Log")
     s.add_argument("--grep", help="with log: regex filter")
@@ -819,6 +874,8 @@ def main(argv=None):
     if args.cmd not in UNRECORDED:
         try:  # who ran what, for `ue who` and the shared-editor checks
             record_activity(find_project(args.project), ["ue"] + (sys.argv[1:] if argv is None else list(argv)))
+            for line in lease_messages(find_project(args.project)):  # requests for this session's lease, a grant
+                print(line, file=sys.stderr)
         except CliError:
             pass  # not in a project: the command itself will say so
     try:

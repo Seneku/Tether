@@ -438,9 +438,80 @@ def read_game_log(path):
         return []
 
 
+MAP_LOADED = re.compile(r"LogLoad: Took [\d.]+ seconds to LoadMap\(")
+GAME_PROBLEM = re.compile(r"Accessed None|Script Msg|Fatal error|Unhandled Exception|Assertion failed|Ensure condition")
+
+
+def smoke_maps(project, wanted):
+    """The maps for `ue game smoke`: the given ones, else the default map and every .umap under Content/ (not
+    Developers/ or World Partition's external actors), up to 12."""
+    if wanted:
+        return [m.strip() for m in wanted.split(",") if m.strip()], 0
+    content, found = os.path.join(os.path.dirname(project), "Content"), []
+    for here, dirs, files in os.walk(content):
+        dirs[:] = [d for d in dirs if d not in ("Developers", "Collections") and not d.startswith("__External")]
+        found += ["/Game/" + os.path.relpath(os.path.join(here, f[:-5]), content).replace("\\", "/")
+                  for f in files if f.endswith(".umap")]
+    first = default_map(project)
+    found = ([first] if first else []) + sorted(m for m in found if m != first)
+    return found[:12], max(0, len(found) - 12)
+
+
+def game_smoke(ctx, args):
+    """`ue game smoke [--maps a,b] [--seconds 15]`: open each map in a headless `-game` process (the editor
+    binary, or --packaged) and play it for a few seconds: what PIE hides shows up there (editor-only components
+    are null, start-up scripts differ). Reports errors, Accessed None and crashes per map."""
+    maps, skipped = smoke_maps(ctx.project, args.maps)
+    if not maps:
+        raise CliError("no maps (pass --maps /Game/Maps/A,/Game/Maps/B)")
+    folder = os.path.join(game_dir(ctx.project), "smoke")
+    os.makedirs(folder, exist_ok=True)
+    env = editor_env(ctx.project) if not args.packaged else None
+    seconds = args.seconds if args.seconds is not None else 15
+    failed, results = 0, []
+    print(f"smoke: {len(maps)} map(s), {seconds:g}s each after loading, headless -game"
+          + (f" ({skipped} more maps not run: --maps)" if skipped else ""))
+    for i, level in enumerate(maps):
+        log = os.path.join(folder, f"{i}-{level.rsplit('/', 1)[-1]}.log")
+        if os.path.exists(log):
+            os.remove(log)
+        run = argparse.Namespace(packaged=args.packaged, windowed=False, map=level, game=args.game, server_args="",
+                                 client_args="", platform=args.platform, server="none", connect=None, python=args.python)
+        proc = subprocess.Popen(game_command(ctx, run, "client", i, free_udp_port(17777), log),
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, env=env)
+        started, loaded = time.time(), None
+        while time.time() - started < args.wait and proc.poll() is None:
+            if loaded is None and any(MAP_LOADED.search(l) for l in read_game_log(log)):
+                loaded = time.time()
+            if loaded and time.time() - loaded >= seconds:
+                break
+            time.sleep(0.5)
+        exited = proc.poll()
+        if exited is None:
+            subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"] if os.name == "nt"
+                           else ["kill", "-9", str(proc.pid)], capture_output=True)
+        lines = read_game_log(log)
+        errors = list(filter_log(lines, level="Error"))
+        problems = [l for l in filter_log(lines, level="Warning") if GAME_PROBLEM.search(l)]
+        crashed = exited is not None or any("Fatal error" in l for l in lines)
+        state = ("CRASHED" if crashed else "no load" if loaded is None else
+                 f"{len(errors)} error(s)" if errors or problems else "OK")
+        failed += state != "OK"
+        took = f"loaded in {loaded - started:.0f}s" if loaded else f"not loaded after {time.time() - started:.0f}s"
+        print(f"  {level}: {state} ({took})")
+        for line in list(dict.fromkeys(problems + errors))[:4]:
+            print(f"    {line[:200]}")
+        results.append({"map": level, "state": state, "log": log, "errors": errors[:20], "problems": problems[:20]})
+    ctx.data = results
+    print(f"{len(maps) - failed} of {len(maps)} map(s) clean" + (f"; logs in {folder}" if failed else ""))
+    return 1 if failed else 0
+
+
 def cmd_game(ctx, args):
     """Multiplayer outside PIE: a server and clients as separate game processes (editor binary, or the packaged
     build), each with its own log; start, status, log, stop."""
+    if args.action == "smoke":
+        return game_smoke(ctx, args)
     folder = game_dir(ctx.project)
     state_file = os.path.join(folder, "session.json")
     state = read_json(state_file) or {}

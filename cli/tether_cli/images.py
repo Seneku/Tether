@@ -250,8 +250,9 @@ def hud_screenshot(ctx, cache=None):
         if widget is not None and thumb_difference(cropped, widget) > HUD_MISMATCH:
             # The window grab did not line up with the viewport (another editor layout, or the offscreen view not
             # composited into the window): the Slate inspector's capture of the viewport itself is right.
-            print("note: the window screenshot did not line up with the game view; this is the viewport's own "
-                  "capture, with UMG but without canvas-drawn text (AHUD, on-screen debug messages)")
+            print("note: the window screenshot did not line up with the game view, so this is the viewport's own "
+                  "capture: UMG is in it; canvas-drawn text (AHUD, debug messages) usually is too, but check the "
+                  "image if you rely on it")
             return widget
     if cache is not None:
         cache.update(rect=rect)
