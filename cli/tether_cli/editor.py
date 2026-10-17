@@ -95,6 +95,7 @@ OTHERS_MINUTES = 15  # another session's edits this recent may be half-written
 
 def cmd_build(ctx, args):
     if getattr(args, "after_close", False):  # the job `ue build --when-closed` starts: wait, then a normal build
+        os.environ.pop("UE_EDITOR_PID", None)  # a job queued before 0.29.3 inherited the --pid of an editor now gone
         print("waiting for every editor on this project to close")
         deadline = time.time() + 24 * 3600
         while live_editors(ctx.project):

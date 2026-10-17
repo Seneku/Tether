@@ -36,9 +36,15 @@ def build_command(ctx, args):
     """`ue build` (editor.cmd_build); --when-closed hands it to a background job that waits for the editors."""
     if args.when_closed and live_editors(ctx.project):
         pids = ", ".join(str(b.get("pid")) for b in live_editors(ctx.project))
-        code = cmd_job(ctx, argparse.Namespace(
-            action="start", name="build when the editors close", platform=None,
-            job_command=[sys.executable, UE_SCRIPT, "--project", ctx.project, "build", "--after-close"]))
+        # not the --pid editor: it is one of those that must close first, and the job's build only runs UBT
+        chosen = os.environ.pop("UE_EDITOR_PID", None)
+        try:
+            code = cmd_job(ctx, argparse.Namespace(
+                action="start", name="build when the editors close", platform=None,
+                job_command=[sys.executable, UE_SCRIPT, "--project", ctx.project, "build", "--after-close"]))
+        finally:
+            if chosen is not None:
+                os.environ["UE_EDITOR_PID"] = chosen
         print(f"it waits for editor(s) {pids} to close, then runs `ue build` (UBT)")
         return code
     return cmd_build(ctx, args)

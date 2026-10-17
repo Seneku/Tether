@@ -3752,3 +3752,17 @@ class UnrealRacingRound6(unittest.TestCase):
         with unittest.mock.patch.dict(os.environ, {"UE_SESSION": "fresh"}):
             self.assertEqual(ue.chosen_editor(p)["pid"], os.getpid())
         self.assertEqual(ue.read_json(os.path.join(folder, "targets.json"))["fresh"]["pid"], os.getpid())
+
+    def test_when_closed_job_drops_the_pid(self):
+        seen = {}
+        ctx = FakeCtx()
+        ctx.project = self.project.uproject
+        args = ue.build_parser().parse_args(["--pid", "16404", "build", "--when-closed"])
+        with unittest.mock.patch.dict(os.environ, {"UE_EDITOR_PID": "16404"}), \
+                unittest.mock.patch.object(ue.cli, "live_editors", return_value=[{"pid": 16404}]), \
+                unittest.mock.patch.object(ue.cli, "cmd_job",
+                                           side_effect=lambda c, a: seen.update(pid=os.environ.get("UE_EDITOR_PID")) or 0), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(ue.build_command(ctx, args), 0)
+            self.assertEqual(os.environ.get("UE_EDITOR_PID"), "16404")  # this command's own choice is kept
+        self.assertIsNone(seen["pid"])

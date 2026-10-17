@@ -140,6 +140,9 @@ editor, and a new session's default is the editor the lease holder and the other
 (targets.json keeps the time), before the user's own. Both checked live in Sandbox with a shared and a `--second`
 editor.
 
+**Done in 0.29.3**: 183 `build --when-closed` no longer hands its `--pid` to the job (that editor is one of those
+it waits to close; the build runs UBT), and a job queued by an earlier version drops it before it builds.
+
 ---
 
 ## Priority 1: asked for, or blocking real work
