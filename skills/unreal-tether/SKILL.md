@@ -39,7 +39,8 @@ content (cars, LevelPrototyping, mannequins) to the /Game path its packages expe
 makes later sessions in that folder load Tether (no plugin there: no `ue` on PATH, no edit hooks).
 
 With several editors open, each session keeps talking to the one it opened or used last (`--pid` changes
-that), so an editor the user opens mid-session does not take your commands.
+that), so an editor the user opens mid-session does not take your commands. A new session starts on the editor
+the lease holder and the other sessions use; `ue status` alone does not pin one.
 
 Several reads or edits in a row? Put them in one `ue batch` (one command per line, from stdin or a file):
 one process and one editor session for all of them.
@@ -249,8 +250,9 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
   after the first run). A folder another session compiled is refused (on Windows staging/ and Staging/ are one
   folder). Do not
   compile the editor target with UBT `-Module=` while the editor runs: Live Coding breaks until a restart.
-- Live Coding patches live only in the editor that loaded them: `ue status` names other editors running
-  without them, and `ue build --when-closed` queues the UBT build for when every editor has closed.
+- Live Coding patches every editor open on the project at once (the user's own and any PIE there included;
+  `ue build` names them), and live only in those processes: `ue status` names editors running without them, and
+  `ue build --when-closed` queues the UBT build for when every editor has closed.
 
 ## C# changes (UnrealSharp projects: a `Script/` folder plus `Plugins/UnrealSharp`)
 - Edit `.cs` files under `Script/`, then run `ue build`. It hot-reloads in ~1 s, covering function

@@ -79,10 +79,14 @@ def cmd_status(ctx, args):
         print(f"  also open on this project: {editor_label(other)}, map {other.get('map')}. Saving the same assets "
               f"from two editors loses work; `ue --pid {other.get('pid')} ...` talks to that one"
               + (f", `ue close --pid {other.get('pid')}` closes it" if other.get("launched_by_tether") else ""))
+    notes = {}  # editors in the same state share a line
     for b in ([beacon] if alive else []) + others:
         stale = stale_code_note(ctx.project, b)
         if stale:
-            print(f"  pid {b.get('pid')} {stale}")
+            notes.setdefault(stale, []).append(str(b.get("pid")))
+    for stale, pids in notes.items():
+        print(f"  pid {pids[0]} {stale}" if len(pids) == 1 else
+              f"  pids {', '.join(pids)} " + stale.replace("runs ", "run ", 1))
     return 0 if alive and age <= 10 else 2
 
 
@@ -428,8 +432,8 @@ def close_editor(ctx, args, explicit):
                   + (f"; {len(left)} still locked (deleted at the next ue open)" if left else ""))
     patches = live_patches(ctx.project)
     if patches:
-        print(f"note: {patches} Live Coding patch(es) since the last UBT build lived only in that editor: `ue open` "
-              "builds them first, but an editor opened from the launcher or the .uproject loads the older binaries. "
+        print(f"note: {patches} Live Coding patch(es) since the last UBT build lived only in the editors open then: "
+              "`ue open` builds them first, but an editor opened from the launcher or the .uproject loads the older binaries. "
               "Handing the project over? Run `ue build` now")
     return 0
 

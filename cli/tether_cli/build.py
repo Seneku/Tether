@@ -7,7 +7,8 @@ import re
 import time
 
 from .core import (
-    CliError, chosen_editor, engine_root, epic_settings_dir, host_platform, live_coding_holders, live_editors, log_end,
+    CliError, chosen_editor, editor_label, engine_root, epic_settings_dir, host_platform, live_coding_holders,
+    live_editors, log_end,
     log_path, logged_dialogs, read_json,
     read_new_log, state_dir, subprocess, uat_command, ubt_command, write_json,
 )
@@ -210,27 +211,68 @@ def classify_changes(project):
     return changed, module, reflected
 
 
-def mark_green(project, key="time", live=False, pid=None):
-    """A green build. Live Coding patches exist only in the editor process that loaded them (`pid`): count them
-    until a UBT build makes them real, so `ue close` can say the code a launcher start would load is older, and
-    `ue status` which other editors run without them."""
+def mark_green(project, key="time", live=False, pid=None, also=()):
+    """A green build. Live Coding patches exist only in the editor processes that loaded them (`pid`, and `also`:
+    every editor open on the project joins one Live++ group, so a build from one patches them all): count them per
+    editor until a UBT build makes them real, so `ue close` can say the code a launcher start would load is older,
+    and `ue status` which editors run with or without them."""
     path = os.path.join(state_dir(project), "last-build.json")
     marker = read_json(path) or {}
     marker[key] = time.time()
     if key == "time":
         marker["live_patches"] = marker.get("live_patches", 0) + 1 if live else 0
         marker["live_pid"] = pid if live else None
+        pids = (marker.get("live_pids") or {}) if live else {}
+        for p in ([pid] if live and pid else []) + list(also if live else ()):
+            pids[str(p)] = pids.get(str(p), 0) + 1
+        marker["live_pids"] = pids
     write_json(path, marker)
 
 
 def stale_code_note(project, beacon):
-    """For an editor that runs without this project's Live Coding patches (another editor got them): a note."""
+    """For an editor that runs without some of this project's Live Coding patches, or with patches the last UBT
+    build does not have: a note."""
     marker = read_json(os.path.join(state_dir(project), "last-build.json")) or {}
-    patched = marker.get("live_pid")
-    if not marker.get("live_patches") or not patched or beacon.get("pid") == patched:
+    total, pid = marker.get("live_patches") or 0, beacon.get("pid")
+    if not total or not pid:
         return None
-    return (f"runs the last UBT build, without the {marker['live_patches']} Live Coding patch(es) made in pid "
-            f"{patched}: `ue build` once every editor is closed (`ue build --when-closed` waits for that)")
+    pids = marker.get("live_pids")
+    if pids is None:  # written before 0.29.2: only the building editor was counted
+        if not marker.get("live_pid") or pid == marker["live_pid"]:
+            return None
+        pids = {str(marker["live_pid"]): total}
+    has = pids.get(str(pid), 0)
+    if has >= total:
+        return (f"runs {total} Live Coding patch(es) newer than the last UBT build (an editor started from the "
+                "launcher would not have them: `ue build` once every editor is closed)")
+    patched = ", ".join(p for p, n in pids.items() if n) or "?"
+    return (f"runs the last UBT build" + (f" plus {has} of" if has else ", without") + f" the {total} Live Coding "
+            f"patch(es) made in pid {patched}: `ue build` once every editor is closed (`ue build --when-closed` "
+            "waits for that)")
+
+
+LIVE_RESULT = re.compile(r"LogLiveCoding: (?:\w+: )?Live coding succeeded")
+
+
+def editors_also_patched(project, offsets, wait=3.0):
+    """The other editors whose logs reported a Live Coding success since `offsets` ({pid: (beacon, log, size)}):
+    Live++ patches every editor in the project's group, not only the one asked to compile."""
+    found, deadline = [], time.time() + wait
+    while offsets and time.time() < deadline:
+        for pid, (beacon, log, size) in list(offsets.items()):
+            try:
+                with open(log, "rb") as f:
+                    f.seek(size if os.path.getsize(log) >= size else 0)
+                    text = f.read().decode("utf-8", "replace")
+            except OSError:
+                del offsets[pid]
+                continue
+            if LIVE_RESULT.search(text):
+                found.append(beacon)
+                del offsets[pid]
+        if offsets:
+            time.sleep(0.25)
+    return found
 
 
 def live_patches(project):
@@ -603,6 +645,12 @@ def live_coding_build(ctx, args, changes):
     lc_log = live_coding_console_log(ctx.project)
     lc_start = os.path.getsize(lc_log) if lc_log and os.path.isfile(lc_log) else 0
     started = time.time()
+    building = (chosen_editor(ctx.project) or {}).get("pid")
+    offsets = {}  # the other editors' logs: Live++ patches them too
+    for b in live_editors(ctx.project):
+        other_log = b.get("log")
+        if b.get("pid") != building and other_log and os.path.isfile(other_log):
+            offsets[b.get("pid")] = (b, other_log, os.path.getsize(other_log))
     ctx.tether("console", command="LiveCoding.Compile")
     result = None
     while time.time() - started < args.wait and result is None:
@@ -615,6 +663,7 @@ def live_coding_build(ctx, args, changes):
     if result is None:
         raise CliError(f"no Live Coding result within {args.wait:.0f}s (ue log --cat LogLiveCoding)", 4)
     ok = not result.startswith("Live coding failed")
+    also = editors_also_patched(ctx.project, offsets) if result.startswith("Live coding succeeded") else []
     # The result reaches the editor log before the UBT and Live Coding console logs are on disk: a failure with
     # no errors found yet gets a few more reads.
     retry_until = time.time() + (5 if not ok else 0)
@@ -636,6 +685,10 @@ def live_coding_build(ctx, args, changes):
         time.sleep(0.5)
     print(f"live coding: {'OK' if ok else 'FAILED'} in {time.time() - started:.1f}s"
           + ("" if ok else f" ({len(errors) + len(link_errors)} errors)"))
+    if also:
+        print("  note: the patch also reached " + "; ".join(
+            editor_label(b) + (", in PIE" if b.get("pie") else "") for b in also)
+            + " (Live Coding patches every editor open on the project)")
     print_diagnostics(errors, warnings, args.limit)
     print_error_owners(ctx.project, errors)
     for line in link_errors[: args.limit]:
@@ -665,5 +718,5 @@ def live_coding_build(ctx, args, changes):
         write_json(layout_marker(ctx.project), {"pid": editor.get("pid"), "time": time.time(),
                                                 "headers": list(dict.fromkeys(headers + [os.path.basename(p) for p in changes[2]]))})
     if ok:
-        mark_green(ctx.project, live=True, pid=(chosen_editor(ctx.project) or {}).get("pid"))
+        mark_green(ctx.project, live=True, pid=building, also=[b.get("pid") for b in also])
     return 0 if ok else 1

@@ -1072,11 +1072,18 @@ def live_editors(project):
     return [b for b in editor_beacons(project) if editor_process(b.get("pid"))]
 
 
+# False while a command that only looks (status, who, lease, hooks) runs: its default pick of an editor must not
+# become this session's sticky target (a fresh session's first `ue status` would otherwise pin the user's editor)
+KEEP_TARGET = True
+TARGET_HOURS = 1  # another session's target this recent says which editor the project's work is going to
+
+
 def chosen_editor(project):
     """The editor the CLI talks to, or the last one seen when none is running (for status and crash
     reports). With several open: --pid / UE_EDITOR_PID if given, else the one this session used last (sticky,
-    so an editor the user opens mid-session does not take over its commands), else the one the user opened
-    rather than one `ue open` launched, else the most recently started."""
+    so an editor the user opens mid-session does not take over its commands), else the one the lease holder
+    and the other sessions use, else the one the user opened rather than one `ue open` launched, else the most
+    recently started."""
     wanted = os.environ.get("UE_EDITOR_PID")
     beacons = editor_beacons(project)
     live = [b for b in beacons if editor_process(b.get("pid"))]
@@ -1090,12 +1097,17 @@ def chosen_editor(project):
         remember_target(project, match)
         return match
     if live:
-        sticky = (read_json(targets_path(project)) or {}).get(session_id())
+        targets = read_json(targets_path(project)) or {}
+        sticky = target_pid(targets.get(session_id()))
         # another session's `ue open --second` editor is never a default
         shared = [b for b in live if b.get("owner") in (None, session_id())] or live
-        choice = next((b for b in live if b.get("pid") == sticky), None) or \
-            sorted(shared, key=lambda b: (bool(b.get("launched_by_tether")), -b.get("started", 0)))[0]
-        remember_target(project, choice)
+        choice = next((b for b in live if b.get("pid") == sticky), None)
+        if choice is None:
+            used = others_targets(project, targets)
+            choice = sorted(shared, key=lambda b: (-used.get(b.get("pid"), 0), bool(b.get("launched_by_tether")),
+                                                   -b.get("started", 0)))[0]
+        if KEEP_TARGET:
+            remember_target(project, choice)
         return choice
     return beacons[0] if beacons else None
 
@@ -1104,11 +1116,34 @@ def targets_path(project):
     return os.path.join(state_dir(project), "targets.json")
 
 
-def remember_target(project, beacon):
-    """The editor this session talks to, kept so it stays this session's default while it runs."""
+def target_pid(entry):
+    """A targets.json entry's pid: {"pid", "time"}, or a bare pid (before 0.29.2)."""
+    return entry.get("pid") if isinstance(entry, dict) else entry
+
+
+def others_targets(project, targets, now=None):
+    """{pid: weight} of the editors the other sessions picked in the last TARGET_HOURS; the lease holder's counts
+    most (its editor is the one the project's shared work is going to)."""
+    now = time.time() if now is None else now
+    lease = read_json(os.path.join(state_dir(project), "lease.json")) or {}
+    holder = lease.get("session") if lease.get("until", 0) > now else None
+    used = {}
+    for sid, entry in targets.items():
+        if sid == session_id() or not isinstance(entry, dict) or entry.get("time", 0) < now - TARGET_HOURS * 3600:
+            continue
+        used[entry.get("pid")] = used.get(entry.get("pid"), 0) + (100 if sid == holder else 1)
+    return used
+
+
+def remember_target(project, beacon, now=None):
+    """The editor this session talks to, kept so it stays this session's default while it runs (and, with its
+    time, so a new session can default to the editor the others use)."""
+    now = time.time() if now is None else now
     targets = read_json(targets_path(project)) or {}
-    if targets.get(session_id()) != beacon.get("pid"):
-        targets[session_id()] = beacon.get("pid")
+    entry = targets.get(session_id())
+    # rewritten when the pick changes, and every few minutes so the time says the session is still at it
+    if target_pid(entry) != beacon.get("pid") or not isinstance(entry, dict) or entry.get("time", 0) < now - 300:
+        targets[session_id()] = {"pid": beacon.get("pid"), "time": round(now)}
         with contextlib.suppress(OSError):
             write_json(targets_path(project), targets)
 

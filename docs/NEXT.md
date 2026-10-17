@@ -132,6 +132,14 @@ the `--wait-file` path.
 **Done in 0.29.1**: 180 a lease reads "until 20:58 (15 min left), held since 20:25" everywhere it is shown,
 so a renewal shows its new expiry.
 
+**Done in 0.29.2**: 181 `ue build` (Live Coding) reads the other editors' logs and names the ones the patch also
+reached ("the patch also reached pid 79284, opened by hand, in PIE"); patches are counted per editor, so `ue status`
+marks the editors running patches newer than the last UBT build and those running without some of them. 182
+commands that only look (`status`, `who`, `lease`, hooks) no longer make their default pick the session's sticky
+editor, and a new session's default is the editor the lease holder and the other sessions picked this past hour
+(targets.json keeps the time), before the user's own. Both checked live in Sandbox with a shared and a `--second`
+editor.
+
 ---
 
 ## Priority 1: asked for, or blocking real work

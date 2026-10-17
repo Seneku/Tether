@@ -621,7 +621,11 @@ class Editors(unittest.TestCase):
                     ue.chosen_editor(project.uproject)
             # the editor a session used last stays its default (an editor opened by hand later does not take over)
             self.assertEqual(ue.chosen_editor(project.uproject)["pid"], os.getpid())
-            with unittest.mock.patch.dict(os.environ, {"UE_SESSION": "another"}):  # a fresh session: the user's
+            with unittest.mock.patch.dict(os.environ, {"UE_SESSION": "another"}):  # a fresh session: the one in use
+                self.assertEqual(ue.chosen_editor(project.uproject)["pid"], os.getpid())
+            path = os.path.join(ue.state_dir(project.uproject), "targets.json")
+            ue.write_json(path, {k: dict(v, time=1) for k, v in ue.read_json(path).items()})  # all long ago
+            with unittest.mock.patch.dict(os.environ, {"UE_SESSION": "third"}):  # no one at work: the user's
                 self.assertEqual(ue.editor_label(ue.chosen_editor(project.uproject)),
                                  f"pid {os.getppid()}, opened by hand")
         finally:
@@ -3177,7 +3181,7 @@ class UnrealRacingRound2(unittest.TestCase):
     def test_stale_code_note(self):
         p = self.project.uproject
         ue.mark_green(p, live=True, pid=111)
-        self.assertIsNone(ue.stale_code_note(p, {"pid": 111}))
+        self.assertIn("runs 1 Live Coding patch(es) newer than the last UBT build", ue.stale_code_note(p, {"pid": 111}))
         self.assertIn("without the 1 Live Coding patch(es) made in pid 111", ue.stale_code_note(p, {"pid": 222}))
         ue.mark_green(p)
         self.assertIsNone(ue.stale_code_note(p, {"pid": 222}))
@@ -3696,3 +3700,55 @@ class UnrealRacingRound5(unittest.TestCase):
         until = time.strftime("%H:%M", time.localtime(1000.0 + 21 * 60))
         since = time.strftime("%H:%M", time.localtime(1000.0))
         self.assertIn(f"until {until} (15 min left), held since {since}", text)
+
+
+class UnrealRacingRound6(unittest.TestCase):
+    """0.29.2: UnrealRacing's notes 181-182."""
+
+    def setUp(self):
+        self.project = Project()
+
+    def tearDown(self):
+        self.project.close()
+
+    def test_live_coding_reaches_every_editor(self):
+        p = self.project.uproject
+        log = self.project.write("Saved/Logs/Other.log", "")
+        size = os.path.getsize(log)
+        with open(log, "a") as f:
+            f.write(stamped("LogLiveCoding: Display: Starting Live Coding compile.") + "\n"
+                    + stamped("LogLiveCoding: Display: Live coding succeeded") + "\n")
+        quiet = self.project.write("Saved/Logs/Quiet.log", "")
+        user = {"pid": 79284, "launched_by_tether": False, "pie": True}
+        found = ue.editors_also_patched(p, {79284: (user, log, size), 5: ({"pid": 5}, quiet, 0)}, wait=0.3)
+        self.assertEqual(found, [user])
+        ue.mark_green(p, live=True, pid=16404, also=[79284])
+        ue.mark_green(p, live=True, pid=16404)
+        self.assertIn("runs 2 Live Coding patch(es) newer", ue.stale_code_note(p, {"pid": 16404}))
+        self.assertIn("plus 1 of the 2 Live Coding patch(es)", ue.stale_code_note(p, {"pid": 79284}))
+        self.assertIn(", without the 2", ue.stale_code_note(p, {"pid": 5}))
+        ue.mark_green(p)
+        self.assertIsNone(ue.stale_code_note(p, {"pid": 79284}))
+
+    def test_looking_does_not_pick_the_sessions_editor(self):
+        p = self.project.uproject
+        folder = ue.state_dir(p)
+        for pid, fields in ((os.getpid(), {"launched_by_tether": True, "headless": True, "started": 200}),
+                            (os.getppid(), {"launched_by_tether": False, "started": 100})):
+            ue.write_json(os.path.join(folder, "editors", f"{pid}.json"),
+                          dict({"pid": pid, "heartbeat": time.time()}, **fields))
+        try:
+            ue.core.KEEP_TARGET = False
+            with unittest.mock.patch.dict(os.environ, {"UE_SESSION": "fresh"}):
+                self.assertEqual(ue.chosen_editor(p)["pid"], os.getppid())  # nobody at work: the user's
+            self.assertIsNone(ue.read_json(os.path.join(folder, "targets.json")))
+        finally:
+            ue.core.KEEP_TARGET = True
+        # the lease holder's editor outweighs the others'
+        ue.write_json(os.path.join(folder, "targets.json"),
+                      {"a": {"pid": os.getppid(), "time": time.time()}, "b": {"pid": os.getppid(), "time": time.time()},
+                       "rivals": {"pid": os.getpid(), "time": time.time()}, "old": os.getppid()})
+        ue.write_json(os.path.join(folder, "lease.json"), {"session": "rivals", "until": time.time() + 600})
+        with unittest.mock.patch.dict(os.environ, {"UE_SESSION": "fresh"}):
+            self.assertEqual(ue.chosen_editor(p)["pid"], os.getpid())
+        self.assertEqual(ue.read_json(os.path.join(folder, "targets.json"))["fresh"]["pid"], os.getpid())

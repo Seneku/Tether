@@ -6,6 +6,7 @@ import re
 import sys
 import time
 
+from . import core
 from .core import UE_SCRIPT, CliError, crash_summary, find_project, live_editors, recent_crash, stall_report
 from .transport import Ctx
 from .share import LEASE_MINUTES, lease_messages, record_activity
@@ -1003,7 +1004,9 @@ def main(argv=None):
     if envelope:
         import io
         captured = sys.stdout = io.StringIO()
-    if args.cmd not in UNRECORDED:
+    if args.cmd in UNRECORDED:  # looking does not pick this session's editor (an explicit --pid still does)
+        core.KEEP_TARGET = False
+    else:
         try:  # who ran what, for `ue who` and the shared-editor checks
             record_activity(find_project(args.project), ["ue"] + (sys.argv[1:] if argv is None else list(argv)))
             for line in lease_messages(find_project(args.project)):  # requests for this session's lease, a grant
