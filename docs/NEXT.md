@@ -140,6 +140,20 @@ editor, and a new session's default is the editor the lease holder and the other
 (targets.json keeps the time), before the user's own. Both checked live in Sandbox with a shared and a `--second`
 editor.
 
+**Done in 0.30.0** (ten small rows): 32 `ue shot --view <mode>` (the level viewport's view mode through
+AutomationLibrary in the editor, the game's `viewmode` in PIE; waits for the view's shaders, then puts it back);
+9a `ue shot --burst N --every S` (separate PNGs; a PIE spectator camera placed once for the series); 9c `ue shot
+--window "<title>"` (a window, or a dock tab cut out of its window's capture after bringing it forward); 34 `ue post`
+(volumes in effect at a point through the brush's closest point and blend radius, merged settings with sources);
+17 actors print as `Label (Name)` where those differ, and every actor lookup takes that form back; 40 `ue build
+--timing` (game target with UBT -Timing: MSVC's per-file front/back-end times from the output, header costs from
+the /d1reportTime files); 37 `ue perf startup [--log]`; 57 `ue stats` (Saved/Tether/stats.jsonl, local); 44 `ue
+move-pack`; 42 `ue lint --fix --rule mesh-lods [--lod-fix lods]`. Also: `pie start` brings the level editor's tab
+back to the front when another tab (the Message Log the editor opens after a PIE session with errors) hides the
+game viewport, which had made `ue ui`, `expect-ui`, clicks and spectator shots fail; `ue call` takes one JSON
+object in place of k=v and says so instead of a traceback. All checked live in Sandbox (editor and PIE); the
+selftest passes (137).
+
 **Done in 0.29.3**: 183 `build --when-closed` no longer hands its `--pid` to the job (that editor is one of those
 it waits to close; the build runs UBT), and a job queued by an earlier version drops it before it builds.
 

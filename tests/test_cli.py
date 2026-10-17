@@ -3766,3 +3766,139 @@ class UnrealRacingRound6(unittest.TestCase):
             self.assertEqual(ue.build_command(ctx, args), 0)
             self.assertEqual(os.environ.get("UE_EDITOR_PID"), "16404")  # this command's own choice is kept
         self.assertIsNone(seen["pid"])
+
+
+class Batch030(unittest.TestCase):
+    """0.30: NEXT.md rows 32, 9a, 9c, 34, 40, 37, 57, 44, 42, 17."""
+
+    def setUp(self):
+        self.project = Project()
+
+    def tearDown(self):
+        self.project.close()
+
+    def test_shot_parser_takes_view_burst_and_window(self):
+        p = ue.build_parser()
+        args = p.parse_args(["shot", "--view", "shadercomplexity", "--burst", "5", "--every", "0.2"])
+        self.assertEqual((args.view, args.burst, args.every), ("shadercomplexity", 5, 0.2))
+        self.assertEqual(p.parse_args(["shot", "--window", "Outliner"]).window, "Outliner")
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            p.parse_args(["shot", "--view", "pretty"])
+        self.assertEqual(set(ue.VIEW_MODES), set(p._subparsers._group_actions[0].choices["shot"]._option_string_actions["--view"].choices))
+
+    def test_window_and_tab_regions_from_a_snapshot(self):
+        snapshot = "\n".join([
+            'window "Sandbox - Unreal Editor" [pos=0,0 size=1280,720] [ref=w1]',
+            '    tab "L_TetherProbe" [pos=99,25 size=210,31] [ref=t2]',
+            '      splitter [pos=808,102 size=468,582] [ref=sp6]',
+            '        tab "Outliner" [pos=808,102 size=160,25] [ref=t5]',
+            '          text "Outliner" [pos=835,106 size=45,15] [ref=x23]',
+            '        text "4 actors" [pos=822,243 size=47,15] [ref=x25]',
+            '        tab "Details" [pos=808,272 size=160,25] [ref=t6]',
+            '        tab "World Settings" [pos=970,272 size=160,25] [ref=t7]',
+            'window "Content Browser" [pos=1126,289 size=1280,720] [ref=w2]',
+        ])
+        rows = ue.slate_entries(snapshot)
+        window, tab, rect = ue.find_window_or_tab(rows, "outliner")
+        self.assertEqual((window[7], tab[7], rect), ("w1", "t5", (808, 102, 468, 170)))
+        window, tab, rect = ue.find_window_or_tab(rows, "Details")
+        self.assertEqual(rect, (808, 272, 468, 412))  # down to the splitter's bottom
+        window, tab, rect = ue.find_window_or_tab(rows, "content browser")
+        self.assertEqual((window[7], tab, rect), ("w2", None, None))
+        with self.assertRaisesRegex(ue.CliError, 'no editor window or tab "Mission".*tab "Outliner"'):
+            ue.find_window_or_tab(rows, "Mission")
+
+    def test_compile_times_by_file_and_module(self):
+        lines = [r"time(C:\VC\bin\Hostx64\x64\c1xx.dll)=3.10s < 1 - 2 > BB [D:\G\Source\Game\A.cpp]",
+                 r"time(C:\VC\bin\Hostx64\x64\c2.dll)=0.60s < 2 - 3 > BB [D:\G\Source\Game\A.cpp]",
+                 r"time(C:\VC\bin\Hostx64\x64\c1xx.dll)=1.00s < 1 - 2 > BB "
+                 r"[D:\G\Plugins\P\Intermediate\Build\Win64\x64\UnrealGame\Development\PCore\Module.PCore.cpp]",
+                 "[3/9] Compile [x64] A.cpp"]
+        times = ue.compile_times(lines)
+        self.assertEqual(times[r"D:\G\Source\Game\A.cpp"], [3.10, 0.60])
+        self.assertEqual(ue.module_of(r"D:\G\Source\Game\A.cpp"), "Game")
+        self.assertEqual(ue.module_of(r"D:\G\Plugins\P\Intermediate\Build\Win64\x64\UnrealGame\Development\PCore\M.cpp"),
+                         "PCore")
+        timing = self.project.write("Intermediate/A.cpp.timing", "Include Headers:\n\tCount: 2\n"
+                                    "\t\tD:\\G\\Source\\Game\\A.h: 0.84s\n\t\t\tC:\\E\\UserWidget.h: 0.79s\n"
+                                    "Class Definitions:\n\tCount: 1\n\t\tFoo: 0.5s\n")
+        costs = ue.header_costs([timing, timing], self.project.root)
+        self.assertEqual(costs["D:\\G\\Source\\Game\\A.h"], [1.68, 2])
+        self.assertNotIn("Foo", costs)
+
+    def test_startup_report_phases_and_pauses(self):
+        def at(sec, text, frame=0):
+            return f"[2026.10.17-12.25.{sec:02d}:000][{frame:>3}]{text}"
+        lines = ["LogConfig: Display: Loading ini files took 0.09 seconds",
+                 at(0, "LogInit: Running DelayedAutoRegister Phase PreRHIInit"),
+                 at(1, "LogRHI: Using Default RHI: D3D12"),
+                 at(2, "LogInit: Running DelayedAutoRegister Phase ShaderTypesReady"),
+                 at(3, "LogModuleManager: InternalLoadLibrary: 'Slow'"),
+                 at(9, "LogSlow: done"),
+                 at(10, "LogInit: Display: Engine is initialized. Leaving FEngineLoop::Init()"),
+                 at(11, "LogUnrealEdMisc: Total Editor Startup Time, took 13.335"),
+                 at(30, "LogTemp: much later", frame=500)]
+        report = ue.startup_report(lines)
+        self.assertEqual(report["total"], 11)
+        self.assertEqual([p[0] for p in report["phases"]][:3], ["config, modules and plugins", "RHI (graphics device)",
+                                                                  "shader types"])
+        self.assertEqual(report["reported"]["editor"], 13.335)
+        self.assertEqual(report["gaps"][0][0], 6)
+        self.assertIn("'Slow'", report["gaps"][0][1])
+        with self.assertRaisesRegex(ue.CliError, "no time-stamped startup lines"):
+            ue.startup_report(["plain"])
+
+    def test_stats_recorded_and_summarised(self):
+        p = self.project.uproject
+        ue.record_stat(p, "pie start", 0, 2.0, now=1000)
+        ue.record_stat(p, "pie start", 4, 9.0, error="timed out after 30 s waiting for /Game/Maps/L_A", now=1001)
+        ue.record_stat(p, "pie start", 4, 8.0, error="timed out after 45 s waiting for /Game/Maps/L_B", now=1002)
+        ue.record_stat(p, "status", 0, 0.1, now=1003)
+        ctx = FakeCtx()
+        ctx.project = p
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(ue.cmd_stats(ctx, argparse.Namespace(days=None, limit=30)), 0)
+        text = out.getvalue()
+        self.assertIn("4 ue command(s)", text)
+        self.assertRegex(text, r"pie start\s+3\s+2 66%")
+        self.assertIn("2x  ue pie start: timed out", text)  # the two time-outs group despite their numbers and paths
+        self.assertEqual(ctx.data["status"], {"runs": 1, "failed": 0})
+
+    def test_lint_fixes_meshes_only_when_asked(self):
+        found = [("mesh-lods", "/Game/Rocks/SM_Rock", "120000 triangles, one LOD and no Nanite"),
+                 ("mesh-collision", "/Game/Rocks/SM_Rock", "no simple collision")]
+        self.assertEqual([i["fix"] for i in ue.lint_plan(found)], ["box"])
+        self.assertEqual([i["fix"] for i in ue.lint_plan(found, {"mesh-lods"})], ["nanite", "box"])
+        self.assertEqual(ue.lint_plan(found, {"mesh-lods"}, "lods")[0]["fix"], "lods:4")
+
+    def test_move_pack_reports_config_and_code_that_name_the_old_path(self):
+        self.project.write("Config/DefaultGame.ini", "[/Script/X]\nMenuMap=/Game/CityPack/Maps/L_Demo.L_Demo\n")
+        self.project.write("Source/Game/A.cpp", 'auto M = TEXT("/Game/Other/M_A");\n')
+        ctx = FakeCtx(json.dumps({"moved": 12, "maps": ["/Game/CityPack/Maps/L_Demo"], "referencers": ["/Game/Maps/L_Main"],
+                                  "notes": [], "left": []}))
+        ctx.project = self.project.uproject
+        args = argparse.Namespace(folder="/Game/CityPack", dest=None, dry_run=False)
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(ue.cmd_move_pack(ctx, args), 0)
+        self.assertEqual(ctx.calls[0][1]["dest"], "/Game/ThirdParty/CityPack")
+        self.assertIn("moved 12 asset(s) /Game/CityPack -> /Game/ThirdParty/CityPack, 1 map(s)", out.getvalue())
+        self.assertIn(os.path.join("Config", "DefaultGame.ini") + ":2", out.getvalue())
+        self.assertNotIn("A.cpp", out.getvalue())
+
+    def test_call_rejects_arguments_without_a_value(self):
+        class Ctx:
+            transport, project, beacon = "mcp", self.project.uproject, {}
+        args = argparse.Namespace(target="SlateInspectorToolset.Windows", kv=["list"], args=None, json=False)
+        tools = {"Windows": {"name": "SlateInspectorToolset.Windows", "inputSchema": {"properties": {}}}}
+        with unittest.mock.patch.object(ue.calls, "resolve_toolset", return_value="SlateInspectorToolset"), \
+                unittest.mock.patch.object(ue.calls, "schema", return_value=tools):
+            with self.assertRaisesRegex(ue.CliError, "arguments are key=value \\(not 'list'\\)"):
+                ue.cmd_call(Ctx(), args)
+
+    def test_level_tab_brought_forward_only_when_hidden(self):
+        rows = ue.slate_entries("\n".join([
+            'window "Sandbox - Unreal Editor" [pos=0,0 size=1280,720] [ref=w1]',
+            '    tab "L_TetherProbe" [pos=102,28 size=210,31] [ref=t2]',
+            '    tab "Message Log" [pos=314,28 size=210,31] [ref=t3]']))
+        self.assertEqual(ue.level_tab_hidden(rows, "L_TetherProbe")[7], "t2")
+        self.assertIsNone(ue.level_tab_hidden(rows + [(12, "tab", "Viewport 1", 4, 102, 160, 25, "t4")], "L_TetherProbe"))

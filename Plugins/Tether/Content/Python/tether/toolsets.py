@@ -150,8 +150,14 @@ def _resolve(ref, pie=False):
                 obj = unreal.load_asset(ref)
         if obj is not None:
             return obj
-    actor_ref, _, comp_ref = ref.partition(".")
-    matches = _match_actors(actor_ref, pie)
+    titled = re.fullmatch(r"(.+?) \((\w+)\)(?:\.(.+))?", ref)  # 'Label (Name)[.Component]', as _label prints
+    matches = []
+    if titled:  # a label with brackets of its own ("Crate (2)") falls through to the plain lookup
+        actor_ref, comp_ref = titled.group(2), titled.group(3) or ""
+        matches = [a for a in _match_actors(actor_ref, pie) if a.get_name().lower() == actor_ref.lower()]
+    if not matches:
+        actor_ref, _, comp_ref = ref.partition(".")
+        matches = _match_actors(actor_ref, pie)
     if not matches and comp_ref:
         matches, comp_ref = _match_actors(ref, pie), ""
     if not matches:
@@ -187,13 +193,20 @@ def _actor_label(actor):
     return label
 
 
+def _actor_title(actor):
+    """'Label (Name)' when an actor's label and object name differ (`ue ai` and the outliner show labels; Python,
+    logs and `pie watch` use names), else the one of them."""
+    label, name = _actor_label(actor), actor.get_name()
+    return label if label == name else f"{label} ({name})"
+
+
 def _label(obj):
     if obj.get_name().startswith("Default__"):  # a class default object: its "actor label" is meaningless
         return _short_path(obj.get_path_name())
     if isinstance(obj, unreal.Actor):
-        return _actor_label(obj)
+        return _actor_title(obj)
     if isinstance(obj, unreal.ActorComponent) and obj.get_owner():
-        return f"{_actor_label(obj.get_owner())}.{obj.get_name()}"
+        return f"{_actor_title(obj.get_owner())}.{obj.get_name()}"
     return _short_path(obj.get_path_name())
 
 
@@ -1540,6 +1553,22 @@ def _texture_dims(texture):
     return f"{texture.blueprint_get_size_x()} x {texture.blueprint_get_size_y()}"
 
 
+def _set_lods(mesh, lods):
+    """Generate `lods` LODs for a static mesh, each with half the triangles of the one before."""
+    Options = getattr(unreal, "StaticMeshReductionOptions", None) or unreal.EditorScriptingMeshReductionOptions
+    Settings = getattr(unreal, "StaticMeshReductionSettings", None) or unreal.EditorScriptingMeshReductionSettings
+    settings = []
+    for i in range(lods):
+        s = Settings()
+        s.set_editor_property("percent_triangles", 0.5 ** i)
+        s.set_editor_property("screen_size", 1.0 if i == 0 else 0.5 ** i)
+        settings.append(s)
+    options = Options()
+    options.set_editor_property("auto_compute_lod_screen_size", True)
+    options.set_editor_property("reduction_settings", settings)
+    unreal.EditorStaticMeshLibrary.set_lods(mesh, options)
+
+
 _IMPORT_TAG = "TetherImport"  # asset metadata: the options `ue import` applied, re-applied on reimport
 
 
@@ -1568,18 +1597,7 @@ def _after_import(asset, opts):
             asset.set_editor_property("nanite_settings", nanite)
         lods = int(opts.get("lods") or 0)
         if lods > 1:
-            Options = getattr(unreal, "StaticMeshReductionOptions", None) or unreal.EditorScriptingMeshReductionOptions
-            Settings = getattr(unreal, "StaticMeshReductionSettings", None) or unreal.EditorScriptingMeshReductionSettings
-            settings = []
-            for i in range(lods):
-                s = Settings()
-                s.set_editor_property("percent_triangles", 0.5 ** i)
-                s.set_editor_property("screen_size", 1.0 if i == 0 else 0.5 ** i)
-                settings.append(s)
-            options = Options()
-            options.set_editor_property("auto_compute_lod_screen_size", True)
-            options.set_editor_property("reduction_settings", settings)
-            lib.set_lods(asset, options)
+            _set_lods(asset, lods)
         tris = _try(lambda: lib.get_number_verts(asset, 0), 0)
         nanite_on = _try(lambda: asset.get_editor_property("nanite_settings").enabled, False)
         complexity = str(_try(lambda: lib.get_collision_complexity(asset), "")).split(".")[-1].split(":")[0]
@@ -4223,6 +4241,115 @@ class TetherCore(_Base):
 
     @_tool
     @staticmethod
+    def post_process(at: str = "", limit: int = 80) -> str:
+        """The post-process volumes in effect at a point and the settings they add up to: unbound volumes, the
+        volumes the point is inside (or within the blend radius of, at a reduced weight), and in PIE the view
+        camera's own post-process settings, merged by priority as the renderer does.
+
+        Args:
+            at: 'x,y,z' or an actor label/name; empty: the camera (the player's in PIE, else the level viewport's).
+            limit: Maximum setting rows.
+
+        Returns:
+            Text.
+        """
+        game = _game_world()
+        world = game or unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_editor_world()
+        camera_comp, where = None, ""
+        if at:
+            nums = re.findall(r"-?[\d.]+", at)
+            if len(nums) == 3 and re.fullmatch(r"[-\d.,\s]+", at):
+                point = unreal.Vector(*map(float, nums))
+            else:
+                actor = _resolve(at, pie=game is not None)
+                point, where = actor.get_actor_location(), f" ({_label(actor)})"
+        elif game is not None:
+            manager = unreal.GameplayStatics.get_player_camera_manager(game, 0)
+            point, where = manager.get_camera_location(), " (the player's camera)"
+            target = _try(lambda: unreal.GameplayStatics.get_player_controller(game, 0).get_view_target())
+            camera_comp = _try(lambda: target.get_component_by_class(unreal.CameraComponent)) if target else None
+        else:
+            info = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_level_viewport_camera_info()
+            point, where = next(x for x in info if isinstance(x, unreal.Vector)), " (the level viewport's camera)"
+        get = lambda obj, prop, default=None: _try(lambda: obj.get_editor_property(prop), default)  # noqa: E731
+
+        def overrides(settings):
+            return [n[len("override_"):] for n in dir(settings) if n.startswith("override_") and get(settings, n)]
+
+        def show(value):
+            if isinstance(value, float):
+                return f"{value:.4g}"
+            if isinstance(value, (unreal.LinearColor, unreal.Vector4)):
+                parts = [getattr(value, k) for k in ("r", "g", "b", "a") if hasattr(value, k)] or \
+                    [getattr(value, k) for k in ("x", "y", "z", "w")]
+                return "(" + ", ".join(f"{v:.3g}" for v in parts) + ")"
+            if isinstance(value, unreal.Object):
+                return _short_path(value.get_path_name())
+            if hasattr(value, "name") and not isinstance(value, str):
+                return _enum_name(value)
+            text = str(value)
+            return text if len(text) < 80 else text[:77] + "..."
+        active, idle = [], []
+        for volume in unreal.GameplayStatics.get_all_actors_of_class(world, unreal.PostProcessVolume):
+            if not get(volume, "enabled", True):
+                idle.append((_label(volume), "disabled"))
+                continue
+            weight, radius = get(volume, "blend_weight", 1.0), get(volume, "blend_radius", 0.0)
+            if get(volume, "unbound", False):
+                how, scale = "unbound", 1.0
+            else:
+                brush = (_try(lambda: volume.get_components_by_class(unreal.BrushComponent), []) or [None])[0]
+                found = _try(lambda: brush.get_closest_point_on_collision(point)) if brush else None
+                distance = found[0] if isinstance(found, tuple) else -1.0
+                if distance < 0:  # no collision to measure against: its bounds
+                    origin, extent = volume.get_actor_bounds(False)
+                    d = [max(0.0, abs(getattr(point, k) - getattr(origin, k)) - getattr(extent, k)) for k in "xyz"]
+                    distance = (d[0] ** 2 + d[1] ** 2 + d[2] ** 2) ** 0.5
+                if distance <= 0:
+                    how, scale = "inside", 1.0
+                elif distance < radius:
+                    how, scale = f"{distance:.0f} cm outside, in its {radius:.0f} cm blend", 1.0 - distance / radius
+                else:
+                    idle.append((_label(volume), f"{distance / 100:.0f} m away"))
+                    continue
+            settings = get(volume, "settings")
+            active.append({"name": _label(volume), "priority": get(volume, "priority", 0.0), "weight": weight * scale,
+                           "how": how, "settings": settings, "keys": overrides(settings)})
+        active.sort(key=lambda v: v["priority"])  # the renderer blends lowest priority first
+        if camera_comp is not None and get(camera_comp, "post_process_blend_weight", 0.0) > 0:
+            settings = get(camera_comp, "post_process_settings")
+            keys = overrides(settings)
+            if keys:
+                active.append({"name": f"camera {_label(camera_comp)}", "priority": float("inf"),
+                               "weight": get(camera_comp, "post_process_blend_weight", 1.0), "how": "the view camera",
+                               "settings": settings, "keys": keys})
+        lines = [f"post process at ({point.x:.0f}, {point.y:.0f}, {point.z:.0f}){where}:"]
+        if not active:
+            lines.append("  no post-process volume in effect here: engine defaults and the project's settings")
+        for v in reversed(active):
+            prio = "camera, last" if v["priority"] == float("inf") else f"priority {v['priority']:g}"
+            lines.append(f"  {v['name']}: {v['how']}, {prio}, weight {v['weight']:.2f}, {len(v['keys'])} setting(s)")
+        if idle:
+            lines.append("  not here: " + ", ".join(f"{n} ({why})" for n, why in idle[:8])
+                         + (f" (+{len(idle) - 8} more)" if len(idle) > 8 else ""))
+        merged = {}
+        for v in active:  # later (higher priority) wins; a weight below 1 blends into what is under it
+            for key in v["keys"]:
+                merged[key] = (show(get(v["settings"], key)), v["name"], v["weight"], merged.get(key))
+        if merged:
+            lines.append(f"settings in effect ({len(merged)}):")
+            for key in sorted(merged)[:limit]:
+                value, source, weight, under = merged[key]
+                blend = ""
+                if weight < 0.999:
+                    blend = f", weight {weight:.2f} over " + (f"{under[0]} from {under[1]}" if under else "the default")
+                lines.append(f"  {key} = {value}  ({source}{blend})")
+            if len(merged) > limit:
+                lines.append(f"  ... {len(merged) - limit} more (--limit)")
+        return "\n".join(lines)
+
+    @_tool
+    @staticmethod
     def lights(limit: int = 60) -> str:
         """The edited level's lighting in one view: every light (type, mobility, intensity, colour, radius,
         shadows, IES, light function), sky light, height fog, post-process exposure, and notes on what commonly
@@ -6704,6 +6831,84 @@ class TetherCore(_Base):
 
     @_tool
     @staticmethod
+    def move_folder(source: str, dest: str, dry_run: bool = False, token: str = "") -> str:
+        """Move a content folder (a Fab or marketplace pack that landed at the content root) and everything in it,
+        fixing up what referenced it: redirectors are resolved and removed, the moved assets saved, the emptied
+        folder deleted (not undoable; version control is the undo).
+
+        Args:
+            source: /Game/... folder to move.
+            dest: /Game/... folder it becomes (must not exist yet, or be empty).
+            dry_run: Only report what would move and who references it.
+            token: Session token from Saved/Tether/editors/<pid>.token (the ue CLI sends it).
+
+        Returns:
+            JSON {moved, maps, referencers, notes, left}.
+        """
+        _authorize(token)
+        library = unreal.EditorAssetLibrary
+        src, dst = source.rstrip("/"), dest.rstrip("/")
+        if not (src.startswith("/Game/") and dst.startswith("/Game/")):
+            raise RuntimeError("both folders must be under /Game")
+        if (dst + "/").startswith(src + "/"):
+            raise RuntimeError(f"{dst} is inside {src}")
+        packages = sorted({a.split(".")[0] for a in library.list_assets(src, recursive=True, include_folder=False)})
+        if not packages:
+            raise RuntimeError(f"no assets under {src} (ue find {src}/*)")
+        clashes = [p for p in library.list_assets(dst, recursive=True, include_folder=False)] \
+            if library.does_directory_exist(dst) else []
+        if clashes:
+            raise RuntimeError(f"{dst} already holds {len(clashes)} asset(s): move into an empty or new folder")
+        registry = unreal.AssetRegistryHelpers.get_asset_registry()
+        options = unreal.AssetRegistryDependencyOptions(
+            include_soft_package_references=True, include_hard_package_references=True,
+            include_searchable_names=False, include_soft_management_references=False,
+            include_hard_management_references=False)
+        inside, outside = set(packages), set()
+        for package in packages:
+            for user in registry.get_referencers(package, options) or []:
+                if str(user) not in inside:
+                    outside.add(str(user))
+        maps = [p for p in packages if str(_try(lambda: library.find_asset_data(p).asset_class_path.asset_name, "")) == "World"]
+        world = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_editor_world()
+        open_map = world.get_outermost().get_name() if world else ""
+        result = {"moved": len(packages), "maps": maps, "referencers": sorted(outside), "notes": [], "left": []}
+        if dry_run:
+            return json.dumps(result)
+        if open_map in inside:
+            raise RuntimeError(f"the open map {open_map} is in {src}: open another map first (ue level open ...)")
+        vcs = _Vcs()
+        files = [_package_file(p) for p in packages]
+        problems, _, notes = vcs.prepare(files)
+        if problems:
+            raise RuntimeError("; ".join(problems[:5]))
+        dirty_before = set(sum(_dirty_packages(), []))
+        if not library.rename_directory(src, dst):
+            raise RuntimeError("the move failed (see ue log); some assets may have moved: ue find " + dst)
+        for package in sorted(a.split(".")[0] for a in library.list_assets(src, recursive=True, include_folder=False)):
+            asset = _try(lambda: unreal.load_asset(package))
+            if asset is not None and asset.get_class().get_name() == "ObjectRedirector":
+                saved, problems = _fixup_redirector(package, vcs)
+                if problems:
+                    notes.append(f"redirector {package} left: " + "; ".join(problems))
+        left = sorted({a.split(".")[0] for a in library.list_assets(src, recursive=True, include_folder=False)})
+        if not left:
+            _try(lambda: library.delete_directory(src))
+        library.save_directory(dst, only_if_is_dirty=True, recursive=True)
+        moved_files = [_package_file(p) for p in sorted({a.split(".")[0] for a in
+                                                          library.list_assets(dst, recursive=True, include_folder=False)})]
+        notes += vcs.added(moved_files) + vcs.deleted([f for f in files if not os.path.isfile(f)])
+        dirty = [p for p in sum(_dirty_packages(), []) if p not in dirty_before and not p.startswith(dst + "/")]
+        if dirty:
+            notes.append(f"{len(dirty)} referencing package(s) updated but unsaved: " + ", ".join(dirty[:5]) + " (ue save)")
+        if maps:
+            notes.append("maps moved: their external actors (World Partition) and saved bookmarks follow the map; "
+                         "open one to check (ue level open)")
+        result.update(notes=notes, left=left)
+        return json.dumps(result)
+
+    @_tool
+    @staticmethod
     def rm(asset: str, force: bool = False, token: str = "") -> str:
         """Delete an asset, refusing while anything references it (not undoable; version control is the undo).
 
@@ -8536,7 +8741,8 @@ class TetherCore(_Base):
         compression, sRGB off for masks, a box collision for meshes without simple collision.
 
         Args:
-            plan: JSON list of {rule, package, fix}: fix is 'rename:<NewName>', 'normalmap', 'linear' or 'box'.
+            plan: JSON list of {rule, package, fix}: fix is 'rename:<NewName>', 'normalmap', 'linear', 'box',
+                'nanite' or 'lods:<N>'.
             save: Save each changed asset (renames save their referencers as ue mv does).
             token: Session token from Saved/Tether/editors/<pid>.token (the ue CLI sends it).
 
@@ -8571,6 +8777,14 @@ class TetherCore(_Base):
                     elif fix == "box":
                         unreal.EditorStaticMeshLibrary.add_simple_collisions(asset, unreal.ScriptCollisionShapeType.BOX)
                         detail = "added a box collision"
+                    elif fix == "nanite":
+                        nanite = asset.get_editor_property("nanite_settings")
+                        nanite.set_editor_property("enabled", True)
+                        asset.set_editor_property("nanite_settings", nanite)
+                        detail = "Nanite on"
+                    elif fix.startswith("lods:"):
+                        _set_lods(asset, int(fix.split(":", 1)[1]))
+                        detail = f"{asset.get_num_lods()} LODs generated (each half the triangles of the one before)"
                     else:
                         raise RuntimeError(f"unknown fix '{fix}'")
                     if save:

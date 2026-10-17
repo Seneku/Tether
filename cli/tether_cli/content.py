@@ -339,14 +339,16 @@ def lint_rules(rows, config=None):
                 add("mesh-collision", package, f"no simple collision ({tags.get('DefaultCollision') or 'default'} "
                                                "profile): characters and physics pass through it")
             if tags.get("NaniteEnabled") != "True" and tags.get("LODs") == "1" and tris > lod_tris:
-                add("mesh-lods", package, f"{tris} triangles, one LOD and no Nanite")
+                add("mesh-lods", package, f"{tris} triangles, one LOD and no Nanite (--fix --rule mesh-lods: "
+                                          "Nanite on, or --lod-fix lods)")
     return found
 
 
 LINT_FIXES = {"texture-normal": "normalmap", "texture-mask-srgb": "linear", "mesh-collision": "box"}
+LOD_FIXES = {"nanite": "nanite", "lods": "lods:4"}
 
 
-def lint_plan(found, rules=None):
+def lint_plan(found, rules=None, lod_fix="nanite"):
     """[{rule, package, fix}] for the findings that have a safe fix. Renames (naming, characters) only when their
     rule is asked for by name: they touch every asset that references the one renamed."""
     plan = []
@@ -360,6 +362,8 @@ def lint_plan(found, rules=None):
             clean = re.sub(r"[^A-Za-z0-9_]+", "_", name).strip("_")
             if clean and clean != name:
                 plan.append({"rule": rule, "package": package, "fix": f"rename:{clean}"})
+        elif rule == "mesh-lods" and rules and "mesh-lods" in rules:  # a big change: only when asked for by name
+            plan.append({"rule": rule, "package": package, "fix": LOD_FIXES[lod_fix]})
         elif rule in LINT_FIXES:
             plan.append({"rule": rule, "package": package, "fix": LINT_FIXES[rule]})
     return plan
@@ -736,9 +740,10 @@ def cmd_lint(ctx, args):
         found = [f for f in found if re.search(args.rule, f[0])]
     if args.fix:
         rules = {f[0] for f in found} if args.rule else None
-        plan = lint_plan(found, rules)
+        plan = lint_plan(found, rules, getattr(args, "lod_fix", "nanite"))
         if not plan:
-            print("nothing to fix" + ("" if args.rule else " (renames need --rule naming or --rule characters)"))
+            print("nothing to fix" + ("" if args.rule else " (renames need --rule naming or --rule characters, LODs "
+                                                           "--rule mesh-lods)"))
             return 0
         if args.dry_run:
             for item in plan[: args.limit]:

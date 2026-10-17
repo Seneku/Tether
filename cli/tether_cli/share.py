@@ -37,6 +37,90 @@ def activity_path(project):
     return os.path.join(state_dir(project), "activity.jsonl")
 
 
+STATS_KEEP = 20000  # rows of stats.jsonl kept (months of use); it stays on this machine
+
+
+def stats_path(project):
+    return os.path.join(state_dir(project), "stats.jsonl")
+
+
+def record_stat(project, command, code, seconds, error=None, now=None):
+    """One row per finished `ue` command for `ue stats`: what ran, its exit code, how long, the error's first line."""
+    now = time.time() if now is None else now
+    row = {"cmd": command, "exit": code, "s": round(seconds, 2), "time": round(now)}
+    if error:
+        row["error"] = error.splitlines()[0][:200]
+    path = stats_path(project)
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(row) + "\n")
+        if os.path.getsize(path) > 4 * 1024 * 1024:  # trim now and then, not on every command
+            rows = read_stats(project)[-STATS_KEEP:]
+            with open(path, "w", encoding="utf-8") as f:
+                f.writelines(json.dumps(r) + "\n" for r in rows)
+    except OSError:
+        pass  # usage stats must never fail the command
+
+
+def read_stats(project, since=0):
+    rows = []
+    try:
+        with open(stats_path(project), encoding="utf-8") as f:
+            for line in f:
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(row, dict) and row.get("time", 0) >= since:
+                    rows.append(row)
+    except OSError:
+        pass
+    return rows
+
+
+def error_shape(text):
+    """An error message with its specifics (paths, numbers, names in quotes) blanked, so repeats group together."""
+    text = re.sub(r"(/Game|/Script|[A-Za-z]:[\\/])[^\s,;)'\"]*", "<path>", text)
+    text = re.sub(r"'[^']*'|\"[^\"]*\"", "'...'", text)
+    return re.sub(r"\d+(\.\d+)?", "N", text)
+
+
+def cmd_stats(ctx, args):
+    """`ue stats [--days N]`: which ue commands this project ran, how often they failed and how long they took, from
+    Saved/Tether/stats.jsonl (local only), to see what needs work."""
+    since = time.time() - args.days * 86400 if args.days else 0
+    rows = read_stats(ctx.project, since)
+    if not rows:
+        print("no ue commands recorded yet" + (f" in the last {args.days:g} day(s)" if args.days else "")
+              + " (Tether 0.30 and later record each command in Saved/Tether/stats.jsonl)")
+        return 0
+    by = {}
+    for row in rows:
+        by.setdefault(row["cmd"], []).append(row)
+    first = min(r["time"] for r in rows)
+    print(f"{len(rows)} ue command(s) since {time.strftime('%Y-%m-%d %H:%M', time.localtime(first))}, "
+          f"{sum(1 for r in rows if r.get('exit'))} failed (exit != 0)")
+    print(f"  {'command':<22} {'runs':>5} {'failed':>7} {'median':>8} {'slowest':>8}")
+    order = sorted(by.items(), key=lambda kv: (-sum(1 for r in kv[1] if r.get("exit")), -len(kv[1])))
+    for cmd, runs in order[: args.limit]:
+        failed = sum(1 for r in runs if r.get("exit"))
+        took = sorted(r.get("s", 0) for r in runs)
+        print(f"  {cmd:<22} {len(runs):>5} {failed:>4} {failed * 100 // len(runs):>2}% {took[len(took) // 2]:>7.1f}s "
+              f"{took[-1]:>7.1f}s")
+    errors = {}
+    for row in rows:
+        if row.get("error"):
+            key = (row["cmd"], error_shape(row["error"]))
+            errors.setdefault(key, [0, row["error"]])[0] += 1
+    if errors:
+        print("most frequent errors:")
+        for (cmd, _), (count, example) in sorted(errors.items(), key=lambda kv: -kv[1][0])[:10]:
+            print(f"  {count:>4}x  ue {cmd}: {example[:140]}")
+    ctx.data = {cmd: {"runs": len(r), "failed": sum(1 for x in r if x.get("exit"))} for cmd, r in by.items()}
+    return 0
+
+
 def record_activity(project, argv, now=None):
     """Append this command to the activity log (one JSON line; trimmed to the last hour now and then)."""
     now = time.time() if now is None else now

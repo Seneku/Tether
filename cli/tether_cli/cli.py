@@ -9,16 +9,19 @@ import time
 from . import core
 from .core import UE_SCRIPT, CliError, crash_summary, find_project, live_editors, recent_crash, stall_report
 from .transport import Ctx
-from .share import LEASE_MINUTES, lease_messages, record_activity
+from .share import LEASE_MINUTES, cmd_stats, lease_messages, record_activity, record_stat
 from .editor import cmd_build, cmd_close, cmd_crash, cmd_git, cmd_lease, cmd_open, cmd_status, cmd_who
 from .calls import (
     cmd_actors, cmd_ai, cmd_anim, cmd_api, cmd_asset, cmd_call, cmd_changes, cmd_config, cmd_delete, cmd_drop,
     cmd_duplicate, cmd_exec, cmd_find, cmd_log, cmd_mat, cmd_mv, cmd_nav, cmd_new, cmd_props, cmd_py, cmd_refs,
-    cmd_class, cmd_collision, cmd_cvar, cmd_tree, cmd_lights, cmd_wp, cmd_level, cmd_rm, cmd_statetree, cmd_trace, cmd_save, cmd_savegame, cmd_scatter, cmd_set, cmd_spawn, cmd_tools, cmd_undo, cmd_watch,
+    cmd_class, cmd_collision, cmd_cvar, cmd_tree, cmd_lights, cmd_post, cmd_wp, cmd_level, cmd_rm, cmd_statetree, cmd_trace, cmd_save, cmd_savegame, cmd_scatter, cmd_set, cmd_spawn, cmd_tools, cmd_undo, cmd_watch,
 )
-from .images import camera_at, cmd_look, cmd_shot, shot_args
+from .images import VIEW_MODES, camera_at, cmd_look, cmd_shot, shot_args
 from .testing import cmd_test
-from .assets import cmd_data, cmd_diff, cmd_fx, cmd_net, cmd_overview, cmd_pcg, cmd_skel, cmd_size, cmd_table, cmd_usages, cmd_validate
+from .assets import (
+    cmd_data, cmd_diff, cmd_fx, cmd_move_pack, cmd_net, cmd_overview, cmd_pcg, cmd_skel, cmd_size, cmd_table, cmd_usages,
+    cmd_validate,
+)
 from .content import (
     cmd_collide, cmd_foliage, cmd_import, cmd_landscape, cmd_lint, cmd_map, cmd_mesh, cmd_tex, cmd_unused, cmd_water,
 )
@@ -250,6 +253,8 @@ def build_parser():
                                                                  "in the last 15 min (it refuses otherwise)")
     s.add_argument("--ignore-lease", action="store_true", help="with --restart: go ahead although another session holds "
                                                                "the lease or used the editor in the last few minutes")
+    s.add_argument("--timing", action="store_true", help="compile the game target with UBT -Timing and list the "
+                                                         "slowest files, modules and headers (the editor is untouched)")
     s.add_argument("--target", help="UBT target (default <Project>Editor)")
     s.add_argument("--config", default="Development")
     s.add_argument("--wait", type=float, default=300, help="seconds to wait for Live Coding (300)")
@@ -399,6 +404,15 @@ def build_parser():
     s.add_argument("--numbers", type=int, default=60, help="number the markers when there are at most this many (60)")
     s.add_argument("-o", "--output", help="PNG path (default Saved/Tether/shots/map-<time>.png)")
     add("lights", cmd_lights, "lighting overview: lights, sky, fog, exposure, and what commonly goes wrong")
+    s = add("stats", cmd_stats, "which ue commands this project ran, failed and took long (kept on this machine only)")
+    s.add_argument("--days", type=float, help="only the last N days")
+    s = add("move-pack", cmd_move_pack, "move a content folder (a Fab or marketplace pack) with its references fixed "
+                                        "up, e.g. into /Game/ThirdParty/<name>")
+    s.add_argument("folder", help="/Game/... folder to move")
+    s.add_argument("dest", nargs="?", help="/Game/... folder it becomes (default /Game/ThirdParty/<its name>)")
+    s.add_argument("--dry-run", action="store_true", help="show what would move and what references it")
+    s = add("post", cmd_post, "post-process volumes in effect at a point (default: the camera) and their merged settings")
+    s.add_argument("at", nargs="?", help="x,y,z or an actor; default the player's camera in PIE, else the viewport's")
     s = add("cvar", cmd_cvar, "console variables: value, who set it, default; set, --reset, or set only --for a command")
     s.add_argument("items", nargs="*", metavar="regex | Name=value", help="a name regex/prefix to list, or Name=value to set")
     s.add_argument("--changed", action="store_true", help="only variables that differ from their built-in default")
@@ -519,6 +533,13 @@ def build_parser():
     s.add_argument("--after", metavar="CMD", help="with --frames: a console command run just before the first capture")
     s.add_argument("--clear", action="store_true", help="with --look-at or --actor: if something blocks the view (the "
                                                        "camera is inside a building), move it in front of that")
+    s.add_argument("--view", choices=sorted(VIEW_MODES), metavar="MODE", help="a debug view for the shot, put back "
+                   "afterwards: " + ", ".join(sorted(VIEW_MODES)) + " (waits for the view's shaders)")
+    s.add_argument("--burst", type=int, metavar="N", help="N full-size PNGs --every S apart into one folder (a fixed "
+                                                         "spectator camera in PIE is placed once for all of them)")
+    s.add_argument("--every", type=float, default=0.5, help="with --burst: seconds between shots, game time in PIE (0.5)")
+    s.add_argument("--window", metavar="TITLE", help="an editor window or dock tab (Outliner, Details, a tool tab) "
+                                                    "instead of a viewport; a tab is brought to the front first")
     s = add("look", cmd_look, "render an asset (mesh, Blueprint, material) from six angles into one contact sheet")
     s.add_argument("asset", help="/Game/... asset path")
     s.add_argument("--studio", action="store_true", help="neutral studio light (HDRI sky light, key light, auto "
@@ -623,7 +644,9 @@ def build_parser():
     s.add_argument("--save", action="store_true", help="save the DataTable afterwards")
     s = perf_parser = add("perf", perf_command, "frame-time capture in PIE: frame/game/render/GPU ms, hitches, change vs last "
                                    "capture; `perf load [map]`: PIE start, streaming, hitches and the loads in them")
-    s.add_argument("action", nargs="?", choices=["load"], help="load: map load and streaming hitches")
+    s.add_argument("action", nargs="?", choices=["load", "startup"], help="load: map load and streaming hitches; "
+                   "startup: where the editor's startup went (or a packaged game's, --log), from its log")
+    s.add_argument("--log", metavar="PATH", help="with startup: the log to read (default: the editor's)")
     s.add_argument("map", nargs="?", help="with load: the map to open first (default: the open one)")
     s.add_argument("--seconds", type=float, help="capture length (10); with load: how long to play (10, or 0 after -f)")
     s.add_argument("-f", "--file", help="with load: a `ue pie do` route to play while measuring")
@@ -830,7 +853,11 @@ def build_parser():
     s.add_argument("--materials", action="store_true", help="materials with many nodes that reach no output (loads "
                                                            "them; `ue mat graph M prune` deletes those nodes)")
     s.add_argument("--min-unused", type=int, default=5, help="with --materials: report from this many unused nodes (5)")
-    s.add_argument("--fix", action="store_true", help="fix what has a safe fix (renames only with --rule naming|characters)")
+    s.add_argument("--fix", action="store_true", help="fix what has a safe fix (renames only with --rule naming|characters, "
+                                                     "meshes without LODs only with --rule mesh-lods)")
+    s.add_argument("--lod-fix", choices=["nanite", "lods"], default="nanite", help="with --fix --rule mesh-lods: turn "
+                   "Nanite on (default), or generate 4 LODs (for meshes Nanite does not suit: translucent, skinned "
+                   "or deforming with WPO)")
     s.add_argument("--dry-run", action="store_true", help="with --fix: show the fixes only")
     s.add_argument("--save", action="store_true", help="with --fix: save the changed assets")
     s = add("find", cmd_find, "search assets by name and/or class (asset registry)")
@@ -1006,7 +1033,7 @@ def main(argv=None):
     started, started_wall = time.perf_counter(), time.time()
     # --json: one JSON document for any command (its own JSON for those that have one, below).
     envelope = args.json and args.fn not in (cmd_call, cmd_test, cmd_selftest)
-    captured, real_stdout, ctx, error = None, sys.stdout, None, None
+    captured, real_stdout, ctx, error, failure = None, sys.stdout, None, None, None
     if envelope:
         import io
         captured = sys.stdout = io.StringIO()
@@ -1045,6 +1072,7 @@ def main(argv=None):
         else:
             print(f"error: {message}", file=sys.stderr)
         code = exc.code
+        failure = message
     except BaseException:
         sys.stdout = real_stdout  # a crash or Ctrl+C prints its traceback, not a half-written envelope
         raise
@@ -1053,6 +1081,14 @@ def main(argv=None):
         lines = captured.getvalue().splitlines()
         print(json.dumps({"command": args.cmd, "ok": not code, "exit": code or 0, "error": error, "lines": lines,
                           "data": getattr(ctx, "data", None)}, default=str))
+    if args.cmd not in ("hook", "stats", "help"):  # `ue stats`: which commands run, fail and take long, kept locally
+        try:
+            action = getattr(args, "action", None)
+            name = args.cmd + (f" {action}" if isinstance(action, str) and action else "")
+            record_stat(find_project(args.project), name, code or 0, time.perf_counter() - started,
+                        error=failure)
+        except CliError:
+            pass
     if args.time:
         sys.stdout.flush()
         print(f"({(time.perf_counter() - started) * 1000:.0f} ms)", file=sys.stderr)

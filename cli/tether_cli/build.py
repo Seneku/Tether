@@ -568,7 +568,112 @@ def compile_check(ctx, limit, files=None):
     return ubt_build(ctx, argparse.Namespace(target=target, config="Development", limit=limit), check=True, extra=extra)
 
 
-def ubt_build(ctx, args, check=False, extra=None):
+COMPILER_TIME = re.compile(r"time\(.*?\\(c1xx|c2)\.dll\)=([\d.]+)s .*?\[(.+?)\]")
+TIMING_INCLUDE = re.compile(r"^(\t+)(.+?): ([\d.]+)s$")
+
+
+def compile_times(lines):
+    """{source file: [front-end s, back-end s]} from MSVC's /Bt+ lines in a `-Timing` UBT build's output."""
+    times = {}
+    for line in lines:
+        m = COMPILER_TIME.search(line)
+        if m:
+            entry = times.setdefault(m.group(3), [0.0, 0.0])
+            entry[0 if m.group(1) == "c1xx" else 1] += float(m.group(2))
+    return times
+
+
+def module_of(path):
+    """The module a compiled file belongs to: its Intermediate folder (.../Development/<Module>/x.cpp), else the
+    folder under Source/."""
+    parts = re.split(r"[\\/]", path)
+    for marker in ("Development", "DebugGame", "Shipping", "Debug", "Test"):
+        if marker in parts[:-1]:
+            return parts[parts.index(marker) + 1] if parts.index(marker) + 1 < len(parts) - 1 else "?"
+    if "Source" in parts[:-1]:
+        i = parts.index("Source")
+        return parts[i + 1] if i + 1 < len(parts) - 1 else "?"
+    return "?"
+
+
+def header_costs(timing_files, project_dir):
+    """{header: [inclusive s summed over files, files]} from /d1reportTime `.timing` files: the headers that cost
+    the most to parse, across the files that include them."""
+    costs = {}
+    for path in timing_files:
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                in_includes = False
+                for line in f:
+                    if line.startswith("Include Headers:"):
+                        in_includes = True
+                        continue
+                    if in_includes and line[:1] not in ("\t",):
+                        break
+                    m = TIMING_INCLUDE.match(line.rstrip("\n"))
+                    if in_includes and m:
+                        entry = costs.setdefault(m.group(2), [0.0, 0])
+                        entry[0] += float(m.group(3))
+                        entry[1] += 1
+        except OSError:
+            continue
+    return costs
+
+
+def build_timing(ctx, args):
+    """`ue build --timing`: compile the game target with UBT's -Timing (the running editor is untouched) and list
+    the slowest files and modules, and the headers that cost the most to parse. Only the files this build compiles
+    are timed: the first -Timing build compiles them all (the flag changes their command lines)."""
+    target = game_target(ctx.project)
+    if not target:
+        raise CliError("no game target (Source/<Project>.Target.cs) to time; the editor target's build would need "
+                       "every editor closed")
+    started, lines = time.time(), []
+    code = ubt_build(ctx, argparse.Namespace(target=target, config="Development", limit=args.limit), check=True,
+                     extra=["-Timing"], output=lines)
+    times = compile_times(lines)
+    if not times:
+        print("  no compiler timings in the output: nothing was compiled (the code is up to date), or the compiler "
+              "is not MSVC")
+        return code
+    project_dir = os.path.dirname(os.path.abspath(ctx.project))
+    rows = sorted(times.items(), key=lambda kv: -sum(kv[1]))
+    total = sum(sum(t) for t in times.values())
+    print(f"timed {len(times)} file(s): {total:.1f} CPU-s of compiling (front end, back end) in a "
+          f"{time.time() - started:.0f}s build")
+    for path, (front, back) in rows[: args.limit]:
+        name = os.path.relpath(path, project_dir) if path.lower().startswith(project_dir.lower()) else path
+        print(f"  {front + back:6.1f}s  {front:5.1f} + {back:4.1f}  {module_of(path):<18} {name}")
+    modules = {}
+    for path, (front, back) in times.items():
+        entry = modules.setdefault(module_of(path), [0.0, 0])
+        entry[0] += front + back
+        entry[1] += 1
+    print("by module: " + ", ".join(f"{m} {s:.1f}s ({n} file(s))" for m, (s, n) in
+                                     sorted(modules.items(), key=lambda kv: -kv[1][0])[:8]))
+    # /d1reportTime writes <file>.timing into the module's Intermediate folder, next to its .obj
+    names = {os.path.basename(p).lower() + ".timing" for p in times}
+    timing_files = []
+    for top, dirs, files in os.walk(project_dir):
+        dirs[:] = [d for d in dirs if d not in ("Content", "Saved", "Binaries", "DerivedDataCache", ".git", "Script")]
+        if "Intermediate" not in top.split(os.sep) and "Intermediate" not in dirs:
+            continue
+        timing_files += [os.path.join(top, f) for f in files if f.lower() in names
+                         and os.path.getmtime(os.path.join(top, f)) >= started - 1]
+    costs = header_costs(timing_files, project_dir)
+    if costs:
+        top = sorted(costs.items(), key=lambda kv: -kv[1][0])[:10]
+        print("costliest headers to parse (inclusive, summed over the files including them):")
+        for header, (seconds, files) in top:
+            name = os.path.relpath(header, project_dir) if header.lower().startswith(project_dir.lower()) else header
+            print(f"  {seconds:6.1f}s in {files} file(s)  {name}")
+    print("  (front end: parsing headers and templates, cut by fewer or lighter includes; back end: code generation "
+          "and optimisation)")
+    ctx.data = {"files": {p: {"front": t[0], "back": t[1]} for p, t in times.items()}}
+    return code
+
+
+def ubt_build(ctx, args, check=False, extra=None, output=None):
     root = engine_root(ctx.project)
     name = os.path.splitext(os.path.basename(ctx.project))[0]
     target = args.target or f"{name}Editor"
@@ -583,9 +688,12 @@ def ubt_build(ctx, args, check=False, extra=None):
     proc = subprocess.run(ubt_command(root) + [target, host_platform(), args.config, f"-Project={ctx.project}", "-WaitMutex"]
                           + extra, capture_output=True, text=True, errors="replace")
     lines = (proc.stdout + proc.stderr).splitlines()
+    if output is not None:
+        output.extend(lines)
     errors, warnings, hidden = compact_diagnostics(lines, os.path.dirname(ctx.project))
     result = next((l.strip() for l in reversed(lines) if l.strip().startswith("Result:")), f"exit {proc.returncode}")
     ok = proc.returncode == 0
+    single = single and any(e.startswith("-SingleFile=") for e in extra)
     print(("compile check, game target " if check else "ubt ") + (f"({len([e for e in extra if e.startswith('-SingleFile=')])} "
                                                                   "file(s), no link) " if single else "")
           + f"{target}: {'OK' if ok else 'FAILED'} in {time.time() - started:.1f}s ({result})"

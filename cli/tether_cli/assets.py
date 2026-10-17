@@ -14,6 +14,47 @@ from .transport import py_json, resolve_toolset
 from .calls import flush_editor_log
 
 
+def cmd_move_pack(ctx, args):
+    """`ue move-pack <folder> [dest]`: move a content folder (a Fab pack at the content root) with references fixed
+    up, then name config and code that still spell the old path (the editor does not rewrite those)."""
+    src = "/Game/" + args.folder.strip("/").split("Game/", 1)[-1] if not args.folder.startswith("/Game/") else args.folder
+    src = src.rstrip("/")
+    dest = (args.dest or f"/Game/ThirdParty/{src.rsplit('/', 1)[-1]}").rstrip("/")
+    data = ctx.tether("move_folder", source=src, dest=dest, dry_run=bool(args.dry_run))
+    data = json.loads(data) if isinstance(data, str) else data
+    refs = data.get("referencers", [])
+    verb = "would move" if args.dry_run else "moved"
+    print(f"{verb} {data['moved']} asset(s) {src} -> {dest}" + (f", {len(data['maps'])} map(s)" if data.get("maps") else ""))
+    if refs:
+        print(f"  {len(refs)} package(s) outside it reference it" + (" (fixed up)" if not args.dry_run else
+                                                                      " (fixed up by the move)") + ": "
+              + ", ".join(refs[:6]) + (" ..." if len(refs) > 6 else ""))
+    for note in data.get("notes", []):
+        print(f"  {note}")
+    if data.get("left"):
+        print(f"  ! {len(data['left'])} asset(s) stayed in {src}: " + ", ".join(data["left"][:5]))
+    # Config and code name content by path; the editor does not rewrite those
+    root = os.path.dirname(os.path.abspath(ctx.project))
+    hits = []
+    for top in ("Config", "Source"):
+        for dirpath, _, files in os.walk(os.path.join(root, top)):
+            for name in files:
+                if not name.endswith((".ini", ".h", ".cpp", ".cs")):
+                    continue
+                path = os.path.join(dirpath, name)
+                try:
+                    with open(path, encoding="utf-8", errors="replace") as f:
+                        for i, line in enumerate(f, 1):
+                            if src + "/" in line or src + "." in line or src + '"' in line:
+                                hits.append(f"{os.path.relpath(path, root)}:{i}")
+                except OSError:
+                    continue
+    if hits:
+        print(f"  ! {len(hits)} line(s) in config or code still name {src}/ (update them by hand): " + ", ".join(hits[:8]))
+    ctx.data = dict(data, config_refs=hits)
+    return 1 if data.get("left") else 0
+
+
 def asset_ref(path):
     """'/Game/X/BP_Y' -> '/Game/X/BP_Y.BP_Y' (object path), leaving full object paths alone."""
     base = path.split(":", 1)[0]

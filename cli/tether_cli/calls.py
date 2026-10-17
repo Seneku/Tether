@@ -69,8 +69,16 @@ def cmd_call(ctx, args):
     tool = tools.get(tool_name) or next((t for k, t in tools.items() if k.lower() == tool_name.lower()), None)
     if not tool:
         raise CliError(f"{toolset} has no tool '{tool_name}' (ue tools {toolset_q})")
-    given = dict(kv.split("=", 1) for kv in args.kv)
-    call_args = json.loads(args.args) if args.args else fill_args(tool, given)
+    raw_json = args.args
+    if not raw_json and len(args.kv) == 1 and args.kv[0].lstrip().startswith("{"):
+        raw_json = args.kv[0]  # `ue call T.tool '{"a": 1}'`: the JSON form without --args
+    bad = [kv for kv in args.kv if "=" not in kv] if not raw_json else []
+    if bad:
+        raise CliError(f"arguments are key=value (not '{bad[0]}'), or one JSON object (--args '{{...}}')")
+    try:
+        call_args = json.loads(raw_json) if raw_json else fill_args(tool, dict(kv.split("=", 1) for kv in args.kv))
+    except ValueError as exc:
+        raise CliError(f"--args is not JSON: {exc}") from None
     name = tool["name"].rsplit(".", 1)[-1]
     if toolset == TETHER and name in GATED and not call_args.get("token"):  # fill_args blanks it to ""
         call_args["token"] = editor_token(ctx.project, ctx.beacon)
@@ -1081,6 +1089,12 @@ def set_assets(ctx, args):
 
 def cmd_lights(ctx, args):
     print(ctx.tether("lights", limit=args.limit))
+    return 0
+
+
+def cmd_post(ctx, args):
+    """`ue post [x,y,z | actor]`: the post-process volumes in effect there and the settings they add up to."""
+    print(ctx.tether("post_process", at=args.at or "", limit=args.limit))
     return 0
 
 

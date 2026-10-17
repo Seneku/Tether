@@ -22,7 +22,8 @@ from .share import (
     active_lease, check_shared, clear_pie_start, describe_lease, pie_owner, record_pie_start, session_id,
 )
 from .images import (
-    cmd_shot, contact_sheet, draw_text, crop_pixels, hud_screenshot, image_diff, png_read, png_write, shot_args, widget_capture,
+    cmd_shot, contact_sheet, draw_text, crop_pixels, front_level_viewport, hud_screenshot, image_diff, png_read, png_write,
+    shot_args, widget_capture,
 )
 from .assets import mcp_tool
 from .jobs import cmd_job, jobs_dir
@@ -2078,6 +2079,9 @@ def cmd_pie(ctx, args):
     print(f"pie {args.action}: OK in {time.time() - started:.1f}s" + (f", {len(issues)} warnings/errors" if issues else ""))
     for line in issues[: args.limit]:
         print("  " + line)
+    if args.action == "start" and ctx.transport == "mcp" and front_level_viewport(ctx):
+        print("note: brought the level editor's tab to the front: another tab (the Message Log the editor opens after a "
+              "PIE session that logged errors) hid the game viewport, which ue ui, clicks and HUD shots read")
     if args.action == "stop":  # put back play settings a `--clients` start changed, and the world target
         with __import__("contextlib").suppress(CliError):
             note = pie_net(ctx, "restore")

@@ -750,11 +750,101 @@ def bp_command(ctx, args):
     return cmd_bp(ctx, args)
 
 
+STARTUP_STAMP = re.compile(r"^\[(\d{4})\.(\d\d)\.(\d\d)-(\d\d)\.(\d\d)\.(\d\d):(\d{3})\]\[\s*(\d+)\]")
+STARTUP_MARKS = [  # (phase, the log line that ends it), in startup order; the first match of each counts
+    ("config, modules and plugins", re.compile(r"LogInit: Running DelayedAutoRegister Phase PreRHIInit")),
+    ("RHI (graphics device)", re.compile(r"LogRHI: Using Default RHI|LogD3D1[12]RHI: .*(Creating|Chosen)|LogVulkanRHI: ")),
+    ("shader types", re.compile(r"Running DelayedAutoRegister Phase ShaderTypesReady")),
+    ("engine init (editor modules, asset registry, startup map)", re.compile(r"LogInit: Display: Engine is initialized")),
+    ("editor UI", re.compile(r"Total Editor Startup Time, took")),
+    ("startup map load", re.compile(r"LogLoad: Took [\d.]+ seconds to LoadMap")),
+    ("rest of engine initialization", re.compile(r"LogLoad: \(Engine Initialization\) Total time")),
+]
+STARTUP_END = re.compile(r"LogLoad: \(Engine Initialization\) Total time|Total Editor Startup Time, took")
+
+
+def log_seconds(line):
+    """(seconds since an arbitrary epoch, frame) of a stamped log line, or None."""
+    m = STARTUP_STAMP.match(line)
+    if not m:
+        return None
+    y, mo, d, h, mi, s, ms, frame = (int(v) for v in m.groups())
+    stamp = datetime.datetime(y, mo, d, h, mi, s, ms * 1000).timestamp()
+    return stamp, frame
+
+
+def startup_report(lines, gaps=6):
+    """{"total", "phases": [(name, seconds since start)], "gaps": [(seconds, line before, line after)],
+    "reported": {...}} for the startup in a log (an editor's, or a packaged game's): its own timings, and the
+    longest pauses between log lines, which show where it waited (shader compiles, asset scans, a slow plugin)."""
+    stamped = [(log_seconds(l), l) for l in lines]
+    stamped = [(t[0], l) for t, l in stamped if t and t[1] == 0]  # frame 0: before the first tick
+    if not stamped:
+        raise CliError("no time-stamped startup lines in this log (frame [0] lines)")
+    start = stamped[0][0]
+    end_i = next((i for i, (_, l) in enumerate(stamped) if STARTUP_END.search(l)), len(stamped) - 1)
+    window = stamped[: end_i + 1]
+    phases, seen = [], set()
+    for t, line in window:
+        for name, pattern in STARTUP_MARKS:
+            if name not in seen and pattern.search(line):
+                seen.add(name)
+                phases.append((name, t - start))
+    found = []
+    for (t0, before), (t1, after) in zip(window, window[1:]):
+        if t1 - t0 >= 0.2:
+            found.append((t1 - t0, before, after))
+    found.sort(key=lambda g: -g[0])
+    reported = {}
+    for _, line in window:
+        m = re.search(r"Total Editor Startup Time, took ([\d.]+)", line)
+        if m:
+            reported["editor"] = float(m.group(1))
+        m = re.search(r"\(Engine Initialization\) Total time: ([\d.]+)", line)
+        if m:
+            reported["engine"] = float(m.group(1))
+        m = re.search(r"Took ([\d.]+) seconds to LoadMap\((.+?)\)", line)
+        if m:
+            reported.setdefault("maps", []).append((m.group(2), float(m.group(1))))
+    return {"total": window[-1][0] - start, "phases": phases, "gaps": found[:gaps], "reported": reported}
+
+
+def perf_startup(ctx, args):
+    """`ue perf startup [--log PATH]`: where the editor's (or a packaged game's) startup went, from its log."""
+    path = getattr(args, "log", None) or log_path(ctx.project)
+    if not path or not os.path.isfile(path):
+        raise CliError(f"no log at {path}: --log <Saved/Logs/X.log> (a packaged game writes "
+                       "<Package>/<Project>/Saved/Logs/<Project>.log)")
+    with open(path, encoding="utf-8", errors="replace") as f:
+        lines = f.read().splitlines()
+    report = startup_report(lines, gaps=args.limit if args.limit < 30 else 6)
+    reported = report["reported"]
+    print(f"startup from {os.path.basename(path)}: {report['total']:.1f}s to the end of startup"
+          + (f" (the editor says {reported['editor']:.1f}s)" if "editor" in reported else "")
+          + (f" (engine initialization {reported['engine']:.1f}s)" if "engine" in reported else ""))
+    last = 0.0
+    for name, at in report["phases"]:
+        print(f"  {at:6.1f}s  +{at - last:5.1f}s  {name}")
+        last = at
+    for name, seconds in reported.get("maps", [])[:3]:
+        print(f"  map load {name}: {seconds:.2f}s")
+    if report["gaps"]:
+        print("longest pauses between log lines (what it waited on comes before the line after):")
+        trim = lambda l: STARTUP_STAMP.sub("", l).strip()[:150]  # noqa: E731
+        for seconds, before, after in report["gaps"]:
+            print(f"  {seconds:5.1f}s  after: {trim(before)}")
+            print(f"         then:  {trim(after)}")
+    ctx.data = {"total": report["total"], "phases": report["phases"], "reported": reported}
+    return 0
+
+
 def perf_command(ctx, args):
-    """`ue perf`: load and --scalability live here; the frame-time capture is play.cmd_perf. --at/--camera measure
-    from a camera of your choosing (in PIE, start it first: the camera is the player's view)."""
+    """`ue perf`: load, startup and --scalability live here; the frame-time capture is play.cmd_perf. --at/--camera
+    measure from a camera of your choosing (in PIE, start it first: the camera is the player's view)."""
     if getattr(args, "action", None) == "load":
         return perf_load(ctx, args)
+    if getattr(args, "action", None) == "startup":
+        return perf_startup(ctx, args)
     if any(getattr(args, k, None) for k in ("at", "look_at", "rot", "actor", "camera")):
         if not args.editor and not (ctx.beacon or {}).get("pie"):
             raise CliError("--at/--camera move the player's view in PIE: start it first (ue pie start), or measure "

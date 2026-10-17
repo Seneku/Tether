@@ -89,7 +89,9 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
   two, size, normal maps compressed as such, masks without sRGB) and meshes (simple collision, LODs or Nanite)
   in under a second, from registry data. Project rules go in Config/Tether/lint.json (prefixes, ignore globs,
   disable, max_texture_size, lod_triangles). Run it on folders you added to; `ue lint <folder> --fix --dry-run`
-  then `--fix --save` corrects texture settings and missing collision (renames: `--rule naming --fix`).
+  then `--fix --save` corrects texture settings and missing collision (renames: `--rule naming --fix`; heavy
+  meshes without LODs: `--rule mesh-lods --fix`, Nanite on, or `--lod-fix lods`). A pack at the content root:
+  `ue move-pack /Game/CityPack` moves it to /Game/ThirdParty/CityPack with references fixed.
 - Cleaning up content: `ue unused [/Game/Folder]` lists assets nothing reaches from the maps, the config, the
   code and the cook settings, biggest first. Confirm with `ue usages <asset>` before `ue rm` (paths built at
   runtime are invisible to it). `ue unused --redirectors --fix` repoints references and deletes redirectors.
@@ -194,6 +196,11 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
   percentage to that pixel count) and `ue shot --res 1920x1080` (in PIE, or a windowed editor).
 - A short event or an animated material: `ue shot --frames 6 --interval 0.1 [--after "<console command>"]` makes
   one contact sheet labelled with times; in PIE the game slows while capturing, so a 0.1 s flash still lands.
+  `--burst N --every S` keeps the series as separate full-size PNGs (a spectator camera is placed once).
+- Why a frame looks or costs what it does: `ue shot --view shadercomplexity|quadoverdraw|lightcomplexity|wireframe|
+  unlit|lods|nanite|lumen ...` (the view is put back afterwards). Post-process at a spot: `ue post [x,y,z|actor]`
+  lists the volumes in effect and the merged settings with their source. An editor tool tab or window:
+  `ue shot --window "<title>"`.
 - Try something in the running game without editing the level: `ue spawn /Game/X/BP_Buoy --pie --at x,y,z`.
 - Many props at once: `ue scatter /Game/X/SM_Rock --count 30 --area 1200,-300,2000 --spacing 250 --scale 0.7,1.4
   --align` (one undo step; same `--seed`, same layout).
@@ -354,6 +361,8 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
   costs: `ue gpu --ab "mat MI_X UseWindows=false" "mat MI_X UseWindows=true" --restore "..."` (in PIE, at a
   camera that shows it) alternates the two states and prints the difference by pass. A fixed view for timings:
   `ue gpu --at x,y,z --look-at x,y,z` (or `--camera <shot baseline>`; `ue perf` takes the same).
+  Slow builds: `ue build --timing` (slowest files, modules and headers; game target, editor untouched). Slow editor
+  start: `ue perf startup`. Which ue commands fail most here: `ue stats`.
   Settings behind it: `ue cvar r.Shadow` lists console variables with who set them; `ue cvar --changed` shows
   everything the project and device profile changed; to try a value, `ue cvar r.X=1 --for "gpu"` sets it only
   for that one command.

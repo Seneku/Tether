@@ -7,8 +7,8 @@ import sys
 import time
 
 from .core import (
-    CliError, compact_error, editor_mode, log_end, log_path, parse_res, read_json, stamped_name, state_dir, unwrap,
-    write_json, zlib,
+    CliError, compact_error, compile_cpu, editor_mode, log_end, log_path, parse_res, read_json, stamped_name, state_dir,
+    unwrap, write_json, zlib,
 )
 from .transport import py_json
 from .calls import flush_editor_log
@@ -27,24 +27,221 @@ def pie_screenshot(ctx, args, pose=None):
     the one shot, then comes back (the game keeps running)."""
     if args.annotate:
         raise CliError("--annotate works outside PIE, or in Simulate (ue pie start --simulate)")
-    if pose and (args.actor or args.at or args.look_at or args.rot):
+    if pose and spectator(args):
         # The debug camera takes the console (HighResShot would go to it), so capture through the Slate inspector.
-        ctx.tether("pie_view", pose=json.dumps({"location": pose["location"], "rotation": pose["rotation"]}))
-        try:
-            time.sleep(0.2)  # a frame or two from the new viewpoint
-            raw = widget_screenshot(ctx, {})
-        finally:
-            ctx.tether("pie_view", pose="")
-        if raw is None:
-            raise CliError("a spectator shot in PIE needs the game viewport inside the editor window and Epic's Slate "
-                           "inspector (ue init); or use Simulate (ue pie start --simulate) and ue shot --at")
-        return raw
+        if getattr(args, "_placed", False):  # a series (--frames/--burst) placed the camera once already
+            return spectator_capture(ctx)
+        with spectator_view(ctx, pose):
+            return spectator_capture(ctx)
     if getattr(args, "hud", False):
         client = pie_client_target(ctx)
         if client:  # a multiplayer client plays in a window of its own: capture that window, not the host's
             return client_window_shot(ctx, client)
         return hud_screenshot(ctx)
     return highres_shot(ctx, getattr(args, "res", None) or "1", pie=True)
+
+
+def spectator(args):
+    return bool(args.actor or args.at or args.look_at or args.rot)
+
+
+@contextlib.contextmanager
+def spectator_view(ctx, pose):
+    """The PIE player's view moved to `pose` (a debug camera) for what runs inside, then given back."""
+    ctx.tether("pie_view", pose=json.dumps({"location": pose["location"], "rotation": pose["rotation"]}))
+    try:
+        time.sleep(0.2)  # a frame or two from the new viewpoint
+        yield
+    finally:
+        ctx.tether("pie_view", pose="")
+
+
+def spectator_capture(ctx):
+    raw = widget_screenshot(ctx, {})
+    if raw is None:
+        raise CliError("a spectator shot in PIE needs the game viewport inside the editor window and Epic's Slate "
+                       "inspector (ue init); or use Simulate (ue pie start --simulate) and ue shot --at")
+    return raw
+
+
+# --view: (the editor's ViewModeIndex member, the game's `viewmode` name)
+VIEW_MODES = {
+    "lit": ("LIT", "Lit"), "unlit": ("UNLIT", "Unlit"), "wireframe": ("WIREFRAME", "Wireframe"),
+    "lightingonly": ("LIGHTING_ONLY", "LightingOnly"), "detaillighting": ("LIT_DETAIL_LIGHTING", "Lit_DetailLighting"),
+    "shadercomplexity": ("SHADER_COMPLEXITY", "ShaderComplexity"), "quadoverdraw": ("QUAD_OVERDRAW", "QuadOverdraw"),
+    "lightcomplexity": ("LIGHT_COMPLEXITY", "LightComplexity"), "lods": ("LOD_COLORATION", "LODColoration"),
+    "nanite": ("VISUALIZE_NANITE", "VisualizeNanite"), "lumen": ("VISUALIZE_LUMEN", "VisualizeLumen"),
+    "shadowcasters": ("SHADOW_CASTERS", "ShadowCasters"), "collision": ("COLLISION_VISIBILITY", "CollisionVis"),
+    "lightmapdensity": ("LIGHTMAP_DENSITY", "LightmapDensity"),
+    "vsm": ("VISUALIZE_VIRTUAL_SHADOW_MAP", "VisualizeVirtualShadowMap"),
+}
+VIEW_SET = """import json
+A = unreal.AutomationLibrary
+old = [A.get_editor_active_viewport_view_mode().name, A.get_editor_active_viewport_wireframe_opacity()]
+A.set_editor_active_viewport_view_mode(unreal.ViewModeIndex.VMI_{mode})
+if {wire}:
+    A.set_editor_active_viewport_wireframe_opacity(1.0)  # the editor's default draws wireframes faintly
+gi = unreal.SystemLibrary.get_console_variable_int_value('r.DynamicGlobalIlluminationMethod')
+print(json.dumps(old + [gi]))
+"""
+VIEW_RESTORE = """A = unreal.AutomationLibrary
+A.set_editor_active_viewport_view_mode(getattr(unreal.ViewModeIndex, {mode!r}))
+A.set_editor_active_viewport_wireframe_opacity({opacity})
+"""
+VIEW_QUIET, VIEW_SETTLE_MAX = 1.5, 60  # seconds without shader-worker CPU / most to wait for a view's shaders
+
+
+def settle_shaders(ctx, limit=VIEW_SETTLE_MAX):
+    """Wait until the editor's shader workers have been idle for VIEW_QUIET seconds (a debug view mode's shaders
+    compile on first use, and a capture before then misses what they draw). False when that cannot be measured."""
+    pid = (ctx.beacon or {}).get("pid")
+    last = compile_cpu(pid) if pid else None
+    if last is None:
+        return False
+    started, quiet = time.time(), None
+    while time.time() - started < limit:
+        time.sleep(0.25)
+        now = compile_cpu(pid)
+        busy = max(0.0, now[1] - last[1]) > 0.02
+        last, quiet = now, (None if busy else (quiet or time.time()))
+        if quiet and time.time() - quiet >= VIEW_QUIET:
+            return True
+    return True
+
+
+@contextlib.contextmanager
+def view_mode(ctx, name, pie, warm):
+    """The view `name` (VIEW_MODES) for the captures inside, then the previous one: the level viewport's view mode
+    in the editor and Simulate (it is what CaptureViewport renders), the game viewport's `viewmode` in PIE. `warm`
+    captures once so the mode's shaders start compiling, then this waits for them."""
+    if not name:
+        yield
+        return
+    editor_mode_name, game_mode_name = VIEW_MODES[name]
+    if pie:
+        ctx.tether("console", command=f"viewmode {game_mode_name}", pie=True)
+        try:
+            warm()
+            settle_shaders(ctx)
+            yield
+        finally:
+            with contextlib.suppress(CliError):
+                ctx.tether("console", command="viewmode Lit", pie=True)
+        return
+    old = py_json(ctx, VIEW_SET.format(mode=editor_mode_name, wire=name == "wireframe"))
+    if name == "lumen" and old[2] != 1:
+        print("note: Lumen is not this project's global illumination (r.DynamicGlobalIlluminationMethod is "
+              f"{old[2]}, not 1), so the Lumen view shows only a message", file=sys.stderr)
+    try:
+        warm()
+        settle_shaders(ctx)
+        yield
+    finally:
+        with contextlib.suppress(CliError):
+            ctx.tether("py", code=VIEW_RESTORE.format(mode=old[0], opacity=old[1]))
+
+
+SNAPSHOT_LINE = re.compile(r'^(\s*)(\w+)(?: "([^"]*)")?.*?\[pos=(-?\d+),(-?\d+) size=(\d+),(\d+)\]')
+
+
+def slate_entries(snapshot):
+    """[(indent, kind, title, x, y, w, h, ref)] for the lines of a Slate inspector snapshot."""
+    rows = []
+    for line in snapshot.splitlines():
+        m = SNAPSHOT_LINE.match(line)
+        ref = SNAPSHOT_REF.search(line)
+        if m and ref:
+            rows.append((len(m.group(1)), m.group(2), m.group(3) or "", int(m.group(4)), int(m.group(5)),
+                         int(m.group(6)), int(m.group(7)), ref.group(1)))
+    return rows
+
+
+def find_window_or_tab(rows, title):
+    """(window row, tab row or None, crop (x, y, w, h) in window units or None) for the window or dock tab whose title
+    matches `title` (exactly, else as a case-insensitive substring)."""
+    want = title.lower()
+    candidates = [r for r in rows if r[1] in ("window", "tab") and r[2]]
+    hit = next((r for r in candidates if r[2].lower() == want), None) or \
+        next((r for r in candidates if want in r[2].lower()), None)
+    if hit is None:
+        names = list(dict.fromkeys(f'{r[1]} "{r[2]}"' for r in candidates))
+        raise CliError(f'no editor window or tab "{title}" (open: {", ".join(names[:20]) or "none"})')
+    i = rows.index(hit)
+    window = next((r for r in reversed(rows[:i + 1]) if r[1] == "window"), None)
+    if window is None:
+        raise CliError(f'"{title}" is not inside an editor window')
+    if hit is window:
+        return window, None, None
+    # A tab's content is not in the snapshot: it is the area below its header, as wide as the container its tab
+    # well is in, down to the next tab well in that container (another row of tabs) or the container's bottom.
+    parent = next((r for r in reversed(rows[:i]) if r[0] < hit[0] and r[5] and r[6]), window)
+    x0, y0 = parent[3], hit[4]
+    bottom = parent[4] + parent[6]
+    for r in rows[i + 1:]:
+        if r[0] < hit[0]:
+            break
+        if r[1] == "tab" and r[0] == hit[0] and r[4] > hit[4]:
+            bottom = r[4]
+            break
+    rect = (x0 - window[3], y0 - window[4], parent[5], bottom - y0)  # x, y, width, height
+    return window, hit, rect
+
+
+def level_tab_hidden(rows, map_name):
+    """The level editor's document tab (titled after the open map) when no viewport tab is in the snapshot: another
+    document tab, such as the Message Log the editor opens after a PIE session that logged errors, is in front."""
+    if any(r[1] == "tab" and r[2].startswith("Viewport") for r in rows):
+        return None
+    return next((r for r in rows if r[1] == "tab" and map_name and r[2] == map_name), None)
+
+
+def front_level_viewport(ctx):
+    """Bring the level editor's tab to the front when another document tab hides it: the PIE viewport is inside it,
+    and `ue ui`, clicks, `expect-ui` and HUD or spectator shots find the game there. True when it had to."""
+    try:
+        text, failed = ctx.mcp.call("SlateInspectorToolset.SlateInspectorToolset", "Snapshot",
+                                    {"ref": "", "maxDepth": 60, "bIncludeSourceLocations": False})
+    except (CliError, AttributeError):
+        return False
+    value = unwrap(text) if not failed else ""
+    rows = slate_entries(value if isinstance(value, str) else json.dumps(value))
+    tab = level_tab_hidden(rows, ((ctx.beacon or {}).get("map") or "").rsplit("/", 1)[-1])
+    if tab is None:
+        return False
+    ctx.mcp.call("SlateInspectorToolset.SlateInspectorToolset", "Click", {"ref": tab[7]})
+    time.sleep(0.3)
+    return True
+
+
+def window_shot(ctx, title):
+    """PNG bytes of an editor window or dock tab (`ue shot --window TITLE`), through the Slate inspector. A tab is
+    brought to the front of its tab well first."""
+    import base64
+
+    def snapshot():
+        text, failed = ctx.mcp.call("SlateInspectorToolset.SlateInspectorToolset", "Snapshot",
+                                    {"ref": "", "maxDepth": 60, "bIncludeSourceLocations": False})
+        if failed:
+            raise CliError("the Slate inspector is not available (ue init enables Epic's SlateInspector toolset)")
+        value = unwrap(text)
+        return value if isinstance(value, str) else json.dumps(value)
+
+    window, tab, rect = find_window_or_tab(slate_entries(snapshot()), title)
+    if tab is not None:
+        ctx.mcp.call("SlateInspectorToolset.SlateInspectorToolset", "Click", {"ref": tab[7]})
+        time.sleep(0.3)
+        window, tab, rect = find_window_or_tab(slate_entries(snapshot()), tab[2])
+    text, failed = ctx.mcp.call("SlateInspectorToolset.SlateInspectorToolset", "Screenshot", {"ref": window[7]})
+    value = unwrap(text) if not failed else None
+    value = value.get("returnValue", value) if isinstance(value, dict) else None
+    if not isinstance(value, dict) or not value.get("data"):
+        raise CliError(f'the Slate inspector could not capture "{window[2]}"' + (f": {compact_error(text)}" if failed else ""))
+    raw = base64.b64decode(value["data"])
+    label = f'window "{window[2]}"' if tab is None else f'tab "{tab[2]}" of "{window[2]}"'
+    if rect is not None:
+        width = int.from_bytes(raw[16:20], "big") if raw[:4] == b"\x89PNG" else window[5]
+        raw = png_crop(raw, rect, width / max(1, window[5]))
+    return raw, label
 
 
 def pie_client_target(ctx):
@@ -443,13 +640,14 @@ def game_clock(ctx, dilation=None):
     return float(now), float(dil)
 
 
-def shot_frames(ctx, args, pie, capture):
+def shot_frames(ctx, args, pie, capture, burst=False):
     """`ue shot --frames N --interval S [--after CMD]`: N captures S seconds apart in one contact sheet. With a game
     world (PIE or Simulate) the game is slowed while capturing, so intervals shorter than a capture still land,
-    and each tile is labelled with its game time; in the editor the interval is real time."""
-    n, interval = args.frames, args.interval
-    if not 2 <= n <= 36:
-        raise CliError("--frames takes 2 to 36")
+    and each tile is labelled with its game time; in the editor the interval is real time. `--burst N --every S`
+    is the same series kept as N full-size PNGs in one folder."""
+    n, interval = (args.burst, args.every) if burst else (args.frames, args.interval)
+    if not 2 <= n <= (200 if burst else 36):
+        raise CliError("--burst takes 2 to 200" if burst else "--frames takes 2 to 36")
     if interval <= 0:
         raise CliError("--interval is in seconds and above 0")
     tiles, stamps = [], []
@@ -469,7 +667,7 @@ def shot_frames(ctx, args, pie, capture):
                     time.sleep(wait)
                     now, _ = game_clock(ctx)
                 stamps.append(now - start)
-                tiles.append(png_read(capture()))
+                tiles.append(capture() if burst else png_read(capture()))
         finally:
             with contextlib.suppress(CliError):
                 game_clock(ctx, before)
@@ -484,10 +682,24 @@ def shot_frames(ctx, args, pie, capture):
             if wait > 0:
                 time.sleep(wait)
             stamps.append(time.time() - start)
-            tiles.append(png_read(capture()))
+            tiles.append(capture() if burst else png_read(capture()))
         late = [s - i * interval for i, s in enumerate(stamps) if s - i * interval > interval / 2]
         note = "real time (no game world to slow: PIE or Simulate for game time)" + (
             f"; {len(late)} capture(s) came late, a capture takes longer than --interval" if late else "")
+    if burst:
+        folder = os.path.abspath(args.output) if args.output else \
+            stamped_name(os.path.join(state_dir(ctx.project), "shots"), "burst", "")
+        os.makedirs(folder, exist_ok=True)
+        paths = []
+        for i, raw in enumerate(tiles):
+            paths.append(os.path.join(folder, f"{i + 1:03d}.png"))
+            with open(paths[-1], "wb") as f:
+                f.write(raw)
+        size = f"{int.from_bytes(tiles[0][16:20], 'big')}x{int.from_bytes(tiles[0][20:24], 'big')}"
+        print(f"{folder}  {n} PNGs ({size}), 001.png .. {n:03d}.png")
+        print(f"at +" + ", +".join(f"{s:.2f}" for s in stamps) + f" s; {note}")
+        ctx.data = {"folder": folder, "paths": paths, "times": stamps}
+        return 0
     columns = n if n <= 3 else 2 if n == 4 else 3 if n <= 9 else 4
     tile_width = 480 if n <= 6 else 360
     width, height, rgb = contact_sheet(tiles, columns=columns, tile_width=tile_width)
@@ -555,7 +767,7 @@ def shot_args(**given):
     test keeps these in step with the `shot` parser, so a new option cannot break the callers again."""
     defaults = dict(actor=None, at=None, look_at=None, rot=None, annotate=False, grid_z=0, ui=False, hud=False,
                     output=None, baseline=None, compare=None, tolerance=0.5, threshold=32, res=None, frames=None,
-                    interval=0.25, after=None, clear=False)
+                    interval=0.25, after=None, clear=False, view=None, burst=None, every=0.5, window=None)
     import argparse
     return argparse.Namespace(**dict(defaults, **given))
 
@@ -617,6 +829,12 @@ def cmd_shot(ctx, args):
     if launch.get("headless") and not launch.get("render"):
         raise CliError("this editor runs headless with -nullrhi and cannot render; "
                        "reopen it with `ue open --headless --render` (or windowed)")
+    if getattr(args, "window", None):
+        if any(getattr(args, k, None) for k in ("actor", "at", "look_at", "rot", "frames", "burst", "res", "view",
+                                                "baseline", "compare", "hud")):
+            raise CliError("--window captures an editor window or tab as it is: no camera, view or series options")
+        raw, label = window_shot(ctx, args.window)
+        return save_shot(ctx, args, raw, label)
     baselines = os.path.join(state_dir(ctx.project), "shots", "baselines")
     if args.compare:  # re-shoot the baseline's exact camera
         meta = read_json(os.path.join(baselines, f"{args.compare}.json"))
@@ -638,15 +856,34 @@ def cmd_shot(ctx, args):
         parse_res(args.res)
         if getattr(args, "hud", False) or args.annotate or args.ui:
             raise CliError("--res renders the scene alone (HighResShot): not with --hud, --annotate or --ui")
-    if getattr(args, "frames", None):
+    view = getattr(args, "view", None)
+    if view and (getattr(args, "hud", False) or args.annotate):
+        raise CliError("--view shows the scene in a debug view: not with --hud or --annotate")
+    playing = pie and not simulate
+    if getattr(args, "frames", None) or getattr(args, "burst", None):
+        series = "--burst" if getattr(args, "burst", None) else "--frames"
+        if getattr(args, "frames", None) and getattr(args, "burst", None):
+            raise CliError("--frames (one contact sheet) or --burst (separate PNGs), not both")
         if getattr(args, "res", None) or args.baseline or args.compare:
-            raise CliError("--frames makes a contact sheet: not with --res, --baseline or --compare")
-        if pie and not simulate:
+            raise CliError(f"{series} makes a series: not with --res, --baseline or --compare")
+        if playing:
             capture = lambda: pie_screenshot(ctx, args, pose)
         else:
             annotations = dict(ANNOTATIONS, gridHeight=args.grid_z) if args.annotate else NO_ANNOTATIONS
             capture = lambda: capture_viewport(ctx, pose, annotations, args.ui)
-        return shot_frames(ctx, args, pie, capture)
+        with contextlib.ExitStack() as stack:
+            if playing and spectator(args):  # the debug camera once for the whole series (about 1.75 s a shot otherwise)
+                stack.enter_context(spectator_view(ctx, pose))
+                args._placed = True
+            stack.enter_context(view_mode(ctx, view, playing, capture))
+            return shot_frames(ctx, args, pie, capture, burst=series == "--burst")
+    with view_mode(ctx, view, playing, lambda: shoot(ctx, args, pose, pie, simulate, launch)):
+        raw = shoot(ctx, args, pose, pie, simulate, launch)
+    return save_shot(ctx, args, raw, "", pose=pose, pie=pie, simulate=simulate)
+
+
+def shoot(ctx, args, pose, pie, simulate, launch):
+    """PNG bytes of one `ue shot` capture: the player's view in PIE, a HighResShot for --res, else CaptureViewport."""
     if pie and not simulate:  # Play: CaptureViewport would render the editor world, so HighResShot the game
         if getattr(args, "res", None) and (args.actor or args.at or args.look_at or args.rot):
             raise CliError("--res with a spectator pose in PIE is not supported; take the player's view, or Simulate")
@@ -687,6 +924,13 @@ def cmd_shot(ctx, args):
     else:  # editor, or Simulate-In-Editor, whose simulation the level viewport shows
         annotations = dict(ANNOTATIONS, gridHeight=args.grid_z) if args.annotate else NO_ANNOTATIONS
         raw = capture_viewport(ctx, pose, annotations, args.ui)
+    return raw
+
+
+def save_shot(ctx, args, raw, label, pose=None, pie=False, simulate=False):
+    """Write a `ue shot` PNG (-o, or Saved/Tether/shots keeping the 50 newest), print it, and handle --baseline and
+    --compare."""
+    baselines = os.path.join(state_dir(ctx.project), "shots", "baselines")
     width, height = (int.from_bytes(raw[16:20], "big"), int.from_bytes(raw[20:24], "big")) if raw[:4] == b"\x89PNG" else (0, 0)
     if args.output:
         path = os.path.abspath(args.output)
@@ -700,9 +944,14 @@ def cmd_shot(ctx, args):
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with open(path, "wb") as f:
         f.write(raw)
+    view = getattr(args, "view", None)
+    print(f"{path}  {width}x{height}  {len(raw) // 1024} KB" + (f"  ({label})" if label else "  (Simulate)" if simulate else
+                                                              "  (PIE, with HUD)" if pie and getattr(args, "hud", False) else "  (PIE)" if pie else "")
+          + (f"  view {view}" if view else ""))
+    ctx.data = {"path": path, "width": width, "height": height}
+    if pose is None:
+        return 0
     loc, rot = pose["location"], pose["rotation"]
-    print(f"{path}  {width}x{height}  {len(raw) // 1024} KB" + ("  (Simulate)" if simulate else
-                                                              "  (PIE, with HUD)" if pie and getattr(args, "hud", False) else "  (PIE)" if pie else ""))
     print(f"camera at ({loc['x']:.0f}, {loc['y']:.0f}, {loc['z']:.0f}) "
           f"rot ({rot['pitch']:.0f}, {rot['yaw']:.0f}, {rot['roll']:.0f})")
     if args.baseline:

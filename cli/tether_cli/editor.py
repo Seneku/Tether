@@ -19,7 +19,8 @@ from .share import (
     session_id, session_label, session_names, set_session_name, sort_changes, take_lease,
 )
 from .build import (
-    classify_changes, compile_check, compile_overlay, csharp_changes, csharp_layout, csharp_reload_build, editor_env,
+    build_timing, classify_changes, compile_check, compile_overlay, csharp_changes, csharp_layout, csharp_reload_build,
+    editor_env,
     live_coding_build,
     live_patches, stale_code_note,
     uat_user_solution, ubt_build,
@@ -103,6 +104,8 @@ def cmd_build(ctx, args):
                 raise CliError("editors still open after 24 h; nothing built", 4)
             time.sleep(10)
         print(f"no editor open ({time.strftime('%H:%M')}): building")
+    if getattr(args, "timing", False):
+        return build_timing(ctx, args)
     if (getattr(args, "files", None) or getattr(args, "overlay", None)) and not args.check:
         raise CliError("--files and --overlay go with --check: ue build --check --files Source/X/A.cpp | "
                        "ue build --check --overlay")
