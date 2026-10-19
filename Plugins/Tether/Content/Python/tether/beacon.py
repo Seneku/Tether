@@ -132,13 +132,17 @@ def _snapshot():
     editor = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem)
     # get_editor_world() logs "The Editor is currently in a play mode" during PIE, so check PIE first.
     game = editor.get_game_world()
+    loaded = None
     if game is None:
         world = editor.get_editor_world()
         level = world.get_path_name().split(".")[0] if world else None
+        # The world object's address: a reload of the same map (`ue map open X --discard`) makes a new one
+        loaded = re.search(r"\(0x[0-9A-Fa-f]+\)", repr(world)) if world else None
+        loaded = loaded.group(0) if loaded else level
     else:
         level = _state.get("map")  # keep the edited map's name while PIE runs
-    if level and level != _state.get("snapshot_map") and game is None:
-        _state["snapshot_map"] = level  # a map was loaded: baseline for `ue changes`
+    if level and (level, loaded) != (_state.get("snapshot_map"), _state.get("snapshot_world")) and game is None:
+        _state["snapshot_map"], _state["snapshot_world"] = level, loaded  # a map was loaded: baseline for `ue changes`
         try:
             from tether import toolsets
             toolsets.snapshot_level(level)

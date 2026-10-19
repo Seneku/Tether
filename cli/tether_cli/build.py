@@ -10,7 +10,7 @@ from .core import (
     CliError, chosen_editor, editor_label, engine_root, epic_settings_dir, host_platform, live_coding_holders,
     live_editors, log_end,
     log_path, logged_dialogs, read_json,
-    read_new_log, state_dir, subprocess, uat_command, ubt_command, write_json,
+    read_new_log, run_git, state_dir, subprocess, uat_command, ubt_command, write_json,
 )
 from .share import file_owner, session_names
 
@@ -26,6 +26,75 @@ CLANG = re.compile(r"^\s*(?P<file>/[^:]+|[A-Za-z]:[^:]+):(?P<line>\d+):(?:\d+:)?
                    r"\s*(?P<msg>.*?)(?:\s+\[(?P<code>-W[\w-]+)\])?$")
 POSIX_LINK = re.compile(r"\b(ld(?:\.lld)?|ld64(?:\.lld)?): (error|warning): (.*)")
 REFLECT = re.compile(r"\b(UCLASS|USTRUCT|UENUM|UINTERFACE|UPROPERTY|UFUNCTION|GENERATED_BODY)\b")
+REFLECT_DECL = re.compile(r"\b(UCLASS|USTRUCT|UENUM|UINTERFACE|UPROPERTY|UFUNCTION|UDELEGATE)\s*\(")
+CPP_COMMENT = re.compile(r"//[^\n]*|/\*.*?\*/", re.S)
+
+
+def reflection_decls(text):
+    """A header's reflected declarations, whitespace-normalised: each UPROPERTY/UFUNCTION/UCLASS/... macro with its
+    specifiers and the declaration after it, up to its ; or {. What UHT sees, not function bodies."""
+    text, out = CPP_COMMENT.sub(" ", text), []
+    for m in REFLECT_DECL.finditer(text):
+        i, depth = m.end(), 1
+        while i < len(text) and depth:
+            depth += {"(": 1, ")": -1}.get(text[i], 0)
+            i += 1
+        ends = [j for j in (text.find(";", i), text.find("{", i)) if j >= 0]
+        out.append(" ".join(text[m.start():min(ends) if ends else len(text)].split()))
+    return out
+
+
+def reflection_path(project):
+    return os.path.join(state_dir(project), "reflection.json")
+
+
+def reflection_snapshot(project):
+    """{header relative to the project: its reflected declarations} for every reflected header under Source/."""
+    project_dir, found = os.path.dirname(os.path.abspath(project)), {}
+    for top, dirs, files in os.walk(os.path.join(project_dir, "Source")):
+        for f in files:
+            if f.endswith(".h"):
+                path = os.path.join(top, f)
+                try:
+                    with open(path, encoding="utf-8", errors="replace") as fh:
+                        text = fh.read()
+                except OSError:
+                    continue
+                if REFLECT.search(text):
+                    found[os.path.relpath(path, project_dir).replace("\\", "/")] = reflection_decls(text)
+    return found
+
+
+def reflection_changes(project, headers):
+    """[(header name, added declarations, removed declarations)] for the changed headers whose reflected
+    declarations differ from the last green build's, or None when there is no record to compare with."""
+    old = read_json(reflection_path(project))
+    if not isinstance(old, dict):
+        return None
+    project_dir, out = os.path.dirname(os.path.abspath(project)), []
+    for path in headers:
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                now = reflection_decls(f.read())
+        except OSError:
+            continue
+        before = old.get(os.path.relpath(os.path.abspath(path), project_dir).replace("\\", "/"), [])
+        added = [d for d in now if d not in before]
+        removed = [d for d in before if d not in now]
+        if added or removed:
+            out.append((os.path.basename(path), added, removed))
+    return out
+
+
+def describe_reflection(changes, limit=3):
+    """'NRRoadNetworkSubsystem.h: + UFUNCTION(BlueprintCallable) void Rebuild()' lines."""
+    lines = []
+    for name, added, removed in changes:
+        lines += [f"{name}: + {d[:110]}" for d in added[:limit]] + [f"{name}: - {d[:110]}" for d in removed[:limit]]
+        more = len(added) + len(removed) - min(len(added), limit) - min(len(removed), limit)
+        if more > 0:
+            lines.append(f"{name}: +{more} more")
+    return lines
 
 
 def ubt_log_path():
@@ -89,11 +158,32 @@ def layout_marker(project):
     return os.path.join(state_dir(project), "live-coding-layout.json")
 
 
+def layout_patch_marker(project, beacon):
+    """The record of Live Coding patches of reflected headers in this editor process, or None. Live++ patches every
+    editor open on the project, so the record names them all ("pids")."""
+    marker = read_json(layout_marker(project)) or {}
+    pid = (beacon or {}).get("pid")
+    if not marker or not pid or (pid != marker.get("pid") and pid not in (marker.get("pids") or [])):
+        return None
+    return marker
+
+
+def reflection_patch_refusal(project, beacon):
+    """Why `pie start` refuses: Live Coding patched new reflected declarations into this editor (`ue build --live`),
+    and a PIE world created on them can assert (GetSubsystem<T> finds the instance of the class before the patch)."""
+    marker = layout_patch_marker(project, beacon)
+    if not marker or not marker.get("reflection"):
+        return None
+    return ("Live Coding patched new reflected declarations into this editor (" + "; ".join(marker["reflection"][:3])
+            + "): a PIE world started on them can crash the editor (Class.h `Ret->IsA(T::StaticClass())` from "
+            "GetSubsystem). `ue build --restart` first, or `ue pie start --patched` to start anyway")
+
+
 def layout_patch_note(project, beacon):
     """A warning when Live Coding patched reflected headers in the running editor process since it started: class
     layouts may then disagree with the objects in memory, and UMG and replication misbehave until a restart."""
-    marker = read_json(layout_marker(project)) or {}
-    if not marker or marker.get("pid") != (beacon or {}).get("pid"):
+    marker = layout_patch_marker(project, beacon)
+    if not marker:
         return None
     return (f"Live Coding patched reflected headers in this editor since it started ({', '.join(marker['headers'][:4])}): "
             "class layouts may not match the objects in memory, so UMG, replication and Blueprints can misbehave "
@@ -219,7 +309,9 @@ def mark_green(project, key="time", live=False, pid=None, also=()):
     path = os.path.join(state_dir(project), "last-build.json")
     marker = read_json(path) or {}
     marker[key] = time.time()
-    if key == "time":
+    if key == "time":  # what UHT saw in this build: `ue build` compares the next change with it (new UFUNCTIONs)
+        with contextlib.suppress(OSError):
+            write_json(reflection_path(project), reflection_snapshot(project))
         marker["live_patches"] = marker.get("live_patches", 0) + 1 if live else 0
         marker["live_pid"] = pid if live else None
         pids = (marker.get("live_pids") or {}) if live else {}
@@ -704,13 +796,91 @@ def ubt_build(ctx, args, check=False, extra=None, output=None):
                         for pid, name, editor in holders)
         print("  Live Coding is active in an editor on this engine (the mutex is per engine install, not per project)"
               + (f": {who}" if who else "") + ". Build through that editor with `ue build`, or close it")
-    print_diagnostics(errors, warnings, args.limit)
+    untouched = untouched_errors(ctx.project, errors) if single and not ok else []
+    print_diagnostics([e for e in errors if e not in untouched], warnings, args.limit)
+    if untouched:  # compiled alone, a file sees only its own includes: what a unity build supplied is missing
+        print(f"  {len(untouched)} error(s) on lines you did not change since the last commit, often an include a "
+              "unity build supplied (compiled alone, a file sees only its own includes):")
+        for line in untouched[: args.limit]:
+            print("  e " + line)
+    for hint in redefinition_hints(ctx.project, errors):
+        print(f"  hint: {hint}")
     if not ok:
-        print_error_owners(ctx.project, errors)
+        print_error_owners(ctx.project, [e for e in errors if e not in untouched] or errors)
         print_link_owners(ctx.project, errors)
     if ok and not check:  # a check builds the game, not the editor this marker is about
         mark_green(ctx.project)
     return 0 if ok else 1
+
+
+HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@", re.M)
+ERROR_AT = re.compile(r"^(?P<file>(?!\w:)[^:]+\.(?:h|hpp|cpp|inl)):(?P<line>\d+):", re.I)
+
+
+def changed_lines(project, rel):
+    """The line numbers of a project file that differ from git HEAD (all of them for a file git does not track), or
+    None when git cannot tell."""
+    full = os.path.join(os.path.dirname(os.path.abspath(project)), rel)
+    if run_git(project, "ls-files", "--error-unmatch", "--", full, check=False) is None:
+        return None if run_git(project, "rev-parse", "--git-dir", check=False) is None else "all"
+    diff = run_git(project, "diff", "-U0", "HEAD", "--", full, check=False)
+    if diff is None:
+        return None
+    lines = set()
+    for m in HUNK.finditer(diff):
+        start, count = int(m.group(1)), int(m.group(2) or 1)
+        lines.update(range(start, start + count))
+    return lines
+
+
+def untouched_errors(project, errors):
+    """The errors on lines git says are unchanged since HEAD: in a single-file check, mostly includes that a unity
+    build had supplied, not the session's own mistakes."""
+    cache, out = {}, []
+    for error in errors:
+        m = ERROR_AT.match(error)
+        if not m:
+            continue
+        rel = m.group("file")
+        if rel not in cache:
+            try:
+                cache[rel] = changed_lines(project, rel)
+            except CliError:
+                cache[rel] = None
+        lines = cache[rel]
+        if lines is not None and lines != "all" and int(m.group("line")) not in lines:
+            out.append(error)
+    return out
+
+
+REDEFINITION = re.compile(r"\b(?:C2084|C2374|C2086|C2011|C2370|C2365|C2371)\b.*?'([A-Za-z_]\w*)'")
+
+
+def redefinition_hints(project, errors, limit=3):
+    """For a redefinition error: the other .cpp files of the project that define the name. In a unity build (and
+    Live Coding regroups files too) file-private names of two .cpp files collide, and adding files reshuffles the
+    groups, so a build that was green goes red."""
+    names = list(dict.fromkeys(m.group(1) for m in (REDEFINITION.search(e) for e in errors) if m))[:limit]
+    hints = []
+    for name in names:
+        # a declaration: a type before the name and nothing assigned or called before it on the line (not a use)
+        rx = re.compile(r"^[^=(\n]*\b(?!return\b|case\b|throw\b|delete\b|else\b|goto\b)\w[\w:<>]*[\s*&]+"
+                        + re.escape(name) + r"\s*(?:=|\(|\[|\{|;)", re.M)
+        where = []
+        for top, dirs, files in os.walk(os.path.join(os.path.dirname(os.path.abspath(project)), "Source")):
+            for f in files:
+                if f.endswith(".cpp"):
+                    try:
+                        with open(os.path.join(top, f), encoding="utf-8", errors="replace") as fh:
+                            if rx.search(CPP_COMMENT.sub(" ", fh.read())):
+                                where.append(f)
+                    except OSError:
+                        pass
+        if len(where) > 1:
+            hints.append(f"'{name}' is defined in {', '.join(sorted(where)[:4])}: a unity build compiles them as one "
+                         "file (adding .cpp files regroups them). Rename one, or move it into a named namespace; "
+                         "`ue lint --cpp` lists every such name")
+    return hints
 
 
 LC_ERROR = re.compile(r"(?:error|fatal error) (?:LNK|C)\d+\s*:")
@@ -799,6 +969,8 @@ def live_coding_build(ctx, args, changes):
             + " (Live Coding patches every editor open on the project)")
     print_diagnostics(errors, warnings, args.limit)
     print_error_owners(ctx.project, errors)
+    for hint in redefinition_hints(ctx.project, errors):
+        print(f"  hint: {hint}")
     for line in link_errors[: args.limit]:
         print(f"  {line}")
     print_link_owners(ctx.project, errors + link_errors)
@@ -814,17 +986,23 @@ def live_coding_build(ctx, args, changes):
         print(f"  note: Live Coding recompiled whole-module unity file(s) ({', '.join(unity)}). Setting "
               "`bUseUnity = false;` in those modules' Build.cs makes it compile only the changed files "
               "(measured on a mid-size game: 30 s -> 6 s per change)")
-    if ok and changes and changes[2]:
+    known_same = getattr(args, "reflection_known", False) and not getattr(args, "reflection", None)
+    if ok and changes and changes[2] and not known_same:  # only bodies or comments changed: nothing to say
         names = ", ".join(os.path.basename(p) for p in changes[2][:4])
-        print(f"  note: reflected headers changed ({names}). Function bodies and new UFUNCTIONs are live "
-              "(call new ones via cdo.call_method('Name')); new UPROPERTYs, layout/CDO changes, Python "
-              "wrappers and Blueprint use need `ue build --restart`")
-        # Remembered for this editor process: PIE starts and empty `ue ui` results say it again
+        forced = getattr(args, "reflection", None) or []
+        print(f"  note: reflected headers changed ({names})" + (
+            ": new reflected declarations went live (--live). `ue pie start` refuses until `ue build --restart`"
+            if forced else ". Function bodies are live; new UFUNCTIONs/UPROPERTYs, layout/CDO changes, Python "
+            "wrappers and Blueprint use need `ue build --restart`"))
+        # Remembered for this editor process and the others Live++ patched: PIE starts and empty `ue ui` results
+        # say it again, and with new declarations `pie start` refuses
         editor = chosen_editor(ctx.project) or {}
-        marker = read_json(layout_marker(ctx.project)) or {}
-        headers = marker.get("headers", []) if marker.get("pid") == editor.get("pid") else []
-        write_json(layout_marker(ctx.project), {"pid": editor.get("pid"), "time": time.time(),
-                                                "headers": list(dict.fromkeys(headers + [os.path.basename(p) for p in changes[2]]))})
+        marker = layout_patch_marker(ctx.project, editor) or {}
+        write_json(layout_marker(ctx.project), {
+            "pid": editor.get("pid"), "time": time.time(),
+            "pids": list(dict.fromkeys([editor.get("pid")] + [b.get("pid") for b in also])),
+            "headers": list(dict.fromkeys(marker.get("headers", []) + [os.path.basename(p) for p in changes[2]])),
+            "reflection": list(dict.fromkeys(marker.get("reflection", []) + forced))})
     if ok:
         mark_green(ctx.project, live=True, pid=building, also=[b.get("pid") for b in also])
     return 0 if ok else 1

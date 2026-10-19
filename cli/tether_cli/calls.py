@@ -9,13 +9,14 @@ import sys
 import time
 
 from .core import (
-    CliError, GATED, LEVELS, TETHER, UE_SCRIPT, compact_error, editor_process, editor_token, emit, filter_log, human_bytes, log_end, log_ignore_entries,
+    CliError, GATED, LEVELS, LOG_LINE, TETHER, UE_SCRIPT, compact_error, editor_process, editor_token, emit, filter_log,
+    human_bytes, log_end, log_ignore_entries,
     live_editors, log_ignore_path, log_path, pid_alive, PY_OUTPUT, summarize_log, write_json,
     port_open,
-    read_json, read_new_log, short, state_dir, unwrap,
+    read_json, read_new_log, session_id, short, state_dir, unwrap,
 )
 from .fabfiles import fab_origin, listing_url, project_fab
-from .share import lease_note
+from .share import LEASED, ago, lease_note, others_edits, pie_owner, session_label, session_names
 from .transport import catalog, fill_args, py_json, resolve_toolset, schema, signature
 
 
@@ -112,10 +113,24 @@ PY_PITFALLS = [  # (pattern in `ue py` code, what goes wrong): engine behaviour 
      "a FontSampleParameter compiles only with a default font set (set_editor_property('font', ...))"),
 ]
 EDITOR_WORLD_API = re.compile(r"EditorActorSubsystem|EditorLevelLibrary|LevelEditorSubsystem|get_editor_world|"
-                              r"get_all_level_actors|spawn_actor_from_(?:class|object)|ScopedEditorTransaction")
-PIE_PY_NOTE = ("PIE is running: Editor Scripting calls act on the edited level, not the game (and some refuse during "
-               "PIE), so a script can take the wrong branch. For the game world: `ue pie run -c \"...\"` "
-               "(tether.world(), tether.player()); or `ue pie stop` first")
+                              r"get_all_level_actors|spawn_actor_from_(?:class|object)|ScopedEditorTransaction|"
+                              r"save_(?:current_level|dirty_packages|map|packages|asset|loaded_asset)\b")
+PIE_PY_REFUSAL = ("PIE is running{owner}: Editor Scripting calls act on the edited level, not the game, and spawns "
+                  "return None during PIE, so a generator stage takes the wrong branch and can save a broken map. "
+                  "`ue pie stop` first; for the game world `ue pie run -c \"...\"` (tether.world(), tether.player()); "
+                  "--allow-pie runs it anyway")
+# Setters that change a component in memory without Modify(): the level is not marked dirty, so `ue changes` does
+# not see it, yet the next save of the level (anyone's) writes it.
+UNMODIFIED_SETTERS = re.compile(r"\.(set_(?:location|tangent|tangents|rotation|scale|up_vector|type)_at_spline_point|"
+                                r"set_spline_points|add_spline_point(?:_at_index)?|remove_spline_point|"
+                                r"clear_spline_points|update_spline|set_(?:world|relative)_(?:location|rotation|scale3d|"
+                                r"transform)(?:_and_rotation)?|set_static_mesh|set_material|add_instance|"
+                                r"update_instance_transform|remove_instance)\s*\(")
+UNMODIFIED_NOTE = ("{setter} changes a component in memory without marking it modified: `ue changes` will not see it, "
+                   "but the next save of the level (anyone's) writes it, and undo cannot take it back. Call "
+                   "comp.modify() (and actor.modify()) before changing it, or set it with set_editor_property")
+SCRIPT_IMPORT = re.compile(r"^\s*(?:from\s+([\w.]+)\s+import|import\s+([\w.]+(?:\s*,\s*[\w.]+)*))", re.M)
+OTHERS_PY_MINUTES = 15  # another session's Python edits this recent may still be under test
 STRUCT_LOOP = re.compile(r"for\s+(\w+)\s+in\s+[^\n]*get_editor_property\([^\n]*:\s*\n((?:[ \t]+[^\n]*\n?)+)")
 
 
@@ -134,21 +149,138 @@ def py_pitfalls(code):
     return notes
 
 
+def script_modules(path, seen=None):
+    """The script and the .py files next to it that it imports, directly or through each other: the project's own
+    modules a `ue py -f` stage runs (a generator that reloads its plan module on every stage)."""
+    seen = seen if seen is not None else []
+    if path in seen or not os.path.isfile(path):
+        return seen
+    seen.append(path)
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            text = f.read()
+    except OSError:
+        return seen
+    folder = os.path.dirname(path)
+    for m in SCRIPT_IMPORT.finditer(text):
+        for name in ([m.group(1)] if m.group(1) else re.split(r"\s*,\s*", m.group(2))):
+            parts = name.strip().split(".")
+            for candidate in (os.path.join(folder, *parts) + ".py", os.path.join(folder, *parts, "__init__.py")):
+                if os.path.isfile(candidate):
+                    script_modules(candidate, seen)
+    return seen
+
+
+OVERLAY_RUN = """import sys as _ts, os as _to, importlib.abc as _tabc, importlib.util as _tutil
+_tether_overlay, _tether_project, _tether_mods = {overlay!r}, {project!r}, {{}}
+def _tether_under(f, root):
+    return bool(f) and _to.path.normcase(_to.path.abspath(f)).startswith(_to.path.normcase(root) + _to.sep)
+def _tether_staged(f):  # the overlay's copy of a project file, or None
+    if not _tether_under(f, _tether_project) or _tether_under(f, _tether_overlay):
+        return None
+    c = _to.path.join(_tether_overlay, _to.path.relpath(_to.path.abspath(f), _tether_project))
+    return c if _to.path.isfile(c) else None
+class _TetherOverlay(_tabc.MetaPathFinder):
+    # Asked first by every import and importlib.reload: a project module the overlay has a copy of loads from there,
+    # whatever the script does to sys.path
+    def find_spec(self, name, path, target=None):
+        for finder in _ts.meta_path:
+            if finder is self or not hasattr(finder, 'find_spec'):
+                continue
+            spec = finder.find_spec(name, path, target)
+            if spec is not None:
+                break
+        else:
+            return None
+        staged = _tether_staged(spec.origin)
+        if not staged:
+            return spec
+        places = None
+        if spec.submodule_search_locations is not None:
+            places = [_to.path.dirname(staged)] + list(spec.submodule_search_locations)
+        return _tutil.spec_from_file_location(name, staged, submodule_search_locations=places)
+for _n, _m in list(_ts.modules.items()):  # imported from the shared folders: import the overlay's copy instead
+    if _tether_staged(getattr(_m, '__file__', None)):
+        _tether_mods[_n] = _ts.modules.pop(_n)
+_tether_finder = _TetherOverlay()
+_ts.meta_path.insert(0, _tether_finder)
+_ts.argv = {argv!r}
+__file__ = {path!r}
+try:
+    with open(__file__, encoding='utf-8-sig') as _tf:
+        _tsrc = _tf.read()
+    exec(compile(_tsrc, __file__, 'exec'), globals())
+finally:  # put the shared copies back for everyone else's stages
+    _ts.meta_path.remove(_tether_finder)
+    for _n, _m in list(_ts.modules.items()):
+        if _tether_under(getattr(_m, '__file__', None), _tether_overlay):
+            del _ts.modules[_n]
+    _ts.modules.update(_tether_mods)
+"""
+
+
+def overlay_script(ctx, args, path):
+    """`ue py -f X --overlay [DIR]`: the code that runs X, and the project modules it imports, from this session's
+    staged copies (Saved/Tether/staging/<session>/Scripts/..., laid out like the project) where they exist, for this
+    run only (an import hook, so a script's own sys.path edits and importlib.reload calls find them too). Returns
+    (code, the file that runs)."""
+    from .build import default_overlay
+    overlay = args.overlay if args.overlay not in ("-", "") else default_overlay(ctx.project, session_id())
+    overlay = os.path.abspath(overlay)
+    if not os.path.isdir(overlay):
+        raise CliError(f"no staging folder {overlay}: copy the scripts you are changing there, laid out like the "
+                       "project (e.g. Scripts/plan.py), or name one: --overlay <dir>")
+    project_dir = os.path.dirname(os.path.abspath(ctx.project))
+    rel = os.path.relpath(path, project_dir) if os.path.splitdrive(path)[0].lower() == \
+        os.path.splitdrive(project_dir)[0].lower() else ".."
+    staged = os.path.join(overlay, rel)
+    run = staged if not rel.startswith("..") and os.path.isfile(staged) else path
+    copies = [os.path.relpath(os.path.join(d, f), overlay).replace("\\", "/")
+              for d, _, files in os.walk(overlay) for f in files if f.endswith(".py")]
+    print(f"note: overlay {overlay}: {len(copies)} staged .py file(s) used ahead of the shared ones for this run"
+          + (f" ({', '.join(copies[:5])}{', ...' if len(copies) > 5 else ''})" if copies else ""), file=sys.stderr)
+    argv = [os.path.basename(path)] + list(args.code)
+    return OVERLAY_RUN.format(overlay=overlay, project=project_dir, argv=argv, path=run), run
+
+
 def cmd_py(ctx, args):
+    in_pie = bool((ctx.beacon or {}).get("pie"))
     if args.file:
-        with open(args.file, encoding="utf-8") as f:
-            code = f.read()
-        # Words after the file are the script's arguments, as with `python script.py clean`.
         path = os.path.abspath(args.file)
-        argv = [os.path.basename(args.file)] + list(args.code)
-        code = (f"import sys as _tether_sys\n_tether_sys.argv = {argv!r}\n__file__ = {path!r}\ndel _tether_sys\n"
-                + code.lstrip("﻿"))
+        if not getattr(args, "include_others", False):
+            # a stage on the shared editor runs the project's Python as it is on disk, half-tested edits included
+            theirs = others_edits(ctx.project, script_modules(path), minutes=OTHERS_PY_MINUTES)
+            if theirs:
+                names = session_names(ctx.project)
+                raise CliError(f"not run: another session edited Python this script runs in the last {OTHERS_PY_MINUTES} "
+                               "min and may still be testing it: " + "; ".join(
+                                   f"{os.path.basename(p)} by {session_label(ctx.project, s, names)} "
+                                   f"{ago(time.time() - t)}" for p, s, t in theirs[:5])
+                               + ". Ask that session (ue who), or pass --include-others", LEASED)
+        if getattr(args, "overlay", None):
+            code, run = overlay_script(ctx, args, path)
+            with open(run, encoding="utf-8-sig") as f:
+                scanned = f.read()
+        else:
+            with open(args.file, encoding="utf-8") as f:
+                code = f.read()
+            # Words after the file are the script's arguments, as with `python script.py clean`.
+            argv = [os.path.basename(args.file)] + list(args.code)
+            code = (f"import sys as _tether_sys\n_tether_sys.argv = {argv!r}\n__file__ = {path!r}\ndel _tether_sys\n"
+                    + code.lstrip("﻿"))
+            scanned = code
     elif args.code == ["-"]:
-        code = sys.stdin.read()
+        code = scanned = sys.stdin.read()
     else:
-        code = " ".join(args.code)
-    in_pie = (ctx.beacon or {}).get("pie") and EDITOR_WORLD_API.search(code)
-    for note in py_pitfalls(code) + [lease_note(ctx.project)] + ([PIE_PY_NOTE] if in_pie else []):
+        code = scanned = " ".join(args.code)
+    if in_pie and not getattr(args, "allow_pie", False) and (args.file or EDITOR_WORLD_API.search(scanned)):
+        owner = pie_owner(ctx.project, ctx.beacon)
+        raise CliError(PIE_PY_REFUSAL.format(owner=f", {owner}" if owner else ""))
+    notes = py_pitfalls(scanned) + [lease_note(ctx.project)]
+    setter = UNMODIFIED_SETTERS.search(scanned)
+    if setter and not in_pie and not re.search(r"\.modify\s*\(|spawn_actor", scanned):
+        notes.append(UNMODIFIED_NOTE.format(setter=setter.group(1)))
+    for note in notes:
         if note:
             print(note if note.startswith("note: ") else f"note: {note}", file=sys.stderr)
     start = log_end(ctx.project)
@@ -164,6 +296,8 @@ def cmd_py(ctx, args):
             print(printed.rstrip("\n"))
         for line in engine_complaints(ctx, start):
             print(f"engine: {line}", file=sys.stderr)
+        for line in save_failures(read_log_from(ctx, start)):
+            print(f"save failed: {line}", file=sys.stderr)
         hint = property_name_hint(ctx, error)
         if hint:
             print(f"hint: {hint}", file=sys.stderr)
@@ -174,7 +308,40 @@ def cmd_py(ctx, args):
         print(out.rstrip("\n") if isinstance(out, str) else json.dumps(out))
     for line in engine_complaints(ctx, start):  # why a call returned None, said only in the log
         print(f"engine: {line}", file=sys.stderr)
+    failed = save_failures(read_log_from(ctx, start))
+    if failed:  # the script went on as if it had saved: say so and fail, while the editor still holds the work
+        for line in failed:
+            print(f"save failed: {line}", file=sys.stderr)
+        print("note: the work is still in the editor, unsaved. " + SAVE_FIX, file=sys.stderr)
+        return 1
     return 0
+
+
+SAVE_LOGS = {"LogSavePackage", "EditorErrors", "LogFileManager"}
+SAVE_FAILED = re.compile(r"cannot|can't|could not|couldn't|unable|fail|read.?only|denied|error", re.I)
+SAVE_FIX = ("A file is read-only: git-lfs leaves `lockable` files (*.uasset, *.umap) read-only after a commit. "
+            "`ue save --writable` makes them writable and saves (or `git lfs lock <file>` where there is a lock "
+            "server); `ue changes` lists what is unsaved")
+SAVE_DIALOG = re.compile(r"Message dialog closed, result: \w+, title: [^,]*, text: (.*?(?:save|read-only|read only).*)$",
+                         re.I)
+
+
+def save_failures(lines):
+    """Lines in which the engine said a package was not saved (LogSavePackage and friends; "Cannot remove ... as it
+    is read only!" comes without a severity; through the editor's save helpers, a message dialog that an unattended
+    editor answers and logs), timestamps stripped, at most 10."""
+    found = []
+    for line in lines:
+        dialog = SAVE_DIALOG.search(line)
+        if dialog and dialog.group(1).strip() not in found:
+            found.append(dialog.group(1).strip())
+        m = LOG_LINE.match(line)
+        if m and m.group(1) in SAVE_LOGS and (m.group(2) in ("Error", "Fatal", "Warning") or SAVE_FAILED.search(m.group(3))):
+            if m.group(1) != "LogFileManager" or re.search(r"read.?only|delete|move|denied", m.group(3), re.I):
+                text = f"{m.group(1)}: {m.group(3).strip()}"
+                if text not in found:
+                    found.append(text)
+    return found[:10]
 
 
 MISSING_PROPERTY = re.compile(r"Failed to find property '[^']*' for attribute '(\w+)' on '(\w+)'")
@@ -216,6 +383,10 @@ def property_name_hint(ctx, error):
     if p:
         return (f"{p.group(2)}.{p.group(1)} is protected from Python, but `ue props <object> --match {p.group(1)}` "
                 "(--pie in PIE) reads it, and `ue pie watch Actor.{0}` samples it".format(p.group(1)))
+    if "rerun_construction_scripts" in error:
+        return ("5.8's Python has no rerun_construction_scripts: tether.rerun(actor) reruns it (a change notification "
+                "on the actor, as the Details panel sends), `ue rerun <actor>` from the shell; `ue set A Prop=v --force` "
+                "sets a value that is already set, with the notification")
     a = MISSING_ATTRIBUTE.search(error)
     if a:  # a UFUNCTION Python has no name for (CallInEditor without BlueprintCallable)
         cls, attr = a.groups()
@@ -321,8 +492,9 @@ def cmd_set(ctx, args):
         if not sep or not key.strip():
             raise CliError(f"expected name=value or name+=delta, got '{pair}'")
         values[key.strip()] = raw
-    try:
-        print(ctx.tether("set_props", target=args.target, values=json.dumps(values), pie=args.pie))
+    try:  # force only when asked: a plugin copy older than 0.31 has no such parameter
+        print(ctx.tether("set_props", target=args.target, values=json.dumps(values), pie=args.pie,
+                         **({"force": True} if getattr(args, "force", False) else {})))
     except CliError as exc:  # Epic prefixes its own report, with the object's full path
         raise CliError(re.sub(r"SetObjectProperties on '[^']*' \((\w+)\): the following properties could not be "
                               r"set: (.*?) (?=invalid value)", r"\1.\2: ", str(exc))) from None
@@ -470,6 +642,12 @@ def delete_in_pie(ctx, names, quiet=False):
     return gone
 
 
+def cmd_rerun(ctx, args):
+    """`ue rerun <actor>...`: rerun construction scripts (one undo step)."""
+    print(ctx.tether("rerun", targets=",".join(args.actors)))
+    return 0
+
+
 def cmd_delete(ctx, args):
     if getattr(args, "pie", False):
         delete_in_pie(ctx, args.actors)
@@ -528,7 +706,8 @@ def read_log_from(ctx, start):
 
 def cmd_save(ctx, args):
     start = log_end(ctx.project)
-    out = ctx.tether("save", paths=",".join(args.paths))
+    # writable only when asked: a plugin copy older than 0.31 has no such parameter
+    out = ctx.tether("save", paths=",".join(args.paths), **({"writable": True} if getattr(args, "writable", False) else {}))
     print(out)
     failed = out.startswith("save failed") or any(line.startswith("not saved (") for line in out.splitlines())
     if failed:

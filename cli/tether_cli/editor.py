@@ -1,6 +1,7 @@
 """Editor lifecycle: status, open, close, build, crash; the shared editor's lease and `ue who`."""
 import argparse
 import os
+import sys
 import time
 
 from .core import (
@@ -8,21 +9,23 @@ from .core import (
     forget_beacon,
     editor_live, editor_process,
     decline_package_restore, editor_label, engine_root, filter_log, live_coding_available, live_editors, logged_dialogs,
-    log_file_lines, newest_log, pick_port, pid_alive, port_open, read_json, read_new_log, recent_crash, remember_target,
+    log_file_lines, newest_log, parse_res, pick_port, pid_alive, port_open, read_json, read_new_log, recent_crash,
+    remember_target,
     run_git, startup_dialogs, startup_failure,
     state_dir,
     subprocess, write_json,
 )
 from .share import (
-    ACTIVE_MINUTES, active_lease, ago, changed_files, check_shared, describe_lease, drop_request, duration,
-    grant_lease, lease_note, lease_requests, others_edits, pie_owner, recent_sessions, release_lease, request_lease,
-    session_id, session_label, session_names, set_session_name, sort_changes, take_lease,
+    ACTIVE_MINUTES, active_lease, ago, changed_files, check_shared, describe_lease, describe_running, drop_request,
+    duration, grant_lease, lease_note, lease_requests, others_edits, pie_owner, pie_starter, recent_sessions,
+    release_lease, request_lease, running_commands, session_id, session_label, session_names, set_session_name,
+    sort_changes, take_lease,
 )
 from .build import (
     build_timing, classify_changes, compile_check, compile_overlay, csharp_changes, csharp_layout, csharp_reload_build,
     editor_env,
     live_coding_build,
-    live_patches, stale_code_note,
+    describe_reflection, live_patches, reflection_changes, stale_code_note,
     uat_user_solution, ubt_build,
 )
 
@@ -52,7 +55,11 @@ def cmd_status(ctx, args):
             state += f" (crashed {time.strftime('%H:%M', time.localtime(crash['time']))}: {crash_summary(crash, 100)}; ue crash)"
     elif age > 10:
         dialogs = blocking_dialogs(beacon.get("pid"))
-        state = f"HUNG? (no heartbeat for {age:.0f}s" + (f"; blocked by modal: \"{dialogs[0][:80]}\")" if dialogs else ")")
+        busy = running_commands(ctx.project)
+        if busy and not dialogs:  # a long `ue py` stage holds the game thread: busy, not hung
+            state = f"busy: {describe_running(ctx.project, busy[0])} (no heartbeat for {age:.0f}s while it runs)"
+        else:
+            state = f"HUNG? (no heartbeat for {age:.0f}s" + (f"; blocked by modal: \"{dialogs[0][:80]}\")" if dialogs else ")")
     else:
         owner = pie_owner(ctx.project, beacon)
         state = ("pie" + (f" ({owner})" if owner else "")) if beacon.get("pie") else "ready"
@@ -156,6 +163,20 @@ def cmd_build(ctx, args):
                     print(f"  {os.path.basename(path)}: {session_label(ctx.project, sid, names)}, {ago(time.time() - when)}")
                 print("  ask that session (ue who), wait until it builds, or pass --include-others")
                 return 5
+        if changes and changes[2]:
+            # New UFUNCTIONs/UPROPERTYs patched into a class with live instances: Live Coding reinstances the class,
+            # and a world subsystem's next GetSubsystem<T> asserts (the next PIE crashed an editor)
+            diffs = reflection_changes(ctx.project, changes[2])
+            if diffs and not getattr(args, "live", False):
+                print("restart required: reflected declarations changed (what UHT sees, not function bodies):")
+                for line in describe_reflection(diffs):
+                    print(f"  {line}")
+                print("  Live Coding would patch them into classes with live instances (a new UFUNCTION on a world "
+                      "subsystem crashed the next PIE). `ue build --restart`; `ue build --live` patches anyway "
+                      "(then `pie start` refuses until a restart)")
+                return 3
+            args.reflection = describe_reflection(diffs or [], limit=2)
+            args.reflection_known = diffs is not None
         if changes is None or changes[0]:  # C++ changed, or no baseline yet
             code = live_coding_build(ctx, args, changes)
             if code:
@@ -184,6 +205,8 @@ def cmd_build(ctx, args):
     else:
         reopen.update(headless=launch.get("headless", False), render=launch.get("render", False),
                       sound=launch.get("sound", False), unattended=launch.get("unattended"))
+    if launch.get("pid") == beacon.get("pid") and launch.get("size"):  # `ue open --size`: the same window again
+        reopen["size"] = launch["size"]
     if changes is None or changes[0]:
         # Compile before closing: a build that fails after the close leaves every session sharing the editor without one.
         code = None if args.no_check else compile_check(ctx, args.limit)
@@ -211,7 +234,7 @@ def reopen_editor(ctx, args, how):
     try:
         code = cmd_open(ctx, argparse.Namespace(map=how.get("map"), headless=how.get("headless", False),
                                                 render=how.get("render", False), sound=how.get("sound", False),
-                                                unattended=how.get("unattended"), no_build=True,
+                                                size=how.get("size"), unattended=how.get("unattended"), no_build=True,
                                                 limit=args.limit, wait=600, no_wait=False))
     except CliError as exc:  # the build went through; the editor did not start
         code = exc.code or 2
@@ -309,12 +332,24 @@ def cmd_open(ctx, args):
             cmd += ["-RUNNINGUNATTENDEDSCRIPT"]
     if unattended:
         cmd += ["-unattended"]
+    size = getattr(args, "size", None)
+    if size:
+        # Offscreen (-RenderOffscreen), the "display" is r.SetRes as the editor starts and the main window fills it;
+        # the project's saved GameUserSettings resolution (often windowed fullscreen at the desktop's size) would
+        # replace it, so that is set for this run too. Nothing is written to the project's config.
+        width, height = parse_res(size)
+        section = "-ini:GameUserSettings:[/Script/Engine.GameUserSettings]:"
+        cmd += [f"-ini:Engine:[SystemSettings]:r.SetRes={width}x{height}", f"{section}ResolutionSizeX={width}",
+                f"{section}ResolutionSizeY={height}", f"{section}LastUserConfirmedResolutionSizeX={width}",
+                f"{section}LastUserConfirmedResolutionSizeY={height}", f"{section}FullscreenMode=2",
+                f"{section}LastConfirmedFullscreenMode=2", f"{section}PreferredFullscreenMode=2"]
     remote = ctx.transport == "remote"
     if remote:  # no MCP server before 5.8: switch on the Python plugin's remote execution for this run
         cmd += ["-ini:Engine:[/Script/PythonScriptPlugin.PythonScriptPluginSettings]:bRemoteExecution=True"]
     write_json(os.path.join(state_dir(ctx.project), "launch.json"),
                {"headless": bool(args.headless), "render": bool(args.render or not args.headless),
                 "sound": bool(getattr(args, "sound", False) or not args.headless), "unattended": unattended, "port": port,
+                "size": getattr(args, "size", None),
                 "pid": None})
     started = time.time()
     detach = ({"creationflags": subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt"
@@ -482,12 +517,55 @@ def cmd_lease(ctx, args):
         print(f"granted to {session_label(ctx.project, lease['session'])}: {lease['what']} "
               f"({max(1, round((lease['until'] - lease['since']) / 60))} min); they see it on their next `ue` command")
         return 0
+    if args.action == "pending":  # for scripts: `ue lease pending && ue lease yield --back`
+        rows = lease_requests(ctx.project)
+        ctx.data = {"requests": rows}
+        for r in rows:
+            print(f"requested by {session_label(ctx.project, r['session'])} {ago(time.time() - r['time'])}: {r['what']}")
+        if not rows:
+            print("nobody is waiting for the editor")
+        return 0 if rows else 1
+    if args.action == "yield":
+        return yield_lease(ctx, args)
     lease = active_lease(ctx.project)
     ctx.data = {"lease": lease, "requests": lease_requests(ctx.project)}
     print(describe_lease(ctx.project, lease) if lease else "no lease: the editor is free (ue lease take --for ...)")
     for r in ctx.data["requests"]:
         print(f"  requested by {session_label(ctx.project, r['session'])} {ago(time.time() - r['time'])}: {r['what']}")
     return 0
+
+
+def yield_lease(ctx, args):
+    """`ue lease yield [--back]`, for scripts between suites: hand the lease to the oldest request, if any; with
+    --back, ask for it again and wait until it is this session's again (granted back, or free and taken)."""
+    me, held = session_id(), active_lease(ctx.project)
+    rows = lease_requests(ctx.project)
+    if not rows:
+        print("nobody is waiting for the editor" + ("; the lease stays yours" if held and held["session"] == me else ""))
+        return 0
+    lease = grant_lease(ctx.project)
+    print(f"yielded to {session_label(ctx.project, lease['session'])}: {lease['what']}")
+    if not args.back:
+        return 0
+    what = args.what or (held or {}).get("what") or "back after yielding"
+    request_lease(ctx.project, what, args.minutes)
+    print(f"asked for it back ({what}); waiting")
+    sys.stdout.flush()
+    started = time.time()
+    deadline = started + (getattr(args, "timeout", None) or 4 * 3600)
+    while time.time() < deadline:
+        now_held = active_lease(ctx.project)
+        if now_held and now_held["session"] == me:
+            print(f"the lease is yours again after {duration(time.time() - started)}: {describe_lease(ctx.project, now_held)}")
+            return 0
+        if not now_held:
+            lease, _ = take_lease(ctx.project, what, args.minutes)
+            print(f"the editor is free again after {duration(time.time() - started)}; taken: "
+                  + describe_lease(ctx.project, lease))
+            return 0
+        time.sleep(2)
+    raise CliError(f"the lease did not come back within {duration(time.time() - started)} (ue lease; --timeout "
+                   "waits longer)", 4)
 
 
 def cmd_who(ctx, args):
@@ -510,12 +588,30 @@ def cmd_who(ctx, args):
     print("lease: " + (describe_lease(ctx.project, lease) if lease else "none"))
     for r in lease_requests(ctx.project, now):
         print(f"  requested by {session_label(ctx.project, r['session'], names)} {ago(now - r['time'])}: {r['what']}")
+    for row in running_commands(ctx.project):
+        print(f"running now: {describe_running(ctx.project, row, now, names)}")
     owner = pie_owner(ctx.project, ctx.beacon)
     if owner:
         print(f"pie: {owner}")
+        for line in pie_starter_lines(ctx.project, ctx.beacon):
+            print(f"  {line}")
     if me not in names:
         print(f"you are {me}; `ue who --as NAME` gives this session a name the others see")
     return 0
+
+
+def pie_starter_lines(project, beacon):
+    """How PIE was started, and the shells above that command still running (a loop that keeps restarting PIE)."""
+    found = pie_starter(project, beacon)
+    if not found:
+        return []
+    command, shells = found
+    lines = [f"by `{command}`"] if command else []
+    if shells:
+        lines.append("still running above that command (a script or loop that may start PIE again; stop it with "
+                     "`taskkill /PID <pid> /T` or `kill <pid>`):")
+        lines += [f"  pid {pid}: {cmdline[:160]}" for pid, cmdline in shells]
+    return lines
 
 
 def cmd_git(ctx, args):

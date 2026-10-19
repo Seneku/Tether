@@ -4,6 +4,7 @@ import contextlib
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import time
@@ -3902,3 +3903,331 @@ class Batch030(unittest.TestCase):
             '    tab "Message Log" [pos=314,28 size=210,31] [ref=t3]']))
         self.assertEqual(ue.level_tab_hidden(rows, "L_TetherProbe")[7], "t2")
         self.assertIsNone(ue.level_tab_hidden(rows + [(12, "tab", "Viewport 1", 4, 102, 160, 25, "t4")], "L_TetherProbe"))
+
+
+class Round031(unittest.TestCase):
+    """0.31: UnrealRacing's notes 184-196, ShooterDomination's 197-200."""
+
+    def setUp(self):
+        self.project = Project()
+        self.p = self.project.uproject
+        self.log = self.project.write("Saved/Logs/Game.log", "")
+
+    def tearDown(self):
+        self.project.close()
+
+    def ctx(self, beacon=None, reply=""):
+        ctx = FakeCtx(reply)
+        ctx.project, ctx.beacon = self.p, beacon or {}
+        return ctx
+
+    def running(self, pid, session, cmd, since):
+        ue.write_json(os.path.join(ue.running_dir(self.p), f"{pid}.json"),
+                      {"session": session, "cmd": cmd, "pid": pid, "since": since})
+
+    # 186, 193: a running command keeps its session's lease and says what the editor is busy with
+    def test_a_running_command_keeps_its_sessions_lease(self):
+        with unittest.mock.patch("tether_cli.share.process_name", return_value=None):
+            with unittest.mock.patch.dict(os.environ, {"UE_SESSION": "holder"}):
+                ue.take_lease(self.p, "city rebuild", 1)
+            later = time.time() + 3600
+            self.assertIsNone(ue.active_lease(self.p, later))
+            self.running(os.getppid(), "holder", "ue py -f Scripts/build_city_layout.py city", time.time() - 420)
+            self.running(999999, "holder", "ue py dead", time.time())  # gone: its record goes
+            held = ue.active_lease(self.p, later)
+            self.assertEqual(held["session"], "holder")
+            self.assertIn("busy: `ue py -f Scripts/build_city_layout.py city` for 7 min", ue.describe_lease(self.p, held))
+            self.assertFalse(os.path.exists(os.path.join(ue.running_dir(self.p), "999999.json")))
+            rows = ue.running_commands(self.p)
+            self.assertEqual([r["pid"] for r in rows], [os.getppid()])
+            self.assertIn("holder `ue py -f Scripts/build_city_layout.py city` for 7 min",
+                          ue.describe_running(self.p, rows[0]))
+            ue.stop_running(os.path.join(ue.running_dir(self.p), f"{os.getppid()}.json"))
+            self.assertIsNone(ue.active_lease(self.p, later))
+
+    def test_start_and_stop_running(self):
+        path = ue.start_running(self.p, ["ue", "py", "-f", "x.py"])
+        self.assertEqual(ue.read_json(path)["cmd"], "ue py -f x.py")
+        self.assertEqual(ue.running_commands(self.p), [])  # this process's own record is not listed
+        ue.stop_running(path)
+        self.assertFalse(os.path.exists(path))
+
+    def test_status_says_busy_rather_than_hung(self):
+        ctx = self.ctx({"pid": os.getpid(), "heartbeat": time.time() - 90, "map": "/Game/M", "engine": "5.8"})
+        ctx.transport = "mcp"
+        self.running(os.getppid(), "gen", "ue py -f Scripts/gen.py city", time.time() - 80)
+        with unittest.mock.patch("tether_cli.share.process_name", return_value=None), \
+                unittest.mock.patch("tether_cli.editor.editor_process", return_value=True), \
+                unittest.mock.patch("tether_cli.editor.blocking_dialogs", return_value=[]), \
+                unittest.mock.patch("tether_cli.editor.port_open", return_value=True), \
+                unittest.mock.patch("tether_cli.editor.live_editors", return_value=[]), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            ue.cmd_status(ctx, argparse.Namespace())
+        self.assertIn("busy: gen `ue py -f Scripts/gen.py city` for 80s", out.getvalue())
+        self.assertNotIn("HUNG", out.getvalue())
+
+    def test_keep_lease_counts_from_the_end_of_a_command(self):
+        with unittest.mock.patch.dict(os.environ, {"UE_SESSION": "holder"}):
+            ue.take_lease(self.p, "suite", 1)
+            self.assertTrue(ue.keep_lease(self.p))
+            self.assertAlmostEqual(ue.active_lease(self.p)["until"], time.time() + 300, delta=2)
+            self.assertFalse(ue.keep_lease(self.p))  # 5 min left already
+
+    # 190: lease pending / yield
+    def lease_args(self, action, **kw):
+        return argparse.Namespace(action=action, name=None, what=kw.get("what"), minutes=15, to=None, force=False,
+                                  back=kw.get("back", False))
+
+    def test_lease_pending_and_yield(self):
+        ctx = self.ctx()
+        with unittest.mock.patch.dict(os.environ, {"UE_SESSION": "races"}):
+            ue.take_lease(self.p, "race suite", 30)
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(ue.cmd_lease(ctx, self.lease_args("pending")), 1)
+                self.assertEqual(ue.cmd_lease(ctx, self.lease_args("yield")), 0)
+            self.assertIn("nobody is waiting", out.getvalue())
+            self.assertEqual(ue.active_lease(self.p)["session"], "races")
+        with unittest.mock.patch.dict(os.environ, {"UE_SESSION": "kinks"}):
+            ue.request_lease(self.p, "route kinks", 10)
+        with unittest.mock.patch.dict(os.environ, {"UE_SESSION": "races"}):
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(ue.cmd_lease(ctx, self.lease_args("pending")), 0)
+                # --back: kinks releases while races waits; races takes it again
+                release = lambda s: os.remove(ue.lease_path(self.p))  # noqa: E731
+                with unittest.mock.patch("tether_cli.editor.time.sleep", side_effect=release):
+                    self.assertEqual(ue.cmd_lease(ctx, self.lease_args("yield", back=True)), 0)
+            text = out.getvalue()
+            self.assertIn("requested by kinks", text)
+            self.assertIn("yielded to kinks: route kinks", text)
+            self.assertIn("the editor is free again", text)
+            held = ue.active_lease(self.p)
+            self.assertEqual((held["session"], held["what"]), ("races", "race suite"))
+
+    # 189
+    def test_wait_lease_takes_the_global_timeout(self):
+        with unittest.mock.patch.dict(os.environ, {"UE_SESSION": "holder"}):
+            ue.take_lease(self.p, "x", 30)
+        args = argparse.Namespace(what="lease", max=None, clock="real", timeout=0.01, timeout_given=True)
+        with unittest.mock.patch.dict(os.environ, {"UE_SESSION": "waiter"}):
+            with self.assertRaisesRegex(ue.CliError, r"still waiting after 0.01s.*--max N waits longer"):
+                ue.cmd_wait(self.ctx(), args)
+
+    # 195: who started PIE, and the shells still running above that command
+    def test_pie_starter_lists_live_shells_above_the_command(self):
+        now = time.time()
+        ue.write_json(ue.pie_owner_path(self.p), {"session": "ramps", "time": now, "cmd": "ue pie do -f race.txt",
+                                                  "pid": 999999, "parents": [[4242, "bash.exe"], [4343, "bash.exe"],
+                                                                             [77, "node.exe"], [88, "bash.exe"]]})
+        beacon = {"pie": True, "pie_since": now + 1}
+        alive = lambda pid: pid in (4242, 88)  # noqa: E731
+        with unittest.mock.patch("tether_cli.share.pid_alive", side_effect=alive), \
+                unittest.mock.patch("tether_cli.share.process_name", return_value=None), \
+                unittest.mock.patch("tether_cli.share.process_ancestry", return_value=[]), \
+                unittest.mock.patch("tether_cli.share.command_lines", return_value={4242: "bash ./run_races.sh"}):
+            command, shells = ue.pie_starter(self.p, beacon)
+            lines = ue.pie_starter_lines(self.p, beacon)
+        self.assertEqual(command, "ue pie do -f race.txt")
+        self.assertEqual(shells, [(4242, "bash ./run_races.sh")])  # 88 is above node: the agent's, not a loop
+        self.assertIn("pid 4242: bash ./run_races.sh", "\n".join(lines))
+
+    def test_py_refuses_scripts_and_editor_world_code_during_pie(self):
+        ctx = self.ctx({"pie": True})
+        code = argparse.Namespace(file=None, code=["unreal.EditorLoadingAndSavingUtils.save_dirty_packages(True, True)"])
+        with self.assertRaisesRegex(ue.CliError, "PIE is running.*--allow-pie"):
+            ue.cmd_py(ctx, code)
+        script = self.project.write("Scripts/gen.py", "print('x')\n")
+        with self.assertRaisesRegex(ue.CliError, "PIE is running"):
+            ue.cmd_py(ctx, argparse.Namespace(file=script, code=[]))
+        with contextlib.redirect_stdout(io.StringIO()):  # the game world through tether.world() is fine
+            self.assertEqual(ue.cmd_py(ctx, argparse.Namespace(file=None, code=["print(tether.world())"])), 0)
+            self.assertEqual(ue.cmd_py(ctx, argparse.Namespace(file=script, code=[], allow_pie=True)), 0)
+
+    # 184
+    def test_py_fails_when_a_save_failed(self):
+        class Saving(FakeCtx):
+            def tether(inner, tool, **kwargs):
+                with open(self.log, "a", encoding="utf-8") as f:
+                    f.write(stamped("Message dialog closed, result: Ok, title: Message, text: Unable to save package "
+                                    "to D:/G/Content/L_Bay.umap because the file is read-only!\n"))
+                    f.write(stamped("LogSavePackage: Cannot remove 'D:/G/Content/M_Light.uasset' as it is read only!\n"))
+                    f.write(stamped("LogFileManager: Display: some unrelated file manager line\n"))
+                return "saved"
+        ctx = Saving()
+        ctx.project, ctx.beacon = self.p, {}
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(ue.cmd_py(ctx, argparse.Namespace(file=None, code=["build()"])), 1)
+        text = err.getvalue()
+        self.assertIn("save failed: Unable to save package to D:/G/Content/L_Bay.umap because the file is read-only!", text)
+        self.assertIn("save failed: LogSavePackage: Cannot remove 'D:/G/Content/M_Light.uasset' as it is read only!", text)
+        self.assertNotIn("unrelated", text)
+        self.assertIn("ue save --writable", text)
+
+    def test_save_passes_writable_only_when_asked(self):
+        ctx = self.ctx(reply="saved 1 package: /Game/L")
+        with contextlib.redirect_stdout(io.StringIO()):
+            ue.cmd_save(ctx, argparse.Namespace(paths=[], writable=False))
+            ue.cmd_save(ctx, argparse.Namespace(paths=[], writable=True))
+        self.assertNotIn("writable", ctx.calls[0][1])
+        self.assertTrue(ctx.calls[1][1]["writable"])
+
+    def test_doctor_names_read_only_packages(self):
+        path = self.project.write("Content/Maps/L_Bay.umap", "x")
+        self.project.write("Content/Maps/L_Ok.umap", "x")
+        os.chmod(path, 0o444)
+        try:
+            self.assertEqual(ue.read_only_packages(self.p), ["Maps/L_Bay.umap"])
+        finally:
+            os.chmod(path, 0o666)
+
+    # 187
+    def test_py_refuses_while_another_session_edits_the_scripts_modules(self):
+        script = self.project.write("Scripts/gen.py", "import os\nimport nr_city_plan\nfrom lib.util import x\n")
+        plan = self.project.write("Scripts/nr_city_plan.py", "from helpers import y\n")
+        helpers = self.project.write("Scripts/helpers.py", "")
+        util = self.project.write("Scripts/lib/util.py", "")
+        self.assertEqual(ue.script_modules(script), [script, plan, helpers, util])
+        with unittest.mock.patch.dict(os.environ, {"UE_SESSION": "local-gen"}):
+            ue.record_edit(self.p, helpers, "local-gen")
+        with unittest.mock.patch.dict(os.environ, {"UE_SESSION": "kinks"}):
+            with self.assertRaises(ue.CliError) as caught:
+                ue.cmd_py(self.ctx(), argparse.Namespace(file=script, code=["city"]))
+            self.assertEqual(caught.exception.code, 5)
+            self.assertIn("helpers.py by local-gen", str(caught.exception))
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(ue.cmd_py(self.ctx(), argparse.Namespace(file=script, code=["city"],
+                                                                           include_others=True)), 0)
+
+    def test_edit_key_on_another_drive(self):
+        if os.name != "nt":
+            self.skipTest("drive letters")
+        self.assertEqual(ue.edit_key("D:/Proj/Game.uproject", "C:/Temp/x.py"), "c:/temp/x.py")
+
+    # 188
+    def test_overlay_runs_staged_modules_for_one_run(self):
+        self.project.write("Scripts/gen.py", "import os, sys, importlib\nsys.path.insert(0, os.path.dirname(__file__))\n"
+                                             "import ovl_plan_031\nimportlib.reload(ovl_plan_031)\n"
+                                             "RESULT.append((ovl_plan_031.VALUE, sys.argv[1:]))\n")
+        self.project.write("Scripts/ovl_plan_031.py", "VALUE = 'shared'\n")
+        staged = os.path.join(self.project.root, "Saved", "Tether", "staging", "me", "Scripts", "ovl_plan_031.py")
+        os.makedirs(os.path.dirname(staged))
+        with open(staged, "w") as f:
+            f.write("VALUE = 'staged'\n")
+        path, saved_path = os.path.join(self.project.root, "Scripts", "gen.py"), list(sys.path)
+        try:
+            with unittest.mock.patch.dict(os.environ, {"UE_SESSION": "me"}), contextlib.redirect_stderr(io.StringIO()) as err:
+                code, run = ue.overlay_script(self.ctx(), argparse.Namespace(overlay="-", code=["city"]), path)
+            self.assertIn("1 staged .py file(s)", err.getvalue())
+            self.assertEqual(run, path)  # the script itself is not staged
+            namespace = {"RESULT": []}
+            exec(code, namespace)
+            exec(code, namespace)  # a second run: the import hook is gone, the staged module was dropped
+            self.assertEqual(namespace["RESULT"], [("staged", ["city"]), ("staged", ["city"])])
+            self.assertNotIn("ovl_plan_031", sys.modules)
+            import ovl_plan_031  # noqa: F401 (the shared copy, as everyone else's stages see it)
+            self.assertEqual(sys.modules["ovl_plan_031"].VALUE, "shared")
+        finally:
+            sys.path[:] = saved_path
+            sys.modules.pop("ovl_plan_031", None)
+
+    # 192
+    def test_py_hints_at_setters_without_modify(self):
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as err:
+            ue.cmd_py(self.ctx(), argparse.Namespace(file=None, code=["road.spline.set_location_at_spline_point(0, p, 1)"]))
+            ue.cmd_py(self.ctx(), argparse.Namespace(file=None, code=["road.modify(); s.set_location_at_spline_point(0, p, 1)"]))
+        self.assertEqual(err.getvalue().count("without marking it modified"), 1)
+
+    # 194
+    def test_log_steps_search_on_from_the_previous_match(self):
+        lines = [stamped("LogTemp: Free fly on"), stamped("LogTemp: Free fly off"), stamped("LogTemp: Free fly on")]
+        cursor = {"line": 0}
+        check = lambda text: ue.log_check(text, lambda: lines, cursor)()  # noqa: E731
+        self.assertTrue(check("Free fly on")[0])
+        ok, detail = check("Free fly off")
+        self.assertTrue(ok)
+        self.assertIn("(at 10:13:00.858)", detail)
+        self.assertTrue(check("Free fly on")[0])
+        ok, detail = check("Free fly off")
+        self.assertFalse(ok)
+        self.assertIn("an earlier one matched", detail)
+        self.assertTrue(check("Free fly off anywhere")[0])
+        self.assertTrue(check("Free fly on count >= 2")[0])  # a tally is still of the whole run
+
+    # 196
+    def test_set_force_and_rerun(self):
+        ctx = self.ctx("UDS\nTime of Day: 1300 -> 1300")
+        base = dict(target="UDS", assignments=["Time of Day=1300"], pie=False, from_file=None, dry_run=False)
+        with contextlib.redirect_stdout(io.StringIO()):
+            ue.cmd_set(ctx, argparse.Namespace(**base))
+            ue.cmd_set(ctx, argparse.Namespace(force=True, **base))
+            ue.cmd_rerun(ctx, argparse.Namespace(actors=["UDS", "Sky2"]))
+        self.assertNotIn("force", ctx.calls[0][1])
+        self.assertTrue(ctx.calls[1][1]["force"])
+        self.assertEqual(ctx.calls[2], ("rerun", {"targets": "UDS,Sky2"}))
+        self.assertIn("rerun", ue.GATED)
+        self.assertIn("tether.rerun(actor)", ue.property_name_hint(
+            ctx, "AttributeError: 'Actor' object has no attribute 'rerun_construction_scripts'"))
+
+    # 185
+    def test_reflection_changes_tell_declarations_from_bodies(self):
+        header = self.project.write("Source/Game/RoadNetwork.h", (
+            "#pragma once\nUCLASS()\nclass URoadNetworkSubsystem : public UWorldSubsystem\n{\n\tGENERATED_BODY()\npublic:\n"
+            "\tUFUNCTION(BlueprintCallable,\n\t\tCategory = \"Roads\")  // rebuilds\n\tvoid Rebuild();\n"
+            "\tint32 Count() const { return 3; }\n};\n"))
+        read = lambda: open(header, encoding="utf-8").read()  # noqa: E731
+        self.assertEqual(ue.reflection_decls(read()),
+                         ["UCLASS() class URoadNetworkSubsystem : public UWorldSubsystem",
+                          'UFUNCTION(BlueprintCallable, Category = "Roads") void Rebuild()'])
+        self.assertIsNone(ue.reflection_changes(self.p, [header]))  # no record yet
+        ue.mark_green(self.p)
+        self.assertEqual(list(ue.read_json(ue.reflection_path(self.p))), ["Source/Game/RoadNetwork.h"])
+        self.project.write("Source/Game/RoadNetwork.h", read().replace("return 3;", "return 4; /* x */"))
+        self.assertEqual(ue.reflection_changes(self.p, [header]), [])  # a body and a comment: Live Coding is fine
+        self.project.write("Source/Game/RoadNetwork.h", read().replace(
+            "\tint32 Count()", "\tUFUNCTION(BlueprintCallable)\n\tbool SnapKinks(float Tolerance);\n\tint32 Count()"))
+        changes = ue.reflection_changes(self.p, [header])
+        self.assertEqual(changes, [("RoadNetwork.h", ["UFUNCTION(BlueprintCallable) bool SnapKinks(float Tolerance)"], [])])
+        self.assertEqual(ue.describe_reflection(changes),
+                         ["RoadNetwork.h: + UFUNCTION(BlueprintCallable) bool SnapKinks(float Tolerance)"])
+
+    def test_pie_start_refuses_after_a_forced_reflection_patch(self):
+        ue.write_json(ue.layout_marker(self.p), {"pid": 11, "pids": [11, 22], "headers": ["RoadNetwork.h"],
+                                                 "reflection": ["RoadNetwork.h: + UFUNCTION() void Rebuild()"]})
+        self.assertIn("ue pie start --patched", ue.reflection_patch_refusal(self.p, {"pid": 22}))
+        self.assertIsNone(ue.reflection_patch_refusal(self.p, {"pid": 33}))
+        ue.write_json(ue.layout_marker(self.p), {"pid": 11, "headers": ["RoadNetwork.h"]})
+        self.assertIsNone(ue.reflection_patch_refusal(self.p, {"pid": 11}))  # a note only (layout_patch_note)
+        self.assertIsNotNone(ue.layout_patch_note(self.p, {"pid": 11}))
+
+    # 197
+    def test_errors_on_unchanged_lines_are_told_apart(self):
+        git = lambda *a: subprocess.run(["git", "-C", self.project.root, "-c", "user.name=t", "-c",  # noqa: E731
+                                         "user.email=t@t", *a], capture_output=True, check=True)
+        git("init", "-q")
+        self.project.write("Source/Game/A.cpp", "".join(f"line {i}\n" for i in range(1, 11)))
+        git("add", "-A")
+        git("commit", "-q", "-m", "x")
+        self.project.write("Source/Game/A.cpp", "".join(f"line {i}{' changed' if i == 5 else ''}\n" for i in range(1, 11)))
+        self.project.write("Source/Game/New.cpp", "int x;\n")
+        errors = ["Source\\Game\\A.cpp:5: C2065 'mine': undeclared identifier",
+                  "Source\\Game\\A.cpp:8: C2065 'FTimerManager': undeclared identifier",
+                  "Source\\Game\\New.cpp:1: C2065 'y': undeclared identifier"]
+        self.assertEqual(ue.untouched_errors(self.p, errors), [errors[1]])
+
+    # 198
+    def test_redefinition_names_the_other_file(self):
+        self.project.write("Source/Game/SDSetPiece.cpp", "namespace\n{\n\tconstexpr float ApproachSeconds = 4.f;\n}\n")
+        self.project.write("Source/Game/SDExtractionObjective.cpp", "namespace {\nconstexpr float ApproachSeconds = 2.f;\n}\n")
+        self.project.write("Source/Game/Other.cpp", "float Wait = ApproachSeconds;  // uses, not definitions\n"
+                                                    "float Twice() { return ApproachSeconds; }\nvoid F() { G(ApproachSeconds); }\n")
+        hints = ue.redefinition_hints(self.p, [
+            "Source\\Game\\SDExtractionObjective.cpp:2: C2374 'ApproachSeconds': redefinition; multiple initialization"])
+        self.assertEqual(len(hints), 1)
+        self.assertIn("'ApproachSeconds' is defined in SDExtractionObjective.cpp, SDSetPiece.cpp", hints[0])
+        self.assertIn("ue lint --cpp", hints[0])
+
+    # 200
+    def test_pie_help_lists_the_steps(self):
+        with contextlib.redirect_stdout(io.StringIO()) as out, self.assertRaises(SystemExit):
+            ue.build_parser().parse_args(["pie", "-h"])
+        for step in ("log <regex> [within N] [anywhere]", "until ...", "exec <console command>", "example:"):
+            self.assertIn(step, out.getvalue())

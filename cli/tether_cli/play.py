@@ -16,8 +16,8 @@ from .core import (
     write_json,
 )
 from .transport import catalog, py_json, resolve_toolset
-from .build import csharp_changes, csharp_layout, csharp_reload_build, layout_patch_note
-from .calls import flush_editor_log, metres_to_cm, scoped_cvars
+from .build import csharp_changes, csharp_layout, csharp_reload_build, layout_patch_note, reflection_patch_refusal
+from .calls import SAVE_FIX, flush_editor_log, metres_to_cm, save_failures, scoped_cvars
 from .share import (
     active_lease, check_shared, clear_pie_start, describe_lease, pie_owner, record_pie_start, session_id,
 )
@@ -26,6 +26,7 @@ from .images import (
     shot_args, widget_capture,
 )
 from .assets import mcp_tool
+from .editor import pie_starter_lines
 from .jobs import cmd_job, jobs_dir
 
 
@@ -1577,6 +1578,9 @@ def pie_run(ctx, args):
     for pattern, line in rejected[:5]:
         print(f"BAD  /{pattern}/  {line.split(']', 2)[-1].strip()[:140]}")
         failures.append(f"rejected pattern /{pattern}/ appeared")
+    for line in save_failures(lines):  # the script saved, or thought it did
+        print(f"save failed: {line}")
+        failures.append("a save failed (" + SAVE_FIX.split(":")[0].lower() + "?)")
     print(("PASS" if not failures else "FAIL") + f" in {time.time() - started:.1f}s"
           + ("" if not failures else ": " + "; ".join(dict.fromkeys(failures))))
     return 1 if failures else 0
@@ -1708,21 +1712,40 @@ def shot_step_args(rest, hud):
 
 LOG_COUNT = re.compile(r"^(.*?)\s+count\s*(>=|<=|==|=|>|<)\s*(\d+)$", re.I)
 LOG_ORDER = re.compile(r"^in order:\s*(.+)$", re.I)
+LOG_ANYWHERE = re.compile(r"\s+anywhere$", re.I)
+LOG_TIME = re.compile(r"^\[\d{4}\.\d\d\.\d\d-(\d\d)\.(\d\d)\.(\d\d):(\d{3})\]")
 
 
-def log_check(rest, log_lines):
+def log_check(rest, log_lines, cursor=None):
     """The check behind a `log` step: `log <regex>` (a line matches), `log <regex> count >= 6` (how many lines
-    match), `log in order: re1, re2, re3` (lines matching each, in that order)."""
-    clean = lambda line: short(re.sub(r"^\[[^\]]*\]\[[^\]]*\]", "", line), 120)  # noqa: E731
+    match, over the whole run), `log in order: re1, re2, re3` (lines matching each, in that order). A match or an
+    order searches the lines after the previous `log` step's match (cursor: {"line": index}, moved past this
+    match), so a step file that toggles something twice checks the second toggle; `log <regex> anywhere` searches
+    the whole run."""
+    cursor = cursor if cursor is not None else {"line": 0}
+    anywhere = LOG_ANYWHERE.search(rest)
+    rest = rest[: anywhere.start()].strip() if anywhere else rest
+    first = 0 if anywhere else cursor["line"]
+
+    def clean(line):
+        t = LOG_TIME.match(line)
+        return short(re.sub(r"^\[[^\]]*\]\[[^\]]*\]", "", line), 120) + (
+            f" (at {t.group(1)}:{t.group(2)}:{t.group(3)}.{t.group(4)})" if t else "")
+
+    def advance(index):
+        cursor["line"] = max(cursor["line"], index + 1)
+
     order, counted = LOG_ORDER.match(rest), LOG_COUNT.match(rest)
     if order:
         patterns = [re.compile(p.strip(), re.I) for p in order.group(1).split(",") if p.strip()]
 
         def in_order():
-            at = 0
-            for line in log_lines():
+            at, last = 0, None
+            for index, line in enumerate(log_lines()[first:], first):
                 if at < len(patterns) and patterns[at].search(line):
-                    at += 1
+                    at, last = at + 1, index
+            if at == len(patterns):
+                advance(last)
             return at == len(patterns), (f"all {len(patterns)} in order" if at == len(patterns) else
                                          f"{at} of {len(patterns)} in order; missing /{patterns[at].pattern}/ after them")
         return in_order
@@ -1731,15 +1754,22 @@ def log_check(rest, log_lines):
         compare = {">=": want.__le__, "<=": want.__ge__, "==": want.__eq__, "=": want.__eq__, ">": want.__lt__,
                    "<": want.__gt__}[op]
 
-        def count():
+        def count():  # a tally of the whole run, whatever earlier steps matched
             n = sum(1 for line in log_lines() if rx.search(line))
             return compare(n), f"{n} matching line(s) (want {op} {want})"
         return count
     rx = re.compile(rest, re.I)
 
     def matched():
-        hit = next((line for line in log_lines() if rx.search(line)), None)
-        return bool(hit), clean(hit) if hit else "no matching log line"
+        lines = log_lines()
+        index = next((i for i in range(first, len(lines)) if rx.search(lines[i])), None)
+        if index is not None:
+            advance(index)
+            return True, clean(lines[index])
+        earlier = None if anywhere else next((l for l in lines[:first] if rx.search(l)), None)
+        return False, "no matching log line" + (
+            f" after the previous log step's match (an earlier one matched: {clean(earlier)}; `log ... anywhere` "
+            "searches the whole run)" if earlier else "")
     return matched
 
 
@@ -1783,6 +1813,8 @@ def pie_do(ctx, args):
             f.seek(log_start)
             return f.read().decode("utf-8", "replace").splitlines()
 
+    log_cursor = {"line": 0}  # `log` steps search on from the previous one's match
+
     def poll(check, seconds):
         deadline = time.time() + seconds
         while True:
@@ -1806,7 +1838,7 @@ def pie_do(ctx, args):
         if verb == "until":
             return poll(lambda: tool("expect " + rest), seconds or 5)
         if verb == "log":
-            return poll(log_check(rest, log_lines), seconds or 5)
+            return poll(log_check(rest, log_lines, log_cursor), seconds or 5)
         if verb == "move":
             tool("move " + rest)
             return poll(lambda: tool(f"near {rest} 120"), seconds or 15)
@@ -1992,6 +2024,9 @@ def cmd_pie(ctx, args):
             record_hud(ctx)
     if args.action == "start":  # every PIE start goes through here, run/do/watch/record included
         check_shared(ctx.project, "pie start", destructive=False)
+        refusal = None if getattr(args, "patched", False) else reflection_patch_refusal(ctx.project, ctx.beacon)
+        if refusal and not (ctx.beacon or {}).get("pie"):
+            raise CliError(refusal, 3)
         if not (ctx.beacon or {}).get("pie"):  # PIE already running stays whoever's it was
             record_pie_start(ctx.project)
     # Said last (below the OK line and any status), where an output filter or a quick read does not lose it
@@ -2059,6 +2094,11 @@ def cmd_pie(ctx, args):
             net = pie_net(ctx, "status")
             if net.count(": ") > 1:  # several PIE worlds: multiplayer
                 print(net)
+            owner = pie_owner(ctx.project, ctx.beacon)
+            if owner:
+                print(f"  {owner}")
+                for line in pie_starter_lines(ctx.project, ctx.beacon):
+                    print(f"  {line}")
             ctx.data = {"running": True, "fps": round(fps, 1) if fps else None}
             return 0
         # Say why the last session ended if it died rather than being stopped.
@@ -2229,13 +2269,15 @@ def wait_lease(ctx, args):
                   if held else f"the editor is free{waited}, PIE stopped (`ue lease take --for \"...\"` before you use it)")
             return 0
         if time.time() >= deadline:
-            raise CliError(f"still waiting after {args.max:g}s: {why}", 4)
+            raise CliError(f"still waiting after {args.max:g}s: {why} (--max N waits longer)", 4)
         time.sleep(2)
 
 
 def cmd_wait(ctx, args):
     """`ue wait N [game]`: N seconds, or N seconds of game time in the running PIE (`pie do "wait N game"`), for
     the pauses between `ue exec` or `ue pie do` calls. `ue wait compile`: until shaders and assets have compiled."""
+    if getattr(args, "max", None) is None:  # `ue --timeout 7500 wait lease`: the global timeout is how long to wait
+        args.max = args.timeout if getattr(args, "timeout_given", False) else 900
     if args.what == "compile":
         return wait_compile(ctx, args)
     if args.what == "grass":

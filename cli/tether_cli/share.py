@@ -9,7 +9,8 @@ import os
 import re
 import time
 
-from .core import CliError, chosen_editor, read_json, run_git, session_id, state_dir, write_json
+from .core import (CliError, chosen_editor, command_lines, pid_alive, process_ancestry, process_name, read_json, run_git,
+                   session_id, state_dir, write_json)
 
 LEASE_MINUTES = 15      # default length of `ue lease take`
 ACTIVE_MINUTES = 5      # other sessions' commands this recent make a restart or close ask for the lease
@@ -179,19 +180,98 @@ def lease_path(project):
 
 
 def active_lease(project, now=None):
-    """The editor lease if one is held and not expired, else None."""
+    """The editor lease if one is held and not expired, else None. A lease whose time ran out while its holder's
+    `ue` command is still running (a long `ue py` stage) is still held: it lasts LEASE_KEEP min past that command."""
     lease = read_json(lease_path(project))
     now = time.time() if now is None else now
-    return lease if isinstance(lease, dict) and lease.get("until", 0) > now else None
+    if not isinstance(lease, dict) or "until" not in lease:
+        return None
+    if lease["until"] > now:
+        return lease
+    busy = [r for r in running_commands(project) if r.get("session") == lease.get("session")]
+    return dict(lease, until=now + LEASE_KEEP * 60, busy=busy[0]) if busy else None
 
 
 def describe_lease(project, lease, now=None):
     now = time.time() if now is None else now
+    busy = lease.get("busy") or next((r for r in running_commands(project) if r.get("session") == lease["session"]),
+                                     None)
     # The expiry first: after a renewal "since" is still the first take, and read alone it looked unextended
     return (f"leased by {session_label(project, lease['session'])}: {lease.get('what') or 'no reason given'}, "
-            f"until {time.strftime('%H:%M', time.localtime(lease['until']))} "
-            f"({max(1, round((lease['until'] - now) / 60))} min left), held since "
-            f"{time.strftime('%H:%M', time.localtime(lease['since']))}")
+            + (f"busy: `{busy['cmd']}` for {duration(now - busy.get('since', now))} (held until it ends, then "
+               f"{LEASE_KEEP} min), " if busy else
+               f"until {time.strftime('%H:%M', time.localtime(lease['until']))} "
+               f"({max(1, round((lease['until'] - now) / 60))} min left), ")
+            + f"held since {time.strftime('%H:%M', time.localtime(lease['since']))}")
+
+
+def keep_lease(project, now=None):
+    """This session's lease, if it would run out within LEASE_KEEP min, now lasts LEASE_KEEP min from now (at the
+    start and at the end of each of its `ue` commands). True when it was about to run out."""
+    now = time.time() if now is None else now
+    held = active_lease(project, now)
+    if not held or held["session"] != session_id() or held["until"] - now >= LEASE_KEEP * 60 - 30:
+        return False  # (renewed within the last half minute, or longer to go anyway)
+    held = {k: v for k, v in held.items() if k != "busy"}
+    write_json(lease_path(project), dict(held, until=now + LEASE_KEEP * 60, kept=True))
+    return True
+
+
+# ---------------------------------------------------------------- commands running now
+
+def running_dir(project):
+    return os.path.join(state_dir(project), "running")
+
+
+def start_running(project, argv, now=None):
+    """Note this `ue` command while it runs (stop_running removes it): a long command keeps its session's lease,
+    and `ue status`, `who` and `lease` say what the editor is busy with. The path, or None."""
+    path = os.path.join(running_dir(project), f"{os.getpid()}.json")
+    try:
+        write_json(path, {"session": session_id(), "cmd": " ".join(argv)[:160], "pid": os.getpid(),
+                          "since": round(time.time() if now is None else now, 1)})
+    except OSError:
+        return None
+    return path
+
+
+def stop_running(path):
+    try:
+        if path:
+            os.remove(path)
+    except OSError:
+        pass
+
+
+def running_commands(project):
+    """[{session, cmd, pid, since}] of the `ue` commands running now on this project (other than this one), oldest
+    first. Records of processes that are gone (or whose pid now belongs to something that is not Python) go."""
+    folder, rows = running_dir(project), []
+    try:
+        names = os.listdir(folder)
+    except OSError:
+        return []
+    for name in names:
+        pid = name[:-5]
+        if not name.endswith(".json") or not pid.isdigit() or int(pid) == os.getpid():
+            continue
+        alive = pid_alive(int(pid))
+        image = process_name(int(pid)) if alive else None
+        row = read_json(os.path.join(folder, name))
+        if not alive or (image and not image.lower().startswith("py")) or not isinstance(row, dict):
+            try:
+                os.remove(os.path.join(folder, name))
+            except OSError:
+                pass
+            continue
+        rows.append(row)
+    return sorted(rows, key=lambda r: r.get("since", 0))
+
+
+def describe_running(project, row, now=None, names=None):
+    now = time.time() if now is None else now
+    return (f"{session_label(project, row.get('session'), names)} `{row.get('cmd')}` for "
+            f"{duration(now - row.get('since', now))} (pid {row.get('pid')})")
 
 
 def take_lease(project, what, minutes, now=None):
@@ -331,13 +411,11 @@ def lease_messages(project, now=None):
         if held.get("granted_by") and not held.get("told"):
             out.append(f"note: the editor lease is yours now, granted by {session_label(project, held['granted_by'])} "
                        f"({max(1, round((held['until'] - now) / 60))} min; `ue lease release` when done)")
-            held = dict(held, told=True)
+            held = {k: v for k, v in dict(held, told=True).items() if k != "busy"}
             write_json(lease_path(project), held)
-        if held["until"] - now < LEASE_KEEP * 60:  # in use: it lasts LEASE_KEEP min past the holder's last command
-            if not held.get("kept"):
-                out.append(f"note: your editor lease ({held.get('what')}) was about to run out; it now lasts "
-                           f"{LEASE_KEEP} min past your last `ue` command (`ue lease release` when done)")
-            write_json(lease_path(project), dict(held, until=now + LEASE_KEEP * 60, kept=True))
+        if keep_lease(project, now) and not held.get("kept"):  # in use: LEASE_KEEP min past the last command
+            out.append(f"note: your editor lease ({held.get('what')}) was about to run out; it now lasts "
+                       f"{LEASE_KEEP} min past your last `ue` command (`ue lease release` when done)")
         rows, due = lease_requests(project, now), []
         for r in rows:
             if r["session"] != me and now - r.get("told", 0) >= REMIND_MINUTES * 60:
@@ -358,7 +436,10 @@ def edits_path(project):
 
 
 def edit_key(project, path):
-    return os.path.relpath(os.path.abspath(path), os.path.dirname(project)).replace("\\", "/").lower()
+    try:
+        return os.path.relpath(os.path.abspath(path), os.path.dirname(project)).replace("\\", "/").lower()
+    except ValueError:  # another drive than the project's (Windows): the absolute path is the key
+        return os.path.abspath(path).replace("\\", "/").lower()
 
 
 def record_edit(project, path, sid, now=None):
@@ -585,7 +666,35 @@ def pie_owner_path(project):
 
 
 def record_pie_start(project, now=None):
-    write_json(pie_owner_path(project), {"session": session_id(), "time": time.time() if now is None else now})
+    """Note who is starting PIE: the session, this `ue` command and the processes above it (a shell loop that
+    keeps starting PIE can then be found and stopped: `ue who`, `ue pie status`)."""
+    import sys
+    write_json(pie_owner_path(project), {"session": session_id(), "time": time.time() if now is None else now,
+                                         "cmd": " ".join(["ue"] + sys.argv[1:])[:160], "pid": os.getpid(),
+                                         "parents": process_ancestry(os.getpid())})
+
+
+SHELL_HOSTS = ("node", "claude", "explorer", "windowsterminal", "openconsole", "conhost", "code", "services",
+               "svchost", "wininit")  # long-lived hosts above any command line, not loops
+
+
+def pie_starter(project, beacon):
+    """For a running PIE session `ue` started: (the command that started it, [(pid, command line)] of the shells
+    above it still running). A shell still running after its `ue pie ...` command ended is usually a loop: the
+    processes to stop. None when PIE is not running or was not started through `ue`."""
+    if pie_owner(project, beacon) in (None, "started by hand in the editor"):
+        return None
+    record = read_json(pie_owner_path(project)) or {}
+    if pid_alive(record.get("pid")):  # the starting command still runs: nothing stray yet
+        return record.get("cmd"), []
+    shells, mine = [], {pid for pid, _ in process_ancestry(os.getpid())}  # the shell asking is not a stray loop
+    for pid, image in record.get("parents") or []:
+        if os.path.splitext(image)[0].lower() in SHELL_HOSTS:
+            break  # the agent or terminal hosting the commands: above here is not a loop
+        if pid not in mine and pid_alive(pid) and (process_name(pid) or image).lower() == image.lower():
+            shells.append(pid)
+    lines = command_lines(shells) if shells else {}
+    return record.get("cmd"), [(pid, lines[pid]) for pid in shells if pid in lines]
 
 
 def clear_pie_start(project):

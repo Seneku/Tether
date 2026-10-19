@@ -15,6 +15,20 @@ from .core import (
 from .build import csharp_layout
 
 
+def read_only_packages(project, cap=2000):
+    """Content-relative paths of the .uasset/.umap files under Content/ that are read-only (the editor cannot save
+    them), from a walk of at most `cap` read-only hits."""
+    content, found = os.path.join(os.path.dirname(project), "Content"), []
+    for top, dirs, files in os.walk(content):
+        dirs[:] = [d for d in dirs if d not in ("__ExternalActors__", "__ExternalObjects__", "Developers", "Collections")]
+        for f in files:
+            if f.endswith((".uasset", ".umap")) and not os.access(os.path.join(top, f), os.W_OK):
+                found.append(os.path.relpath(os.path.join(top, f), content).replace("\\", "/"))
+                if len(found) >= cap:
+                    return found
+    return found
+
+
 def cmd_doctor(ctx, args):
     """Check the setup Tether depends on and say how to fix what is wrong."""
     import io
@@ -129,6 +143,12 @@ def cmd_doctor(ctx, args):
         lfs = run_git(project, "lfs", "version", check=False) if lfs_needed else "n/a"
         report("ok" if lfs else "WARN", "git" + (f", LFS {'installed' if lfs else 'NOT installed'}" if lfs_needed else ""),
                "" if lfs else "install Git LFS (git lfs install): assets are LFS pointers without it")
+        locked = read_only_packages(project)
+        if locked:
+            report("WARN", f"{len(locked)} read-only package file(s) under Content/ ({', '.join(locked[:3])}"
+                           + (", ..." if len(locked) > 3 else "") + "): saving them fails",
+                   "git-lfs leaves `lockable` files read-only after a commit: `ue save --writable` makes the ones it "
+                   "saves writable (or `git lfs lock <file>` where there is a lock server)")
     else:
         report("WARN", "git not found", "ue diff and ue validate --changed need git")
     free = shutil.disk_usage(os.path.dirname(project)).free / 1024 ** 3

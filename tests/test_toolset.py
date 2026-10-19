@@ -201,7 +201,15 @@ class RevisionControl(unittest.TestCase):
         vcs = toolsets._Vcs(FakeSourceControl("None"))
         problems, _, _ = vcs.prepare([self.path("A.uasset")])
         self.assertEqual(len(problems), 1)
-        self.assertIn("A.uasset is read-only (not checked out?", problems[0])
+        self.assertIn("A.uasset is read-only (git-lfs leaves lockable files read-only", problems[0])
+        self.assertIn("ue save --writable", problems[0])
+
+    def test_writable_clears_the_read_only_flag_without_a_provider(self):  # 184
+        vcs = toolsets._Vcs(FakeSourceControl("Git"))
+        problems, _, notes = vcs.prepare([self.path("A.uasset")], writable=True)
+        self.assertEqual(problems, [])
+        self.assertEqual(notes, ["made A.uasset writable"])
+        self.assertTrue(os.access(self.path("A.uasset"), os.W_OK))
 
 
 class LegacyNames(unittest.TestCase):

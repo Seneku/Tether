@@ -949,6 +949,10 @@ def save_shot(ctx, args, raw, label, pose=None, pie=False, simulate=False):
                                                               "  (PIE, with HUD)" if pie and getattr(args, "hud", False) else "  (PIE)" if pie else "")
           + (f"  view {view}" if view else ""))
     ctx.data = {"path": path, "width": width, "height": height}
+    if pie and getattr(args, "hud", False) and width < 1000 and (ctx.beacon or {}).get("headless"):
+        print(f"note: the headless editor's PIE viewport is only {width}x{height} (a part of its main window, whose size "
+              "the project's saved resolution sets). `ue open --headless --render --size 2560x1440` after a `ue close` "
+              "makes it bigger; `ue ui` reads widget texts at any size")
     if pose is None:
         return 0
     loc, rot = pose["location"], pose["rotation"]

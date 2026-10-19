@@ -157,6 +157,33 @@ selftest passes (137).
 **Done in 0.29.3**: 183 `build --when-closed` no longer hands its `--pid` to the job (that editor is one of those
 it waits to close; the build runs UBT), and a job queued by an earlier version drops it before it builds.
 
+**Done in 0.31.0** (UnrealRacing's notes 184-196, ShooterDomination's loadouts notes 197-200): 184 a save that
+failed during `ue py` or `pie run` (the editor's "Unable to save package ... read-only" dialog, which an unattended
+editor answers and logs, or LogSavePackage lines) prints `save failed:` and exits 1; `ue save --writable` clears the
+read-only flag where there is no check-out provider, and `ue doctor` counts read-only packages; 185 `ue build`
+compares each changed header's reflected declarations (macro, specifiers, declaration) with the last green build's
+and says "restart required" with them (exit 3) instead of patching a new UFUNCTION/UPROPERTY; `--live` patches
+anyway and `pie start` then refuses until a restart (`--patched`); comment and body edits in headers go through
+Live Coding without the old note; 186/193 each running `ue` command leaves a record (Saved/Tether/running/), so a
+lease is held while its holder's command runs and lasts 5 min past its end, and `status` says "busy: <command> for
+N s" instead of "HUNG?"; `who` and `lease` show it; 187 `ue py -f` refuses while another session edited the script
+or a module it imports in the last 15 min (exit 5, `--include-others`); 188 `ue py -f --overlay [DIR]` runs the
+staged copies through an import hook (a script's own sys.path edits and `importlib.reload` find them), for that run
+only; 189 `wait` takes the global `--timeout`; 190 `ue lease yield [--back]` and `ue lease pending`; 191 `ue changes`
+reports a delete and respawn with the same label and class as "rebuilt", and takes a new baseline when the same map
+is opened again; 192 `ue py` notes component setters without `modify()`; 194 `log` steps search after the previous
+`log` step's match (`anywhere` for the whole run) and print the matched line's time; 195 `ue py` refuses `-f`
+scripts and editor-world code during PIE (`--allow-pie`), and `who`/`pie status` name the command that started PIE
+and the shells still running above it; 196 `ue set --force`, `ue rerun <actor>` and `tether.rerun(actor)` (a
+change notification, as the Details panel sends); 197 `build --check --files` lists errors on lines unchanged since
+the last commit apart from the session's own; 198 redefinition errors name the other .cpp files that define the
+name; 199 `ue open --size WxH` (offscreen, the main window fills r.SetRes, and the project's saved GameUserSettings
+resolution would replace it, so both are set for that run; ShooterDomination's saved one gave a 395x281 PIE
+viewport), with a note on small `shot --hud` captures; 200 `ue help pie` lists every step. All checked live in
+Sandbox except 198 (unit-tested) and the `--live` path of 185. Plugin changes (rerun, `set --force`,
+`save --writable`, the rebuilt actors and the reload baseline) need each project's plugin copy updated (`ue init`,
+then `ue reload`); the CLI sends the new parameters only when they are asked for, so older copies keep working.
+
 ---
 
 ## Priority 1: asked for, or blocking real work

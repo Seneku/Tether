@@ -13,6 +13,7 @@ import io
 import json
 import math
 import os
+import stat
 import re
 import sys
 import time
@@ -1805,8 +1806,9 @@ class _Vcs:
     def error(self):
         return str(_try(lambda: self.sc.last_error_msg(), "")) or "see ue log"
 
-    def prepare(self, files):
-        """Make existing files writable (check them out). Returns (problems, new files, notes)."""
+    def prepare(self, files, writable=False):
+        """Make existing files writable (check them out; with `writable` and no check-out provider, clear the
+        read-only flag). Returns (problems, new files, notes)."""
         problems, new, notes = [], [], []
         for path in files:
             if not path:
@@ -1827,10 +1829,17 @@ class _Vcs:
                     else:
                         problems.append(f"could not check out {os.path.basename(path)}: {self.error()}")
                         continue
+            if not os.access(path, os.W_OK) and writable and not self.checkouts:
+                try:
+                    os.chmod(path, os.stat(path).st_mode | stat.S_IWRITE)
+                    notes.append(f"made {os.path.basename(path)} writable")
+                except OSError as exc:
+                    problems.append(f"{os.path.basename(path)} is read-only and could not be made writable: {exc}")
+                    continue
             if not os.access(path, os.W_OK):
                 problems.append(f"{os.path.basename(path)} is read-only" + (
-                    "" if self.checkouts else " (not checked out? enable revision control in the editor, or check "
-                    "it out first)"))
+                    "" if self.checkouts else " (git-lfs leaves lockable files read-only after a commit: `ue save "
+                    "--writable` makes them writable, or `git lfs lock` it; in a Perforce workspace, check it out)"))
         return problems, new, notes
 
     def added(self, files):
@@ -3583,7 +3592,7 @@ class TetherCore(_Base):
 
     @_tool
     @staticmethod
-    def set_props(target: str, values: str, pie: bool = False, token: str = "") -> str:
+    def set_props(target: str, values: str, pie: bool = False, token: str = "", force: bool = False) -> str:
         """Set reflected properties from compact text, as one undoable editor transaction.
 
         Values are JSON, true/false, numbers, enum names, object paths, or positional tuples for
@@ -3596,6 +3605,8 @@ class TetherCore(_Base):
             values: JSON object of property name to value text, e.g. {"Intensity": "10", "location+": "0,0,200"}.
             pie: Change the PIE world instead of the editor level (not undoable, not saved).
             token: Session token from Saved/Tether/editors/<pid>.token (the ue CLI sends it).
+            force: Set values that are already set too, so the change notification fires (an actor's construction
+                script reruns).
 
         Returns:
             One 'name: old -> new' line per property.
@@ -3610,7 +3621,7 @@ class TetherCore(_Base):
             head = _label(obj) + (" (PIE)" if pie else "")
             if not rest:
                 return "\n".join([head] + rows)
-            more = TetherCore.set_props(target, json.dumps(rest), pie, token).split("\n")[1:]
+            more = TetherCore.set_props(target, json.dumps(rest), pie, token, force).split("\n")[1:]
             return "\n".join([head] + rows + more)
         legacy_obj = _resolve(target, pie) if not _LEGACY else None
         legacy_cls = legacy_obj and (legacy_obj if isinstance(legacy_obj, unreal.Struct) else legacy_obj.get_class())
@@ -3675,11 +3686,13 @@ class TetherCore(_Base):
         # Skip values that are already set: a write that changes nothing opens an empty transaction, which the
         # editor drops, and `ue undo` would then line up with the wrong entry.
         unchanged = [n for n in new if n in old and isinstance(new[n], (int, float, bool, dict)) and _took(new[n], old[n])
-                     and (not isinstance(new[n], dict) or all(isinstance(v, (int, float, bool)) for v in new[n].values()))]
+                     and (not isinstance(new[n], dict) or all(isinstance(v, (int, float, bool)) for v in new[n].values()))
+                     and not force]
         for name in unchanged:
             del new[name]
         if not new:
-            return _label(obj) + (" (PIE)" if pie else "") + "\n(no change: " + ", ".join(unchanged) + " already set)"
+            return (_label(obj) + (" (PIE)" if pie else "") + "\n(no change: " + ", ".join(unchanged) + " already set; "
+                    "--force sets it anyway, firing the change notification: `ue rerun` reruns a construction script)")
 
         def apply():
             props = {n: v for n, v in new.items() if n in schema}
@@ -6754,6 +6767,41 @@ class TetherCore(_Base):
 
     @_tool
     @staticmethod
+    def rerun(targets: str, token: str = "") -> str:
+        """Rerun actors' construction scripts (undoable), as editing a property in the Details panel does: for a
+        Blueprint that applies its variables there, after they were set without a change notification.
+
+        Args:
+            targets: Comma-separated actor labels or names.
+            token: Session token from Saved/Tether/editors/<pid>.token (the ue CLI sends it).
+
+        Returns:
+            One line per actor: its class and component count before and after.
+        """
+        _authorize(token)
+        from tether import scripting
+        actors = []
+        for ref in [t.strip() for t in targets.split(",") if t.strip()]:
+            obj = _resolve(ref)
+            if not isinstance(obj, unreal.Actor):
+                raise RuntimeError(f"'{ref}' is not an actor")
+            actors.append(obj)
+        before = unreal.ToolsetLibrary.get_active_undo_count() if not _LEGACY else 0
+        rows = []
+        with unreal.ScopedEditorTransaction("ue rerun"):
+            for actor in actors:
+                count = len(actor.get_components_by_class(unreal.ActorComponent))
+                scripting.rerun(actor)
+                cls = actor.get_class()
+                blueprint = cls.get_name().endswith("_C")
+                rows.append(f"{_actor_label(actor)} ({cls.get_name()}): reran its construction script, "
+                            f"{count} -> {len(actor.get_components_by_class(unreal.ActorComponent))} components"
+                            + ("" if blueprint else " (a C++ class: only OnConstruction runs again)"))
+        _record_undo(before, "rerun " + ", ".join(_actor_label(a) for a in actors))
+        return "\n".join(rows)
+
+    @_tool
+    @staticmethod
     def duplicate(target: str, offset: str = "100,0,0", count: int = 1, token: str = "") -> str:
         """Duplicate an actor (undoable), each copy shifted by `offset` from the previous one.
 
@@ -6978,14 +7026,35 @@ class TetherCore(_Base):
         base = _LEVELS.get(level)
         if level and base is not None and (maps or actor_packages):
             now = {a.get_path_name(): a for a in _authored_actors()}
-            added = [_actor_label(now[p]) for p in now if p not in base]
-            removed = [base[p][0] for p in base if p not in now]
+            # A delete and respawn with the same label and class (a generator's rebuild) is one actor rebuilt, not
+            # one added and one removed
+            gone = {}
+            for p in base:
+                if p not in now:
+                    gone.setdefault(tuple(base[p][:2]), []).append(p)
+            added, rebuilt, rebuilt_moved = [], [], []
+            for p in now:
+                if p in base:
+                    continue
+                label = _actor_label(now[p])
+                old = gone.get((label, now[p].get_class().get_name()))
+                if old:
+                    rebuilt.append(label)
+                    if _pose_key(now[p]) != base[old.pop()][2]:
+                        rebuilt_moved.append(label)
+                else:
+                    added.append(label)
+            removed = [base[p][0] for paths in gone.values() for p in paths]
             moved = [_actor_label(now[p]) for p in now if p in base and _pose_key(now[p]) != base[p][2]]
             dirty_actor = {p.rsplit("/", 1)[-1] for p in actor_packages}
             changed = [_actor_label(now[p]) for p in now if p in base and _actor_label(now[p]) not in moved
                        and now[p].get_outermost().get_name().rsplit("/", 1)[-1] in dirty_actor]
             parts = [f"{n} {kind} ({cap(names)})" for kind, names in
                      (("added", added), ("removed", removed), ("moved", moved), ("changed", changed)) for n in [len(names)] if n]
+            if rebuilt:
+                parts.append(f"{len(rebuilt)} rebuilt (deleted and spawned again with the same label and class: "
+                             f"{cap(rebuilt)}; " + (f"{len(rebuilt_moved)} of them elsewhere: {cap(rebuilt_moved)})"
+                                                    if rebuilt_moved else "all in place)"))
             lines.append(f"  level {level} since load/save: " + ("; ".join(parts) if parts else
                          "no actors added, removed or moved (other edits: see the map package)"))
         elif level and base is None:
@@ -6994,13 +7063,15 @@ class TetherCore(_Base):
 
     @_tool
     @staticmethod
-    def save(paths: str = "", token: str = "") -> str:
+    def save(paths: str = "", token: str = "", writable: bool = False) -> str:
         """Save unsaved packages: the given ones, or all of them. Untitled /Temp maps are skipped (saving them
         would open a Save As dialog).
 
         Args:
             paths: Comma-separated package paths ('' saves every unsaved package).
             token: Session token from Saved/Tether/editors/<pid>.token (the ue CLI sends it).
+            writable: Make read-only package files writable first (without a check-out provider: git-lfs leaves
+                lockable files read-only after a commit).
 
         Returns:
             What was saved and what was skipped.
@@ -7015,7 +7086,7 @@ class TetherCore(_Base):
         # Check files out first (Perforce and co.): saving a read-only file would ask in a modal dialog.
         vcs = _Vcs()
         files = {p: _package_file(p, p in maps) for p in todo}
-        problems, new_files, notes = vcs.prepare(list(files.values()))
+        problems, new_files, notes = vcs.prepare(list(files.values()), writable=writable)
         blocked = [p for p in todo if any(os.path.basename(files[p]) in problem for problem in problems)]
         todo = [p for p in todo if p not in blocked]
         packages = [unreal.find_package(p) for p in todo]

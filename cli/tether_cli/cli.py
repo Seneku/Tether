@@ -9,11 +9,12 @@ import time
 from . import core
 from .core import UE_SCRIPT, CliError, crash_summary, find_project, live_editors, recent_crash, stall_report
 from .transport import Ctx
-from .share import LEASE_MINUTES, cmd_stats, lease_messages, record_activity, record_stat
+from .share import (LEASE_MINUTES, cmd_stats, keep_lease, lease_messages, record_activity, record_stat, start_running,
+                    stop_running)
 from .editor import cmd_build, cmd_close, cmd_crash, cmd_git, cmd_lease, cmd_open, cmd_status, cmd_who
 from .calls import (
     cmd_actors, cmd_ai, cmd_anim, cmd_api, cmd_asset, cmd_call, cmd_changes, cmd_config, cmd_delete, cmd_drop,
-    cmd_duplicate, cmd_exec, cmd_find, cmd_log, cmd_mat, cmd_mv, cmd_nav, cmd_new, cmd_props, cmd_py, cmd_refs,
+    cmd_duplicate, cmd_exec, cmd_find, cmd_log, cmd_mat, cmd_mv, cmd_nav, cmd_new, cmd_props, cmd_py, cmd_refs, cmd_rerun,
     cmd_class, cmd_collision, cmd_cvar, cmd_tree, cmd_lights, cmd_post, cmd_wp, cmd_level, cmd_rm, cmd_statetree, cmd_trace, cmd_save, cmd_savegame, cmd_scatter, cmd_set, cmd_spawn, cmd_tools, cmd_undo, cmd_watch,
 )
 from .images import VIEW_MODES, camera_at, cmd_look, cmd_shot, shot_args
@@ -189,6 +190,26 @@ def cmd_help(ctx, args):
     return 0
 
 
+PIE_STEPS = """steps (ue pie do "step" "step" ..., or -f steps.txt with one per line; pie watch -f runs the same):
+  at <x,y,z|actor> [dx,dy,dz]     teleport the player        look <x,y,z|actor>          aim the camera
+  move <x,y,z|actor> [within N]   walk there on the navmesh  near <x,y,z|actor> [radius] check the distance
+  tap <IA_x> | press <IA_x> [s]   an input action once / held s seconds
+  hold <IA_x> [x[,y]] ... release <IA_x>                     hold an action (or a 2D value) until released
+  key <Key> down [value]|up|tap | mouse <dx> <dy> | stick <Key> x,y [s]   raw input through the mappings
+  key|ui-key <Key> | type "<textbox>" <text> | click "<button label>" [--event]
+  wait <s> [game]                 wall-clock or game seconds exec <console command>
+  call <target> <Fn> [json args]  call a function            exists <actor> | gone <actor>
+  expect <target>.<prop> <op> <value>   once (op: = != < > <= >= ~regex); until ... [within N] polls it
+  log <regex> [within N] [anywhere]     a log line after the previous log step's match (anywhere: the whole run)
+  log <regex> count >= N | log in order: re1, re2, ...
+  expect-ui "<text>" | ui-gone "<text>" | expect-sound <regex> [within N]
+  shot [PNG] [--at x,y,z] [--look-at x,y,z|actor] [--hud] | shot-check <name>
+targets: player, controller, player.<Component>, or an actor label/name. Lines starting # are comments;
+`# map: /Game/Maps/L_X` plays on that map, `# watch: Actor.Prop` samples while the steps run.
+example:  ue pie do "at PlayerStart" "hold IA_Move 0,1" "wait 2 game" "release IA_Move" "log Landed within 3"
+"""
+
+
 def build_parser():
     # Global options are accepted before or after the subcommand (agents write both).
     common = argparse.ArgumentParser(add_help=False)
@@ -221,6 +242,9 @@ def build_parser():
     s.add_argument("--headless", action="store_true", help="no window: -nullrhi -nosound (+ -unattended, see below)")
     s.add_argument("--render", action="store_true", help="with --headless: render offscreen instead of -nullrhi (for ue shot)")
     s.add_argument("--sound", action="store_true", help="with --headless: keep a (silent) audio device, for ue audio")
+    s.add_argument("--size", metavar="WxH", help="the editor window's size, e.g. 1920x1080: a headless editor's "
+                                                 "viewport (and PIE's, for shot --hud and ue ui) is a part of it; the "
+                                                 "editor keeps it for later starts")
     s.add_argument("--unattended", dest="unattended", action="store_true", default=None,
                    help="force -unattended (default for headless, except UnrealSharp projects)")
     s.add_argument("--attended", dest="unattended", action="store_false", help="never pass -unattended")
@@ -236,6 +260,8 @@ def build_parser():
     s.add_argument("--restart", action="store_true", help="save/close editor, UBT build, reopen same map")
     s.add_argument("--save", action="store_true", help="with --restart: save dirty packages first")
     s.add_argument("--discard", action="store_true", help="with --restart: drop unsaved changes")
+    s.add_argument("--live", action="store_true", help="Live Coding even when reflected declarations changed (new "
+                                                       "UFUNCTIONs/UPROPERTYs; default: restart required, exit 3)")
     s.add_argument("--check", action="store_true", help="compile the game target only (UBT): the running editor and its "
                                                          "Live Coding are untouched; misses editor-only code")
     s.add_argument("--no-check", action="store_true", help="with --restart: skip the compile check made before closing")
@@ -266,21 +292,25 @@ def build_parser():
                                                                "used the editor in the last few minutes")
     s = add("lease", cmd_lease, "share the editor between sessions: take --for WHAT [--minutes N] | release | request "
                                     "--for WHAT | grant [SESSION] | (show)")
-    s.add_argument("action", nargs="?", choices=["take", "release", "request", "grant"])
+    s.add_argument("action", nargs="?", choices=["take", "release", "request", "grant", "yield", "pending"],
+                   help="yield: for scripts between suites, hand the lease to a waiting request (--back: then wait to "
+                        "get it back); pending: list requests, exit 0 when someone is waiting")
     s.add_argument("to", nargs="?", help="with grant: the session to hand the lease to (default: the oldest request)")
     s.add_argument("--for", "--reason", dest="what", help="with take/request: what the editor is for, as the other sessions will see it")
     s.add_argument("--minutes", type=float, default=LEASE_MINUTES, help=f"with take: how long ({LEASE_MINUTES}); "
                                                                          "take again to renew")
     s.add_argument("--as", dest="name", help="a name for this session that the others see (kept)")
     s.add_argument("--force", action="store_true", help="with release: release another session's lease")
+    s.add_argument("--back", action="store_true", help="with yield: ask for the lease again and wait until it is "
+                                                       "yours (granted back, or free and taken)")
     s = add("wait", cmd_wait, "wait N seconds, N seconds of game time in PIE (ue wait 4 game), or until shaders and "
                               "assets have compiled (ue wait compile)")
     s.add_argument("what", help="seconds, compile, grass (until landscape grass for the view has been built), or idle "
                                 "(until the editor ticks again: a timed-out `ue py` script finished), or lease (until the lease is free or "
                                 "granted to this session and PIE has stopped)")
     s.add_argument("clock", nargs="?", choices=["game", "real"], default="real", help="game: PIE game time")
-    s.add_argument("--max", type=float, default=900, help="with compile, grass, idle or lease: give up "
-                                                                         "after this many seconds (900)")
+    s.add_argument("--max", type=float, help="with compile, grass, idle or lease: give up after this many seconds "
+                                             "(the global --timeout when given, else 900)")
     s = add("who", cmd_who, "sessions that used this editor recently, their last command, the lease, who started PIE")
     s.add_argument("--minutes", type=float, default=15, help="how far back (15)")
     s.add_argument("--as", dest="name", help="a name for this session that the others see (kept)")
@@ -299,6 +329,13 @@ def build_parser():
     s = add("py", cmd_py, "run Python in the live editor (code, -f file, or - for stdin)")
     s.add_argument("code", nargs="*", help="Python code; with -f, the script's arguments (its sys.argv[1:])")
     s.add_argument("-f", "--file")
+    s.add_argument("--allow-pie", action="store_true", help="run while PIE is running (refused for -f scripts and "
+                                                            "editor-world code: they act on the edited level)")
+    s.add_argument("--include-others", action="store_true", help="with -f: run although another session edited the "
+                                                                 "script or a module it imports in the last 15 min")
+    s.add_argument("--overlay", nargs="?", const="-", metavar="DIR",
+                   help="with -f: run the script and its modules from a staged copy (DIR, laid out like the project; "
+                        "default Saved/Tether/staging/<session>/) ahead of the shared ones, for this run only")
     s = add("props", cmd_props, "reflected properties of an object/actor/component")
     s.add_argument("target")
     s.add_argument("match", nargs="?")
@@ -309,6 +346,8 @@ def build_parser():
     s.add_argument("assignments", nargs="*", metavar="name=value")
     s.add_argument("--pie", action="store_true", help="change the PIE world (not undoable, not saved)")
     s.add_argument("--from", dest="from_file", metavar="FILE", help="apply the values in FILE (JSON) that differ")
+    s.add_argument("--force", action="store_true", help="set values that are already set too, firing the change "
+                                                        "notification (an actor's construction script reruns)")
     s.add_argument("--dry-run", action="store_true", help="with --from or --assets: show what would change")
     s.add_argument("--assets", metavar="FOLDER", help="set on every asset under a folder ('/Game/Props', '/Game/T/*_N')")
     s.add_argument("--class", dest="cls", help="with --assets: regex on the asset class, e.g. 'Texture2D$'")
@@ -488,6 +527,8 @@ def build_parser():
     s = add("delete", cmd_delete, "delete actors from the level (undoable)")
     s.add_argument("actors", nargs="+", help="actor labels or names")
     s.add_argument("--pie", action="store_true", help="from the running PIE world instead (they come back with PIE)")
+    s = add("rerun", cmd_rerun, "rerun actors' construction scripts (undoable), as a Details panel edit does")
+    s.add_argument("actors", nargs="+", help="actor labels or names")
     s = add("duplicate", cmd_duplicate, "duplicate an actor (undoable)")
     s.add_argument("actor")
     s.add_argument("--offset", default="100,0,0", help="shift per copy x,y,z (100,0,0)")
@@ -504,6 +545,8 @@ def build_parser():
     add("changes", cmd_changes, "unsaved work: dirty packages and the level's actors added/removed/moved since load")
     s = add("save", cmd_save, "save unsaved packages (all, or the given ones); untitled /Temp maps are skipped")
     s.add_argument("paths", nargs="*", help="package paths (default: everything unsaved)")
+    s.add_argument("--writable", action="store_true", help="make read-only package files writable first (git-lfs "
+                                                           "leaves lockable files read-only after a commit)")
     s = add("watch", cmd_watch, "wait for a log line, or for a property value (exit 4 on timeout)")
     s.add_argument("pattern", nargs="?", help="log regex to wait for")
     s.add_argument("--prop", nargs=2, metavar=("TARGET", "NAME"), help="watch this property instead")
@@ -574,6 +617,7 @@ def build_parser():
     s.add_argument("--grep", help="regex filter")
     s = add("pie", pie_command, "Play-In-Editor: start | stop | status | run <script> | do <steps...> | watch <props> | record "
                                 "| loop <commands>")
+    s.epilog, s.formatter_class = PIE_STEPS, argparse.RawDescriptionHelpFormatter
     s.add_argument("action", choices=["start", "stop", "status", "run", "do", "target", "watch", "record", "loop"])
     s.add_argument("-c", "--code", help="with run: inline Python instead of a script file")
     s.add_argument("script", nargs="*", help="with run: Python file to execute in the PIE world, in a fresh namespace "
@@ -589,6 +633,8 @@ def build_parser():
     s.add_argument("--hud", action="store_true", help="with do: shot steps include the game's UMG HUD (film frames always do)")
     s.add_argument("--film-output", metavar="PNG", help="with --film: where the contact sheet goes")
     s.add_argument("--clients", type=int, help="with start: multiplayer PIE with this many clients")
+    s.add_argument("--patched", action="store_true", help="with start: start although Live Coding patched new "
+                                                          "reflected declarations into the editor (`build --live`)")
     s.add_argument("--game", metavar="CLASS", help="with start: play with this game mode (/Script/Module.Class or "
                                                   "/Game/BP_X.BP_X_C) instead of the project default; put back on stop")
     s.add_argument("--net", choices=["listen", "client", "standalone"],
@@ -1033,7 +1079,7 @@ def main(argv=None):
     started, started_wall = time.perf_counter(), time.time()
     # --json: one JSON document for any command (its own JSON for those that have one, below).
     envelope = args.json and args.fn not in (cmd_call, cmd_test, cmd_selftest)
-    captured, real_stdout, ctx, error, failure = None, sys.stdout, None, None, None
+    captured, real_stdout, ctx, error, failure, running = None, sys.stdout, None, None, None, None
     if envelope:
         import io
         captured = sys.stdout = io.StringIO()
@@ -1042,6 +1088,7 @@ def main(argv=None):
     else:
         try:  # who ran what, for `ue who` and the shared-editor checks
             record_activity(find_project(args.project), ["ue"] + (sys.argv[1:] if argv is None else list(argv)))
+            running = start_running(find_project(args.project), ["ue"] + (sys.argv[1:] if argv is None else list(argv)))
             for line in lease_messages(find_project(args.project)):  # requests for this session's lease, a grant
                 print(line, file=sys.stderr)
         except CliError:
@@ -1076,6 +1123,13 @@ def main(argv=None):
     except BaseException:
         sys.stdout = real_stdout  # a crash or Ctrl+C prints its traceback, not a half-written envelope
         raise
+    finally:
+        if running:
+            stop_running(running)
+            try:  # a lease is kept LEASE_KEEP min past the end of its holder's last command, not its start
+                keep_lease(find_project(args.project))
+            except CliError:
+                pass
     if envelope:
         sys.stdout = real_stdout
         lines = captured.getvalue().splitlines()

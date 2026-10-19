@@ -83,6 +83,15 @@ def spawn(what, location=(0, 0, 0), rotation=(0, 0, 0), label=None):
     return actor
 
 
+def rerun(actor):
+    """Rerun an editor-world actor's construction script (5.8's Python has no rerun_construction_scripts): a
+    property change notification on the actor makes the engine rerun it, as editing any property in the Details
+    panel does. For a Blueprint whose construction script applies a variable (Ultra Dynamic Sky's time of day)."""
+    actor.modify()
+    actor.set_editor_property("tags", actor.get_editor_property("tags"), unreal.PropertyAccessChangeNotifyMode.ALWAYS)
+    return actor
+
+
 def finish(value=None):
     """End a `ue pie run --wait` script that runs on over ticks (a tick callback driving a test): the CLI waits for
     this call and prints `value` (JSON-able) as the result."""

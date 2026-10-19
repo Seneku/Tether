@@ -23,7 +23,7 @@ socket, subprocess, zlib = _Lazy("socket"), _Lazy("subprocess"), _Lazy("zlib")
 CLI_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # cli/
 UE_SCRIPT = os.path.join(CLI_DIR, "ue.py")  # the entry point, for the CLI's own child processes
 TETHER = "tether.toolsets.TetherCore"
-GATED = {"py", "console", "set_props", "undo", "save", "spawn", "delete", "duplicate", "mv", "rm", "set_material", "pie_step", "set_config", "umg", "new_asset", "drop", "pie_net", "look_stage", "scatter", "bp_component", "set_savegame", "import_files", "reimport_assets", "fix_redirectors", "foliage", "landscape_edit", "mat_graph", "editor_undo", "lint_fix", "set_assets", "wp", "set_cvars", "set_niagara", "pcg", "pie_view", "pie_loop", "mpc_check", "move_folder"}  # tools that need the session token (see beacon.session_token)
+GATED = {"py", "console", "set_props", "undo", "save", "spawn", "delete", "duplicate", "mv", "rm", "set_material", "pie_step", "set_config", "umg", "new_asset", "drop", "pie_net", "look_stage", "scatter", "bp_component", "set_savegame", "import_files", "reimport_assets", "fix_redirectors", "foliage", "landscape_edit", "mat_graph", "editor_undo", "lint_fix", "set_assets", "wp", "set_cvars", "set_niagara", "pcg", "pie_view", "pie_loop", "mpc_check", "move_folder", "rerun"}  # tools that need the session token (see beacon.session_token)
 LEVELS = {"Fatal": 0, "Error": 1, "Warning": 2, "Display": 3, "Log": 4, "Verbose": 5, "VeryVerbose": 6}
 NOISE = {"LogModelContextProtocol", "LogToolsetRegistry"}  # our own transport chatter
 # Epic logs this whenever a schema is generated for a class with delegates (props, set, describe_toolset, class).
@@ -879,6 +879,59 @@ def process_tree(pid):
     """A process and all its descendants' pids (a packaged game's launcher runs the real game as a child)."""
     if os.name != "nt":
         return [pid]
+    parents = {}
+    for child, (parent, _) in process_table().items():
+        parents.setdefault(parent, []).append(child)
+    tree, queue = [], [pid]
+    while queue:
+        p = queue.pop()
+        if p not in tree:
+            tree.append(p)
+            queue += [c for c in parents.get(p, []) if c != p]
+    return tree
+
+
+def process_ancestry(pid, depth=6):
+    """[(pid, executable name)] of a process's parent, its parent and so on (Windows; [] elsewhere)."""
+    table, out = process_table(), []
+    while pid in table and len(out) < depth:
+        pid = table[pid][0]
+        if pid not in table or any(p == pid for p, _ in out):
+            break
+        out.append((pid, table[pid][1]))
+    return out
+
+
+def command_lines(pids):
+    """{pid: command line} of running processes (Windows: one PowerShell CIM query, about a second)."""
+    pids = [int(p) for p in pids if p]
+    if not pids:
+        return {}
+    try:
+        if os.name == "nt":
+            where = " or ".join(f"ProcessId={p}" for p in pids)
+            out = subprocess.run(["powershell", "-NoProfile", "-Command",
+                                  f"Get-CimInstance Win32_Process -Filter \"{where}\" | "
+                                  "ForEach-Object { \"$($_.ProcessId)`t$($_.CommandLine)\" }"],
+                                 capture_output=True, text=True, timeout=30).stdout
+        else:
+            out = subprocess.run(["ps", "-o", "pid=,args=", "-p", ",".join(map(str, pids))], capture_output=True,
+                                 text=True, timeout=30).stdout
+            out = "\n".join(l.strip().replace(" ", "\t", 1) for l in out.splitlines())
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    found = {}
+    for line in out.splitlines():
+        pid, _, command = line.partition("\t")
+        if pid.strip().isdigit():
+            found[int(pid)] = command.strip()
+    return found
+
+
+def process_table():
+    """{pid: (parent pid, executable name)} of every process (Windows; {} elsewhere)."""
+    if os.name != "nt":
+        return {}
     import ctypes
     from ctypes import wintypes
 
@@ -891,24 +944,18 @@ def process_tree(pid):
     kernel32.CreateToolhelp32Snapshot.restype = ctypes.c_void_p
     kernel32.Process32FirstW.argtypes = kernel32.Process32NextW.argtypes = (ctypes.c_void_p, ctypes.POINTER(Entry))
     kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
-    parents = {}
+    table = {}
     snapshot = kernel32.CreateToolhelp32Snapshot(0x2, 0)
     try:
         entry = Entry()
         entry.dwSize = ctypes.sizeof(Entry)
         ok = kernel32.Process32FirstW(snapshot, ctypes.byref(entry))
         while ok:
-            parents.setdefault(entry.th32ParentProcessID, []).append(entry.th32ProcessID)
+            table[entry.th32ProcessID] = (entry.th32ParentProcessID, entry.szExeFile)
             ok = kernel32.Process32NextW(snapshot, ctypes.byref(entry))
     finally:
         kernel32.CloseHandle(snapshot)
-    tree, queue = [], [pid]
-    while queue:
-        p = queue.pop()
-        if p not in tree:
-            tree.append(p)
-            queue += [c for c in parents.get(p, []) if c != p]
-    return tree
+    return table
 
 
 def live_coding_holders(engine):

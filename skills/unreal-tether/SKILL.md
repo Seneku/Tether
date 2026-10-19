@@ -21,7 +21,11 @@ lease to everyone. While another session holds it, `build --restart`, `close` an
 and say who holds it and for what: wait, or `ue lease request --for "why"` (the holder sees it on its next
 command and runs `ue lease grant` when done), rather than passing `--ignore-lease`; `ue wait lease` then
 returns once it is yours or free and PIE has stopped. Asked for yours? Grant it when you reach a stopping point.
-A lease lasts at least 5 minutes past its holder's last `ue` command, so it does not run out mid-task. Work that
+A lease lasts at least 5 minutes past the end of its holder's last `ue` command, and is held while one of its
+commands runs (a long `ue py` stage), so it does not run out mid-task; `status`, `who` and `lease` show "busy:
+<command> for N min" for a command in flight (a busy editor, not a hung one). A test script that runs `ue` with its
+output thrown away never sees requests: call `ue lease yield --back` between suites (hands the lease to a waiting
+request, then waits to get it back; `ue lease pending` exits 0 when someone waits). Work that
 needs another map or a throwaway import while others use the editor: `ue open --second` starts your own headless
 editor next to the shared one (its own port; your commands go there, others' do not; no lease needed; no
 pre-build, as the binaries are in use), and `ue close` closes it as soon as you are done: while it runs, the shared
@@ -68,12 +72,27 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
   pre-imported, the namespace persists between calls, and a trailing expression is printed. Words after the
   script file arrive as `sys.argv[1:]`. A call that times out (default 120 s) leaves the script running in the
   editor: do not run it again; `ue wait idle` returns when it has finished (or pass `--timeout 600`).
+  A save that failed during the call (a read-only file: git-lfs leaves lockable `.uasset`/`.umap` files read-only
+  after a commit) prints `save failed:` lines and exits 1; the work is still in the editor: `ue save --writable`.
+  While PIE runs, `-f` scripts and editor-world code (EditorActorSubsystem, spawns, saves) are refused: they act on
+  the edited level and spawns return None, so a generator stage can save a broken map (`ue pie stop`, or
+  `--allow-pie`). `-f` also refuses when another session edited the script or a module it imports in the last
+  15 min (exit 5; `--include-others`). To test your own edits to shared generator scripts in the shared editor,
+  stage copies laid out like the project in Saved/Tether/staging/<session>/ (e.g. Scripts/plan.py) and run
+  `ue py -f Scripts/gen.py --overlay -- args`: your copies win for that run only, `importlib.reload` included.
 - `ue set <target> name=value [name+=delta ...]`: write properties as one undoable transaction, and
   print `old -> new` for each. Values: numbers, true/false, enum names, object paths, JSON, or tuples
   for structs (`location+=0,0,200`, `lightColor=1,0.5,0.2`; missing trailing fields keep their values).
   Actors also take `location`, `rotation` (pitch,yaw,roll) and `scale`. If one value fails, nothing
   changes. `--pie` edits the running game instead (not undoable, not saved). Prefer this over `ue py`
-  for property edits.
+  for property edits. A value already set is skipped; `--force` sets it anyway, so the change notification
+  fires (a Blueprint's construction script reruns). `ue rerun <actor>` (or `tether.rerun(actor)` in a script)
+  reruns construction scripts: 5.8's Python has no rerun_construction_scripts, and set_editor_property from
+  Python (or a value set without a notification) leaves a Blueprint like Ultra Dynamic Sky unapplied.
+- Python setters on components (spline points, set_world_location, instances) change them in memory without
+  Modify(): `ue changes` does not see it, yet anyone's next level save writes it. Call `comp.modify()` first
+  (`ue py` notes it). `ue changes` reports actors deleted and spawned again with the same label and class (a
+  generator's rebuild) as "rebuilt", and takes a new baseline when a map is opened again (`--discard`).
 - Your edits stay unsaved until saved. Before finishing a task that changed content, run `ue changes` to
   review what you changed, then `ue save` (or tell the user what is unsaved and why), then `ue validate`:
   data validation on the changed and unsaved assets plus Map Check of the open level, one line per
@@ -239,8 +258,11 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
   .cpp files of a module collide in a unity build, and reflected types whose names differ only by prefix
   (`FSDThing` / `ASDThing`) fail UHT. It also lists BindKey keys an input mapping context maps (the mapping
   consumes the key, so the BindKey never fires).
-- Function bodies and new UFUNCTIONs go live. Call a new UFUNCTION through reflection:
-  `unreal.get_default_object(unreal.MyLib).call_method('NewFunc')`.
+- Function bodies go live. A change to what UHT sees (a new or changed UFUNCTION, UPROPERTY, UCLASS specifier)
+  makes `ue build` say "restart required" with the declarations (exit 3): patched into a class with live
+  instances it can crash the next PIE (a new UFUNCTION on a world subsystem asserted in GetSubsystem).
+  `ue build --live` patches anyway; `pie start` then refuses until `ue build --restart` (`--patched` overrides).
+  Header edits that leave the declarations alone (comments, inline bodies) still go through Live Coding.
 - New UPROPERTYs, class layout or constructor defaults, Build.cs/.uproject changes, or Blueprint/Python
   wrappers that need the new API: run `ue build --restart`. It closes the editor, builds, reopens the
   same map and waits until ready. It refuses if there is unsaved work unless you pass `--save` or
@@ -250,7 +272,10 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
   for everyone sharing it. `ue build --check` runs the same check alone, with the editor up and Live
   Coding untouched (it misses editor-only modules and WITH_EDITOR code). `ue build --check --files
   Source/X/A.cpp Source/X/B.h` compiles just those files (a header: the .cpp files that include it), with no
-  link and no lease needed, for checking your own work while another session holds the editor. New classes
+  link and no lease needed, for checking your own work while another session holds the editor. Compiled alone a
+  file sees only its own includes: errors on lines you did not change since the last commit are listed apart
+  (often includes a unity build supplied); yours come first. A "redefinition" error names the other .cpp that
+  defines the name (unity groups change when files are added; `ue lint --cpp` finds them all). New classes
   while another session's Live Coding builds? Keep them out of Source/ (its builds compile every changed file
   there): stage them in your own folder, Saved/Tether/staging/<session>/Source/<Module>/X.h, and run `ue build
   --check --overlay` (no folder: that one), which compiles a copy of the project with them on top (incremental
@@ -375,6 +400,8 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
   `player.control` and getters like `player.GetVelocity()`.
 - When `ue py` prints `engine: ...` lines, that is why a call returned None (e.g. Editor Scripting refusing in PIE).
 - UI checks: `ue shot --hud` in PIE captures the game view with its UMG HUD (plain `ue shot` has the 3D view only).
+  A headless editor's PIE viewport is a part of its main window, which can be small (the project's saved
+  resolution sets it): `ue open --headless --render --size 2560x1440` gives a viewport big enough to read menus.
 - To see what happened between checks: `ue pie do -f steps.txt --film 0.25` adds a contact sheet of the game's view
   (with HUD), four frames a second with times on them; read that one image instead of many screenshots.
 - A side view during play (an enemy's wind-up, a door from outside): `ue shot --at x,y,z --look-at Enemy_1` in PIE
@@ -402,7 +429,9 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
 - To play the game like a player would: `ue pie do "at ItemPickup_Key -150,0,100" "look ItemPickup_Key"
   "tap InteractAction" "until player.Inventory.Items ~ Key within 2" "gone ItemPickup_Key"` (or `-f steps.txt`).
   Steps: at, look, move, press/tap/hold/release (Enhanced Input actions: asset names, or actions the
-  character creates in C++), call, expect/until (`= != < > <= >= ~`), log, exists/gone, wait, exec, shot.
+  character creates in C++), call, expect/until (`= != < > <= >= ~`), log, exists/gone, wait, exec, shot
+  (`ue help pie` lists them all with their arguments). A `log` step matches lines after the previous `log`
+  step's match (a toggle checked twice proves the second toggle); `log <regex> anywhere` searches the whole run.
   Each step prints ok/FAIL; it stops at the first failure. Write the step file once and rerun it after changes.
   Keep step files in `tests/play/` with a `# map: /Game/...` line: `ue ci --play` runs them all as regression tests.
 - To turn the user's own play-through into a test: ask them to run `ue pie record -o tests/play/<name>.txt` in a
@@ -525,7 +554,8 @@ editor lease (`ue lease`).
   AttributeError): `obj.call_method('RebuildJunction')`; `ue py` says so when it sees that error. The same for
   Actor.AddComponentByClass: `actor.call_method('AddComponentByClass', (cls, False, unreal.Transform(), False))`.
 - During PIE, Editor Scripting (EditorActorSubsystem, EditorLevelLibrary) acts on the edited level, not the
-  game: `ue pie run -c` for the game world (`ue py` notes it).
+  game: `ue pie run -c` for the game world (`ue py` refuses such code during PIE; `ue who` and `ue pie status`
+  name the command that started PIE and any shell still running above it, such as a stray test loop).
 - Material Parameter Collections: never rewrite `scalar_parameters`/`vector_parameters` with new structs. Each
   parameter gets a new ID and every material's Collection Parameter node keeps the old one, reading 0 with no
   warning. Edit values in place; `ue lint --mpc` finds stale nodes and `--fix` re-links them by name.
