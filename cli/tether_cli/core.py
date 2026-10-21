@@ -104,6 +104,95 @@ def session_id():
     return claude[:8] if claude else "user"
 
 
+_AGENT = []  # this process's sub-agent, worked out once
+AGENT_WORD = re.compile(r"[\w.,@=+-]+")  # argv words that appear verbatim in the shell command that ran them
+TRANSCRIPT_TAIL = 262144  # bytes of a transcript read from its end: its newest tool calls
+
+
+def agent_id():
+    """The Claude Code sub-agent (the Agent tool) running this command, as its transcript's short id ('a55cee02'), or
+    None for the session's main thread and outside Claude Code. Sub-agents share their session's environment
+    (CLAUDE_CODE_SESSION_ID included), so the only trace is their own transcript, subagents/agent-<id>.jsonl in the
+    session's folder: the one whose newest Bash call holds this command line. UE_AGENT overrides it."""
+    if not _AGENT:
+        try:
+            _AGENT.append(find_agent(sys.argv[1:]))
+        except (OSError, ValueError):
+            _AGENT.append(None)
+    return _AGENT[0]
+
+
+def find_agent(argv, now=None, base=None):
+    explicit = os.environ.get("UE_AGENT")
+    if explicit is not None:
+        return explicit or None
+    sid = os.environ.get("CLAUDE_CODE_SESSION_ID")
+    if not sid or os.environ.get("UE_SESSION"):
+        return None
+    base = base or os.path.join(os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(os.path.expanduser("~"), ".claude"),
+                                "projects")
+    now = time.time() if now is None else now
+    agents, mains = [], []
+    for folder in os.listdir(base) if os.path.isdir(base) else []:
+        sub = os.path.join(base, folder, sid, "subagents")
+        if os.path.isdir(sub):
+            agents += [os.path.join(sub, f) for f in os.listdir(sub) if f.startswith("agent-") and f.endswith(".jsonl")
+                       and now - os.path.getmtime(os.path.join(sub, f)) < 600]
+            mains.append(os.path.join(base, folder, sid + ".jsonl"))
+    if not agents:  # no sub-agent at work: the session itself
+        return None
+    words = [w for w in argv if len(w) > 1 and AGENT_WORD.fullmatch(w)][:8]
+    best = None
+    for path in sorted(agents, key=os.path.getmtime)[-16:] + mains:
+        when = last_call_with(path, words)
+        if when is not None and (best is None or when > best[0]):
+            best = (when, None if path in mains else os.path.basename(path)[len("agent-"):-len(".jsonl")][:8])
+    return best[1] if best else None
+
+
+TOOL_STAMP = re.compile(r'"timestamp":\s*"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d+))?Z?"')
+
+
+def last_call_with(path, words):
+    """When a transcript's newest shell call holding every one of `words` and `ue` was made (epoch seconds), or
+    None."""
+    import calendar
+    try:
+        with open(path, "rb") as f:
+            f.seek(max(0, os.path.getsize(path) - TRANSCRIPT_TAIL))
+            lines = f.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return None
+    for line in reversed(lines):
+        if '"tool_use"' not in line:
+            continue
+        try:
+            content = (json.loads(line).get("message") or {}).get("content")
+        except ValueError:
+            continue
+        for block in content if isinstance(content, list) else []:
+            command = (block.get("input") or {}).get("command") if block.get("type") == "tool_use" else None
+            if isinstance(command, str) and re.search(r"\bue(?:\.py)?\b", command) and all(w in command for w in words):
+                stamp = TOOL_STAMP.search(line)
+                if not stamp:
+                    return 0.0
+                return calendar.timegm(time.strptime(stamp.group(1), "%Y-%m-%dT%H:%M:%S"))
+    return None
+
+
+def actor_id():
+    """Who is running this command, finer than session_id(): '<session>/<agent>' for a sub-agent. The sticky editor,
+    a --second editor's owner and `ue who --as` names are per actor; the lease stays per session (it covers the
+    session's agents)."""
+    agent = agent_id()
+    return f"{session_id()}/{agent}" if agent else session_id()
+
+
+def same_session(owner):
+    """True when a --second editor's owner (an actor id) is this session or one of its agents."""
+    return bool(owner) and owner.split("/")[0] == session_id()
+
+
 def write_json(path, data):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
@@ -1145,9 +1234,9 @@ def chosen_editor(project):
         return match
     if live:
         targets = read_json(targets_path(project)) or {}
-        sticky = target_pid(targets.get(session_id()))
-        # another session's `ue open --second` editor is never a default
-        shared = [b for b in live if b.get("owner") in (None, session_id())] or live
+        sticky = target_pid(targets.get(actor_id()))
+        # a `ue open --second` editor is the default only for the session (or sub-agent) that opened it
+        shared = [b for b in live if b.get("owner") in (None, actor_id())] or live
         choice = next((b for b in live if b.get("pid") == sticky), None)
         if choice is None:
             used = others_targets(project, targets)
@@ -1176,7 +1265,7 @@ def others_targets(project, targets, now=None):
     holder = lease.get("session") if lease.get("until", 0) > now else None
     used = {}
     for sid, entry in targets.items():
-        if sid == session_id() or not isinstance(entry, dict) or entry.get("time", 0) < now - TARGET_HOURS * 3600:
+        if sid == actor_id() or not isinstance(entry, dict) or entry.get("time", 0) < now - TARGET_HOURS * 3600:
             continue
         used[entry.get("pid")] = used.get(entry.get("pid"), 0) + (100 if sid == holder else 1)
     return used
@@ -1187,10 +1276,10 @@ def remember_target(project, beacon, now=None):
     time, so a new session can default to the editor the others use)."""
     now = time.time() if now is None else now
     targets = read_json(targets_path(project)) or {}
-    entry = targets.get(session_id())
+    entry = targets.get(actor_id())
     # rewritten when the pick changes, and every few minutes so the time says the session is still at it
     if target_pid(entry) != beacon.get("pid") or not isinstance(entry, dict) or entry.get("time", 0) < now - 300:
-        targets[session_id()] = {"pid": beacon.get("pid"), "time": round(now)}
+        targets[actor_id()] = {"pid": beacon.get("pid"), "time": round(now)}
         with contextlib.suppress(OSError):
             write_json(targets_path(project), targets)
 
@@ -1222,8 +1311,9 @@ def editor_label(beacon):
     parts.append("started by ue open" if beacon.get("launched_by_tether") else
                  "opened by hand" if "launched_by_tether" in beacon else "")
     if beacon.get("owner"):
-        parts.append("this session's own (--second)" if beacon["owner"] == session_id()
-                     else f"session {beacon['owner']}'s own (--second)")
+        parts.append("this session's own (--second)" if beacon["owner"] == actor_id()
+                     else f"agent {beacon['owner'].split('/')[1]} of this session's own (--second)"
+                     if same_session(beacon["owner"]) else f"session {beacon['owner']}'s own (--second)")
     return ", ".join(p for p in parts if p)
 
 

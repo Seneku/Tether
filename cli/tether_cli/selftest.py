@@ -1,6 +1,7 @@
 """ue selftest and ue ci: the toolset checked against a live editor."""
 import json
 import os
+import re
 import sys
 import time
 
@@ -90,7 +91,9 @@ def cmd_selftest(ctx, args):
             results.append(("FAIL", name, f"no answer within {timeout}s", float(timeout)))
             return None
         passed = ok(code, out)
-        detail = "" if passed else (out.splitlines() or [f"exit {code}"])[-1][:160]
+        # a failed step list: its FAIL line says why (the last line only says which step)
+        failed_step = next((l.strip() for l in out.splitlines() if re.match(r"\s*\d+ FAIL ", l)), None)
+        detail = "" if passed else (failed_step or (out.splitlines() or [f"exit {code}"])[-1])[:240]
         results.append(("PASS" if passed else "FAIL", name, detail, took))
         return out if passed else None
 

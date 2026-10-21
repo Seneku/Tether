@@ -7664,6 +7664,12 @@ class TetherCore(_Base):
         _record_undo(before, f"mat {_label(material)}: " + ", ".join(n for _, n, _ in plan))
         rows = [f"{name}: {_mat_text(old[name])} -> {_mat_text(_mat_value(material, kind, name))}"
                 + (" (parent value)" if name in resets else "") for kind, name, _ in plan]
+        if not is_instance:  # a debug toggle set here once stayed on in a saved asset through a full rebuild
+            back = " ".join(f'"{name}={_mat_text(old[name])}"' if " " in f"{name}{_mat_text(old[name])}"
+                            else f"{name}={_mat_text(old[name])}" for _, name, _ in plan)
+            rows.append("note: these are the base material's own defaults, saved with it and seen by every instance "
+                        "that does not override them; a generator that rebuilds the material can keep them. Put them "
+                        f"back before saving: ue mat {material.get_path_name().split('.')[0]} {back}")
         return "\n".join([_label(material)] + rows)
 
     @_tool

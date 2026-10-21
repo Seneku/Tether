@@ -13,7 +13,7 @@ from .core import (
     human_bytes, log_end, log_ignore_entries,
     live_editors, log_ignore_path, log_path, pid_alive, PY_OUTPUT, summarize_log, write_json,
     port_open,
-    read_json, read_new_log, session_id, short, state_dir, unwrap,
+    read_json, read_json_retry, read_new_log, session_id, short, state_dir, unwrap,
 )
 from .fabfiles import fab_origin, listing_url, project_fab
 from .share import LEASED, ago, lease_note, others_edits, pie_owner, session_label, session_names
@@ -1016,16 +1016,45 @@ def written_screenshots(ctx, lines):
     return list(dict.fromkeys(found))
 
 
-def flush_editor_log(ctx):
-    """The editor writes its log asynchronously; ask it to flush so just-logged lines are on disk."""
+def editor_busy(ctx, seconds=5):
+    """True when the editor's game thread has not ticked for a while (a long script, a compile, a hang): a call
+    would wait for it."""
+    beacon = getattr(ctx, "beacon", None) or {}
+    if beacon.get("pid") and getattr(ctx, "project", None):  # now, not as it was when this command started
+        beacon = read_json_retry(os.path.join(state_dir(ctx.project), "editors", f"{beacon['pid']}.json")) or beacon
+    return bool(beacon.get("heartbeat")) and time.time() - beacon["heartbeat"] > seconds
+
+
+@contextlib.contextmanager
+def short_calls(ctx, seconds):
+    """Editor calls in this block give up after `seconds` instead of the command's --timeout (120 s): for extras a
+    command can do without (a log flush, a recheck)."""
+    mcp, args = getattr(ctx, "_mcp", None), getattr(ctx, "args", None)
+    saved = (getattr(mcp, "timeout", None), getattr(args, "timeout", None))
+    for holder in (mcp, args):
+        if holder is not None and getattr(holder, "timeout", None):
+            holder.timeout = min(holder.timeout, seconds)
+    try:
+        yield
+    finally:
+        for holder, value in zip((mcp, args), saved):
+            if holder is not None and value is not None:
+                holder.timeout = value
+
+
+def flush_editor_log(ctx, when_busy=True):
+    """The editor writes its log asynchronously; ask it to flush so just-logged lines are on disk (giving up after
+    10 s). when_busy=False skips it while the editor's game thread is busy, as for `ue log`, which only reads (one
+    timed out at 120 s in a busy editor); right after a call of ours the heartbeat may not show it is free yet."""
     beacon = ctx.beacon
     if getattr(ctx, "transport", "mcp") == "remote":
         reachable = ctx._rex is not None  # a fresh remote connection costs ~1 s of discovery; skip it
     else:
         reachable = beacon and editor_process(beacon.get("pid")) and beacon.get("mcp_port") and port_open(beacon["mcp_port"])
-    if reachable:
+    if reachable and (when_busy or not editor_busy(ctx)):
         try:
-            ctx.tether("console", command="FLUSHLOG")
+            with short_calls(ctx, 10):
+                ctx.tether("console", command="FLUSHLOG")
         except CliError:
             pass  # hung or busy editor: read whatever is on disk
 
@@ -1063,7 +1092,7 @@ def since_duration(lines, text, now=None):
 def cmd_log(ctx, args):
     if args.ignore:
         return add_log_ignore(ctx, args.ignore, args.why)
-    flush_editor_log(ctx)
+    flush_editor_log(ctx, when_busy=False)
     level = args.level or ("VeryVerbose" if args.grep else "Warning")  # a search looks at every line unless told otherwise
     if args.summary:
         lines = read_new_log(ctx.project, from_start=True, advance=False)
@@ -1120,9 +1149,15 @@ def stale_material_failures(ctx, lines, most=3):
         package = "/Game/" + m.group(1).replace("\\", "/").split("/Content/", 1)[1]
         found.setdefault(package, []).append(line)
     stale = {}
+    if editor_busy(ctx):
+        return stale
+    deadline = time.time() + 20  # extras: a slow compile must not hold up the log itself
     for package, hits in list(found.items())[:most]:
+        if time.time() > deadline:
+            break
         try:
-            text = str(ctx.tether("material", target=package, compile=True, limit=0))
+            with short_calls(ctx, max(1.0, deadline - time.time())):
+                text = str(ctx.tether("material", target=package, compile=True, limit=0))
         except CliError:
             continue
         if text.rstrip().endswith(": no errors"):

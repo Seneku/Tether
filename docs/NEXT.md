@@ -157,6 +157,24 @@ selftest passes (137).
 **Done in 0.29.3**: 183 `build --when-closed` no longer hands its `--pid` to the job (that editor is one of those
 it waits to close; the build runs UBT), and a job queued by an earlier version drops it before it builds.
 
+**Done in 0.32.0** (UnrealRacing's notes 201-206): 201 `log` steps take `within N` and `anywhere` in either
+order; 202 sub-agents (Claude Code's Agent tool share their session's environment, session id included) are told
+apart by their own transcripts (subagents/agent-<id>.jsonl: the newest shell call holding the command line), so the
+sticky editor, a `--second` editor's owner and `ue who --as` names are per agent (`<session>/<agent>`), while the
+lease stays per session; an `ue` call from inside a script cannot be placed and counts as the session's; 203 `ue
+shot` reads the log's "Building/Built static mesh" lines since the last shot, waits for builds still running, and
+after rebuilds renders six throwaway frames at the shot's view first (1.5 s in PIE), saying so (in-editor
+FinishAllCompilation and Nanite streaming are not reachable from Python); 204 `ue log` skips the log flush while
+the editor's game thread is busy, editor calls for extras (the flush, the stale-material recheck) give up after
+10-20 s, and filtering itself takes 0.12 s for 66k lines (the 120 s was a flush or recompile waiting on a busy
+editor); 205 `shot --res` in a windowed editor that takes no HighResShot falls back to a viewport-size shot with a
+note; 206 `ue mat` on a base material notes that the value is the saved default and prints the command that puts the
+old one back. All checked live in Sandbox except 205 (needs a hand-opened, minimised editor). Also: a click on a
+UMG button covered by another window fires its OnClicked by the text asked for when the snapshot's label carries
+its panel's text in front ("Tether probe panel GARAGE"); a floating Content Browser in the machine-wide editor
+layout (%LOCALAPPDATA%/UnrealEngine/Editor/EditorLayout.json) had made the selftest's menu check fail; and a
+failed selftest step list reports its FAIL line.
+
 **Done in 0.31.0** (UnrealRacing's notes 184-196, ShooterDomination's loadouts notes 197-200): 184 a save that
 failed during `ue py` or `pie run` (the editor's "Unable to save package ... read-only" dialog, which an unattended
 editor answers and logs, or LogSavePackage lines) prints `save failed:` and exits 1; `ue save --writable` clears the

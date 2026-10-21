@@ -823,6 +823,64 @@ def camera_at(ctx, args):
         ctx.tether("py", code=place.format(*camera[0], *camera[1]))
 
 
+MESH_BUILDING = re.compile(r"LogStaticMesh: (?:Display: )?Building static mesh (\S+)")
+MESH_BUILT = re.compile(r"LogStaticMesh: (?:Display: )?Built static mesh \[[\d.]+s\] (\S+)")
+MESH_LOG_TAIL = 4 * 1024 * 1024  # bytes of the log searched for mesh builds when no shot was taken before
+
+
+def mesh_builds(lines):
+    """(names still building, names built) from the editor log's static mesh build lines."""
+    pending, built = {}, []
+    for line in lines:
+        m = MESH_BUILDING.search(line)
+        if m:
+            pending[m.group(1)] = pending.get(m.group(1), 0) + 1
+            continue
+        m = MESH_BUILT.search(line)
+        if m:
+            name = m.group(1).rsplit(".", 1)[-1].rsplit("/", 1)[-1]
+            built.append(name)
+            if pending.get(name):
+                pending[name] -= 1
+    return [n for n, count in pending.items() if count > 0], built
+
+
+def settle_mesh_builds(ctx, warm, wait=180):
+    """Before a shot: wait for static meshes still building, and when meshes were rebuilt since the last shot, call
+    warm() (render a few frames at the shot's view) so Nanite streaming, render state and lighting catch up. An
+    offscreen editor renders only when asked, so after 358 road tiles were rebuilt in place, shots showed missing
+    decks and wrong materials for minutes. Returns the meshes rebuilt since the last shot."""
+    path = os.path.join(state_dir(ctx.project), "last-shot.json")
+    log = log_path(ctx.project)
+    if not os.path.isfile(log):
+        return []
+    state = read_json(path) or {}
+    size = os.path.getsize(log)
+    start = state["offset"] if state.get("log") == log and 0 <= state.get("offset", -1) <= size else max(0, size - MESH_LOG_TAIL)
+
+    def read():
+        with open(log, "rb") as f:
+            f.seek(start)
+            return f.read().decode("utf-8", "replace").splitlines()
+    pending, built = mesh_builds(read())
+    if pending:
+        started = time.time()
+        while pending and time.time() - started < wait:
+            time.sleep(0.5)
+            flush_editor_log(ctx)
+            pending, built = mesh_builds(read())
+        print(f"note: waited {time.time() - started:.0f}s for static meshes still building"
+              + (f"; {len(pending)} still are ({', '.join(pending[:3])})" if pending else ""), file=sys.stderr)
+    write_json(path, {"log": log, "offset": os.path.getsize(log)})
+    if built:
+        names = list(dict.fromkeys(built))
+        warm()
+        print(f"note: {len(names)} static mesh(es) were rebuilt since the last shot ({', '.join(names[:3])}"
+              + (", ..." if len(names) > 3 else "") + "): rendered a few frames at this view first, so streaming, "
+              "render state and lighting catch up", file=sys.stderr)
+    return built
+
+
 def cmd_shot(ctx, args):
     """Capture the viewport (or the player's view during PIE) to a PNG and print its path."""
     launch = editor_mode(ctx.project, ctx.beacon)
@@ -860,6 +918,9 @@ def cmd_shot(ctx, args):
     if view and (getattr(args, "hud", False) or args.annotate):
         raise CliError("--view shows the scene in a debug view: not with --hud or --annotate")
     playing = pie and not simulate
+    # a running game renders all the time; the editor's viewport only when asked: throwaway captures at this view
+    settle_mesh_builds(ctx, (lambda: time.sleep(1.5)) if playing else
+                       (lambda: [capture_viewport(ctx, pose, NO_ANNOTATIONS, False) for _ in range(6)]))
     if getattr(args, "frames", None) or getattr(args, "burst", None):
         series = "--burst" if getattr(args, "burst", None) else "--frames"
         if getattr(args, "frames", None) and getattr(args, "burst", None):
@@ -917,10 +978,15 @@ def shoot(ctx, args, pose, pie, simulate, launch):
             if launch.get("headless"):
                 raise CliError("--res in the editor needs a level viewport to HighResShot, and a headless editor has "
                                "none: take it during PIE (ue pie start), or in a windowed editor", 4) from None
-            raise CliError("--res: the level viewport took no HighResShot, even after a redraw. Is the editor "
-                           "minimised, or the viewport tab hidden behind another? (ue log --level Warning)", 4) from None
+            raw = None  # a hand-opened editor (minimised, or the viewport tab behind another): see below
         finally:
             ctx.tether("py", code=place.format(*camera[0], *camera[1]))
+        if raw is None:  # the shot at the viewport's own size still works there: better than none
+            print(f"note: the level viewport took no HighResShot at {args.res}, even after a redraw (is the editor "
+                  "minimised, or its viewport tab behind another?); this shot is at the viewport's own size",
+                  file=sys.stderr)
+            annotations = dict(ANNOTATIONS, gridHeight=args.grid_z) if args.annotate else NO_ANNOTATIONS
+            raw = capture_viewport(ctx, pose, annotations, args.ui)
     else:  # editor, or Simulate-In-Editor, whose simulation the level viewport shows
         annotations = dict(ANNOTATIONS, gridHeight=args.grid_z) if args.annotate else NO_ANNOTATIONS
         raw = capture_viewport(ctx, pose, annotations, args.ui)

@@ -44,7 +44,10 @@ makes later sessions in that folder load Tether (no plugin there: no `ue` on PAT
 
 With several editors open, each session keeps talking to the one it opened or used last (`--pid` changes
 that), so an editor the user opens mid-session does not take your commands. A new session starts on the editor
-the lease holder and the other sessions use; `ue status` alone does not pin one.
+the lease holder and the other sessions use; `ue status` alone does not pin one. Sub-agents (the Agent tool)
+count apart here: each keeps its own editor, its own `ue who --as` name, and a `--second` editor one agent opens
+is the default for that agent only (the lease still covers the whole session). Tether tells them apart by their
+transcripts; for an `ue` call made from inside a script it cannot, so pass `--pid` there.
 
 Several reads or edits in a row? Put them in one `ue batch` (one command per line, from stdin or a file):
 one process and one editor session for all of them.
@@ -314,7 +317,9 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
 - Materials: `ue mat /Game/Path/MI_X` lists parameters with values (and which are overridden);
   `ue mat MI_X Roughness=0.3 Tint=1,0,0 UseDetail=true` sets them (undoable); `ue mat <actor>` shows which
   material is on each slot; `ue mat M_X --compile` lists shader compile errors. Prefer it over `ue props`
-  on materials, which shows parameter arrays raw.
+  on materials, which shows parameter arrays raw. On a base material (M_, not MI_) it changes the parameter's
+  saved default, which every instance without an override sees and a generator rebuilding the material can
+  keep: it prints the command that puts the old value back; run it before saving a temporary debug value.
 - Settings: `ue config` lists sections; `ue config maps` / `ue config rendering lumen` reads one;
   `ue config maps gameDefaultMap=/Game/Maps/L` sets and saves it (to Config/Default*.ini for project settings).
   Prefer it to editing .ini files by hand: names and values are checked, and the editor applies them live.
@@ -400,6 +405,10 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
   `player.control` and getters like `player.GetVelocity()`.
 - When `ue py` prints `engine: ...` lines, that is why a call returned None (e.g. Editor Scripting refusing in PIE).
 - UI checks: `ue shot --hud` in PIE captures the game view with its UMG HUD (plain `ue shot` has the 3D view only).
+  After static meshes were rebuilt in place (a generator's bake), `ue shot` waits for builds still running and
+  renders a few frames at the view first, saying so: an offscreen editor renders only when asked, and shots right
+  after a bake showed missing meshes and wrong materials. `--res` in a hand-opened editor whose viewport takes no
+  HighResShot (minimised, tab hidden) falls back to the viewport's own size and says so.
   A headless editor's PIE viewport is a part of its main window, which can be small (the project's saved
   resolution sets it): `ue open --headless --render --size 2560x1440` gives a viewport big enough to read menus.
 - To see what happened between checks: `ue pie do -f steps.txt --film 0.25` adds a contact sheet of the game's view
@@ -431,7 +440,7 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
   Steps: at, look, move, press/tap/hold/release (Enhanced Input actions: asset names, or actions the
   character creates in C++), call, expect/until (`= != < > <= >= ~`), log, exists/gone, wait, exec, shot
   (`ue help pie` lists them all with their arguments). A `log` step matches lines after the previous `log`
-  step's match (a toggle checked twice proves the second toggle); `log <regex> anywhere` searches the whole run.
+  step's match (a toggle checked twice proves the second toggle); `log <regex> anywhere` searches the whole run (`within N` before or after it).
   Each step prints ok/FAIL; it stops at the first failure. Write the step file once and rerun it after changes.
   Keep step files in `tests/play/` with a `# map: /Game/...` line: `ue ci --play` runs them all as regression tests.
 - To turn the user's own play-through into a test: ask them to run `ue pie record -o tests/play/<name>.txt` in a

@@ -242,9 +242,9 @@ def build_parser():
     s.add_argument("--headless", action="store_true", help="no window: -nullrhi -nosound (+ -unattended, see below)")
     s.add_argument("--render", action="store_true", help="with --headless: render offscreen instead of -nullrhi (for ue shot)")
     s.add_argument("--sound", action="store_true", help="with --headless: keep a (silent) audio device, for ue audio")
-    s.add_argument("--size", metavar="WxH", help="the editor window's size, e.g. 1920x1080: a headless editor's "
-                                                 "viewport (and PIE's, for shot --hud and ue ui) is a part of it; the "
-                                                 "editor keeps it for later starts")
+    s.add_argument("--size", metavar="WxH", help="with --headless --render: the main window's size, e.g. 2560x1440 "
+                                                 "(the level and PIE viewports are a part of it; for shot --hud and "
+                                                 "ue ui), for this run")
     s.add_argument("--unattended", dest="unattended", action="store_true", default=None,
                    help="force -unattended (default for headless, except UnrealSharp projects)")
     s.add_argument("--attended", dest="unattended", action="store_false", help="never pass -unattended")

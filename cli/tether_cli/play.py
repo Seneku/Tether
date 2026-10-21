@@ -396,14 +396,18 @@ def ui_click(ctx, target, event=False, near=None):
     if not cover and not beacon.get("headless") and centre(node):
         cover = os_window_at(centre(node), beacon.get("pid"))  # a windowed editor under another program's window
     if cover:
-        try:
-            fired = ctx.tether("umg", click=node["label"] or target)
-            return fired + f' (window "{cover}" covers it on screen, so its OnClicked was fired instead of a click)'
-        except CliError:
-            raise CliError(f'{node["role"]} "{node["label"]}" is covered by window "{cover}": a click would land '
-                           f"there (a press without a release over the button: it only takes focus). Move or close "
-                           f"that window, or for an editor window: ue call SlateInspectorToolset.Windows action=list, "
-                           f"then action=close index=N") from None
+        # by the snapshot's label, then by the text asked for: a snapshot label can carry its panel's accessible
+        # text in front ("Tether probe panel GARAGE"), which UMG does not know
+        for label in dict.fromkeys(l for l in (node["label"], target) if l):
+            try:
+                fired = ctx.tether("umg", click=label)
+                return fired + f' (window "{cover}" covers it on screen, so its OnClicked was fired instead of a click)'
+            except CliError:
+                continue
+        raise CliError(f'{node["role"]} "{node["label"]}" is covered by window "{cover}": a click would land '
+                       f"there (a press without a release over the button: it only takes focus). Move or close "
+                       f"that window, or for an editor window: ue call SlateInspectorToolset.Windows action=list, "
+                       f"then action=close index=N")
     mcp_tool(ctx, "SlateInspectorToolset", "Click", {"ref": node["ref"]})
     return f'clicked {node["role"]} "{node["label"]}"'
 
@@ -1716,6 +1720,20 @@ LOG_ANYWHERE = re.compile(r"\s+anywhere$", re.I)
 LOG_TIME = re.compile(r"^\[\d{4}\.\d\d\.\d\d-(\d\d)\.(\d\d)\.(\d\d):(\d{3})\]")
 
 
+def step_suffixes(verb, rest):
+    """(the step's text without its `within N`, seconds or None). A log step keeps `anywhere` at its end, whichever
+    order the two suffixes came in (`log X within 5 anywhere` once left "within 5" in the regex)."""
+    anywhere = LOG_ANYWHERE.search(rest) if verb == "log" else None
+    rest = rest[: anywhere.start()].strip() if anywhere else rest
+    within = WITHIN.search(rest)
+    seconds = float(within.group(1)) if within else None
+    rest = rest[: within.start()].strip() if within else rest
+    if verb == "log" and not anywhere:
+        anywhere = LOG_ANYWHERE.search(rest)
+        rest = rest[: anywhere.start()].strip() if anywhere else rest
+    return rest + (" anywhere" if anywhere else ""), seconds
+
+
 def log_check(rest, log_lines, cursor=None):
     """The check behind a `log` step: `log <regex>` (a line matches), `log <regex> count >= 6` (how many lines
     match, over the whole run), `log in order: re1, re2, re3` (lines matching each, in that order). A match or an
@@ -1826,9 +1844,7 @@ def pie_do(ctx, args):
     def run(step):
         verb, _, rest = step.partition(" ")
         verb, rest = verb.lower(), rest.strip()
-        within = WITHIN.search(rest)
-        seconds = float(within.group(1)) if within else None
-        rest = rest[: within.start()].strip() if within else rest
+        rest, seconds = step_suffixes(verb, rest)
         if verb == "wait":
             amount, _, clock = (rest or "1").partition(" ")
             if clock.strip().lower() == "game":  # game time, whatever the frame rate

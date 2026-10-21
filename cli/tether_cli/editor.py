@@ -5,7 +5,7 @@ import sys
 import time
 
 from .core import (
-    CliError, blocking_dialogs, crash_reports, crash_summary, describe_crash, editor_beacons, editor_executable, flush_deletes,
+    CliError, actor_id, blocking_dialogs, crash_reports, crash_summary, describe_crash, editor_beacons, editor_executable, flush_deletes,
     forget_beacon,
     editor_live, editor_process,
     decline_package_restore, editor_label, engine_root, filter_log, live_coding_available, live_editors, logged_dialogs,
@@ -262,7 +262,7 @@ def cmd_open(ctx, args):
         second = False
     elif beacon and editor_process(beacon.get("pid")) and not second:  # attach to the open editor, the user's own included
         print(f"already open ({editor_label(beacon)}); using it"
-              + ("" if beacon.get("owner") in (None, session_id()) else
+              + ("" if beacon.get("owner") in (None, actor_id()) else
                  " (another session's private editor: `ue open --second` starts your own)"))
         return cmd_status(ctx, args)
     if second:
@@ -311,7 +311,7 @@ def cmd_open(ctx, args):
         "-TetherLaunched"]  # marks the editors the CLI started, so it never closes one the user opened
     shared_log = None
     if second:
-        cmd += [f"-TetherOwner={session_id()}"]
+        cmd += [f"-TetherOwner={actor_id()}"]
         shared_log = (beacon or {}).get("log")
         shared_log = (shared_log, os.path.getsize(shared_log)) if shared_log and os.path.isfile(shared_log) else None
     # UnrealSharp disables C# hot reload under -unattended, so headless UnrealSharp editors stay
@@ -570,12 +570,12 @@ def yield_lease(ctx, args):
 
 def cmd_who(ctx, args):
     """`ue who`: the sessions that used this editor recently (last command, when), the lease and the PIE owner."""
-    me = session_id()
+    me = actor_id()
     if args.name:
         set_session_name(ctx.project, args.name)
-        print(f"this session ({me}) is now '{args.name}' to the others")
+        print(f"this {'agent' if '/' in me else 'session'} ({me}) is now '{args.name}' to the others")
     now, names = time.time(), session_names(ctx.project)
-    recent = recent_sessions(ctx.project, args.minutes, now=now)
+    recent = recent_sessions(ctx.project, args.minutes, now=now, by="actor")
     ctx.data = {"you": me, "sessions": recent, "lease": active_lease(ctx.project)}
     print(f"sessions using this editor in the last {args.minutes:g} min ({len(recent)}):" if recent
           else f"no `ue` commands in the last {args.minutes:g} min")

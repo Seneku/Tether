@@ -9,7 +9,7 @@ import os
 import re
 import time
 
-from .core import (CliError, chosen_editor, command_lines, pid_alive, process_ancestry, process_name, read_json, run_git,
+from .core import (CliError, actor_id, chosen_editor, same_session, command_lines, pid_alive, process_ancestry, process_name, read_json, run_git,
                    session_id, state_dir, write_json)
 
 LEASE_MINUTES = 15      # default length of `ue lease take`
@@ -24,12 +24,13 @@ def session_names(project):
 
 def set_session_name(project, name, sid=None):
     names = session_names(project)
-    names[sid or session_id()] = name
+    names[sid or actor_id()] = name
     write_json(os.path.join(state_dir(project), "sessions.json"), names)
 
 
 def session_label(project, sid, names=None):
-    """'spire (3f2a9c1d)' when the session named itself, else the id; "user" stays "user"."""
+    """'spire (3f2a9c1d)' when the session (or a sub-agent, '3f2a9c1d/a55cee02') named itself, else the id; "user"
+    stays "user"."""
     name = (names if names is not None else session_names(project)).get(sid)
     return f"{name} ({sid})" if name and name != sid else sid
 
@@ -126,7 +127,7 @@ def record_activity(project, argv, now=None):
     """Append this command to the activity log (one JSON line; trimmed to the last hour now and then)."""
     now = time.time() if now is None else now
     path = activity_path(project)
-    line = json.dumps({"session": session_id(), "cmd": " ".join(argv)[:160], "time": round(now, 1)})
+    line = json.dumps({"session": session_id(), "actor": actor_id(), "cmd": " ".join(argv)[:160], "time": round(now, 1)})
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "a", encoding="utf-8") as f:
@@ -155,13 +156,14 @@ def read_activity(project):
     return rows
 
 
-def recent_sessions(project, minutes, exclude=None, now=None):
-    """{session: its last row} for the sessions that ran a command in the last `minutes`, newest first."""
+def recent_sessions(project, minutes, exclude=None, now=None, by="session"):
+    """{session: its last row} for the sessions that ran a command in the last `minutes`, newest first; by="actor"
+    lists a session's sub-agents apart."""
     now = time.time() if now is None else now
     last = {}
     for row in read_activity(project):
         if row["time"] >= now - minutes * 60 and row["session"] != exclude:
-            last[row["session"]] = row
+            last[row.get(by) or row["session"]] = row
     return dict(sorted(last.items(), key=lambda kv: -kv[1]["time"]))
 
 
@@ -228,7 +230,7 @@ def start_running(project, argv, now=None):
     and `ue status`, `who` and `lease` say what the editor is busy with. The path, or None."""
     path = os.path.join(running_dir(project), f"{os.getpid()}.json")
     try:
-        write_json(path, {"session": session_id(), "cmd": " ".join(argv)[:160], "pid": os.getpid(),
+        write_json(path, {"session": session_id(), "actor": actor_id(), "cmd": " ".join(argv)[:160], "pid": os.getpid(),
                           "since": round(time.time() if now is None else now, 1)})
     except OSError:
         return None
@@ -331,7 +333,7 @@ def check_shared(project, action, destructive, ignore=False, now=None):
 def own_editor(project):
     """True when the editor this session talks to is its own (`ue open --second`)."""
     try:
-        return bool((chosen_editor(project) or {}).get("owner") == session_id() and session_id())
+        return same_session((chosen_editor(project) or {}).get("owner")) and bool(session_id())
     except CliError:
         return False
 

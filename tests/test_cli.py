@@ -4231,3 +4231,120 @@ class Round031(unittest.TestCase):
             ue.build_parser().parse_args(["pie", "-h"])
         for step in ("log <regex> [within N] [anywhere]", "until ...", "exec <console command>", "example:"):
             self.assertIn(step, out.getvalue())
+
+
+class Round032(unittest.TestCase):
+    """0.32: UnrealRacing's notes 201-206."""
+
+    def setUp(self):
+        self.project = Project()
+        self.p = self.project.uproject
+        ue.core._AGENT.clear()
+
+    def tearDown(self):
+        ue.core._AGENT.clear()
+        self.project.close()
+
+    # 201
+    def test_log_step_suffixes_in_either_order(self):
+        for text in ("Standings within 5 anywhere", "Standings anywhere within 5"):
+            self.assertEqual(ue.step_suffixes("log", text), ("Standings anywhere", 5.0))
+        self.assertEqual(ue.step_suffixes("log", "Standings within 2"), ("Standings", 2.0))
+        self.assertEqual(ue.step_suffixes("until", "player.Speed > 3 within 4"), ("player.Speed > 3", 4.0))
+
+    # 202
+    def transcript(self, path, command, stamp):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"timestamp": stamp, "message": {"content": [
+                {"type": "tool_use", "id": "t", "name": "Bash", "input": {"command": command}}]}}) + "\n")
+
+    def test_the_sub_agent_running_a_command_is_found_from_its_transcript(self):
+        base = os.path.join(self.project.root, "claude", "projects")
+        sid = "11112222-aaaa-bbbb-cccc-000000000000"
+        folder = os.path.join(base, "D--Projects-Game", sid)
+        main = os.path.join(base, "D--Projects-Game", sid + ".jsonl")
+        studio = os.path.join(folder, "subagents", "agent-a55cee026ce86ba58.jsonl")
+        signs = os.path.join(folder, "subagents", "agent-b77dee026ce86ba59.jsonl")
+        self.transcript(main, "ue status", "2026-10-20T10:00:00.000Z")
+        self.transcript(studio, "cd D:/G && ue open --second --headless --render --map L_NR_InteriorStudio",
+                        "2026-10-20T10:01:00.000Z")
+        self.transcript(signs, "ue shot --at 0,0,100 -o signs.png", "2026-10-20T10:02:00.000Z")
+        env = {"CLAUDE_CODE_SESSION_ID": sid}
+        with unittest.mock.patch.dict(os.environ, env), unittest.mock.patch.dict(os.environ, {}, clear=False) as e:
+            e.pop("UE_SESSION", None)
+            e.pop("UE_AGENT", None)
+            self.assertEqual(ue.find_agent(["open", "--second", "--headless", "--render", "--map", "L_NR_InteriorStudio"],
+                                           base=base), "a55cee02")
+            self.assertEqual(ue.find_agent(["shot", "--at", "0,0,100", "-o", "signs.png"], base=base), "b77dee02")
+            self.assertIsNone(ue.find_agent(["status"], base=base))  # the main thread's own call
+            self.assertIsNone(ue.find_agent(["log"], base=base))  # nobody's: the session itself
+            os.utime(studio, (time.time() - 3600, time.time() - 3600))
+            os.utime(signs, (time.time() - 3600, time.time() - 3600))
+            self.assertIsNone(ue.find_agent(["shot", "--at", "0,0,100", "-o", "signs.png"], base=base))  # idle agents
+        with unittest.mock.patch.dict(os.environ, {"UE_SESSION": "x", "UE_AGENT": "studio"}):
+            self.assertEqual(ue.find_agent([], base=base), "studio")
+
+    def test_an_agents_second_editor_is_the_default_only_for_that_agent(self):
+        def beacon(pid, **fields):
+            ue.write_json(os.path.join(ue.state_dir(self.p), "editors", f"{pid}.json"),
+                          dict({"pid": pid, "heartbeat": time.time(), "started": time.time() - 100}, **fields))
+        beacon(os.getpid(), launched_by_tether=True)
+        beacon(os.getppid(), launched_by_tether=True, owner="city/studio", started=time.time())
+        with unittest.mock.patch("tether_cli.core.editor_process", return_value=True):
+            for agent, want in (("studio", os.getppid()), ("signs", os.getpid()), ("", os.getpid())):
+                ue.core._AGENT.clear()
+                with unittest.mock.patch.dict(os.environ, {"UE_SESSION": "city", "UE_AGENT": agent}):
+                    self.assertEqual(ue.chosen_editor(self.p)["pid"], want, agent)
+            ue.core._AGENT.clear()
+            with unittest.mock.patch.dict(os.environ, {"UE_SESSION": "city", "UE_AGENT": "signs"}):
+                self.assertIn("agent studio of this session's own (--second)",
+                              ue.editor_label({"pid": 1, "owner": "city/studio"}))
+                self.assertTrue(ue.same_session("city/studio"))
+                ue.set_session_name(self.p, "signs")
+            ue.core._AGENT.clear()
+            with unittest.mock.patch.dict(os.environ, {"UE_SESSION": "city", "UE_AGENT": "studio"}):
+                ue.set_session_name(self.p, "studio")
+        self.assertEqual(ue.session_names(self.p), {"city/signs": "signs", "city/studio": "studio"})
+
+    # 203
+    def test_mesh_builds_pending_and_done(self):
+        lines = [stamped("LogStaticMesh: Display: Building static mesh SM_Road_1 (Required Memory Estimate: 6 MB)..."),
+                 stamped("LogStaticMesh: Display: Building static mesh SM_Road_2 (Required Memory Estimate: 6 MB)..."),
+                 stamped("LogStaticMesh: Built static mesh [0.25s] /Game/NR/SM_Road_1.SM_Road_1")]
+        self.assertEqual(ue.mesh_builds(lines), (["SM_Road_2"], ["SM_Road_1"]))
+
+    def test_shots_render_a_few_frames_after_meshes_were_rebuilt(self):
+        log = self.project.write("Saved/Logs/Game.log", stamped("LogInit: boot\n"))
+        ctx = FakeCtx()
+        ctx.project, ctx.beacon = self.p, {}
+        warmed = []
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(ue.settle_mesh_builds(ctx, lambda: warmed.append(1)), [])
+            with open(log, "a", encoding="utf-8") as f:
+                f.write(stamped("LogStaticMesh: Display: Building static mesh SM_Deck (x)...\n"))
+                f.write(stamped("LogStaticMesh: Built static mesh [1.0s] /Game/NR/SM_Deck.SM_Deck\n"))
+            self.assertEqual(ue.settle_mesh_builds(ctx, lambda: warmed.append(1)), ["SM_Deck"])
+            self.assertEqual(ue.settle_mesh_builds(ctx, lambda: warmed.append(1)), [])  # once per rebuild
+        self.assertEqual(warmed, [1])
+        self.assertIn("1 static mesh(es) were rebuilt since the last shot (SM_Deck)", err.getvalue())
+
+    # 204
+    def test_log_skips_the_flush_while_the_editor_is_busy(self):
+        self.project.write("Saved/Logs/Game.log", stamped("LogTemp: Warning: careful\n"))
+        ctx = FakeCtx()
+        ctx.project, ctx.beacon, ctx.transport = self.p, {"pid": 0, "heartbeat": time.time() - 90, "mcp_port": 1}, "mcp"
+        with unittest.mock.patch("tether_cli.calls.editor_process", return_value=True), \
+                unittest.mock.patch("tether_cli.calls.port_open", return_value=True):
+            self.assertTrue(ue.editor_busy(ctx))
+            ue.flush_editor_log(ctx, when_busy=False)
+            self.assertEqual(ctx.calls, [])
+            ue.flush_editor_log(ctx)  # after a call of ours: flushed anyway
+            self.assertEqual(ctx.calls, [("console", {"command": "FLUSHLOG"})])
+
+    def test_short_calls_restores_the_timeout(self):
+        ctx = FakeCtx()
+        ctx._mcp, ctx.args = types.SimpleNamespace(timeout=120.0), types.SimpleNamespace(timeout=120.0)
+        with ue.short_calls(ctx, 10):
+            self.assertEqual((ctx._mcp.timeout, ctx.args.timeout), (10, 10))
+        self.assertEqual((ctx._mcp.timeout, ctx.args.timeout), (120.0, 120.0))
