@@ -474,7 +474,9 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
   itself), other single keys go to it
   through Slate on their own (`--game` forces the game's input); step files take `key --slate Enter` or
   `ui-key Enter`, and `click --event LABEL` (fires OnClicked, for a covered window). `ue ui --rects` prints each
-  widget's screen rectangle (what `ue ui at x,y` takes). A button with no text child (a transparent UButton over
+  widget's screen rectangle (what `ue ui at x,y` takes); a plain `--headless` editor (-nullrhi) lays out no
+  geometry, so rectangles, `ui at` and arrow-key menu navigation need `ue open --headless --render`, while clicks
+  there fire the UMG button's OnClicked. A button with no text child (a transparent UButton over
   a text row) is labelled by the text under it; better, give it an accessible name
   (`SetAccessibleBehavior(EAccessibleBehavior::Custom, Text)`), which screen readers use too.
   One tap is one press, as on a keyboard, and taps in a row (two `key Down tap` steps) stay two presses. A legacy BindKey chord on a key an Enhanced Input mapping also uses

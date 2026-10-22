@@ -4428,3 +4428,66 @@ class Round033(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(ue.check_map_load(self._ctx(self.GOOD), "/Game/Maps/L_HikariBay"), 0)
         self.assertIsNone(ue.suspect_map(self.p, beacon))
+
+    # the selftest's UI checks on a machine whose own editor layout has floating windows
+    def test_a_headless_editor_closing_leaves_the_users_layout_as_it_was(self):
+        layout = self.project.write("LocalAppData/UnrealEngine/Editor/EditorLayout.json", '{"mine": 1}')
+
+        class Quitting(FakeCtx):
+            def tether(self, tool, **kwargs):
+                if "quit_editor" in kwargs.get("code", ""):  # the editor saves its layout as it exits
+                    with open(layout, "w") as f:
+                        f.write('{"headless": 1}')
+                return "0"
+        for headless, want in ((True, '{"mine": 1}'), (False, '{"headless": 1}')):
+            with open(layout, "w") as f:
+                f.write('{"mine": 1}')
+            ctx = Quitting()
+            ctx.project, ctx.beacon = self.p, {"pid": 4242, "launched_by_tether": True, "headless": headless}
+            alive = iter([True, True, False, False, False])
+            args = argparse.Namespace(force=False, save=False, discard=False, ignore_lease=False)
+            with unittest.mock.patch("tether_cli.editor.pid_alive", side_effect=lambda pid: next(alive)), \
+                    unittest.mock.patch("tether_cli.editor.check_shared"), \
+                    unittest.mock.patch("tether_cli.editor.user_layout_file", return_value=layout), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(ue.close_editor(ctx, args, None), 0)
+            with open(layout) as f:
+                self.assertEqual(f.read(), want, headless)
+
+    def test_ui_brings_the_level_tab_forward_when_the_message_log_hides_it(self):
+        hidden = "\n".join(['window "Sandbox - Unreal Editor" [pos=0,0 size=0,0] [ref=w1]',
+                            '  tab "L_TetherProbe" [pos=0,0 size=0,0] [ref=t2]',
+                            '  tab "Message Log" [pos=0,0 size=0,0] [ref=t3]'])
+        shown = hidden + '\n    tab "Viewport 1" [pos=0,0 size=0,0] [src=SLevelEditor.cpp:1] [ref=t4]'
+        calls = []
+
+        def tool(ctx, toolset, name, params):
+            calls.append((name, params.get("ref")))
+            return shown if any(c[0] == "Click" for c in calls) else hidden
+        ctx = FakeCtx()
+        ctx.project, ctx.beacon, ctx.transport = self.p, {"pid": 1, "map": "/Game/TetherFixtures/L_TetherProbe"}, "mcp"
+        with unittest.mock.patch("tether_cli.play.mcp_tool", side_effect=tool), \
+                unittest.mock.patch("tether_cli.play.catalog", return_value={ue.play.UI_TOOLSET: {}}), \
+                unittest.mock.patch("tether_cli.play.pie_net", return_value=""), \
+                unittest.mock.patch("time.sleep"), contextlib.redirect_stderr(io.StringIO()) as err:
+            ue.play.ui_nodes(ctx)
+        self.assertEqual(calls, [("Snapshot", ""), ("Click", "t2"), ("Snapshot", "")])
+        self.assertIn("brought the level editor's tab to the front", err.getvalue())
+        self.assertTrue(ue.play.unlaid_out(ctx.ui_all))
+        self.assertFalse(ue.play.unlaid_out(ue.play.parse_snapshot('window "W" [pos=0,0 size=1280,720] [ref=w1]')))
+
+    def test_text_less_buttons_take_their_rows_text_without_geometry(self):
+        rows = []
+        for i, name in enumerate(("FREE ROAM", "GARAGE", "QUIT")):
+            rows += [f'      generic [pos=0,0 size=0,0] [ref=g{i}]', f'        image [pos=0,0 size=0,0] [ref=i{i}]',
+                     f'        text "{name}" [pos=0,0 size=0,0] [ref=x{i}]', f'        button [pos=0,0 size=0,0] [ref=b{i}]']
+        nodes = ue.play.label_buttons(ue.play.parse_snapshot("\n".join(['    generic [pos=0,0 size=0,0] [ref=g9]'] + rows)))
+        self.assertEqual([n["label"] for n in nodes if n["role"] == "button"], ["FREE ROAM", "GARAGE", "QUIT"])
+        # as the snapshot really gives a C++-built menu: each row flattened to a text and then its button
+        flat = ['    combobox [pos=0,0 size=0,0] [ref=co1]', '      button [pos=0,0 size=0,0] [ref=b1]',
+                '        image [pos=0,0 size=0,0] [ref=i1]', '    checkbox [pos=0,0 size=0,0] [ref=cb1]',
+                '    button [pos=0,0 size=0,0] [ref=b9]']
+        for name in ("GARAGE", "FREE ROAM", "QUIT"):
+            flat += [f'    text "{name}" [pos=0,0 size=0,0] [ref=x{name[0]}]', f'    button [pos=0,0 size=0,0] [ref=b{name[0]}]']
+        nodes = ue.play.label_buttons(ue.play.parse_snapshot("\n".join(['  generic [pos=0,0 size=0,0] [ref=g9]'] + flat)))
+        self.assertEqual([n["label"] for n in nodes if n["role"] == "button"], ["", "", "GARAGE", "FREE ROAM", "QUIT"])

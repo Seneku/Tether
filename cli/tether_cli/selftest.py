@@ -343,8 +343,9 @@ def cmd_selftest(ctx, args):
                                                "--watch", "IA_TetherMove"],
           skip=None if has_imc else "no input fixture (Sandbox's IMC_TetherProbe)",
           ok=lambda c, o: c == 0 and "(0, 1)" in o)
-    check("ui at", ["ui", "at", "5,5"], skip=None if "SlateInspectorToolset.SlateInspectorToolset" in toolsets
-          else "no Epic Slate inspector", ok=lambda c, o: c == 0 and "window" in o)
+    check("ui at", ["ui", "at", "5,5"], skip="no Epic Slate inspector" if "SlateInspectorToolset.SlateInspectorToolset"
+          not in toolsets else None if rendering else "headless with -nullrhi (no Slate geometry)",
+          ok=lambda c, o: c == 0 and "window" in o)
     check("log --since pie", ["log", "--since", "pie", "--level", "Display"],
           ok=lambda c, o: c == 0 and "since the last PIE start" in o)
     check("gpu", ["gpu", "--frames", "1"], timeout=300, skip="needs 5.8" if remote else None if rendering else
@@ -365,11 +366,13 @@ def cmd_selftest(ctx, args):
     menu = (ue("py", "hasattr(unreal.TetherProbeUILibrary, 'show_probe_menu')")[1].splitlines() or [""])[-1] == "True" \
         if fixture else False
     # a title screen holding focus itself, then rows of text-less buttons inside nested user widgets
-    check("ui menu keys and clicks (Sandbox fixture)",
+    # Slate's arrow-key navigation picks the next widget by geometry, which a -nullrhi editor does not lay out
+    navigate = ["key Down", "key Enter"] if rendering else []
+    check("ui menu keys and clicks (Sandbox fixture)" if rendering else "ui menu clicks (Sandbox fixture)",
           ["pie", "do", "call /Script/Sandbox.Default__TetherProbeUILibrary ShowProbeMenu", "key Enter",
-           "expect-ui GARAGE", "key Down", "key Enter", "click --event QUIT", "click GARAGE",
-           "log TetherProbeMenu: FREE ROAM clicked", "log TetherProbeMenu: QUIT clicked",
-           "log TetherProbeMenu: GARAGE clicked"],
+           "expect-ui GARAGE"] + navigate + ["click --event QUIT", "click GARAGE"]
+          + (["log TetherProbeMenu: FREE ROAM clicked"] if rendering else [])
+          + ["log TetherProbeMenu: QUIT clicked", "log TetherProbeMenu: GARAGE clicked"],
           skip=None if menu else "no menu fixture (Sandbox's ShowProbeMenu)", ok=lambda c, o: c == 0 and "PASS" in o)
     check("shot --hud", ["shot", "--hud", "-o", os.path.join(tempfile.gettempdir(), "tether-selftest-hud.png")],
           skip="needs 5.8" if remote else None if rendering else "headless with -nullrhi",

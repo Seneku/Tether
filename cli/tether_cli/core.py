@@ -66,6 +66,22 @@ def state_dir(project):
     return os.path.join(os.path.dirname(project), "Saved", "Tether")
 
 
+def user_layout_file():
+    """The editor's window layout shared by every project and engine on this machine (Slate's LayoutService loads
+    it before the per-project EditorLayout.ini), or None off Windows."""
+    base = os.environ.get("LOCALAPPDATA")
+    return os.path.join(base, "UnrealEngine", "Editor", "EditorLayout.json") if base else None
+
+
+def read_bytes(path):
+    """A file's bytes, or None."""
+    try:
+        with open(path, "rb") as f:
+            return f.read()
+    except (OSError, TypeError):
+        return None
+
+
 def stamped_name(folder, prefix, ext):
     """folder/prefix-YYYYmmdd-HHMMSS-mmm.ext, made unique: two shots in one second must not overwrite each other."""
     now = time.time()

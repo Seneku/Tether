@@ -9,8 +9,8 @@ from .core import (
     forget_beacon,
     editor_live, editor_process,
     decline_package_restore, editor_label, engine_root, filter_log, live_coding_available, live_editors, logged_dialogs,
-    log_file_lines, newest_log, parse_res, pick_port, pid_alive, port_open, read_json, read_new_log, recent_crash,
-    remember_target,
+    log_file_lines, newest_log, parse_res, pick_port, pid_alive, port_open, read_bytes, read_json, read_new_log,
+    recent_crash, remember_target, user_layout_file,
     run_git, startup_dialogs, startup_failure,
     state_dir,
     subprocess, write_json,
@@ -329,6 +329,10 @@ def cmd_open(ctx, args):
         # --render keeps a GPU renderer with no window (-RenderOffscreen), for `ue shot`; plain headless
         # skips rendering entirely (-nullrhi), which boots faster and leaves the viewport zero-sized.
         cmd += ["-RenderOffscreen" if args.render else "-nullrhi", "-AutoDeclinePackageRecovery"]
+        # The Message Log the editor opens after a PIE session that logged errors goes in front of the level
+        # editor's tab and hides the game viewport (ue ui, clicks, HUD shots); with -nullrhi Slate has no
+        # geometry, so a click cannot bring the tab back
+        cmd += ["-ini:Engine:[ConsoleVariables]:MessageLog.DisablePopup=1"]
         if getattr(args, "sound", False):  # a real audio device (for ue audio) that stays silent: PIE at volume 0, editor at 0
             cmd += ["-ini:EditorPerProjectUserSettings:[/Script/UnrealEd.LevelEditorPlaySettings]:EnableGameSound=False",
                     "-ini:EditorPerProjectUserSettings:[/Script/UnrealEd.LevelEditorMiscSettings]:EditorVolumeLevel=0"]
@@ -452,10 +456,17 @@ def close_editor(ctx, args, explicit):
             # Quitting would stop on a "Save Content?" modal; dropping the work was requested.
             print(f"discarding {dirty_count} unsaved packages")
         else:
+            # A headless editor saves its window layout on exit into the machine-wide EditorLayout.json, the one
+            # the user's own editors load: put the user's back
+            layout = user_layout_file() if beacon.get("launched_by_tether") and beacon.get("headless") else None
+            before = read_bytes(layout)
             ctx.tether("py", code="unreal.SystemLibrary.quit_editor()")
             deadline = time.time() + 30
             while time.time() < deadline and pid_alive(pid):
                 time.sleep(0.25)
+            if before is not None and read_bytes(layout) != before:
+                with open(layout, "wb") as f:
+                    f.write(before)
     if pid_alive(pid):
         if not (args.force or args.discard):
             raise CliError("editor did not exit within 30s (modal dialog open?); retry with --force", 4)

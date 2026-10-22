@@ -22,8 +22,8 @@ from .share import (
     active_lease, check_shared, clear_pie_start, describe_lease, pie_owner, record_pie_start, session_id,
 )
 from .images import (
-    cmd_shot, contact_sheet, draw_text, crop_pixels, front_level_viewport, hud_screenshot, image_diff, png_read, png_write,
-    shot_args, widget_capture,
+    cmd_shot, contact_sheet, draw_text, crop_pixels, front_level_viewport, hud_screenshot, image_diff, level_tab_hidden,
+    png_read, png_write, shot_args, slate_entries, widget_capture,
 )
 from .assets import mcp_tool
 from .editor import pie_starter_lines
@@ -200,9 +200,22 @@ def ui_nodes(ctx):
     """(game widget nodes, True) via Epic's Slate inspector, or (None, False) when it is not enabled."""
     if ctx.transport == "remote" or UI_TOOLSET not in catalog(ctx):
         return None, False
-    text = mcp_tool(ctx, "SlateInspectorToolset", "Snapshot", {"ref": "", "maxDepth": 120, "bIncludeSourceLocations": True})
+
+    def snapshot():
+        out = mcp_tool(ctx, "SlateInspectorToolset", "Snapshot", {"ref": "", "maxDepth": 120, "bIncludeSourceLocations": True})
+        return out if isinstance(out, str) else json.dumps(out)
+
+    text = snapshot()
     target = re.search(r"^\* (\d+):", pie_net(ctx, "status"), re.M)  # `ue pie target` picks a client's window
-    nodes = parse_snapshot(text if isinstance(text, str) else json.dumps(text))
+    hidden = None if target else level_tab_hidden(slate_entries(text), ((ctx.beacon or {}).get("map") or "").rsplit("/", 1)[-1])
+    if hidden:  # the Message Log the editor opens after a PIE session that logged errors hides the game viewport
+        mcp_tool(ctx, "SlateInspectorToolset", "Click", {"ref": hidden[7]})
+        time.sleep(0.3)
+        text = snapshot()
+        if not getattr(ctx, "fronted_level_tab", False):
+            ctx.fronted_level_tab = True
+            print("note: brought the level editor's tab to the front (another tab hid the game viewport)", file=sys.stderr)
+    nodes = parse_snapshot(text)
     ctx.ui_all = nodes  # every window, for hit tests
     return label_buttons(game_ui(nodes, int(target.group(1)) if target else 0)), True
 
@@ -212,6 +225,8 @@ def label_buttons(nodes):
     a sibling text row) after the text widgets inside its rectangle, so it can be clicked by that text. Flagged
     "text under it" in `ue ui`. Each text goes to the one button whose centre is nearest its own (menu rows can
     overlap a little on screen, and a row's text and button share one rectangle)."""
+    if unlaid_out(nodes):
+        return label_buttons_by_tree(nodes)
     buttons = [(n, box(n)) for n in nodes if n["role"] == "button" and not n["label"] and box(n) and box(n)[2] and box(n)[3]]
     found = {}
     for t in nodes:
@@ -229,6 +244,39 @@ def label_buttons(nodes):
     return nodes
 
 
+def label_buttons_by_tree(nodes):
+    """label_buttons without geometry (a -nullrhi editor lays nothing out): a text-less button takes the text just
+    before it among its siblings, back to the previous button (a row Overlay[text, button on top] comes out of the
+    snapshot flattened, as a text then its button), else the texts of its row, the nearest enclosing widget whose
+    subtree holds no other button."""
+    for i, n in enumerate(nodes):
+        if n["role"] != "button" or n["label"]:
+            continue
+        labels = []
+        for k in range(i - 1, -1, -1):
+            c = nodes[k]
+            if c["indent"] < n["indent"] or (c["indent"] == n["indent"] and c["role"] == "button"):
+                break
+            if c["indent"] == n["indent"] and c["role"] == "text" and c["label"]:
+                labels.insert(0, c["label"])
+            elif c["indent"] == n["indent"]:
+                break
+        own = {id(c) for c in subtree(nodes, i)}
+        j = i
+        while not labels:
+            j = next((k for k in range(j - 1, -1, -1) if nodes[k]["indent"] < nodes[j]["indent"]), None)
+            if j is None:
+                break
+            row = subtree(nodes, j)
+            if any(c["role"] == "button" and c is not n for c in row):
+                break
+            labels = [c["label"] for c in row if c["role"] == "text" and c["label"] and id(c) not in own]
+        if labels:
+            n["label"] = " ".join(dict.fromkeys(labels))[:80]
+            n["flags"] = n["flags"] + ["text under it"]
+    return nodes
+
+
 def box(node):
     """(x, y, w, h) of a snapshot node, or None."""
     try:
@@ -237,6 +285,15 @@ def box(node):
         return x, y, w, h
     except (KeyError, ValueError):
         return None
+
+
+NO_GEOMETRY = ("this editor lays out no Slate geometry (every widget at 0,0 size 0x0: a -nullrhi editor paints "
+               "nothing), so positions and hit tests need a rendering one: ue open --headless --render")
+
+
+def unlaid_out(nodes):
+    """True when a snapshot (or part of one) has widgets but not one with a size."""
+    return bool(nodes) and not any((box(n) or (0, 0, 0, 0))[2] for n in nodes)
 
 
 def windows(nodes):
@@ -395,6 +452,13 @@ def ui_click(ctx, target, event=False, near=None):
     beacon = ctx.beacon or {}
     if not cover and not beacon.get("headless") and centre(node):
         cover = os_window_at(centre(node), beacon.get("pid"))  # a windowed editor under another program's window
+    if not cover and unlaid_out(getattr(ctx, "ui_all", nodes)):
+        # -nullrhi: no geometry, so the press lands at 0,0; a UMG button's OnClicked still fires
+        for label in dict.fromkeys(l for l in (node["label"], target) if l):
+            try:
+                return ctx.tether("umg", click=label) + " (no Slate geometry in this editor, so its OnClicked was fired)"
+            except CliError:
+                continue
     if cover:
         # by the snapshot's label, then by the text asked for: a snapshot label can carry its panel's accessible
         # text in front ("Tether probe panel GARAGE"), which UMG does not know
@@ -518,6 +582,8 @@ def cmd_ui(ctx, args):
         if not slate:
             raise CliError("ue ui at needs Epic's SlateInspectorToolset (ue init enables it)")
         nodes = ctx.ui_all
+        if unlaid_out(nodes):
+            raise CliError(NO_GEOMETRY)
         hits = []
         for i, title, rect in windows(nodes):
             if inside(point, rect):
@@ -564,6 +630,8 @@ def cmd_ui(ctx, args):
     note = layout_patch_note(ctx.project, ctx.beacon) if not lines and not match else None
     if note:
         print("note: no widgets at all: " + note)
+    if getattr(args, "rects", False) and unlaid_out(ctx.ui_all):
+        print("note: " + NO_GEOMETRY)
     return 0
 
 

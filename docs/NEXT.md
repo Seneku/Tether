@@ -175,6 +175,18 @@ its panel's text in front ("Tether probe panel GARAGE"); a floating Content Brow
 layout (%LOCALAPPDATA%/UnrealEngine/Editor/EditorLayout.json) had made the selftest's menu check fail; and a
 failed selftest step list reports its FAIL line.
 
+**Done in 0.33.1** (the selftest's UI checks failing on this machine): a Tether headless editor that exits puts
+back the machine-wide %LOCALAPPDATA%/UnrealEngine/Editor/EditorLayout.json (the layout every editor of the user's
+loads first; there is no switch to point an editor at another file) when its exit rewrote it, so `ue close` no
+longer resizes or rearranges the user's own editor windows; headless editors start with
+`MessageLog.DisablePopup=1`, since the Message Log the editor opens after a PIE session that logged errors went in
+front of the level editor's tab and hid the game viewport, and without geometry no click brings the tab back (`ue
+ui` and clicks still bring it forward when they can). On 5.8.4 (installed the day before) a -nullrhi editor lays out no Slate
+geometry (every widget 0,0 0x0): `ue ui at` and `--rects` say so instead of answering "nothing", text-less buttons
+are labelled from the widget tree, clicks fire a UMG button's OnClicked, and the selftest skips `ui at` and the
+arrow-key part of the menu check there (Slate's navigation goes by geometry). Selftest: headless 127/0/10,
+`--render` 137/0/2; the floating windows in the layout turned out not to be the cause.
+
 **Done in 0.33.0** (UnrealRacing's note 207): after loading, `ue map open` takes a fingerprint of the level (per
 actor class: actors, actors at the origin, actors whose mesh components are all empty, zero-length splines, plus
 three sample actors with location and mesh) and compares it with the map's last good load in
