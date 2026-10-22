@@ -547,6 +547,7 @@ def build_parser():
     s.add_argument("paths", nargs="*", help="package paths (default: everything unsaved)")
     s.add_argument("--writable", action="store_true", help="make read-only package files writable first (git-lfs "
                                                            "leaves lockable files read-only after a commit)")
+    s.add_argument("--anyway", action="store_true", help="save a map `ue map open` found loaded broken in this editor")
     s = add("watch", cmd_watch, "wait for a log line, or for a property value (exit 4 on timeout)")
     s.add_argument("pattern", nargs="?", help="log regex to wait for")
     s.add_argument("--prop", nargs=2, metavar=("TARGET", "NAME"), help="watch this property instead")

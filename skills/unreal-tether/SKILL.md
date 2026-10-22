@@ -144,7 +144,9 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
   (works headless) with player starts, spawners, AI and triggers as numbered dots; read the PNG to plan placement.
   `ue map --footprints` writes the collidable geometry as data (each mesh's turned outline, top and bottom) for
   minimaps and layout checks. `ue map open /Game/Maps/X` switches the editor's map (`--save`/`--discard` when the
-  current one has unsaved edits).
+  current one has unsaved edits) and compares the level with its last good load: a WARNING (exit 1) means it came
+  back broken (actors at the origin, meshes gone, empty splines), typically in an editor carrying many Live Coding
+  patches. Don't save it from there (`ue save` refuses); `ue build --restart` and reopen.
 - Why AI (or players) get stuck somewhere: `ue collide x,y,r --z 100` draws what blocks at that height around the
   point, coloured by class, from overlap tests: generated roads, junction walls and raised medians show up.
 - On terrain, never guess heights: `ue spawn /Game/X/SM_Rock --at 1200,-300,0 --ground` (or `ue drop Rock1 Rock2`,

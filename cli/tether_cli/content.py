@@ -8,6 +8,7 @@ import time
 
 from .core import CliError, editor_live, filter_log, human_bytes, log_end, log_path, stamped_name, state_dir
 from .share import file_owner
+from .build import editor_patches, map_baseline_path, mark_suspect_map, reload_risk_note
 from .transport import py_json
 from .calls import flush_editor_log
 from .images import flip_rows, grid_to_bytes, png_gray16_bytes, png_write, read_grid
@@ -1357,6 +1358,9 @@ def map_open(ctx, args):
         raise CliError("ue map open /Game/Maps/MyMap [--save|--discard]")
     if (ctx.beacon or {}).get("pie"):
         raise CliError("PIE is running (ue pie stop first)")
+    risk = reload_risk_note(ctx.project, ctx.beacon)
+    if risk:
+        print(f"note: this editor {risk}", file=sys.stderr)
     state = py_json(ctx, MAP_STATE)
     if state["maps"] and not (args.save or args.discard):
         raise CliError(f"unsaved changes in {', '.join(state['maps'])}: pass --save or --discard (ue changes lists "
@@ -1375,7 +1379,114 @@ def map_open(ctx, args):
     print(f"opened {target}" + (f" (unsaved edits to {', '.join(state['maps'])} dropped)" if state["maps"] and args.discard
                                  else "")
           + (f"; {state['assets']} unsaved asset(s) stay unsaved in memory" if state["assets"] else ""))
-    return 0
+    return check_map_load(ctx, target)
+
+
+# What a level looks like once loaded, per actor class: [actors, at the origin, mesh components all empty, a spline
+# of zero length], plus three sample actors per class (name, location, first mesh) to compare by name next time.
+MAP_FINGERPRINT = """import json
+classes, rows = {}, {}
+for a in unreal.get_editor_subsystem(unreal.EditorActorSubsystem).get_all_level_actors():
+    c = a.get_class().get_name()
+    e = classes.setdefault(c, [0, 0, 0, 0])
+    l = a.get_actor_location()
+    comps = a.get_components_by_class(unreal.SceneComponent)
+    meshes = [m for m in comps if isinstance(m, unreal.StaticMeshComponent)]
+    mesh = next((m.static_mesh for m in meshes if m.static_mesh), None)
+    origin = abs(l.x) < 1 and abs(l.y) < 1 and abs(l.z) < 1
+    e[0] += 1
+    e[1] += origin
+    e[2] += bool(meshes) and mesh is None
+    e[3] += any(isinstance(s, unreal.SplineComponent) and s.get_spline_length() < 1 for s in comps)
+    rows.setdefault(c, []).append([a.get_name(), [round(l.x), round(l.y), round(l.z)],
+                                   mesh.get_path_name().split('.')[0] if mesh else None])
+samples = {c: dict((r[0], r[1:]) for r in sorted(v)[:3]) for c, v in rows.items()}
+wp = bool(unreal.WorldPartitionBlueprintLibrary.get_actor_descs()) if hasattr(unreal, 'WorldPartitionBlueprintLibrary') else False
+json.dumps({'classes': classes, 'samples': samples, 'wp': wp})"""
+
+
+def map_load_problems(prev, now, saved_since=False):
+    """What looks broken in a level load: compared with an earlier load of the same map when there is one (`prev`),
+    else only what is broken on its face (many mesh-less actors of a class, zero-length splines). Fewer actors is
+    expected after a save since that load (`saved_since`), and on World Partition levels (cells load by camera)."""
+    problems, wp = [], now.get("wp")
+    bad = lambda grew, n: grew >= max(2, -(-n // 10))  # noqa: E731 (at least 2, and a tenth of the class)
+    for cls, (n, origin, nomesh, nospline) in sorted(now["classes"].items(), key=lambda kv: -kv[1][0]):
+        if prev is None:
+            if n >= 10 and nomesh >= 0.9 * n:
+                problems.append(f"{nomesh} of {n} {cls} have no mesh")
+            if n >= 3 and nospline == n:
+                problems.append(f"all {n} {cls} have a zero-length spline")
+            continue
+        p = prev["classes"].get(cls)
+        if not p:
+            continue
+        for what, was, is_ in (("at the origin", p[1], origin), ("with no mesh", p[2], nomesh),
+                               ("with a zero-length spline", p[3], nospline)):
+            if bad(is_ - was, n):
+                problems.append(f"{is_} of {n} {cls} {what} (was {was})")
+    if prev is not None:
+        if not wp and not saved_since:
+            for cls, p in sorted(prev["classes"].items(), key=lambda kv: -kv[1][0]):
+                n = now["classes"].get(cls, [0])[0]
+                if bad(p[0] - n, p[0]):
+                    problems.append(f"{n} {cls} (was {p[0]})")
+        moved = []
+        for cls, names in prev.get("samples", {}).items():
+            for name, (loc, mesh) in names.items():
+                cur = now.get("samples", {}).get(cls, {}).get(name)
+                if not cur:
+                    continue
+                if any(abs(v) >= 1 for v in loc) and not any(abs(v) >= 1 for v in cur[0]):
+                    moved.append(f"{name} moved to the origin (was {','.join(map(str, loc))})")
+                elif mesh and not cur[1]:
+                    moved.append(f"{name} lost its mesh {mesh.rsplit('/', 1)[-1]}")
+        problems += moved[:4] + ([f"... {len(moved) - 4} more sample actor(s) like that"] if len(moved) > 4 else [])
+    return problems
+
+
+def check_map_load(ctx, target):
+    """207: after `ue map open`, compare the level with its last good load and warn loudly when it came back broken
+    (an editor carrying many Live Coding patches reloaded a level with empty splines and mesh-less actors at the
+    origin, without an error). A good load becomes the next comparison; a bad one marks the map so `ue save` refuses it."""
+    try:
+        now = py_json(ctx, MAP_FINGERPRINT)
+    except CliError as e:
+        print(f"note: could not check the loaded level ({e})", file=sys.stderr)
+        return 0
+    path = map_baseline_path(ctx.project, target)
+    try:
+        with open(path, encoding="utf-8") as f:
+            prev = json.load(f)
+    except (OSError, ValueError):
+        prev = None
+    umap = (os.path.join(os.path.dirname(ctx.project), "Content", target[len("/Game/"):] + ".umap")
+            if target.startswith("/Game/") else None)
+    mtime = os.path.getmtime(umap) if umap and os.path.isfile(umap) else None
+    problems = map_load_problems(prev, now, saved_since=bool(prev and mtime and mtime > prev.get("umap_mtime", 0) + 1))
+    pid = (ctx.beacon or {}).get("pid")
+    ctx.data = {"map": target, "problems": problems, "actors": sum(c[0] for c in now["classes"].values())}
+    if not problems:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(dict(now, time=time.time(), pid=pid, umap_mtime=mtime), f)
+        if pid:
+            mark_suspect_map(ctx.project, pid, target, None)
+        return 0
+    when = (f"its last good load ({time.strftime('%Y-%m-%d %H:%M', time.localtime(prev['time']))}, pid {prev.get('pid')})"
+            if prev else "what a level normally holds (no earlier load to compare with)")
+    print(f"WARNING: {target} looks broken after loading, compared with {when}:")
+    for p in problems[:10]:
+        print(f"  {p}")
+    patches = editor_patches(ctx.project, ctx.beacon)
+    print(("  this editor carries " + f"{patches} Live Coding patch(es); a reload in such an editor has brought a level "
+           "back broken without an error. " if patches else "  ")
+          + "Don't save this level from here (`ue save` refuses it until a good load): `ue build --restart` and reopen "
+          f"it, or compare in a fresh editor (`ue open --second --headless --map {target}`). If you changed these "
+          "actors on purpose, `ue save --anyway`")
+    if pid:
+        mark_suspect_map(ctx.project, pid, target, problems)
+    return 1
 
 
 def map_footprints(ctx, args):

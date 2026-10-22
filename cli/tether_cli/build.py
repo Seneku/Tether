@@ -343,6 +343,60 @@ def stale_code_note(project, beacon):
             "waits for that)")
 
 
+RELOAD_RISK_PATCHES = 5  # 207: an editor with 7 patches reloaded a level broken (splines empty, meshes gone, actors at 0)
+
+
+def editor_patches(project, beacon):
+    """How many Live Coding patches newer than the last UBT build this editor process carries."""
+    marker = read_json(os.path.join(state_dir(project), "last-build.json")) or {}
+    pid = (beacon or {}).get("pid")
+    if not marker.get("live_patches") or not pid:
+        return 0
+    pids = marker.get("live_pids")
+    if pids is None:  # written before 0.29.2
+        return marker["live_patches"] if pid == marker.get("live_pid") else 0
+    return pids.get(str(pid), 0)
+
+
+def reload_risk_note(project, beacon):
+    """Advice for an editor carrying many Live Coding patches: reloading a map in it has brought levels back broken."""
+    n = editor_patches(project, beacon)
+    if n < RELOAD_RISK_PATCHES:
+        return None
+    return (f"carries {n} Live Coding patches: `ue build --restart` before reloading a map (a reload in such an "
+            "editor has brought a level back broken, silently)")
+
+
+def suspect_maps_path(project):
+    return os.path.join(state_dir(project), "maps", "suspect.json")
+
+
+def map_baseline_path(project, map_path):
+    """The last good load of a map that `ue map open` compares the next load with."""
+    return os.path.join(state_dir(project), "maps", map_path.split(".")[0].strip("/").replace("/", "_") + ".json")
+
+
+def suspect_map(project, beacon):
+    """{map, problems, time} when `ue map open` found this editor's current level loaded broken, else None."""
+    pid, current = (beacon or {}).get("pid"), (beacon or {}).get("map")
+    entry = (read_json(suspect_maps_path(project)) or {}).get(str(pid))
+    if not entry or (current and entry["map"].rsplit("/", 1)[-1] != str(current).rsplit("/", 1)[-1].split(".")[0]):
+        return None
+    return entry
+
+
+def mark_suspect_map(project, pid, map_path, problems):
+    """Record (problems) or clear (None) a broken-looking load of `map_path` in editor `pid`."""
+    path = suspect_maps_path(project)
+    marks = read_json(path) or {}
+    if problems:
+        marks[str(pid)] = {"map": map_path, "problems": problems[:6], "time": time.time()}
+    else:
+        marks.pop(str(pid), None)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    write_json(path, marks)
+
+
 LIVE_RESULT = re.compile(r"LogLiveCoding: (?:\w+: )?Live coding succeeded")
 
 

@@ -17,6 +17,7 @@ from .core import (
 )
 from .fabfiles import fab_origin, listing_url, project_fab
 from .share import LEASED, ago, lease_note, others_edits, pie_owner, session_label, session_names
+from .build import map_baseline_path, mark_suspect_map, suspect_map
 from .transport import catalog, fill_args, py_json, resolve_toolset, schema, signature
 
 
@@ -705,11 +706,26 @@ def read_log_from(ctx, start):
 
 
 def cmd_save(ctx, args):
+    suspect = None if getattr(args, "anyway", False) else suspect_map(ctx.project, ctx.beacon)
+    name = suspect["map"].rsplit("/", 1)[-1] if suspect else None
+    if suspect and not args.paths:  # a save of everything writes the map only when it has unsaved changes
+        dirty = py_json(ctx, "import json\njson.dumps([p.get_name() for p in "
+                             "unreal.EditorLoadingAndSavingUtils.get_dirty_map_packages()])")
+        suspect = suspect if any(d.rsplit("/", 1)[-1] == name for d in dirty) else None
+    if suspect and (not args.paths or any(p.split(".")[0].rsplit("/", 1)[-1] == name for p in args.paths)):
+        raise CliError(f"{suspect['map']} loaded broken in this editor (`ue map open` found: "
+                       f"{'; '.join(suspect['problems'][:3])}); saving it would write that state. Restart the editor "
+                       "(`ue build --restart`) and reopen the map, save other packages by path, or pass --anyway")
     start = log_end(ctx.project)
     # writable only when asked: a plugin copy older than 0.31 has no such parameter
     out = ctx.tether("save", paths=",".join(args.paths), **({"writable": True} if getattr(args, "writable", False) else {}))
     print(out)
     failed = out.startswith("save failed") or any(line.startswith("not saved (") for line in out.splitlines())
+    marked = suspect_map(ctx.project, ctx.beacon) if getattr(args, "anyway", False) and not failed else None
+    if marked:  # saved on purpose: the next load is the one to compare with
+        mark_suspect_map(ctx.project, ctx.beacon["pid"], marked["map"], None)
+        with contextlib.suppress(OSError):
+            os.remove(map_baseline_path(ctx.project, marked["map"]))
     if failed:
         note = held_by_other_editor(ctx, start)
         if note:

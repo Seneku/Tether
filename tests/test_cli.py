@@ -4348,3 +4348,83 @@ class Round032(unittest.TestCase):
         with ue.short_calls(ctx, 10):
             self.assertEqual((ctx._mcp.timeout, ctx.args.timeout), (10, 10))
         self.assertEqual((ctx._mcp.timeout, ctx.args.timeout), (120.0, 120.0))
+
+
+class Round033(unittest.TestCase):
+    """0.33: UnrealRacing's note 207 (a map reloaded broken in an editor carrying many Live Coding patches)."""
+
+    GOOD = {"classes": {"StaticMeshActor": [361, 0, 0, 0], "NRRoad": [40, 0, 0, 0], "WorldSettings": [1, 1, 0, 0]},
+            "samples": {"StaticMeshActor": {"RoadTile_0_0": [[100, 200, 0], "/Game/NR/SM_Tile_0_0"]},
+                        "NRRoad": {"NRRoad_1": [[5000, 0, 10], None]}}, "wp": False}
+    BROKEN = {"classes": {"StaticMeshActor": [361, 361, 361, 0], "NRRoad": [40, 40, 0, 40], "WorldSettings": [1, 1, 0, 0]},
+              "samples": {"StaticMeshActor": {"RoadTile_0_0": [[0, 0, 0], None]}, "NRRoad": {"NRRoad_1": [[0, 0, 0], None]}},
+              "wp": False}
+
+    def setUp(self):
+        self.project = Project()
+        self.p = self.project.uproject
+
+    def tearDown(self):
+        self.project.close()
+
+    def test_a_reload_like_207_is_flagged_against_the_last_good_load(self):
+        problems = ue.map_load_problems(self.GOOD, self.BROKEN)
+        text = "\n".join(problems)
+        self.assertIn("361 of 361 StaticMeshActor at the origin (was 0)", text)
+        self.assertIn("361 of 361 StaticMeshActor with no mesh (was 0)", text)
+        self.assertIn("40 of 40 NRRoad with a zero-length spline (was 0)", text)
+        self.assertIn("RoadTile_0_0 moved to the origin (was 100,200,0)", text)
+        self.assertEqual(ue.map_load_problems(self.GOOD, self.GOOD), [])
+
+    def test_without_an_earlier_load_only_plain_breakage_counts(self):
+        text = "\n".join(ue.map_load_problems(None, self.BROKEN))
+        self.assertIn("361 of 361 StaticMeshActor have no mesh", text)
+        self.assertIn("all 40 NRRoad have a zero-length spline", text)
+        self.assertEqual(ue.map_load_problems(None, self.GOOD), [])
+
+    def test_fewer_actors_count_only_when_the_map_was_not_saved_since(self):
+        fewer = json.loads(json.dumps(self.GOOD))
+        fewer["classes"]["StaticMeshActor"][0] = 200
+        self.assertEqual(ue.map_load_problems(self.GOOD, fewer), ["200 StaticMeshActor (was 361)"])
+        self.assertEqual(ue.map_load_problems(self.GOOD, fewer, saved_since=True), [])
+        self.assertEqual(ue.map_load_problems(self.GOOD, dict(fewer, wp=True)), [])
+
+    def _ctx(self, reply, pid=4242):
+        ctx = FakeCtx(json.dumps(reply))
+        ctx.project, ctx.beacon = self.p, {"pid": pid, "map": "L_HikariBay"}
+        return ctx
+
+    def test_check_keeps_good_loads_and_marks_a_broken_one_for_save(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(ue.check_map_load(self._ctx(self.GOOD), "/Game/Maps/L_HikariBay"), 0)
+            ue.write_json(os.path.join(ue.state_dir(self.p), "last-build.json"),
+                          {"live_patches": 7, "live_pids": {"4242": 7}})
+            self.assertEqual(ue.check_map_load(self._ctx(self.BROKEN), "/Game/Maps/L_HikariBay"), 1)
+        self.assertIn("WARNING: /Game/Maps/L_HikariBay looks broken after loading", out.getvalue())
+        self.assertIn("this editor carries 7 Live Coding patch(es)", out.getvalue())
+        beacon = {"pid": 4242, "map": "L_HikariBay"}
+        self.assertIn("NRRoad", " ".join(ue.suspect_map(self.p, beacon)["problems"]))
+        self.assertIsNone(ue.suspect_map(self.p, {"pid": 4242, "map": "L_Other"}))
+        self.assertIn("carries 7 Live Coding patches", ue.reload_risk_note(self.p, beacon))
+        # ue save refuses the map, by path or when it has unsaved changes; --anyway and other packages pass
+        ctx = self._ctx(["/Game/Maps/L_HikariBay"])
+        with self.assertRaises(ue.CliError):
+            ue.cmd_save(ctx, argparse.Namespace(paths=["/Game/Maps/L_HikariBay"], writable=False, anyway=False))
+        with self.assertRaises(ue.CliError):
+            ue.cmd_save(ctx, argparse.Namespace(paths=[], writable=False, anyway=False))
+        with contextlib.redirect_stdout(io.StringIO()):
+            ue.cmd_save(self._ctx("saved 1 package(s)"), argparse.Namespace(paths=["/Game/NR/M_Road"], writable=False,
+                                                                           anyway=False))
+            ue.cmd_save(self._ctx("saved"), argparse.Namespace(paths=["/Game/Maps/L_HikariBay"], writable=False,
+                                                              anyway=True))
+        # saved on purpose: the mark and the old baseline go, so the next load is the new baseline
+        self.assertIsNone(ue.suspect_map(self.p, beacon))
+        self.assertFalse(os.path.exists(ue.map_baseline_path(self.p, "/Game/Maps/L_HikariBay")))
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(ue.check_map_load(self._ctx(self.GOOD), "/Game/Maps/L_HikariBay"), 0)
+            self.assertEqual(ue.check_map_load(self._ctx(self.BROKEN), "/Game/Maps/L_HikariBay"), 1)
+        # a good load afterwards clears the mark, and the baseline stays the good one
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(ue.check_map_load(self._ctx(self.GOOD), "/Game/Maps/L_HikariBay"), 0)
+        self.assertIsNone(ue.suspect_map(self.p, beacon))

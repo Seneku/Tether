@@ -175,6 +175,17 @@ its panel's text in front ("Tether probe panel GARAGE"); a floating Content Brow
 layout (%LOCALAPPDATA%/UnrealEngine/Editor/EditorLayout.json) had made the selftest's menu check fail; and a
 failed selftest step list reports its FAIL line.
 
+**Done in 0.33.0** (UnrealRacing's note 207): after loading, `ue map open` takes a fingerprint of the level (per
+actor class: actors, actors at the origin, actors whose mesh components are all empty, zero-length splines, plus
+three sample actors with location and mesh) and compares it with the map's last good load in
+Saved/Tether/maps/. A load that came back like 207's (more actors at the origin or mesh-less, splines collapsed,
+sample actors moved to 0,0,0 or without their mesh, fewer actors unless the .umap was saved since or the level is
+World Partition) prints a WARNING with what changed and the editor's Live Coding patch count, exits 1, and marks
+the map so `ue save` refuses it in that editor (`--anyway` saves it and starts a new baseline); with no earlier
+load only plain breakage counts (a class of 10+ almost all mesh-less, every spline of a class zero-length). `ue
+status` and `ue map open` advise a restart before reloading a map once an editor carries 5+ Live Coding patches.
+Checked live in Sandbox with a doctored baseline (a real broken reload needs 207's patched editor).
+
 **Done in 0.31.0** (UnrealRacing's notes 184-196, ShooterDomination's loadouts notes 197-200): 184 a save that
 failed during `ue py` or `pie run` (the editor's "Unable to save package ... read-only" dialog, which an unattended
 editor answers and logs, or LogSavePackage lines) prints `save failed:` and exits 1; `ue save --writable` clears the

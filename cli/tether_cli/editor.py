@@ -25,7 +25,7 @@ from .build import (
     build_timing, classify_changes, compile_check, compile_overlay, csharp_changes, csharp_layout, csharp_reload_build,
     editor_env,
     live_coding_build,
-    describe_reflection, live_patches, reflection_changes, stale_code_note,
+    describe_reflection, live_patches, reflection_changes, reload_risk_note, stale_code_note, suspect_map,
     uat_user_solution, ubt_build,
 )
 
@@ -95,6 +95,13 @@ def cmd_status(ctx, args):
     for stale, pids in notes.items():
         print(f"  pid {pids[0]} {stale}" if len(pids) == 1 else
               f"  pids {', '.join(pids)} " + stale.replace("runs ", "run ", 1))
+    risk = reload_risk_note(ctx.project, beacon) if alive else None
+    if risk:
+        print(f"  pid {beacon.get('pid')} {risk}")
+    suspect = suspect_map(ctx.project, beacon) if alive else None
+    if suspect:
+        print(f"  {suspect['map']} loaded broken in this editor ({'; '.join(suspect['problems'][:2])}): don't save it from "
+              "here (`ue save` refuses it); restart the editor and reopen the map")
     return 0 if alive and age <= 10 else 2
 
 
