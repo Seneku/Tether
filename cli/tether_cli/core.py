@@ -944,6 +944,74 @@ def run_git(project, *argv, binary=False, check=True):
     return proc.stdout if binary else proc.stdout.decode("utf-8", "replace")
 
 
+P4_SETTINGS = {"Port": "-p", "UserName": "-u", "Workspace": "-c"}
+
+
+def p4_options(project):
+    """The Perforce connection the editor uses (Saved/Config/<Platform>Editor/SourceControlSettings.ini) as p4
+    options; [] leaves it to p4's own settings (P4PORT, P4CONFIG, p4 set)."""
+    import glob
+    for path in glob.glob(os.path.join(os.path.dirname(project), "Saved", "Config", "*Editor", "SourceControlSettings.ini")):
+        section, values = "", {}
+        with contextlib.suppress(OSError), open(path, encoding="utf-8-sig", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("["):
+                    section = line.strip("[]")
+                elif "=" in line:
+                    key, _, value = line.partition("=")
+                    values[(section, key.strip())] = value.strip()
+        if values.get(("SourceControl.SourceControlSettings", "Provider")) == "Perforce":
+            opts = []
+            for key, flag in P4_SETTINGS.items():
+                if values.get(("PerforceSourceControl.PerforceSourceControlSettings", key)):
+                    opts += [flag, values[("PerforceSourceControl.PerforceSourceControlSettings", key)]]
+            return opts
+    return []
+
+
+def p4_exe():
+    import shutil
+    return shutil.which("p4") or next((p for p in (r"C:\Program Files\Perforce\p4.exe",) if os.path.isfile(p)), None)
+
+
+def run_p4(project, *argv, check=True):
+    """p4 in the project folder, with the editor's connection: its records (-ztag -Mj), messages left out.
+    A failure (or, with check, a 'no such file' warning) raises; without check it returns None."""
+    exe = p4_exe()
+    if not exe:
+        raise CliError("the p4 command-line client is not installed or not on PATH (Perforce's P4 CLI)")
+    try:
+        proc = subprocess.run([exe, *p4_options(project), "-ztag", "-Mj", *argv], capture_output=True,
+                              cwd=os.path.dirname(project))
+    except OSError as exc:
+        raise CliError(f"p4: {exc}") from None
+    records = []
+    for line in proc.stdout.decode("utf-8", "replace").splitlines():
+        with contextlib.suppress(ValueError):
+            records.append(json.loads(line))
+    messages = [r for r in records if "severity" in r]
+    worst = max([m["severity"] for m in messages] + [3 if proc.returncode else 0])
+    if worst >= 3 or (check and worst >= 2):
+        if not check:
+            return None
+        text = (messages[-1]["data"] if messages else proc.stderr.decode("utf-8", "replace")).strip()
+        raise CliError(f"p4 {argv[0]}: {text.splitlines()[-1] if text else 'failed'}")
+    return [r for r in records if "severity" not in r]
+
+
+def p4_workspace(project):
+    """True when the project lies in the Perforce workspace the editor (or p4's own settings) names."""
+    if not p4_exe():
+        return False
+    info = (run_p4(project, "info", check=False) or [{}])[0]
+    root = info.get("clientRoot")
+    if not root or info.get("clientName") in (None, "*unknown*"):
+        return False
+    here, root = os.path.normcase(os.path.realpath(os.path.dirname(project))), os.path.normcase(os.path.realpath(root))
+    return here == root or here.startswith(root.rstrip(os.sep) + os.sep)
+
+
 def human_bytes(n):
     for unit, size in (("GB", 1024 ** 3), ("MB", 1024 ** 2), ("KB", 1024)):
         if n >= size:

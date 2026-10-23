@@ -8,7 +8,7 @@ import time
 from .core import (
     CliError, LEVELS, LOG_LINE, NOISE, NOISE_MESSAGE, compact_error, editor_live, engine_root, human_bytes, log_end,
     log_path,
-    read_json, run_git, short, state_dir, unwrap, write_json,
+    p4_exe, p4_options, p4_workspace, read_json, run_git, run_p4, short, state_dir, unwrap, write_json,
 )
 from .transport import py_json, resolve_toolset
 from .calls import flush_editor_log
@@ -488,6 +488,7 @@ def stage_copy(project, data, name, ext):
     Named by content hash, so the same version is loaded once per editor session."""
     import hashlib
     tag = hashlib.sha1(data).hexdigest()[:12]
+    name = re.sub(r"[^A-Za-z0-9_]", "_", re.split(r"[#@]", name)[0]) or "Asset"  # P4V's temp files: BP_X#3
     folder = os.path.join(os.path.dirname(project), "Saved", "Tether", "diff", tag)
     path = os.path.join(folder, name + ext)
     if not os.path.isfile(path):
@@ -512,28 +513,72 @@ def bp_outline(ctx, path):
             "graphs": [name(g) for g in mcp_tool(ctx, "blueprint", "list_graphs", ref) or []]}
 
 
-def external_actor_changes(ctx, package, rev, to):
+def uses_p4(project, *revs):
+    """Compare Perforce revisions? Yes for a Perforce revision (#have, #head, #3, @1234, @label), or with none
+    named for a project in a Perforce workspace and not in git."""
+    named = [r for r in revs if r]
+    if named:
+        return any(r[0] in "#@" for r in named)
+    if run_git(project, "rev-parse", "--git-dir", check=False) is not None:
+        return False
+    if p4_options(project) and not p4_exe():
+        raise CliError("the editor uses Perforce, but the p4 command-line client is not on PATH (Perforce's P4 CLI)")
+    return p4_workspace(project)
+
+
+def p4_blob(project, file, revision):
+    """A file's bytes at a Perforce revision, or None if it has none there."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        out = os.path.join(tmp, "file")
+        run_p4(project, "print", "-q", "-o", out, file + revision, check=False)
+        if os.path.isfile(out):
+            with open(out, "rb") as f:
+                return f.read()
+    return None
+
+
+def p4_digests(project, folder, revision):
+    """{path: MD5} of the files under a folder at a Perforce revision ('' = the files on disk now)."""
+    import hashlib
+    if not revision:
+        found = {}
+        for root, _, names in os.walk(folder):
+            for name in names:
+                with open(os.path.join(root, name), "rb") as f:
+                    found[os.path.normcase(os.path.join(root, name))] = hashlib.md5(f.read()).hexdigest().upper()
+        return found
+    records = run_p4(project, "fstat", "-Ol", os.path.join(folder, "...") + revision, check=False) or []
+    return {os.path.normcase(os.path.normpath(r["clientFile"])): r.get("digest", "").upper() for r in records
+            if r.get("clientFile") and "delete" not in r.get("headAction", "")}
+
+
+def external_actor_changes(ctx, package, rev, to, p4=False):
     """World Partition actors of a map added, removed or changed between rev and `to` (or the working tree)."""
     project = ctx.project
     mount, _, rest = package.strip("/").partition("/")
-    folder = os.path.join(os.path.dirname(package_file(project, package)) or "", "")
     content = os.path.join(os.path.dirname(project), "Content") if mount == "Game" else None
     if not content:
         return []
     actors_dir = os.path.join(content, "__ExternalActors__", *rest.split("/"))
-    top = run_git(project, "rev-parse", "--show-toplevel").strip()
-    rel = os.path.relpath(os.path.realpath(actors_dir), top).replace("\\", "/")
-    args = ["diff", "--name-status", "-z", "--no-renames", rev] + ([to] if to else []) + ["--", rel]
-    fields = run_git(project, *args).split("\0")
-    entries = [(s, p) for s, p in zip(fields[0::2], fields[1::2]) if s]
-    if not to:  # untracked actor files are new too
-        entries += [("A", p) for p in run_git(project, "ls-files", "-z", "--others", "--exclude-standard", "--", rel)
-                    .split("\0") if p]
+    if p4:
+        old, new = p4_digests(project, actors_dir, rev), p4_digests(project, actors_dir, to or "")
+        entries = [("D", p) for p in old if p not in new] + [
+            ("A" if p not in old else "M", p) for p in new if old.get(p) != new[p]]
+    else:
+        top = run_git(project, "rev-parse", "--show-toplevel").strip()
+        rel = os.path.relpath(os.path.realpath(actors_dir), top).replace("\\", "/")
+        args = ["diff", "--name-status", "-z", "--no-renames", rev] + ([to] if to else []) + ["--", rel]
+        fields = run_git(project, *args).split("\0")
+        entries = [(s, os.path.join(top, p)) for s, p in zip(fields[0::2], fields[1::2]) if s]
+        if not to:  # untracked actor files are new too
+            entries += [("A", os.path.join(top, p)) for p in run_git(
+                project, "ls-files", "-z", "--others", "--exclude-standard", "--", rel).split("\0") if p]
     if not entries:
         return []
     packages = {}
     for status, path in entries:
-        pkg = content_package(project, os.path.join(top, path))
+        pkg = content_package(project, path)
         if pkg:
             packages[pkg] = status[0]
     labels = ctx.tether("py", code=(
@@ -552,11 +597,12 @@ def external_actor_changes(ctx, package, rev, to):
 
 
 def cmd_diff(ctx, args):
-    """What changed in an asset between git revisions, or between a revision and the editor's current state."""
+    """What changed in an asset between git or Perforce revisions, or between a revision and the editor's
+    current state."""
     project = ctx.project
     if not args.files and not args.asset:
         raise CliError("give an asset: ue diff /Game/Path/Asset [rev] [--to rev], or --files OLD NEW")
-    rev, to = args.rev or "HEAD", args.to
+    rev, to, p4 = args.rev, args.to, False
     if args.files:
         old_file, new_file = args.files
         named = args.as_path or old_file
@@ -577,12 +623,17 @@ def cmd_diff(ctx, args):
         file = package_file(project, package or "")
         if not file:
             raise CliError(f"{target}: not a /Game/... asset of this project (or a file under its Content)")
-        top = run_git(project, "rev-parse", "--show-toplevel").strip()
+        p4 = uses_p4(project, rev, to)
+        rev = rev or ("#have" if p4 else "HEAD")
+        top = None if p4 else run_git(project, "rev-parse", "--show-toplevel").strip()
 
         def blob(revision):
             for candidate in (file, os.path.splitext(file)[0] + (".umap" if file.endswith(".uasset") else ".uasset")):
-                rel = os.path.relpath(os.path.realpath(candidate), top).replace("\\", "/")
-                data = run_git(project, "cat-file", "--filters", f"{revision}:{rel}", binary=True, check=False)
+                if p4:
+                    data = p4_blob(project, candidate, revision)
+                else:
+                    rel = os.path.relpath(os.path.realpath(candidate), top).replace("\\", "/")
+                    data = run_git(project, "cat-file", "--filters", f"{revision}:{rel}", binary=True, check=False)
                 if data is not None:
                     return data, os.path.splitext(candidate)[1]
             return None, None
@@ -590,7 +641,8 @@ def cmd_diff(ctx, args):
         name = package.rsplit("/", 1)[-1]
         old_data, ext = blob(rev)
         if old_data is None:
-            raise CliError(f"{package} does not exist at {rev} (added since? `git log --diff-filter=A -- <file>`)")
+            raise CliError(f"{package} does not exist at {rev} (added since? " + (
+                "`p4 filelog <file>`)" if p4 else "`git log --diff-filter=A -- <file>`)"))
         if to:
             new_data, new_ext = blob(to)
             if new_data is None:
@@ -628,7 +680,7 @@ def cmd_diff(ctx, args):
         for graph in [g for g in new_bp["graphs"] if g not in old_bp["graphs"]]:
             print(f"== {graph} (new)\n" + read_graph(ctx, source, new, graph).rstrip())
     if not args.files and package.startswith("/Game/") and ext == ".umap":
-        actors = external_actor_changes(ctx, package, rev, to)
+        actors = external_actor_changes(ctx, package, rev, to, p4)
         if actors:
             print(f"World Partition actors ({len(actors)} changed; properties not compared):")
             for line in actors[: max(args.limit, 50)]:
@@ -658,6 +710,79 @@ def saved_since(project, since):
 
 
 MAP_CHECK = re.compile(r"Map check complete: (\d+) Error\(s\), (\d+) Warning\(s\)")
+
+
+def p4_status(project, paths):
+    """vcs_status (the editor's tool) without an editor: p4 fstat of the content folders or assets."""
+    content = os.path.join(os.path.dirname(project), "Content")
+    targets = []
+    for path in paths or ["/Game"]:
+        rest = path.rstrip("/").split(".")[0][len("/Game"):].strip("/")
+        folder = os.path.join(content, *rest.split("/")) if rest else content
+        if os.path.isdir(folder) or not rest:
+            targets.append(os.path.join(folder, "..."))
+            continue
+        file = package_file(project, path)
+        targets.append(file)
+        if file.endswith(".umap"):  # its World Partition / One File Per Actor actors
+            targets.append(os.path.join(content, "__ExternalActors__", *rest.split("/"), "..."))
+    rows, records = [], run_p4(project, "fstat", *targets, check=False) or []
+    for r in records:
+        others = sorted({r[k].split("@")[0] for k in r if re.fullmatch(r"otherOpen\d+", k)})
+        have, head = int(r.get("haveRev") or 0), int(r.get("headRev") or 0)
+        behind = have < head and "delete" not in r.get("headAction", "")
+        action = r.get("action", "")
+        if not (others or action or behind):
+            continue
+        package = content_package(project, r.get("clientFile", "")) or r.get("clientFile", "")
+        rows.append({"package": package, "label": package, "other": ", ".join(others), "mine": action == "edit",
+                     "behind": behind, "action": action if action in ("add", "delete") else ""})
+    return {"provider": "Perforce", "files": len(records), "rows": rows}
+
+
+def cmd_locks(ctx, args):
+    """`ue locks [paths]`: who has which content checked out, and what is behind the depot (Perforce, Plastic ...):
+    from the editor when one runs (any check-out provider), else from p4."""
+    project = ctx.project
+    paths = [p for p in args.paths]
+    bad = [p for p in paths if not p.startswith("/Game")]
+    if bad:
+        raise CliError(f"{bad[0]}: give /Game folders or assets")
+    if editor_live(project):
+        data = ctx.tether("vcs_status", paths=json.dumps(paths) if paths else "")
+        data = json.loads(data) if isinstance(data, str) else data
+    elif p4_workspace(project):
+        data = p4_status(project, paths)
+    else:
+        raise CliError("no editor is running and the project is not in a Perforce workspace (p4 info); "
+                       "start one with `ue open --headless` to ask its revision control provider")
+    ctx.data = data
+    if not data.get("provider") or data["provider"] in ("None", "Git"):
+        print(f"{data.get('provider') or 'no revision control'}: no check-outs to report"
+              + (" (Git LFS locks: `git lfs locks`)" if data.get("provider") == "Git" else ""))
+        return 0
+    rows = data["rows"]
+    by_other, mine, behind = {}, [], []
+    for row in rows:
+        for name in [n.strip() for n in row["other"].split(",") if n.strip()]:
+            by_other.setdefault(name, []).append(row["label"])
+        if row["mine"] or row["action"]:
+            mine.append(row["label"] + (f" ({row['action']})" if row["action"] else ""))
+        if row["behind"]:
+            behind.append(row["label"])
+    where = ", ".join(paths) or "/Game"
+    print(f"{data['provider']}: {data['files']} file(s) under {where}; " + (
+        f"{sum(len(v) for v in by_other.values())} checked out by others, {len(mine)} by you, {len(behind)} behind the depot"
+        if rows else "nothing checked out, nothing behind the depot"))
+    limit = args.limit
+    for name, labels in sorted(by_other.items()):
+        print(f"checked out by {name} ({len(labels)}): " + ", ".join(labels[:limit]) + (" ..." if len(labels) > limit else ""))
+    if mine:
+        print(f"checked out by you ({len(mine)}): " + ", ".join(mine[:limit]) + (" ..." if len(mine) > limit else ""))
+    if behind:
+        print(f"behind the depot, sync before editing ({len(behind)}): " + ", ".join(behind[:limit])
+              + (" ..." if len(behind) > limit else ""))
+    return 0
 
 
 def cmd_validate(ctx, args):

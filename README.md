@@ -197,7 +197,8 @@ them. After a restart it checks the editor came back, and says why not (a crash,
 | `ue set <target> "Name[i].Field=value"` | Struct fields inside arrays or structs (e.g. a grass type's `GrassVarieties[0].EndCullDistance=(Default=15000)`), including fields editor Python cannot set at all (uint32 such as `InstanceWorldPositionOffsetDisableDistance`): the struct's text is edited, imported back and read back to check. One undo step. |
 | `ue crash [N] [--list]` | Why the editor died: the error, the module chain (and which of your modules were on it), and the last log lines before the crash. `ue status`, `ue open` and the call that was running all mention a recent crash. |
 | `ue validate [paths\|folders] [--changed [REV]] [--strict]` | Unreal's data validation (every registered validator, including your project's, plus each asset's `IsDataValid`) and Map Check, one line per problem. With no paths: the assets changed in git (uncommitted, plus `--changed REV` for commits since REV) and the unsaved ones, then Map Check of the open level. Deleted assets that something still references are errors. Without git, the assets saved since the editor started stand in for the changed ones. Exit 1 on errors (`--strict`: on warnings too). The end-of-turn hook suggests it once after assets were saved. |
-| `ue diff <asset> [REV] [--to REV2]` | What changed in a `.uasset`/`.umap` between a git revision (default `HEAD`) and the editor's current state (unsaved changes included), or between two revisions. Blueprints: parent, variables, dispatchers, components, class defaults, and each changed graph as a text diff. DataTables: rows added, removed and changed by column. Maps: actors added, removed and changed (property by property); for World Partition maps, the actors whose packages changed, by label. Anything else: its properties. LFS works. As a difftool: `git config difftool.ue.cmd 'ue diff --files "$LOCAL" "$REMOTE" --as "$MERGED"'`, then `git difftool -t ue`. |
+| `ue locks [/Game/Folder ...]` | Perforce/Plastic: who has which content checked out, your own check-outs, and what is behind the depot; a map includes its One File Per Actor actors, by label. See [Revision control](#revision-control-perforce-and-others). |
+| `ue diff <asset> [REV] [--to REV2]` | What changed in a `.uasset`/`.umap` between a git revision (default `HEAD`) or a Perforce one (`#have`, the default in a Perforce workspace; `#head`, `#3`, `@1234`, `@label`) and the editor's current state (unsaved changes included), or between two revisions. Blueprints: parent, variables, dispatchers, components, class defaults, and each changed graph as a text diff. DataTables: rows added, removed and changed by column. Maps: actors added, removed and changed (property by property); for World Partition maps, the actors whose packages changed, by label. Anything else: its properties. LFS works. As a difftool: `git config difftool.ue.cmd 'ue diff --files "$LOCAL" "$REMOTE" --as "$MERGED"'`, then `git difftool -t ue`. |
 | `ue changes` / `ue save [paths] [--writable] [--anyway]` | Review unsaved work (dirty packages; the level's actors added, removed, moved, changed or rebuilt since it was loaded or saved), then save it. Untitled `/Temp` maps are skipped. `--writable` clears the read-only flag git-lfs leaves on lockable files. `--anyway` saves a map `ue map open` found loaded broken in this editor (refused otherwise). `ue status` shows the unsaved count. |
 | `ue spawn <class\|asset> [--at x,y,z] [--rot p,y,r] [--label L]` | Place an actor from a class (`PointLight`, `/Script/Module.Class`) or an asset (a mesh, a Blueprint). Undoable. |
 | `ue spawn <class or asset> --pie [--at x,y,z] [--ground] [--label L]` | Spawn into the running PIE world (the `ue pie target` one) without touching the level: Python cannot spawn there, so the cheat manager's `summon` does, and the actor is then moved to `--at` (and grounded). Gone when PIE stops. `--replace` (with `--label`) removes the PIE actors with that label first, so repeated test runs do not stack copies; `ue delete --pie <label>...` removes them. |
@@ -339,18 +340,37 @@ usages, size, ui, perf, fab and overview. `ue call`, `ue test` and `ue selftest`
 
 ## Revision control (Perforce and others)
 
-`ue save`, `ue mv` and `ue rm` go through the revision control provider the editor is connected to
-(Perforce, Plastic/Unity Version Control, ...), silently, because the editor's own prompts are modal
-dialogs that would stall an agent:
+Tether works through the revision control provider the editor is connected to (Perforce, Plastic/Unity
+Version Control, ...), silently, because the editor's own prompts are modal dialogs that would stall an agent.
+It is built for teams sharing binary assets with exclusive check-outs (Perforce `binary+l`), where the way to
+avoid conflicts is to find out who holds a file before working on it, not at submit time:
 
-- files are checked out before they are written; a file checked out by someone else is refused, naming them;
-- new files (a saved new asset, the target of a move) are marked for add, and a moved or deleted file for delete;
-- without a connected provider, read-only files (an unconnected Perforce workspace) are refused up front
-  instead of raising the editor's "make writable?" dialog. `ue save` exits 1 when something was not saved.
+- **Every edit claims its files.** Any Tether command that changes the editor's content (`ue set`, `bp edit`,
+  `mat`, `spawn`, `ue py` code, ...) checks out the files of the packages it modified as soon as it returns, so
+  teammates see them locked while the work goes on. With One File Per Actor maps that is the actor's own file.
+- **Edits that could not be submitted are undone.** If an edit touched a file someone else has checked out, or
+  one behind the depot (someone submitted a newer revision: binary files don't merge), the command undoes it
+  (its editor transactions, then a reload from disk of the assets it modified) and fails, naming the holder:
+  `error: actor Crate1 (15G2LQ2749XAOZKMYEXXB3) is checked out by bob. Nothing was changed (the edit was undone)`.
+  `ue set --assets`, `ue lint --fix`, `ue mv` and `ue move-pack` check their targets, and the assets that
+  reference them, before changing anything.
+- **Bulk changes need `--bulk`.** One command may check out at most 20 files (`Config/Tether/vcs.json`:
+  `{"bulk_limit": 20}`), so an agent's sweep can't lock half the project by accident; above that it is undone or
+  refused with the count. Tell the team, then rerun with `--bulk`.
+- `ue save`, `ue mv` and `ue rm` check files out before writing them, mark new files for add and moved or
+  deleted ones for delete. Without a connected provider, read-only files (an unconnected Perforce workspace)
+  are refused up front instead of raising the editor's "make writable?" dialog. `ue save` exits 1 when
+  something was not saved.
+- `ue locks [/Game/Folder ...]` lists who has which content checked out, your own check-outs, and what is
+  behind the depot (a map includes its actors, by label). It asks the editor when one runs, else `p4` directly.
+- `ue diff <asset> #have|#head|#3|@1234|@label [--to REV]` compares Perforce revisions (the default in a
+  Perforce workspace is `#have`). As P4V's diff tool for `.uasset`/`.umap`: `ue diff --files %1 %2`.
 
-With Git nothing is checked out or staged. `ue status` names the provider. This was tested without a
-Perforce server (unit tests with a fake provider, and read-only files on a live editor); reports from
-Perforce users are welcome.
+The command-line `p4` uses the connection in the editor's `Saved/Config/<Platform>Editor/SourceControlSettings.ini`
+(else p4's own settings). With Git nothing is checked out or staged. `ue status` names the provider. Tested
+against a local P4 Server 2026.1 with two users and an exclusive-lock typemap: editing a file the other user
+holds, editing behind the depot, bulk edits through `ue set --assets` and `ue py` loops, `ue mv` with a locked
+referencer, a One File Per Actor map, and `ue selftest` (117/0/20) with the editor connected to Perforce.
 
 ## C# with UnrealSharp (optional)
 

@@ -9,6 +9,8 @@ and the ue CLI calls them over Python remote execution instead of MCP.
 """
 import ast
 import contextlib
+import functools
+import inspect
 import io
 import json
 import math
@@ -45,8 +47,45 @@ def _tool(fn):
     # The registry turns tools into native bindings that report exceptions as script warnings and return
     # an empty value, so remote execution calls the plain function from _RAW to see errors.
     raw = fn.__func__ if isinstance(fn, staticmethod) else fn
+    if "token" in inspect.signature(raw).parameters:  # tools that change things: under the revision-control guard
+        raw = _guarded(raw)
+        fn = staticmethod(raw) if isinstance(fn, staticmethod) else raw
     _RAW[raw.__name__] = raw
     return toolset_registry.tool_call(fn) if toolset_registry else fn
+
+
+BULK = "+bulk"  # appended to the session token (ue --bulk): allow more check-outs than the bulk limit
+_GUARD = {"depth": 0, "bulk": False, "claimed": 0}  # claimed: files checked out so far in this call
+
+
+def _guarded(raw):
+    """Wrap a tool that changes things in the revision-control guard. Under a check-out provider (Perforce,
+    Plastic), the files of packages it newly modified are checked out at once, so teammates see them locked
+    while the work goes on. An edit to a file someone else has checked out, to one behind the depot, or to
+    more files than the bulk limit (without --bulk) is undone and refused: it could not be submitted."""
+    signature = inspect.signature(raw)
+
+    @functools.wraps(raw)
+    def call(*args, **kwargs):
+        if _GUARD["depth"]:  # a tool calling another: the outer call guards both
+            return raw(*args, **kwargs)
+        bound = signature.bind(*args, **kwargs)  # the registry passes arguments by position
+        token = bound.arguments.get("token")
+        bulk = isinstance(token, str) and token.endswith(BULK)
+        if bulk:
+            bound.arguments["token"] = token[:-len(BULK)]
+        _GUARD.update(depth=1, bulk=bulk, claimed=0)
+        try:
+            vcs = _Vcs()
+            before = vcs.snapshot() if vcs.checkouts else None
+            result = raw(*bound.args, **bound.kwargs)
+            if before is not None:
+                vcs.claim(before)
+            return result
+        finally:
+            _GUARD.update(depth=0, bulk=False, claimed=0)
+    call.__signature__ = signature
+    return call
 
 
 _MAX_OUT = 20000
@@ -1788,6 +1827,40 @@ def _clean_copy(asset):
     return unreal.load_asset(f"/Temp/Tether/diff/{tag}/{name}.{name}") or asset
 
 
+def _norm_path(path):
+    return os.path.normcase(os.path.abspath(path))
+
+
+def _holder(state):
+    """Who has a file checked out: Perforce reports 'bob @ ' or 'bob @ bob_ws'."""
+    return re.sub(r"\s*@\s*$", "", str(getattr(state, "checked_out_other", "") or "").strip()) or "someone else"
+
+
+def _bulk_limit():
+    try:
+        path = os.path.join(unreal.Paths.convert_relative_path_to_full(unreal.Paths.project_config_dir()),
+                            "Tether", "vcs.json")
+        with open(path, encoding="utf-8") as f:
+            return int(json.load(f).get("bulk_limit", 20))
+    except (OSError, ValueError, TypeError, AttributeError):
+        return 20
+
+
+def _package_label(package):
+    """A package as people know it: a World Partition / One File Per Actor package by its actor's label."""
+    if "/__ExternalActors__/" not in package:
+        return package
+    for actor in _try(_authored_actors, []):
+        if actor.get_outermost().get_name() == package:
+            return f"actor {_actor_label(actor)} ({package.rsplit('/', 1)[-1]})"
+    registry = unreal.AssetRegistryHelpers.get_asset_registry()
+    for data in _try(lambda: registry.get_assets_by_package_name(package), []) or []:
+        label = _try(lambda: str(data.get_tag_value("ActorLabel") or ""), "")
+        if label:
+            return f"actor {label} ({package.rsplit('/', 1)[-1]})"
+    return package
+
+
 class _Vcs:
     """Check-outs through the editor's revision control provider (Perforce, Plastic, ...), silently: the
     editor's own prompts are modal dialogs. Git needs no check-outs, and new files are left for the user to
@@ -1802,14 +1875,125 @@ class _Vcs:
         except Exception:
             self.provider = ""
         self.checkouts = self.provider not in ("", "None", "Git")
+        self.bulk, self.refused_all = _GUARD["bulk"], False
 
     def error(self):
         return str(_try(lambda: self.sc.last_error_msg(), "")) or "see ue log"
+
+    def states(self, files):
+        """{normalized path: state} for files, in one query to the server."""
+        got = self.sc.query_file_states(list(files), True) if files else []
+        return {_norm_path(s.filename): s for s in got or []}
+
+    def over_limit(self, count):
+        """The refusal for checking out `count` more files in this call, or '' (the limit is
+        Config/Tether/vcs.json {"bulk_limit": N}, 20 by default; --bulk lifts it)."""
+        limit, total = _bulk_limit(), _GUARD["claimed"] + count
+        if total <= limit or self.bulk:
+            return ""
+        return (f"this would check out {total} files, more than the bulk limit of {limit} (Config/Tether/vcs.json): "
+                "they would be locked for the whole team. Say so to the team, then rerun with --bulk")
+
+    def check_out(self, files):
+        if files and not self.sc.check_out_files(files, True):
+            raise RuntimeError(f"could not check out {len(files)} file(s): {self.error()}")
+        _GUARD["claimed"] += len(files)
+
+    def judge(self, packages):
+        """(problems, files to check out) for editing these packages: a file checked out by someone else or
+        behind the depot is a problem, and so are more files than the bulk limit."""
+        files = {}
+        for package in packages:
+            path = _package_file(package) if not package.startswith("/Temp/") else ""
+            if path and os.path.isfile(path):  # a new package is marked for add when it is saved
+                files[package] = os.path.abspath(path)
+        states, problems, want = self.states(files.values()), [], []
+        for package, path in files.items():
+            state = states.get(_norm_path(path))
+            if state is None or not getattr(state, "is_source_controlled", False):
+                continue
+            if getattr(state, "is_checked_out_other", False):
+                problems.append(f"{_package_label(package)} is checked out by {_holder(state)}")
+            elif not getattr(state, "is_current", True):
+                problems.append(f"{_package_label(package)} is behind the depot (someone submitted a newer revision: "
+                                "sync it, then make the change on that)")
+            elif getattr(state, "can_check_out", False) and not getattr(state, "is_checked_out", False):
+                want.append(path)
+        if not problems and self.over_limit(len(want)):
+            problems.append(self.over_limit(len(want)))
+        if len(problems) > 5:
+            problems = problems[:5] + [f"+{len(problems) - 5} more"]
+        return problems, want
+
+    def reserve(self, packages):
+        """Before editing known packages: raise if they can't be edited (see judge), else check them out now."""
+        if self.checkouts:
+            problems, want = self.judge(packages)
+            if problems:
+                raise RuntimeError("; ".join(problems) + ". Nothing was changed")
+            self.check_out(want)
+
+    def snapshot(self):
+        """What is unsaved and how deep the undo history is, before a tool runs (see claim)."""
+        maps, content = _dirty_packages()
+        undo = None if _LEGACY else unreal.ToolsetLibrary.get_active_undo_count()
+        return set(maps) | set(content), undo, len(_UNDO)
+
+    def claim(self, before):
+        """After a tool ran: check out the files of the packages it newly modified, or undo the change and
+        raise if it can't be kept (see judge)."""
+        maps, content = _dirty_packages()
+        packages = sorted((set(maps) | set(content)) - before[0])
+        if not packages:
+            return
+        problems, want = self.judge(packages)
+        if problems:
+            raise RuntimeError("; ".join(problems).replace("would check out", "changed") + ". " + self.revert(before))
+        try:
+            self.check_out(want)
+        except RuntimeError as exc:
+            raise RuntimeError(f"the change was made, but {exc}") from None
+
+    def revert(self, before):
+        """Undo what a tool changed since snapshot(): its editor transactions, then a reload from disk of the
+        content packages it modified. Says what is left."""
+        dirty, undo, mine = before
+        undone = 0
+        if undo is not None:
+            for _ in range(max(0, unreal.ToolsetLibrary.get_active_undo_count() - undo)):
+                if not unreal.ToolsetLibrary.undo_transaction(False):
+                    break
+                undone += 1
+        del _UNDO[mine:]
+        maps, content = _dirty_packages()
+        stale = [unreal.find_package(p) for p in content if p not in dirty and not p.startswith("/Temp/")
+                 and os.path.isfile(_package_file(p))]
+        if stale:  # undone or never transacted, they are still marked modified: load them back from disk
+            unreal.EditorLoadingAndSavingUtils.reload_packages(
+                [p for p in stale if p], unreal.ReloadPackagesInteractionMode.ASSUME_POSITIVE)
+        maps, content = _dirty_packages()
+        left = sorted(p for p in set(maps) | set(content) if p not in dirty and not p.startswith("/Temp/"))
+        if not left:
+            return "Nothing was changed (the edit was undone)"
+        if undone:
+            return (f"The edit was undone ({undone} editor transaction(s)); still marked unsaved: {', '.join(left[:5])}. "
+                    "Do not save those")
+        return f"It could not be undone: {', '.join(left[:5])} changed in memory. Do not save them (reload instead)"
 
     def prepare(self, files, writable=False):
         """Make existing files writable (check them out; with `writable` and no check-out provider, clear the
         read-only flag). Returns (problems, new files, notes)."""
         problems, new, notes = [], [], []
+        states = {}
+        if self.checkouts:
+            existing = [p for p in files if p and os.path.isfile(p)]
+            states = self.states(existing)
+            need = [p for p in existing if getattr(states.get(_norm_path(p)), "can_check_out", False)
+                    and not getattr(states.get(_norm_path(p)), "is_checked_out", False)]
+            if self.over_limit(len(need)):
+                self.refused_all = True
+                return [self.over_limit(len(need))], [], []
+            _GUARD["claimed"] += len(need)
         for path in files:
             if not path:
                 continue
@@ -1817,9 +2001,9 @@ class _Vcs:
                 new.append(path)
                 continue
             if self.checkouts:
-                state = self.sc.query_file_state(path, True)
+                state = states.get(_norm_path(path)) or self.sc.query_file_state(path, True)
                 if getattr(state, "is_checked_out_other", False):
-                    problems.append(f"{os.path.basename(path)} is checked out by {state.checked_out_other or 'someone else'}")
+                    problems.append(f"{os.path.basename(path)} is checked out by {_holder(state)}")
                     continue
                 if getattr(state, "is_source_controlled", False) and not getattr(state, "is_current", True):
                     notes.append(f"{os.path.basename(path)} is not at the latest revision (sync it)")
@@ -6858,6 +7042,8 @@ class TetherCore(_Base):
         if library.does_asset_exist(target):
             raise RuntimeError(f"{target} already exists")
         vcs, source_file = _Vcs(), _package_file(source)
+        registry = unreal.AssetRegistryHelpers.get_asset_registry()
+        vcs.reserve(sorted({str(n) for n in registry.get_referencers(source, _dependency_options()) or []} - {source}))
         problems, _, notes = vcs.prepare([source_file])
         if problems:
             raise RuntimeError("; ".join(problems))
@@ -6926,6 +7112,7 @@ class TetherCore(_Base):
         if open_map in inside:
             raise RuntimeError(f"the open map {open_map} is in {src}: open another map first (ue level open ...)")
         vcs = _Vcs()
+        vcs.reserve(sorted(outside))  # they get resaved: refuse before moving anything if one is someone else's
         files = [_package_file(p) for p in packages]
         problems, _, notes = vcs.prepare(files)
         if problems:
@@ -7063,6 +7250,60 @@ class TetherCore(_Base):
 
     @_tool
     @staticmethod
+    def vcs_status(paths: str = "") -> str:
+        """Revision-control state of content files: who has what checked out, and what is behind the depot.
+
+        Args:
+            paths: JSON list of /Game folders or packages ('' = all of /Game). A map includes its One File Per
+                Actor actor files.
+
+        Returns:
+            JSON {provider, files, rows: [{package, label, other, mine, behind, action}]}, rows only for files
+            that are checked out (by anyone), behind the depot, or marked for add/delete.
+        """
+        vcs = _Vcs()
+        if not vcs.checkouts:
+            return json.dumps({"provider": vcs.provider, "files": 0, "rows": []})
+        content = unreal.Paths.convert_relative_path_to_full(unreal.Paths.project_content_dir())
+        files = {}
+
+        def walk(folder):
+            for root, _, names in os.walk(folder):
+                for name in names:
+                    if name.endswith((".uasset", ".umap")):
+                        files.setdefault(_norm_path(os.path.join(root, name)), (os.path.join(root, name), None))
+
+        for path in json.loads(paths) if paths else ["/Game"]:
+            path = path.rstrip("/").split(".")[0]
+            if not path.startswith("/Game"):
+                raise RuntimeError(f"{path}: give /Game folders or assets")
+            rest = path[len("/Game"):].strip("/")
+            folder = os.path.join(content, *rest.split("/")) if rest else content
+            if os.path.isdir(folder):
+                walk(folder)
+                continue
+            file = _package_file(path)
+            if not os.path.isfile(file):
+                raise RuntimeError(f"{path}: no such folder or asset")
+            files.setdefault(_norm_path(file), (file, path))
+            if file.endswith(".umap"):  # its World Partition / One File Per Actor actors
+                walk(os.path.join(content, "__ExternalActors__", *rest.split("/")))
+        states, rows = vcs.states([file for file, _ in files.values()]), []
+        for norm, state in sorted(states.items()):
+            other = getattr(state, "is_checked_out_other", False)
+            mine = getattr(state, "is_checked_out", False)
+            behind = getattr(state, "is_source_controlled", False) and not getattr(state, "is_current", True)
+            action = "add" if getattr(state, "is_added", False) else "delete" if getattr(state, "is_deleted", False) else ""
+            if not (other or mine or behind or action):
+                continue
+            file, package = files.get(norm, (state.filename, None))
+            package = package or str(_try(lambda: unreal.PackageTools.filename_to_package_name(file), "")) or file
+            rows.append({"package": package, "label": _package_label(package), "other": _holder(state) if other else "",
+                         "mine": mine, "behind": behind, "action": action})
+        return json.dumps({"provider": vcs.provider, "files": len(files), "rows": rows})
+
+    @_tool
+    @staticmethod
     def save(paths: str = "", token: str = "", writable: bool = False) -> str:
         """Save unsaved packages: the given ones, or all of them. Untitled /Temp maps are skipped (saving them
         would open a Save As dialog).
@@ -7087,7 +7328,8 @@ class TetherCore(_Base):
         vcs = _Vcs()
         files = {p: _package_file(p, p in maps) for p in todo}
         problems, new_files, notes = vcs.prepare(list(files.values()), writable=writable)
-        blocked = [p for p in todo if any(os.path.basename(files[p]) in problem for problem in problems)]
+        blocked = todo if vcs.refused_all else \
+            [p for p in todo if any(os.path.basename(files[p]) in problem for problem in problems)]
         todo = [p for p in todo if p not in blocked]
         packages = [unreal.find_package(p) for p in todo]
         saved = bool(packages) and unreal.EditorLoadingAndSavingUtils.save_packages([p for p in packages if p], False)
@@ -8789,6 +9031,8 @@ class TetherCore(_Base):
         found = sorted(set(found))
         requested = json.loads(values)
         rows = []
+        if not dry_run:  # all or nothing: refuse before the first edit if a file is someone else's
+            _Vcs().reserve(found[:limit])
         for package in found[:limit]:
             try:
                 if dry_run:
@@ -8828,6 +9072,7 @@ class TetherCore(_Base):
         """
         _authorize(token)
         results = []
+        _Vcs().reserve(sorted({item["package"] for item in json.loads(plan)}))  # all or nothing, before any fix
         for item in json.loads(plan):
             package, fix = item["package"], item["fix"]
             try:

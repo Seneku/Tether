@@ -1892,7 +1892,7 @@ class WatchShapes(unittest.TestCase):
         parser = ue.build_parser()
         sub = next(a for a in parser._actions if a.dest == "cmd").choices["shot"]
         wanted = {a.dest for a in sub._actions if a.dest not in ("help", "project", "pid", "port", "timeout", "json",
-                                                                 "limit", "time")}
+                                                                 "limit", "time", "bulk")}
         self.assertLessEqual(wanted, set(vars(ue.shot_args())))
 
 
@@ -4491,3 +4491,89 @@ class Round033(unittest.TestCase):
             flat += [f'    text "{name}" [pos=0,0 size=0,0] [ref=x{name[0]}]', f'    button [pos=0,0 size=0,0] [ref=b{name[0]}]']
         nodes = ue.play.label_buttons(ue.play.parse_snapshot("\n".join(['  generic [pos=0,0 size=0,0] [ref=g9]'] + flat)))
         self.assertEqual([n["label"] for n in nodes if n["role"] == "button"], ["", "", "GARAGE", "FREE ROAM", "QUIT"])
+
+
+class Perforce(unittest.TestCase):
+    def setUp(self):
+        self.project = Project()
+
+    def tearDown(self):
+        self.project.close()
+
+    def test_p4_options_come_from_the_editors_settings(self):
+        self.assertEqual(ue.p4_options(self.project.uproject), [])
+        self.project.write("Saved/Config/WindowsEditor/SourceControlSettings.ini",
+                           "[SourceControl.SourceControlSettings]\nProvider=Perforce\n\n"
+                           "[PerforceSourceControl.PerforceSourceControlSettings]\nPort=ssl:p4:1666\nUserName=kim\n"
+                           "Workspace=kim_game\n")
+        self.assertEqual(ue.p4_options(self.project.uproject), ["-p", "ssl:p4:1666", "-u", "kim", "-c", "kim_game"])
+
+    def run_p4(self, lines, returncode=0, check=True):
+        done = subprocess.CompletedProcess([], returncode, "\n".join(json.dumps(l) for l in lines).encode(), b"")
+        with unittest.mock.patch.object(ue.core, "p4_exe", return_value="p4"), \
+                unittest.mock.patch("subprocess.run", return_value=done) as run:
+            result = ue.run_p4(self.project.uproject, "fstat", "x", check=check)
+        self.assertEqual(run.call_args.args[0][:4], ["p4", "-ztag", "-Mj", "fstat"])
+        return result
+
+    def test_run_p4_records_and_messages(self):
+        record = {"depotFile": "//depot/A.uasset", "headRev": "2"}
+        warning = {"data": "x - no such file(s).\n", "severity": 2}
+        self.assertEqual(self.run_p4([record]), [record])
+        self.assertEqual(self.run_p4([record, warning], check=False), [record])  # a warning only matters with check
+        with self.assertRaises(ue.CliError) as caught:
+            self.run_p4([warning])
+        self.assertEqual(str(caught.exception), "p4 fstat: x - no such file(s).")
+        self.assertIsNone(self.run_p4([{"data": "Connect to server failed", "severity": 3}], 1, check=False))
+
+    def test_diff_picks_perforce_by_revision_or_workspace(self):
+        uproject = self.project.uproject
+        self.assertTrue(ue.uses_p4(uproject, "#have", None))
+        self.assertTrue(ue.uses_p4(uproject, "@1234", None))
+        self.assertFalse(ue.uses_p4(uproject, "HEAD~1", None))
+        with unittest.mock.patch.object(ue.assets, "run_git", return_value=None), \
+                unittest.mock.patch.object(ue.assets, "p4_workspace", return_value=True):
+            self.assertTrue(ue.uses_p4(uproject, None, None))
+        with unittest.mock.patch.object(ue.assets, "run_git", return_value=None), \
+                unittest.mock.patch.object(ue.assets, "p4_options", return_value=["-p", "p4:1666"]), \
+                unittest.mock.patch.object(ue.assets, "p4_exe", return_value=None):
+            with self.assertRaises(ue.CliError):  # the editor uses Perforce: say p4 is missing, not "not a git repo"
+                ue.uses_p4(uproject, None, None)
+
+    def test_p4v_temp_file_names_are_staged_as_package_names(self):
+        self.assertRegex(ue.stage_copy(self.project.uproject, b"v1", "BP_X#3", ".uasset"), r"/BP_X[.]BP_X$")
+
+    def test_locks_without_an_editor_reads_p4(self):
+        content = os.path.join(self.project.root, "Content")
+        records = [{"clientFile": os.path.join(content, "A.uasset"), "otherOpen0": "bob@bob_ws", "otherOpen": "1",
+                    "haveRev": "1", "headRev": "1"},
+                   {"clientFile": os.path.join(content, "B.uasset"), "action": "edit", "haveRev": "1", "headRev": "1"},
+                   {"clientFile": os.path.join(content, "C.uasset"), "haveRev": "1", "headRev": "3"},
+                   {"clientFile": os.path.join(content, "D.uasset"), "haveRev": "2", "headRev": "2"}]
+        with unittest.mock.patch.object(ue.assets, "run_p4", return_value=records) as run:
+            data = ue.p4_status(self.project.uproject, [])
+        self.assertEqual(run.call_args.args[2:], (os.path.join(content, "..."),))
+        self.assertEqual(data["files"], 4)
+        self.assertEqual([(r["package"], r["other"], r["mine"], r["behind"]) for r in data["rows"]],
+                         [("/Game/A", "bob", False, False), ("/Game/B", "", True, False), ("/Game/C", "", False, True)])
+        ctx = FakeCtx()
+        ctx.project = self.project.uproject
+        args = argparse.Namespace(paths=[], limit=30)
+        out = io.StringIO()
+        with unittest.mock.patch.object(ue.assets, "editor_live", return_value=False), \
+                unittest.mock.patch.object(ue.assets, "p4_workspace", return_value=True), \
+                unittest.mock.patch.object(ue.assets, "run_p4", return_value=records), contextlib.redirect_stdout(out):
+            self.assertEqual(ue.cmd_locks(ctx, args), 0)
+        self.assertEqual(out.getvalue().splitlines(), [
+            "Perforce: 4 file(s) under /Game; 1 checked out by others, 1 by you, 1 behind the depot",
+            "checked out by bob (1): /Game/A", "checked out by you (1): /Game/B",
+            "behind the depot, sync before editing (1): /Game/C"])
+
+    def test_bulk_rides_on_the_token(self):
+        ctx = ue.Ctx(argparse.Namespace(bulk=True))
+        ctx._project = self.project.uproject
+        with unittest.mock.patch.object(sys.modules["tether_cli.transport"], "editor_token", return_value="secret"):
+            self.assertEqual(ctx.token({}), "secret+bulk")
+            plain = ue.Ctx(argparse.Namespace())
+            plain._project = self.project.uproject
+            self.assertEqual(plain.token({}), "secret")

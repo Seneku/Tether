@@ -245,10 +245,14 @@ class Ctx:
         write_json(path, seen)
         return True
 
+    def token(self, beacon):
+        # --bulk rides on the token: the editor's revision-control guard then allows more check-outs
+        return editor_token(self.project, beacon) + ("+bulk" if getattr(self.args, "bulk", False) else "")
+
     def tether(self, tool, **kwargs):
         if tool in GATED:  # the editor writes a per-session token next to the beacon
             beacon = self.beacon
-            kwargs["token"] = editor_token(self.project, beacon)
+            kwargs["token"] = self.token(beacon)
             others = [b for b in live_editors(self.project) if b.get("pid") != (beacon or {}).get("pid")]
             if others and not self._warned and self._first_note(beacon, others):
                 self._warned = True
@@ -264,7 +268,7 @@ class Ctx:
         if is_error and tool in GATED and "unauthorized" in text:
             # a token read while the beacon rewrote it (a reload): read it again and retry once
             time.sleep(0.2)
-            kwargs["token"] = editor_token(self.project, self.beacon)
+            kwargs["token"] = self.token(self.beacon)
             text, is_error = self.mcp.call(TETHER, tool, kwargs)
         if is_error:
             raise CliError(compact_error(text))

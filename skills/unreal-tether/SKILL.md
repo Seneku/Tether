@@ -101,9 +101,13 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
   data validation on the changed and unsaved assets plus Map Check of the open level, one line per
   problem (`ue validate /Game/Some/Folder` for a folder). Fix errors it reports before calling the task done.
   Without git, it takes the assets saved since the editor started instead of the changed ones.
-- In a Perforce (or other check-out) workspace, `ue save`/`mv`/`rm` check files out and mark new ones for add
-  themselves; if one is checked out by someone else, or read-only without a connection, it says so and
-  `ue save` exits 1: tell the user rather than making files writable yourself.
+- In a Perforce (or other check-out) workspace, teammates share binary files that can't be merged. Before a
+  task, `ue locks /Game/Area` shows who holds what there and what is behind the depot. Every Tether edit checks
+  out the files it modified right away; an edit to a file someone else holds, or one behind the depot, is undone
+  and fails naming them ("is checked out by bob. Nothing was changed"): tell the user, don't work around it.
+  One command may check out at most 20 files (Config/Tether/vcs.json): above that it is refused; ask the user
+  before rerunning with `--bulk`. `ue save`/`mv`/`rm` check out and mark adds/deletes themselves; if a file is
+  read-only without a connection, `ue save` exits 1: tell the user rather than making files writable yourself.
 - New assets: `ue new bp /Game/X/BP_Door --parent Actor` (or a C++ class, or another Blueprint), `ue new mi
   /Game/X/MI_Rock --parent /Game/X/M_Rock`, `ue new datatable /Game/X/DT_Items --parent ItemRow`, `ue new level
   /Game/Maps/L_Test`, `ue new folder /Game/X`. Then `ue save` (or pass --save).
@@ -330,7 +334,8 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
 - `ue diff /Game/Path/Asset [rev]` shows what changed in a binary asset since a git revision (default HEAD,
   compared with the editor's current version) or between two (`--to rev2`): Blueprint variables, components,
   defaults and graph text, DataTable rows, map actors. Use it to review your own asset edits before
-  committing, and to understand someone else's commit (`ue diff X <sha>~1 --to <sha>`).
+  committing, and to understand someone else's commit (`ue diff X <sha>~1 --to <sha>`). Perforce revisions work
+  too: `#have` (the default in a Perforce workspace), `#head`, `#3`, `@1234` (`ue diff X @1233 --to @1234`).
 - `ue find <regex> [--class StaticMesh] [--under /Game/x]` (or a path: `ue find "/Game/X/Presets/*"`) to locate assets; `ue refs <asset>` before deleting
   or renaming one (what uses it), `--deps` for what it uses.
 - `ue api <Class> [regex]` before writing editor Python: real method signatures and property names in a

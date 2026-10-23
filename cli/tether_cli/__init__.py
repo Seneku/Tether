@@ -8,7 +8,7 @@ Exit codes: 0 ok, 1 tool/command failed, 2 editor unavailable, 3 restart require
 5 another session holds the editor lease.
 
 Modules, lowest layer first (each imports only from those above it):
-  core       project/beacon files, engine discovery, ports, dialogs, crash reports, git, rendering, logs
+  core       project/beacon files, engine discovery, ports, dialogs, crash reports, git, Perforce, rendering, logs
   share      sessions sharing one editor: identity, activity log, the editor lease, PIE owner
   fabfiles   Fab content from files: the launcher's vault, each project's Fab record, nearby projects
   transport  Epic's MCP server, Python remote execution (5.4-5.7), the toolset catalog

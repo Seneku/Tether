@@ -20,7 +20,7 @@ from .calls import (
 from .images import VIEW_MODES, camera_at, cmd_look, cmd_shot, shot_args
 from .testing import cmd_test
 from .assets import (
-    cmd_data, cmd_diff, cmd_fx, cmd_move_pack, cmd_net, cmd_overview, cmd_pcg, cmd_skel, cmd_size, cmd_table, cmd_usages,
+    cmd_data, cmd_diff, cmd_locks, cmd_fx, cmd_move_pack, cmd_net, cmd_overview, cmd_pcg, cmd_skel, cmd_size, cmd_table, cmd_usages,
     cmd_validate,
 )
 from .content import (
@@ -223,6 +223,9 @@ def build_parser():
     common.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="one JSON document: {command, ok, exit, error, lines, data}")
     common.add_argument("--limit", type=int, default=argparse.SUPPRESS, help="max rows to print (30)")
     common.add_argument("--time", action="store_true", default=argparse.SUPPRESS, help="elapsed time to stderr")
+    common.add_argument("--bulk", action="store_true", default=argparse.SUPPRESS,
+                        help="let this command check out more files than the bulk limit (Perforce/Plastic: "
+                             "Config/Tether/vcs.json, 20 by default)")
 
     p = argparse.ArgumentParser(prog="ue", description=sys.modules[__package__].__doc__.split("\n\n")[0], parents=[common])
     p.add_argument("--version", action="version", version=f"ue (Tether) {tether_version()}")
@@ -738,12 +741,18 @@ def build_parser():
     s.add_argument("--top", type=int, default=40, help="rows (40)")
     s = add("asset", cmd_asset, "a few lines about assets, by type (mesh, texture, material, Blueprint, ...)")
     s.add_argument("paths", nargs="+", help="/Game/... asset paths")
-    s = add("diff", cmd_diff, "what changed in an asset between git revisions, or a revision and the editor now")
+    s = add("diff", cmd_diff, "what changed in an asset between git or Perforce revisions, or a revision and the "
+                              "editor now")
     s.add_argument("asset", nargs="?", help="/Game/... asset, or its file under Content/")
-    s.add_argument("rev", nargs="?", help="git revision to compare with (default HEAD)")
+    s.add_argument("rev", nargs="?", help="revision to compare with: git (default HEAD) or Perforce #have, #head, #3, "
+                                          "@1234, @label (default #have in a Perforce workspace)")
     s.add_argument("--to", metavar="REV", help="compare with this revision instead of the editor's current state")
-    s.add_argument("--files", nargs=2, metavar=("OLD", "NEW"), help="compare two files (for git difftool)")
+    s.add_argument("--files", nargs=2, metavar=("OLD", "NEW"), help="compare two files (for git difftool, or P4V's "
+                                                                    "diff tool: --files %%1 %%2)")
     s.add_argument("--as", dest="as_path", metavar="PATH", help="with --files: the asset's path in the repo ($MERGED)")
+    s = add("locks", cmd_locks, "who has which content checked out (Perforce, Plastic), and what is behind the depot")
+    s.add_argument("paths", nargs="*", help="/Game folders or assets (default: all of /Game); a map includes its "
+                                            "One File Per Actor actors")
     s = add("validate", cmd_validate, "data validation + Map Check; default: assets changed in git or unsaved")
     s.add_argument("paths", nargs="*", help="assets or content folders (default: changed and unsaved assets)")
     s.add_argument("--changed", nargs="?", const="", metavar="REV",

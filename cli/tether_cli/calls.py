@@ -9,7 +9,7 @@ import sys
 import time
 
 from .core import (
-    CliError, GATED, LEVELS, LOG_LINE, TETHER, UE_SCRIPT, compact_error, editor_process, editor_token, emit, filter_log,
+    CliError, GATED, LEVELS, LOG_LINE, TETHER, UE_SCRIPT, compact_error, editor_process, emit, filter_log,
     human_bytes, log_end, log_ignore_entries,
     live_editors, log_ignore_path, log_path, pid_alive, PY_OUTPUT, summarize_log, write_json,
     port_open,
@@ -83,7 +83,7 @@ def cmd_call(ctx, args):
         raise CliError(f"--args is not JSON: {exc}") from None
     name = tool["name"].rsplit(".", 1)[-1]
     if toolset == TETHER and name in GATED and not call_args.get("token"):  # fill_args blanks it to ""
-        call_args["token"] = editor_token(ctx.project, ctx.beacon)
+        call_args["token"] = ctx.token(ctx.beacon)
     text, is_error = ctx.mcp.call(toolset, name, call_args)
     if is_error:
         raise CliError(compact_error(text))

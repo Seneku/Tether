@@ -137,14 +137,21 @@ class FakeSourceControl:
         return self.provider
 
     def query_file_state(self, path, silent):
-        return types.SimpleNamespace(**dict({"is_source_controlled": True, "is_current": True, "can_check_out": True,
-                                             "is_checked_out": False, "is_checked_out_other": False,
-                                             "checked_out_other": "", "is_deleted": False},
+        return types.SimpleNamespace(**dict({"filename": path, "is_source_controlled": True, "is_current": True,
+                                             "can_check_out": True, "is_checked_out": False,
+                                             "is_checked_out_other": False, "checked_out_other": "", "is_deleted": False},
                                             **self.states.get(os.path.basename(path), {})))
+
+    def query_file_states(self, files, silent):
+        return [self.query_file_state(f, silent) for f in files]
 
     def check_out_file(self, path, silent):
         self.calls.append(("checkout", os.path.basename(path)))
         os.chmod(path, 0o666)
+        return True
+
+    def check_out_files(self, files, silent):
+        self.calls.append(("checkout", sorted(os.path.basename(f) for f in files)))
         return True
 
     def mark_files_for_add(self, files, silent):
@@ -210,6 +217,75 @@ class RevisionControl(unittest.TestCase):
         self.assertEqual(problems, [])
         self.assertEqual(notes, ["made A.uasset writable"])
         self.assertTrue(os.access(self.path("A.uasset"), os.W_OK))
+
+    def patched(self, **names):
+        for name, value in names.items():
+            saved = getattr(toolsets, name)
+            setattr(toolsets, name, value)
+            self.addCleanup(setattr, toolsets, name, saved)
+
+    def test_more_check_outs_than_the_bulk_limit_are_refused_before_any(self):
+        self.patched(_bulk_limit=lambda: 1)
+        sc = FakeSourceControl("Perforce")
+        vcs = toolsets._Vcs(sc)
+        problems, _, _ = vcs.prepare([self.path("A.uasset"), self.path("B.uasset")])
+        self.assertIn("this would check out 2 files, more than the bulk limit of 1", problems[0])
+        self.assertTrue(vcs.refused_all)
+        self.assertEqual(sc.calls, [])
+        toolsets._GUARD["bulk"] = True  # ue --bulk
+        self.addCleanup(toolsets._GUARD.update, bulk=False, claimed=0)
+        problems, _, _ = toolsets._Vcs(sc).prepare([self.path("A.uasset"), self.path("B.uasset")])
+        self.assertEqual(problems, [])
+        self.assertEqual(sc.calls, [("checkout", "A.uasset"), ("checkout", "B.uasset")])
+
+    def claim(self, states, limit=20):
+        """claim() after a tool modified /Game/A and /Game/B: (raised message or None, check-out calls)."""
+        files = {"/Game/A": self.path("A.uasset"), "/Game/B": self.path("B.uasset")}
+        self.patched(_dirty_packages=lambda: ([], ["/Game/A", "/Game/B", "/Game/Old"]),
+                     _package_file=lambda package, is_map=False: files.get(package, ""), _bulk_limit=lambda: limit,
+                     _package_label=lambda package: package)
+        self.addCleanup(toolsets._GUARD.update, claimed=0)
+        sc = FakeSourceControl("Perforce", states)
+        vcs = toolsets._Vcs(sc)
+        vcs.revert = lambda before: "Nothing was changed (the edit was undone)"
+        try:
+            vcs.claim(({"/Game/Old"}, 0, 0))  # /Game/Old was unsaved before the tool ran: not this call's
+        except RuntimeError as exc:
+            return str(exc), sc.calls
+        return None, sc.calls
+
+    def test_claim_checks_out_what_a_tool_modified(self):
+        self.assertEqual(self.claim({"B.uasset": {"is_checked_out": True}}), (None, [("checkout", ["A.uasset"])]))
+
+    def test_claim_undoes_an_edit_to_a_file_someone_else_has_or_that_is_behind(self):
+        error, calls = self.claim({"A.uasset": {"is_checked_out_other": True, "checked_out_other": "bob @ "},
+                                   "B.uasset": {"is_current": False}})
+        self.assertEqual(calls, [])
+        self.assertIn("/Game/A is checked out by bob; /Game/B is behind the depot", error)
+        self.assertTrue(error.endswith("Nothing was changed (the edit was undone)"))
+
+    def test_claim_undoes_a_bulk_edit(self):
+        error, calls = self.claim({}, limit=1)
+        self.assertEqual(calls, [])
+        self.assertIn("this changed 2 files, more than the bulk limit of 1", error)
+
+    def test_guard_takes_bulk_off_a_positional_token(self):
+        seen = {}
+
+        def tool(paths: str = "", token: str = "") -> str:
+            seen.update(token=token, bulk=toolsets._GUARD["bulk"])
+            return "ok"
+
+        guarded = toolsets._guarded(tool)
+        self.assertEqual(guarded("x", "secret+bulk"), "ok")  # the registry passes arguments by position
+        self.assertEqual(seen, {"token": "secret", "bulk": True})
+        self.assertFalse(toolsets._GUARD["bulk"])
+        self.assertEqual(str(toolsets.inspect.signature(guarded)), "(paths: str = '', token: str = '') -> str")
+
+    def test_holder_names(self):
+        self.assertEqual(toolsets._holder(types.SimpleNamespace(checked_out_other="bob @ ")), "bob")
+        self.assertEqual(toolsets._holder(types.SimpleNamespace(checked_out_other="kim @ kim_ws")), "kim @ kim_ws")
+        self.assertEqual(toolsets._holder(types.SimpleNamespace(checked_out_other="")), "someone else")
 
 
 class LegacyNames(unittest.TestCase):
