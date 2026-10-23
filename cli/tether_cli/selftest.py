@@ -369,8 +369,8 @@ def cmd_selftest(ctx, args):
     # Slate's arrow-key navigation picks the next widget by geometry, which a -nullrhi editor does not lay out
     navigate = ["key Down", "key Enter"] if rendering else []
     check("ui menu keys and clicks (Sandbox fixture)" if rendering else "ui menu clicks (Sandbox fixture)",
-          ["pie", "do", "call /Script/Sandbox.Default__TetherProbeUILibrary ShowProbeMenu", "key Enter",
-           "expect-ui GARAGE"] + navigate + ["click --event QUIT", "click GARAGE"]
+          ["pie", "do", "call /Script/Sandbox.Default__TetherProbeUILibrary ShowProbeMenu", "key Enter down",
+           "key Enter up", "expect-ui GARAGE"] + navigate + ["click --event QUIT", "click GARAGE"]
           + (["log TetherProbeMenu: FREE ROAM clicked"] if rendering else [])
           + ["log TetherProbeMenu: QUIT clicked", "log TetherProbeMenu: GARAGE clicked"],
           skip=None if menu else "no menu fixture (Sandbox's ShowProbeMenu)", ok=lambda c, o: c == 0 and "PASS" in o)

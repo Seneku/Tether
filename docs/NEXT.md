@@ -175,6 +175,14 @@ its panel's text in front ("Tether probe panel GARAGE"); a floating Content Brow
 layout (%LOCALAPPDATA%/UnrealEngine/Editor/EditorLayout.json) had made the selftest's menu check fail; and a
 failed selftest step list reports its FAIL line.
 
+**Done in 0.34.2** (UnrealRacing's note 209): split key steps follow the rule single keys already did. `key X
+down` (and `tap`) on a screen where a UMG widget holds keyboard focus presses X through Slate right then, so
+NativeOnKeyDown and buttons get it; Epic's inspector only sends KeyDown and KeyUp together, so the matching `key X
+up` sends nothing and says so. `key --slate X down`/`up` do the same (before, "X down" went to Slate as a key name
+and nothing happened), and `key --game X down`/`up` are raw game input. Reproduced on Sandbox's title-screen fixture
+(Enter in NativeOnKeyDown), which the selftest's menu check now drives with `key Enter down` / `key Enter up`.
+Selftest `--render` 137/0/2.
+
 **Done in 0.34.1** (UnrealRacing's note 208): `ue spawn --pie` keeps the names of the class's actors already in the
 PIE world inside the editor (`ue py`'s namespace, under a key per spawn) and gets back only their count, so a level
 with thousands of them no longer overflows the reply; reproduced with 1,700 StaticMeshActors, then two spawns

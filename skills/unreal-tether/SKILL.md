@@ -478,7 +478,8 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
   When a UMG widget has keyboard focus (a menu reading keys in NativeOnKeyDown, or a title screen holding focus
   itself), other single keys go to it
   through Slate on their own (`--game` forces the game's input); step files take `key --slate Enter` or
-  `ui-key Enter`, and `click --event LABEL` (fires OnClicked, for a covered window). `ue ui --rects` prints each
+  `ui-key Enter`, and split steps follow the same rule: `key E down` on a focused screen presses E through Slate
+  right there (Slate sends KeyDown and KeyUp together, so its `key E up` sends nothing); `click --event LABEL` (fires OnClicked, for a covered window). `ue ui --rects` prints each
   widget's screen rectangle (what `ue ui at x,y` takes); a plain `--headless` editor (-nullrhi) lays out no
   geometry, so rectangles, `ui at` and arrow-key menu navigation need `ue open --headless --render`, while clicks
   there fire the UMG button's OnClicked. A button with no text child (a transparent UButton over

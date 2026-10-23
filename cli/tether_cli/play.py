@@ -541,22 +541,31 @@ def umg_focus(ctx):
         return None
 
 
+def slate_focus(ctx, text):
+    """Why a key goes through Slate on its own (a game widget has keyboard focus), or None. Escape and chords
+    never do: through Slate those can reach the editor's shortcuts (Escape stops PIE)."""
+    if "+" in text.strip("+") or KEY_NAMES.get(text.lower()) == "Escape":
+        return None
+    nodes, slate = ui_nodes(ctx)
+    focus = focused_widget(nodes) if slate else None
+    if focus:
+        return (f'{focus["role"]} "{focus["label"]}"' if focus["label"] else f'a {focus["role"]} widget') + \
+            " has keyboard focus"
+    if slate:  # a user widget holding focus itself (a title screen) is not in the snapshot: ask UMG
+        holder = umg_focus(ctx)
+        if holder:
+            return f"UMG widget {holder} has keyboard focus"
+    return None
+
+
 def press_key(ctx, text, route="auto"):
     """A key in PIE: through the game's input (the player controller), or through Slate to the focused widget
-    (UMG menus). auto: Slate when a game widget has keyboard focus, except Escape and chords (through Slate those
-    can reach the editor's shortcuts: Escape stops PIE). Returns what was done."""
+    (UMG menus). auto: Slate when a game widget has keyboard focus (see slate_focus). Returns what was done."""
     text, why = text.strip(), "the focused widget, the editor's shortcuts included"
-    if route == "auto" and "+" not in text.strip("+") and KEY_NAMES.get(text.lower()) != "Escape":
-        nodes, slate = ui_nodes(ctx)
-        focus = focused_widget(nodes) if slate else None
+    if route == "auto":
+        focus = slate_focus(ctx, text)
         if focus:
-            route = "slate"
-            why = (f'{focus["role"]} "{focus["label"]}"' if focus["label"] else f'a {focus["role"]} widget') + \
-                " has keyboard focus"
-        elif slate:  # a user widget holding focus itself (a title screen) is not in the snapshot: ask UMG
-            holder = umg_focus(ctx)
-            if holder:
-                route, why = "slate", f"UMG widget {holder} has keyboard focus"
+            route, why = "slate", focus
     if route == "slate":
         key = KEY_NAMES.get(text.lower(), text)
         mcp_tool(ctx, "SlateInspectorToolset", "PressKey", {"key": key})
@@ -1948,6 +1957,28 @@ def pie_do(ctx, args):
         if verb == "click":
             event = rest.startswith("--event ")
             return True, ui_click(ctx, rest[len("--event "):].strip() if event else rest, event)
+        split = re.fullmatch(r"(?:--(slate|game) )?(\S+) (down|up|tap)\b(.*)", rest, re.I) if verb == "key" else None
+        if split:  # a key held across steps, or tapped, for the game or a focused UMG screen
+            forced, key, action, tail = split.group(1), split.group(2), split.group(3).lower(), split.group(4)
+            if action == "up" and key in slate_keys:
+                slate_keys.discard(key)
+                return True, f"{key} up: nothing left to send (Slate took the whole press at `down`)"
+            why = None if forced == "game" or action == "up" else \
+                "" if forced == "slate" else slate_focus(ctx, key)
+            if why is not None:  # Slate's PressKey sends KeyDown and KeyUp together: the press happens now
+                if action == "down":
+                    slate_keys.add(key)
+                done = press_key(ctx, key, "slate")
+                return True, (done if why == "" else done.replace("(the focused widget, the editor's shortcuts "
+                                                                  "included)", f"({why})")) + \
+                    (" (KeyDown and KeyUp together; its `up` step sends nothing)" if action == "down" else "")
+            if forced == "slate":  # an `up` with no Slate `down` before it
+                return True, f"{key} up: nothing to send (Slate presses are whole, at `down`)"
+            if action == "down":  # released when the steps end, passed or failed
+                held_keys.add(key)
+            elif action == "up":
+                held_keys.discard(key)
+            return tool(f"key {key} {action}{tail}")  # raw key input through the key mappings (forced keys)
         if verb == "ui-key" or (verb == "key" and rest.startswith(("--slate ", "--game "))):
             route = "slate" if verb == "ui-key" or rest.startswith("--slate ") else "game"
             return True, press_key(ctx, rest.split(" ", 1)[1] if verb == "key" else rest, route)
@@ -1957,14 +1988,6 @@ def pie_do(ctx, args):
                 ok = ui_has_text(ctx, rest) == want
                 return ok, "" if ok else ("still on screen" if not want else "not on screen")
             return poll(check, seconds or 3)
-        if verb == "key" and re.search(r"\s(down|up|tap)\b", rest, re.I):
-            key, _, action = rest.partition(" ")
-            action = action.split()[0].lower() if action.split() else ""
-            if action == "down":  # released when the steps end, passed or failed
-                held_keys.add(key)
-            elif action == "up":
-                held_keys.discard(key)
-            return tool(step)  # raw key input through the key mappings (the toolset's forced keys)
         if verb == "stick" and len(rest.split()) == 2:  # no duration: held until `key <Key> up`
             held_keys.add(rest.split()[0])
         if verb in ("type", "key"):
@@ -1988,7 +2011,7 @@ def pie_do(ctx, args):
             return True, buf.getvalue().strip()
         return tool(step)
 
-    failures, held, held_keys = [], set(), set()
+    failures, held, held_keys, slate_keys = [], set(), set(), set()  # slate_keys: `down` sent through Slate
     film = start_film(ctx, args) if getattr(args, "film", None) else None
     try:
         for number, step in enumerate(steps, 1):

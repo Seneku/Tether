@@ -3445,12 +3445,45 @@ class UnrealRacingRound3(unittest.TestCase):
         args = argparse.Namespace(script=["key W down", "key E down", "key E up", "expect fail.x = 1"], file=None,
                                   reject=None, warmup=0, keep=False, keep_going=False)
         with unittest.mock.patch.object(ue, "log_end", return_value=0), \
+                unittest.mock.patch.object(ue.play, "slate_focus", return_value=None), \
                 contextlib.redirect_stdout(io.StringIO()) as out:
             self.assertEqual(ue.pie_do(Ctx(), args), 1)
         steps = [kw["step"] for tool, kw in calls if tool == "pie_step"]
         self.assertEqual(steps[-1], "key W up")
         self.assertNotIn("key E up", steps[4:])
         self.assertIn("released W (still down", out.getvalue())
+
+    def test_split_key_steps_reach_a_focused_umg_screen(self):  # 209
+        calls, sent = [], []
+
+        class Ctx:
+            project = "x.uproject"
+
+            def tether(self, tool, **kw):
+                calls.append((tool, kw))
+                return "running" if tool == "pie" else {"ok": True, "detail": "d"}
+
+        def run(script, focus):
+            calls.clear(), sent.clear()
+            args = argparse.Namespace(script=script, file=None, reject=None, warmup=0, keep=False, keep_going=False)
+            with unittest.mock.patch.object(ue, "log_end", return_value=0), \
+                    unittest.mock.patch.object(ue.play, "slate_focus", return_value=focus), \
+                    unittest.mock.patch.object(ue.play, "mcp_tool", side_effect=lambda *a: sent.append(a[3]["key"])), \
+                    contextlib.redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(ue.pie_do(Ctx(), args), 0)
+            return [kw["step"] for tool, kw in calls if tool == "pie_step"], out.getvalue()
+
+        steps, out = run(["key E down", "key E up", "key Enter tap"], "UMG widget WBP_Map_C has keyboard focus")
+        self.assertEqual((steps, sent), ([], ["E", "Enter"]))  # one whole press each, at down / tap
+        self.assertIn("pressed E through Slate (UMG widget WBP_Map_C has keyboard focus)", out)
+        self.assertIn("E up: nothing left to send", out)
+        steps, _ = run(["key --slate Enter down", "key --slate Enter up"], None)
+        self.assertEqual((steps, sent), ([], ["Enter"]))
+        steps, _ = run(["key W down", "key W up", "key --game E down", "key --game E up"], "a button has focus")
+        self.assertEqual(sent, ["W"])  # with a widget focused, W went to it; --game kept E in the game
+        self.assertEqual(steps, ["key E down", "key E up"])
+        steps, _ = run(["key W down 0.5", "key W up"], None)
+        self.assertEqual((steps, sent), (["key W down 0.5", "key W up"], []))  # nothing focused: the game's input
 
     def test_watch_csv_names_rotator_parts(self):
         path = os.path.join(self.project.root, "w.csv")
