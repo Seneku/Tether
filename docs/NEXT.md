@@ -175,6 +175,18 @@ its panel's text in front ("Tether probe panel GARAGE"); a floating Content Brow
 layout (%LOCALAPPDATA%/UnrealEngine/Editor/EditorLayout.json) had made the selftest's menu check fail; and a
 failed selftest step list reports its FAIL line.
 
+**Done in 0.34.1** (UnrealRacing's note 208): `ue spawn --pie` keeps the names of the class's actors already in the
+PIE world inside the editor (`ue py`'s namespace, under a key per spawn) and gets back only their count, so a level
+with thousands of them no longer overflows the reply; reproduced with 1,700 StaticMeshActors, then two spawns
+there. A JSON reply from editor Python that hits `ue py`'s 20,000-character output cap now says so, with its size
+("the editor's reply was cut short: 34001 chars, more than ue py returns (20000)"), instead of "not JSON".
+
+**Done in 0.34.0** (Perforce teams): every Tether tool that changes things checks out the files it modified as
+it returns; an edit to a file someone else has checked out, or behind the depot, is undone and fails naming the
+holder (One File Per Actor files by actor label); one command may check out at most 20 files
+(Config/Tether/vcs.json, `--bulk` lifts it); `ue locks` lists check-outs and what is behind the depot; `ue diff`
+takes Perforce revisions. Tested on a local P4 Server 2026.1 with two users and a `binary+l` typemap.
+
 **Done in 0.33.1** (the selftest's UI checks failing on this machine): a Tether headless editor that exits puts
 back the machine-wide %LOCALAPPDATA%/UnrealEngine/Editor/EditorLayout.json (the layout every editor of the user's
 loads first; there is no switch to point an editor at another file) when its exit rewrote it, so `ue close` no

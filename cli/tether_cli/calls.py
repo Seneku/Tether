@@ -539,18 +539,22 @@ else:
 if isinstance(cls, type):  # a Python wrapper type (unreal.StaticMeshActor), not the UClass
     cls = cls.static_class()
 w = tether.world()
-before = [a.get_name() for a in unreal.GameplayStatics.get_all_actors_of_class(w, cls)]
-print(json.dumps({{"path": cls.get_path_name(), "mesh": mesh, "before": before}}))
+# The names stay in the editor (ue py's namespace): a level can hold thousands, more than a reply carries.
+before = {{a.get_name() for a in unreal.GameplayStatics.get_all_actors_of_class(w, cls)}}
+globals().setdefault("_tether_spawns", {{}})[{key!r}] = before
+print(json.dumps({{"path": cls.get_path_name(), "mesh": mesh, "count": len(before)}}))
 """
 PIE_SPAWN_PLACE = """
 import json
 from tether import toolsets
 w = tether.world()
 cls = unreal.load_class(None, {path!r})
-new = [a for a in unreal.GameplayStatics.get_all_actors_of_class(w, cls) if a.get_name() not in {before!r}]
+before = _tether_spawns.get({key!r}, set())
+new = [a for a in unreal.GameplayStatics.get_all_actors_of_class(w, cls) if a.get_name() not in before]
 if not new:
     print(json.dumps(None))
 else:
+    _tether_spawns.pop({key!r}, None)
     a = new[0]
     if {mesh!r}:
         c = a.static_mesh_component
@@ -585,14 +589,14 @@ def spawn_in_pie(ctx, args):
     if at is not None and len(at) != 3:
         raise CliError("--at x,y,z")
     rot = [float(v) for v in args.rot.split(",")] if args.rot else [0.0, 0.0, 0.0]
-    found = py_json(ctx, PIE_SPAWN_CLASS.format(what=args.what))
+    key = f"{os.getpid()}-{time.time():.6f}"  # names this spawn's actors-before set in the editor
+    found = py_json(ctx, PIE_SPAWN_CLASS.format(what=args.what, key=key))
     ctx.tether("console", command=f"summon {found['path']}", pie=True)
     placed, deadline = None, time.time() + 8  # in multiplayer PIE the command runs on the world's next tick
     while placed is None and time.time() < deadline:
         time.sleep(0.25)
-        placed = py_json(ctx, PIE_SPAWN_PLACE.format(path=found["path"], before=found["before"], mesh=found["mesh"],
-                                                     at=at, rot=rot, label=args.label or "", ground=args.ground,
-                                                     align=args.align))
+        placed = py_json(ctx, PIE_SPAWN_PLACE.format(path=found["path"], key=key, mesh=found["mesh"], at=at, rot=rot,
+                                                     label=args.label or "", ground=args.ground, align=args.align))
     if placed is None:
         raise CliError(f"summon {found['path']} spawned nothing within 8 s (the PIE player needs a cheat manager; "
                        "ue log --grep Fabricate)", 4)

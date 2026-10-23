@@ -373,5 +373,10 @@ def py_json(ctx, code):
     try:
         return json.loads(lines[-1])
     except (ValueError, IndexError):
+        cut = re.fullmatch(r"\.\.\. truncated (\d+) chars", lines[-1]) if lines else None
+        if cut:  # ue py caps its output (toolsets._MAX_OUT)
+            size = len(out) - len(lines[-1]) - 1 + int(cut.group(1))
+            raise CliError(f"the editor's reply was cut short: {size} chars, more than ue py returns "
+                           f"({size - int(cut.group(1))}); the code should print less") from None
         text = " ".join(lines[-3:]) if lines else "nothing"
         raise CliError("the editor's reply was not JSON: " + (text[:300] + " ..." if len(text) > 300 else text)) from None

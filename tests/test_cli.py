@@ -4,6 +4,7 @@ import contextlib
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -2628,11 +2629,15 @@ class IslandHorrorRound(unittest.TestCase):
         self.assertIn("get_editor_property('Time of Day')", hint)
 
     def test_spawn_in_pie_moves_the_summoned_actor(self):
-        replies = iter([{"path": "/Script/Engine.StaticMeshActor", "mesh": "/Engine/BasicShapes/Cube.Cube", "before": []},
+        replies = iter([{"path": "/Script/Engine.StaticMeshActor", "mesh": "/Engine/BasicShapes/Cube.Cube", "count": 1600},
                         None,
                         {"name": "StaticMeshActor_3", "label": "Buoy", "class": "StaticMeshActor", "at": [10, 20, 30],
                          "landed": "Island"}])
-        sent = []
+        sent, codes = [], []
+
+        def reply(ctx, code):
+            codes.append(code)
+            return next(replies)
 
         class Ctx(FakeCtx):
             beacon = {"pie": True}
@@ -2642,12 +2647,19 @@ class IslandHorrorRound(unittest.TestCase):
                 sent.append((tool, kwargs))
                 return ""
         out = io.StringIO()
-        with unittest.mock.patch.object(ue.calls, "py_json", side_effect=lambda ctx, code: next(replies)), \
+        with unittest.mock.patch.object(ue.calls, "py_json", side_effect=reply), \
                 unittest.mock.patch.object(ue.calls.time, "sleep"), contextlib.redirect_stdout(out):
             ue.cmd_spawn(Ctx(), argparse.Namespace(what="/Engine/BasicShapes/Cube", at="10,20,500", rot=None,
                                                    label="Buoy", ground=True, align=False, pie=True))
         self.assertEqual(sent[0], ("console", {"command": "summon /Script/Engine.StaticMeshActor", "pie": True}))
         self.assertIn("spawned Buoy (StaticMeshActor) in the PIE world at (10, 20, 30) on Island", out.getvalue())
+        # 208: the actors already there stay in the editor under one key, never in a reply (thousands overflow it)
+        key = re.search(r"_tether_spawns\", \{\}\)\['([^']+)'\]", codes[0]).group(1)
+        self.assertTrue(all(f"_tether_spawns.get('{key}'" in code for code in codes[1:]))
+
+    def test_py_json_names_a_reply_cut_at_the_output_cap(self):
+        with self.assertRaisesRegex(ue.CliError, r"cut short: 20500 chars, more than ue py returns \(20000\)"):
+            ue.py_json(FakeCtx("[" + "x" * 19999 + "\n... truncated 500 chars"), "x")
 
     def test_wait_grass_until_batches_stop(self):
         done = stamped("LogGrass: Verbose: ASYNC GRASS INSTANCES COMPLETE a b 1 2 (3)")
