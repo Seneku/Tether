@@ -181,6 +181,16 @@ def lease_path(project):
     return os.path.join(state_dir(project), "lease.json")
 
 
+def current_lease(lease, now):
+    """The innermost lease of a stack still running: a session's lease taken again for something else (a script it
+    runs) sits on top of the first, under "outer", which comes back when the inner one is released or runs out."""
+    while isinstance(lease, dict) and "until" in lease:
+        if lease["until"] > now:
+            return lease
+        lease = lease.get("outer")
+    return None
+
+
 def active_lease(project, now=None):
     """The editor lease if one is held and not expired, else None. A lease whose time ran out while its holder's
     `ue` command is still running (a long `ue py` stage) is still held: it lasts LEASE_KEEP min past that command."""
@@ -188,8 +198,9 @@ def active_lease(project, now=None):
     now = time.time() if now is None else now
     if not isinstance(lease, dict) or "until" not in lease:
         return None
-    if lease["until"] > now:
-        return lease
+    held = current_lease(lease, now)
+    if held:
+        return held
     busy = [r for r in running_commands(project) if r.get("session") == lease.get("session")]
     return dict(lease, until=now + LEASE_KEEP * 60, busy=busy[0]) if busy else None
 
@@ -198,13 +209,16 @@ def describe_lease(project, lease, now=None):
     now = time.time() if now is None else now
     busy = lease.get("busy") or next((r for r in running_commands(project) if r.get("session") == lease["session"]),
                                      None)
+    outer = current_lease(lease.get("outer"), now)
     # The expiry first: after a renewal "since" is still the first take, and read alone it looked unextended
     return (f"leased by {session_label(project, lease['session'])}: {lease.get('what') or 'no reason given'}, "
             + (f"busy: `{busy['cmd']}` for {duration(now - busy.get('since', now))} (held until it ends, then "
                f"{LEASE_KEEP} min), " if busy else
                f"until {time.strftime('%H:%M', time.localtime(lease['until']))} "
                f"({max(1, round((lease['until'] - now) / 60))} min left), ")
-            + f"held since {time.strftime('%H:%M', time.localtime(lease['since']))}")
+            + f"held since {time.strftime('%H:%M', time.localtime(lease['since']))}"
+            + (f" (inside its lease for {outer.get('what')}, until {time.strftime('%H:%M', time.localtime(outer['until']))})"
+               if outer else ""))
 
 
 def keep_lease(project, now=None):
@@ -277,32 +291,45 @@ def describe_running(project, row, now=None, names=None):
 
 
 def take_lease(project, what, minutes, now=None):
-    """Take (or renew) the lease for this session; refuse while another session holds it."""
+    """Take (or renew) the lease for this session; refuse while another session holds it. Taken again by this
+    session for something else (a script inside a session's lease takes its own), the new lease goes on top and
+    the one before comes back when it is released: a script's `lease release` no longer drops its caller's lease.
+    Returns (lease, "taken" | "renewed" | "nested")."""
     now = time.time() if now is None else now
     held = active_lease(project, now)
     me = session_id()
     if held and held["session"] != me:
         raise CliError(f"the editor is {describe_lease(project, held, now)}; wait, or ask that session to run "
                        "`ue lease release`", LEASED)
-    lease = {"session": me, "what": what, "since": held["since"] if held else now, "until": now + minutes * 60}
+    held = {k: v for k, v in held.items() if k != "busy"} if held else None
+    if held and held.get("what") != what:
+        lease, how = {"session": me, "what": what, "since": now, "until": now + minutes * 60, "outer": held}, "nested"
+    else:
+        lease = dict(held or {"session": me, "what": what, "since": now}, until=now + minutes * 60)
+        how = "renewed" if held else "taken"
     write_json(lease_path(project), lease)
     drop_request(project, me)  # asked for it earlier: answered
-    return lease, bool(held)
+    return lease, how
 
 
 def release_lease(project, force=False):
-    """Release this session's lease (any session's with force). The lease released, or None if none was held."""
+    """Release this session's lease (any session's with force): the innermost one, so a lease it was taken inside
+    of is held again. Returns (the lease released, the lease held again or None), or (None, None) if none was."""
     held = active_lease(project)
     if not held:
-        return None
+        return None, None
     if held["session"] != session_id() and not force:
         raise CliError(f"the lease is not yours: the editor is {describe_lease(project, held)} "
                        "(--force releases it anyway)", LEASED)
+    back = current_lease(held.get("outer"), time.time()) if not force else None
+    if back:
+        write_json(lease_path(project), back)
+        return held, back
     try:
         os.remove(lease_path(project))
     except OSError:
         pass
-    return held
+    return held, None
 
 
 def check_shared(project, action, destructive, ignore=False, now=None):

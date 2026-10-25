@@ -10,6 +10,12 @@ from .core import (
     live_editors, load_log_ignore, pid_alive, port_from_log, read_json, session_id, socket, stall_report, state_dir, unwrap,
     write_json,
 )
+from .share import check_shared, lease_note
+
+# Tools that write packages to disk: while another session holds the editor lease (PIE runs, before/after shots,
+# GPU baselines), these refuse instead of changing the files under it; --ignore-lease goes ahead.
+SAVES = {"save", "import_files", "reimport_assets", "mv", "rm", "move_folder", "fix_redirectors"}
+NOTED = {"py", "console"}  # say the lease themselves
 
 
 # ---------------------------------------------------------------- MCP client
@@ -184,7 +190,7 @@ class Ctx:
     def __init__(self, args):
         self.args = args
         self._project = self._mcp = self._rex = self._transport = None
-        self._warned = False
+        self._warned = self._lease_noted = False
         self.data = None  # structured result a command offers for --json
 
     @property
@@ -253,6 +259,13 @@ class Ctx:
         if tool in GATED:  # the editor writes a per-session token next to the beacon
             beacon = self.beacon
             kwargs["token"] = self.token(beacon)
+            if tool in SAVES or kwargs.get("save") is True:
+                check_shared(self.project, f"{tool} (it writes to disk)", destructive=False)
+            elif tool not in NOTED and not self._lease_noted:
+                self._lease_noted = True
+                note = lease_note(self.project)
+                if note:
+                    print(note, file=sys.stderr)
             others = [b for b in live_editors(self.project) if b.get("pid") != (beacon or {}).get("pid")]
             if others and not self._warned and self._first_note(beacon, others):
                 self._warned = True

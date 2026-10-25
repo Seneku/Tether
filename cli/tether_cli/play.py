@@ -2274,18 +2274,29 @@ def wait_game_seconds(ctx, seconds):
 
 COMPILE_QUIET = 3        # seconds of no shader-worker CPU and a quiet editor that count as "compiled"
 EDITOR_BUSY_CORES = 1.5  # editor CPU above this many cores counts as asset builds still running
+DRAWING_QUIET = 60       # a rendering editor: seconds of quiet shader workers after which its own CPU is drawing
+COMPILE_REPORT = 30      # seconds between "still waiting" lines
 
 
 def wait_compile(ctx, args):
     """`ue wait compile`: until the editor's shader workers and its own threads have been quiet for a few seconds
-    (shader and asset compilation are not visible to editor Python; their CPU use is)."""
-    pid = (ctx.beacon or {}).get("pid")
+    (shader and asset compilation are not visible to editor Python; their CPU use is). An editor that renders
+    (windowed, or `--render`) draws every frame, which can keep its own threads busy for good: there, shader
+    workers quiet for DRAWING_QUIET seconds end the wait too, saying the editor's CPU was taken for drawing."""
+    beacon = ctx.beacon or {}
+    pid = beacon.get("pid")
     if not pid or not editor_process(pid):
         raise CliError("no editor running (ue open)", 2)
     last = compile_cpu(pid)
     if last is None:
         raise CliError("ue wait compile reads process CPU times, which is Windows-only for now")
-    started, quiet_since, totals, peak = time.time(), None, [0.0, 0.0], 0
+    rendering = not beacon.get("nullrhi")
+    started, quiet_since, workers_quiet, totals, peak = time.time(), None, None, [0.0, 0.0], 0
+    reported, recent = started, []  # recent: (editor, workers) cores of the last COMPILE_REPORT seconds
+
+    def state(editor, workers, count):
+        return (f"shader workers {workers:.1f} cores ({count} running), the editor {editor:.1f} cores"
+                + (" (rendering: frames count as editor CPU)" if rendering else ""))
     while True:
         time.sleep(1)
         now = compile_cpu(pid)
@@ -2294,16 +2305,30 @@ def wait_compile(ctx, args):
         totals[1] += workers
         peak = max(peak, now[2])
         last = now
+        recent = (recent + [(editor, workers)])[-COMPILE_REPORT:]
         # workers_only: while PIE runs the editor's own threads are never quiet; shader compiles show in the workers
         busy = workers > 0.05 or (editor > EDITOR_BUSY_CORES and not getattr(args, "workers_only", False))
         quiet_since = None if busy else (quiet_since or time.time())
+        workers_quiet = None if workers > 0.05 else (workers_quiet or time.time())
+        waited = time.time() - started
         if quiet_since and time.time() - quiet_since >= COMPILE_QUIET:
-            print(f"compiled: quiet after {time.time() - started - COMPILE_QUIET:.0f}s (shader workers "
+            print(f"compiled: quiet after {waited - COMPILE_QUIET:.0f}s (shader workers "
                   f"{totals[1]:.0f} CPU-s, the editor {totals[0]:.0f} CPU-s; measured as CPU use)")
             return 0
-        if time.time() - started > args.max:
-            raise CliError(f"still compiling after {args.max:g}s (shader workers {workers:.1f} cores, editor "
-                           f"{editor:.1f} cores)", 4)
+        if rendering and workers_quiet and time.time() - workers_quiet >= DRAWING_QUIET:
+            print(f"compiled: shader workers quiet for {DRAWING_QUIET}s (after {waited - DRAWING_QUIET:.0f}s); the "
+                  f"editor itself stayed at {sum(e for e, _ in recent) / len(recent):.1f} cores, which in a rendering "
+                  "editor is drawing frames (asset builds on its threads can't be told apart from that)")
+            return 0
+        if time.time() - reported >= COMPILE_REPORT:
+            reported = time.time()
+            avg_editor = sum(e for e, _ in recent) / len(recent)
+            avg_workers = sum(w for _, w in recent) / len(recent)
+            print(f"still waiting after {waited:.0f}s: {state(avg_editor, avg_workers, now[2])}", flush=True)
+        if waited > args.max:
+            raise CliError(f"still compiling after {args.max:g}s: {state(editor, workers, now[2])}. Shader compiles "
+                           "run in the workers; asset builds (textures, meshes, Nanite, distance fields) and drawing "
+                           "on the editor's threads. `--workers-only` waits for shaders alone", 4)
 
 
 GRASS_DONE = re.compile(r"ASYNC GRASS INSTANCES COMPLETE")

@@ -1893,7 +1893,7 @@ class WatchShapes(unittest.TestCase):
         parser = ue.build_parser()
         sub = next(a for a in parser._actions if a.dest == "cmd").choices["shot"]
         wanted = {a.dest for a in sub._actions if a.dest not in ("help", "project", "pid", "port", "timeout", "json",
-                                                                 "limit", "time", "bulk")}
+                                                                 "limit", "time", "bulk", "ignore_lease")}
         self.assertLessEqual(wanted, set(vars(ue.shot_args())))
 
 
@@ -2309,9 +2309,10 @@ class SharedEditor(unittest.TestCase):
 
     def test_lease_take_renew_refuse_release(self):
         p = self.project.uproject
-        lease, renewed = ue.take_lease(p, "map rebuild + PIE", 15, now=1000)
-        self.assertFalse(renewed)
-        self.assertEqual(ue.take_lease(p, "map rebuild + PIE", 15, now=1100)[0]["since"], 1000)  # renewal keeps since
+        lease, how = ue.take_lease(p, "map rebuild + PIE", 15, now=1000)
+        self.assertEqual(how, "taken")
+        lease, how = ue.take_lease(p, "map rebuild + PIE", 15, now=1100)
+        self.assertEqual((how, lease["since"]), ("renewed", 1000))  # renewal keeps since
         with self.as_session("spire"):
             with self.assertRaises(ue.CliError) as caught:
                 ue.take_lease(p, "mine", 15, now=1200)
@@ -2322,8 +2323,68 @@ class SharedEditor(unittest.TestCase):
                     ue.release_lease(p)
         self.assertIsNone(ue.active_lease(p, now=1100 + 15 * 60 + 1))  # expired
         with unittest.mock.patch.object(ue.share.time, "time", return_value=1200):
-            self.assertEqual(ue.release_lease(p)["what"], "map rebuild + PIE")
+            self.assertEqual(ue.release_lease(p)[0]["what"], "map rebuild + PIE")
             self.assertIsNone(ue.active_lease(p))
+
+    def test_a_script_inside_a_lease_gives_it_back(self):  # 210: run_city_check.sh's trap dropped its caller's lease
+        p = self.project.uproject
+        ue.take_lease(p, "pieces round 3", 40, now=1000)
+        lease, how = ue.take_lease(p, "city check (run_city_check.sh)", 15, now=1100)
+        self.assertEqual((how, lease["outer"]["what"]), ("nested", "pieces round 3"))
+        self.assertIn("(inside its lease for pieces round 3", ue.describe_lease(p, lease, now=1100))
+        self.assertEqual(ue.take_lease(p, "city check (run_city_check.sh)", 15, now=1150)[1], "renewed")
+        with unittest.mock.patch.object(ue.share.time, "time", return_value=1200):
+            released, back = ue.release_lease(p)  # the script's EXIT trap
+            self.assertEqual((released["what"], back["what"]), ("city check (run_city_check.sh)", "pieces round 3"))
+            self.assertEqual(ue.active_lease(p)["what"], "pieces round 3")
+        # the inner lease running out gives the outer one back too
+        ue.take_lease(p, "level check", 1, now=1300)
+        self.assertEqual(ue.active_lease(p, now=1300 + 61)["what"], "pieces round 3")
+        with unittest.mock.patch.object(ue.share.time, "time", return_value=1400):
+            released, back = ue.release_lease(p)  # level check ran out: the session's own release ends its lease
+            self.assertEqual((released["what"], back), ("pieces round 3", None))
+            self.assertIsNone(ue.active_lease(p))
+
+    def test_ubt_build_waits_for_another_sessions_restart(self):  # 210
+        p = self.project.uproject
+        restart = {"session": "skyline", "cmd": "ue build --restart", "pid": 4242, "since": time.time() - 30}
+        with unittest.mock.patch.object(ue.editor, "running_commands", return_value=[restart]):
+            with self.assertRaises(ue.CliError) as caught:
+                ue.check_restarts(p)
+            self.assertEqual(caught.exception.code, ue.LEASED)
+            self.assertIn("closed for another session's restart (skyline `ue build --restart`", str(caught.exception))
+            ue.check_restarts(p, ignore=True)
+        with unittest.mock.patch.object(ue.editor, "running_commands", return_value=[dict(restart, session="menu")]):
+            ue.check_restarts(p)  # this session's own restart
+        with self.as_session("skyline"):
+            ue.take_lease(p, "before shots", 15)
+        with self.assertRaisesRegex(ue.CliError, r"build \(UBT, no editor open\) refused: the editor is leased by skyline"):
+            ue.check_restarts(p)
+
+    def test_saves_refuse_under_another_sessions_lease(self):  # 214
+        p = self.project.uproject
+        with self.as_session("skyline"):
+            ue.take_lease(p, "GPU baseline", 15)
+        sent = []
+        ctx = ue.Ctx(argparse.Namespace(project=p, timeout=5))
+        ctx._project, ctx._transport = p, "mcp"
+        ctx._mcp = types.SimpleNamespace(call=lambda toolset, tool, kw: (sent.append(tool) or '"ok"', False))
+        transport = sys.modules["tether_cli.transport"]
+        with unittest.mock.patch.object(transport, "editor_token", return_value="t"), \
+                unittest.mock.patch.object(transport, "chosen_editor", return_value={"pid": 1}), \
+                unittest.mock.patch.object(transport, "live_editors", return_value=[]), \
+                contextlib.redirect_stderr(io.StringIO()) as err:
+            for tool, kwargs in (("save", {}), ("import_files", {"files": "[]"}), ("new_asset", {"save": True})):
+                with self.assertRaises(ue.CliError) as caught:
+                    ctx.tether(tool, **kwargs)
+                self.assertEqual(caught.exception.code, ue.LEASED)
+                self.assertIn("(it writes to disk) refused: the editor is leased by skyline", str(caught.exception))
+            ctx.tether("set_props", target="A", values="{}")  # edits in memory go ahead, with one note
+            ctx.tether("spawn", what="X")
+            with unittest.mock.patch.dict(os.environ, {"UE_IGNORE_LEASE": "1"}):
+                ctx.tether("save")
+        self.assertEqual(sent, ["set_props", "spawn", "save"])
+        self.assertEqual(err.getvalue().count("note: the editor is leased by skyline"), 1)
 
     def test_check_shared(self):
         p = self.project.uproject
@@ -2545,6 +2606,57 @@ class TerrainRound(unittest.TestCase):
                 unittest.mock.patch.object(ue.play.time, "sleep"), contextlib.redirect_stdout(out):
             self.assertEqual(ue.cmd_wait(ctx, argparse.Namespace(what="compile", clock="real", max=600)), 0)
         self.assertIn("shader workers 80 CPU-s", out.getvalue())
+
+    def test_wait_compile_in_a_rendering_editor(self):  # 211: drawing keeps the editor's own CPU up for good
+        clock = iter(range(0, 10000))
+        editor = iter(range(0, 100000, 3))  # 3 cores, every second, forever
+        ctx = types.SimpleNamespace(beacon={"pid": 1, "headless": True, "nullrhi": False})
+        out = io.StringIO()
+        with unittest.mock.patch.object(ue.play, "editor_process", return_value=True), \
+                unittest.mock.patch.object(ue.play, "compile_cpu", side_effect=lambda pid: (next(editor), 0, 0)), \
+                unittest.mock.patch.object(ue.play.time, "time", side_effect=lambda: next(clock)), \
+                unittest.mock.patch.object(ue.play.time, "sleep"), contextlib.redirect_stdout(out):
+            self.assertEqual(ue.cmd_wait(ctx, argparse.Namespace(what="compile", clock="real", max=900)), 0)
+        self.assertIn("compiled: shader workers quiet for 60s", out.getvalue())
+        self.assertIn("the editor itself stayed at 3.0 cores, which in a rendering editor is drawing frames",
+                      out.getvalue())
+        self.assertIn("still waiting after", out.getvalue())  # a progress line every 30 s
+        ctx.beacon["nullrhi"] = True  # no rendering: the editor's CPU is asset builds, and the wait gives up
+        clock, editor = iter(range(0, 10000)), iter(range(0, 100000, 3))
+        with unittest.mock.patch.object(ue.play, "editor_process", return_value=True), \
+                unittest.mock.patch.object(ue.play, "compile_cpu", side_effect=lambda pid: (next(editor), 0, 0)), \
+                unittest.mock.patch.object(ue.play.time, "time", side_effect=lambda: next(clock)), \
+                unittest.mock.patch.object(ue.play.time, "sleep"), contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(ue.CliError, r"still compiling after 100s: shader workers 0.0 cores \(0 "
+                                                     r"running\), the editor 3.0 cores.*--workers-only"):
+                ue.cmd_wait(ctx, argparse.Namespace(what="compile", clock="real", max=100))
+
+    def test_compile_overlay_tells_others_errors_apart(self):  # 213
+        root = tempfile.mkdtemp()
+        shadow = os.path.join(root, "shadow", "Game.uproject")
+        builds = []
+
+        def build(c, a, check=False, extra=None, output=None):
+            builds.append(extra)
+            if output is not None:
+                output += [os.path.join(os.path.dirname(shadow), "Source", "Game", "NRRoadNode.cpp")
+                           + "(12): error C3861: 'Foo': identifier not found"]
+            return 1 if extra is None else 0
+        ctx = types.SimpleNamespace(project=os.path.join(root, "Game.uproject"))
+        out = io.StringIO()
+        with unittest.mock.patch.object(ue.build, "game_target", return_value="Game"), \
+                unittest.mock.patch.object(ue.build, "claim_overlay", side_effect=lambda p, o, s: o), \
+                unittest.mock.patch.object(ue.build, "shadow_project",
+                                           return_value=(shadow, ["Source/Game/Skyline.cpp", "Source/Game/Skyline.h"])), \
+                unittest.mock.patch.object(ue.build, "ubt_build", side_effect=build), \
+                unittest.mock.patch.object(ue.build, "file_owner", return_value="edited by roads (1a2b) 5 min ago (not you)"), \
+                contextlib.redirect_stdout(out):
+            self.assertEqual(ue.compile_overlay(ctx, "staged", 30, "me"), 0)
+        self.assertIn("Source/Game/NRRoadNode.cpp: edited by roads (1a2b) 5 min ago (not you)", out.getvalue())
+        self.assertIn("none of them is yours: checking the overlay's own 2 file(s) alone", out.getvalue())
+        self.assertEqual(len(builds), 2)
+        self.assertIn("-SingleFileBuildDependents", builds[1])
+        self.assertTrue(any(e.endswith("Skyline.cpp") for e in builds[1]))
 
     def test_drop_group_is_sent(self):
         ctx = FakeCtx("group of 3 actor(s) moved -591 cm")

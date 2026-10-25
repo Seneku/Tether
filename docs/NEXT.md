@@ -175,6 +175,26 @@ its panel's text in front ("Tether probe panel GARAGE"); a floating Content Brow
 layout (%LOCALAPPDATA%/UnrealEngine/Editor/EditorLayout.json) had made the selftest's menu check fail; and a
 failed selftest step list reports its FAIL line.
 
+**Done in 0.34.3** (UnrealRacing's notes 210-214):
+- 210: the lease was not lost to the restart (it is one file per project, not per editor pid) but to
+  `tests/city/run_city_check.sh`, run inside the holder's lease: a script runs as its caller's session, so its
+  `lease take` renewed the caller's lease (and replaced what it was for) and its EXIT trap's `lease release`
+  dropped it. A session that takes the lease again for something else now nests it (the new lease on top, the
+  earlier under "outer"); a release, or the inner lease running out, gives the earlier one back, and `lease yield
+  --back` restores the whole stack. `ue build` with no editor open refuses (exit 5) while another session's `build
+  --restart` has the editor closed, or another session holds the lease.
+- 211: `ue wait compile` judges by CPU use, and an editor that renders (windowed, `--render`) draws every frame,
+  so on a big level its own threads never went quiet. It now prints what it waits on every 30 s, ends in a
+  rendering editor once the shader workers have been quiet for 60 s (saying the editor's CPU looked like drawing),
+  and says what was busy when it gives up. `ue wait compile --workers-only` is now on the command line.
+- 212: `ue shot --view unlit` already existed; `ue exec "viewmode X"` now points at it.
+- 213: `ue build --check --overlay` names who last wrote each failing file outside the overlay and, when none of
+  the errors is in the overlay's files, checks those alone (as `--files`) and returns that result.
+- 214: anything that writes packages to disk (`save`, `import`, `reimport`, `mv`, `rm`, `move-pack`, redirector
+  fixes, any `save=True` call) refuses with exit 5 while another session holds the lease, and other edits print a
+  one-line note once per command. `--ignore-lease` is now a global option. `lease take` already exited 5 when
+  refused: chain it with `&&`.
+
 **Done in 0.34.2** (UnrealRacing's note 209): split key steps follow the rule single keys already did. `key X
 down` (and `tap`) on a screen where a UMG widget holds keyboard focus presses X through Slate right then, so
 NativeOnKeyDown and buttons get it; Epic's inspector only sends KeyDown and KeyUp together, so the matching `key X

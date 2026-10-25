@@ -17,15 +17,18 @@ go to the user's; `ue --pid <pid> ...` picks the other, and saving the same asse
 Other Claude sessions may share this editor (`ue who` lists who ran what in the last 15 min, and who started PIE).
 Before anything that takes the editor away from them (a map rebuild, a long PIE run, `ue build --restart`,
 `ue close`), run `ue lease take --for "map rebuild + PIE"` and `ue lease release` when done; `ue status` shows the
-lease to everyone. While another session holds it, `build --restart`, `close` and `pie start` refuse with exit 5
-and say who holds it and for what: wait, or `ue lease request --for "why"` (the holder sees it on its next
+lease to everyone. While another session holds it, `build --restart`, `close`, `pie start`, a UBT build with no
+editor open, and anything that writes to disk (`save`, `import`, `mv`, `rm`, `--save`) refuse with exit 5 and say
+who holds it and for what (edits in memory go ahead, with a note; `lease take` exits 5 too, so chain with `&&`, not
+`;`): wait, or `ue lease request --for "why"` (the holder sees it on its next
 command and runs `ue lease grant` when done), rather than passing `--ignore-lease`; `ue wait lease` then
 returns once it is yours or free and PIE has stopped. Asked for yours? Grant it when you reach a stopping point.
 A lease lasts at least 5 minutes past the end of its holder's last `ue` command, and is held while one of its
 commands runs (a long `ue py` stage), so it does not run out mid-task; `status`, `who` and `lease` show "busy:
 <command> for N min" for a command in flight (a busy editor, not a hung one). A test script that runs `ue` with its
 output thrown away never sees requests: call `ue lease yield --back` between suites (hands the lease to a waiting
-request, then waits to get it back; `ue lease pending` exits 0 when someone waits). Work that
+request, then waits to get it back; `ue lease pending` exits 0 when someone waits). A script you run inside your
+own lease can take and release its own: its lease goes on top of yours, and its release gives yours back. Work that
 needs another map or a throwaway import while others use the editor: `ue open --second` starts your own headless
 editor next to the shared one (its own port; your commands go there, others' do not; no lease needed; no
 pre-build, as the binaries are in use), and `ue close` closes it as soon as you are done: while it runs, the shared
@@ -178,7 +181,11 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
   rendering editor (`ue open --headless --render`); each prints the file that undoes it. Python cannot create a
   new landscape; if the project has its own C++ helper for that, use it.
 - After opening a big level or editing materials, `ue wait compile` waits until shaders and assets have
-  compiled, before screenshots, timings or a nav build.
+  compiled, before screenshots, timings or a nav build. It says what it waits on every 30 s; in a rendering
+  editor, whose frames keep its own CPU busy, it ends once the shader workers have been quiet for 60 s
+  (`--workers-only` waits for the workers alone).
+- `ue shot` sets its own view per capture: `ue exec "viewmode unlit"` does not carry over; use
+  `ue shot --view unlit` (or wireframe, lightingonly, ...).
 - Water: `ue water` lists zones and bodies and flags the usual mistakes (an ocean whose brush flattens the
   terrain, a coarse shoreline, a stock material on the distant water mesh).
 - Multiplayer: `ue pie start --clients 2` (add `--game /Script/MyGame.MyGameMode` to try another game mode), then
@@ -288,8 +295,10 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
   while another session's Live Coding builds? Keep them out of Source/ (its builds compile every changed file
   there): stage them in your own folder, Saved/Tether/staging/<session>/Source/<Module>/X.h, and run `ue build
   --check --overlay` (no folder: that one), which compiles a copy of the project with them on top (incremental
-  after the first run). A folder another session compiled is refused (on Windows staging/ and Staging/ are one
-  folder). Do not
+  after the first run). The copy takes the live Source/ under your files, so another session's half-written
+  files can fail it: those are listed with who wrote them, and when none of the errors is in your files it checks
+  yours alone (as `--files`) and reports that. A folder another session compiled is refused (on Windows staging/
+  and Staging/ are one folder). Do not
   compile the editor target with UBT `-Module=` while the editor runs: Live Coding breaks until a restart.
 - Live Coding patches every editor open on the project at once (the user's own and any PIE there included;
   `ue build` names them), and live only in those processes: `ue status` names editors running without them, and

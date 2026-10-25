@@ -1012,6 +1012,10 @@ def cmd_exec(ctx, args, after=None):
         print(f"({shown.folded} repeated line(s) in a row folded into \"xN\")")
     for path in written_screenshots(ctx, lines):
         print(f"screenshot: {path}")
+    view = re.match(r"\s*viewmode\s+(\w+)", command, re.I)
+    if view:  # `ue shot` sets its own view for each capture, so this one would not show in it
+        print(f"note: `ue shot` uses its own view (lit unless told), whatever the viewport shows: "
+              f"`ue shot --view {view.group(1).lower()}` takes the shot in that view and puts the old one back")
     return 0
 
 

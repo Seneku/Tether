@@ -223,6 +223,8 @@ def build_parser():
     common.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="one JSON document: {command, ok, exit, error, lines, data}")
     common.add_argument("--limit", type=int, default=argparse.SUPPRESS, help="max rows to print (30)")
     common.add_argument("--time", action="store_true", default=argparse.SUPPRESS, help="elapsed time to stderr")
+    common.add_argument("--ignore-lease", action="store_true", default=argparse.SUPPRESS,
+                        help="go ahead although another session holds the editor lease (restart, close, PIE, saves, imports, UBT builds)")
     common.add_argument("--bulk", action="store_true", default=argparse.SUPPRESS,
                         help="let this command check out more files than the bulk limit (Perforce/Plastic: "
                              "Config/Tether/vcs.json, 20 by default)")
@@ -280,8 +282,6 @@ def build_parser():
                         "builds. No DIR: this session's own, Saved/Tether/staging/<session>/")
     s.add_argument("--include-others", action="store_true", help="Live Coding: compile even files another session edited "
                                                                  "in the last 15 min (it refuses otherwise)")
-    s.add_argument("--ignore-lease", action="store_true", help="with --restart: go ahead although another session holds "
-                                                               "the lease or used the editor in the last few minutes")
     s.add_argument("--timing", action="store_true", help="compile the game target with UBT -Timing and list the "
                                                          "slowest files, modules and headers (the editor is untouched)")
     s.add_argument("--target", help="UBT target (default <Project>Editor)")
@@ -291,8 +291,6 @@ def build_parser():
     s.add_argument("--save", action="store_true", help="save dirty packages first")
     s.add_argument("--discard", action="store_true", help="drop unsaved changes (terminates if a dialog blocks)")
     s.add_argument("--force", action="store_true", help="terminate immediately")
-    s.add_argument("--ignore-lease", action="store_true", help="close although another session holds the lease or "
-                                                               "used the editor in the last few minutes")
     s = add("lease", cmd_lease, "share the editor between sessions: take --for WHAT [--minutes N] | release | request "
                                     "--for WHAT | grant [SESSION] | (show)")
     s.add_argument("action", nargs="?", choices=["take", "release", "request", "grant", "yield", "pending"],
@@ -314,6 +312,8 @@ def build_parser():
     s.add_argument("clock", nargs="?", choices=["game", "real"], default="real", help="game: PIE game time")
     s.add_argument("--max", type=float, help="with compile, grass, idle or lease: give up after this many seconds "
                                              "(the global --timeout when given, else 900)")
+    s.add_argument("--workers-only", action="store_true", help="with compile: wait for the shader workers alone (the "
+                                                               "editor's own threads, asset builds and drawing, ignored)")
     s = add("who", cmd_who, "sessions that used this editor recently, their last command, the lease, who started PIE")
     s.add_argument("--minutes", type=float, default=15, help="how far back (15)")
     s.add_argument("--as", dest="name", help="a name for this session that the others see (kept)")
@@ -662,8 +662,6 @@ def build_parser():
                    "over ticks (a tick callback); wait for it to call tether.finish(value) and print that (120)")
     s.add_argument("--wait-file", metavar="PATH", help="with run: wait until the script has written this file (within "
                                                        "--seconds, default 60) and print it")
-    s.add_argument("--ignore-lease", action="store_true", help="with start/run/do: start PIE although another session "
-                                                               "holds the editor lease")
     s.add_argument("--simulate", action="store_true", help="Simulate-In-Editor (no player pawn)")
     s.add_argument("--warmup", type=float, default=0.5, help="seconds to let BeginPlay settle (0.5)")
     s = add("bp", bp_command, "Blueprint graphs as text: read, --diff, --apply; check; edit; trace (what ran in PIE)")
@@ -1024,7 +1022,7 @@ def parse_command(parser, raw):
     args.job_command = command
     args.timeout_given = hasattr(args, "timeout")
     for key, default in (("project", None), ("pid", None), ("port", None), ("timeout", 120.0), ("json", False),
-                         ("limit", 30), ("time", False)):
+                         ("limit", 30), ("time", False), ("ignore_lease", False)):
         if not hasattr(args, key):
             setattr(args, key, default)
     if args.pid:  # every lookup of "the editor" reads this, the beacon helpers in core included

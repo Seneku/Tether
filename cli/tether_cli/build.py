@@ -669,6 +669,9 @@ def claim_overlay(project, overlay, sid, now=None):
     return overlay
 
 
+CODE_EXTS = (".cpp", ".h", ".hpp", ".inl")
+
+
 def compile_overlay(ctx, overlay, limit, sid):
     """`ue build --check --overlay DIR`: compile the game target of a copy of the project with DIR's files on top,
     so work staged outside Source/ is checked without another session's Live Coding picking it up. Errors in
@@ -688,11 +691,28 @@ def compile_overlay(ctx, overlay, limit, sid):
     if ignored:
         print(f"  (left out, not under Source/, Config/ or Plugins/: {', '.join(ignored[:5])}"
               + (f" +{len(ignored) - 5}" if len(ignored) > 5 else "") + ")")
-    code = ubt_build(argparse.Namespace(project=shadow), argparse.Namespace(target=target, config="Development",
-                                                                            limit=limit), check=True)
-    if code:
-        print("errors in " + ", ".join(overlaid[:6]) + " are in the staged copies under " + overlay)
-    return code
+    build_args, lines = argparse.Namespace(target=target, config="Development", limit=limit), []
+    code = ubt_build(argparse.Namespace(project=shadow), build_args, check=True, output=lines)
+    if not code:
+        return code
+    errors = compact_diagnostics(lines, os.path.dirname(shadow))[0]
+    failed = list(dict.fromkeys(m.group("file").replace("\\", "/") for m in map(ERROR_FILE.match, errors) if m))
+    ours = {rel.lower() for rel in overlaid}
+    mine, theirs = [f for f in failed if f.lower() in ours], [f for f in failed if f.lower() not in ours]
+    if mine:
+        print("errors in " + ", ".join(mine[:6]) + " are in the staged copies under " + overlay)
+    if theirs:  # the copy takes the live Source/ under the overlay: another session's half-written files come along
+        print(f"errors in {len(theirs)} file(s) outside the overlay, from the live Source/:")
+        for rel in theirs[:6]:
+            print(f"  {rel}: {file_owner(ctx.project, rel) or 'not written by a session Tether saw'}")
+    sources = [rel for rel in overlaid if rel.lower().startswith("source/") and rel.lower().endswith(CODE_EXTS)]
+    if mine or not theirs or not sources:
+        return code
+    print(f"none of them is yours: checking the overlay's own {len(sources)} file(s) alone (as --files does)")
+    extra = [f"-SingleFile={os.path.join(os.path.dirname(shadow), rel)}" for rel in sources]
+    if any(rel.lower().endswith((".h", ".hpp", ".inl")) for rel in sources):
+        extra.append("-SingleFileBuildDependents")  # a header compiles through the files that include it
+    return ubt_build(argparse.Namespace(project=shadow), build_args, check=True, extra=extra)
 
 
 def compile_check(ctx, limit, files=None):

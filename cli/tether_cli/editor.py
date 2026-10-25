@@ -1,6 +1,7 @@
 """Editor lifecycle: status, open, close, build, crash; the shared editor's lease and `ue who`."""
 import argparse
 import os
+import re
 import sys
 import time
 
@@ -16,8 +17,8 @@ from .core import (
     subprocess, write_json,
 )
 from .share import (
-    ACTIVE_MINUTES, active_lease, ago, changed_files, check_shared, describe_lease, describe_running, drop_request,
-    duration, grant_lease, lease_note, lease_requests, others_edits, pie_owner, pie_starter, recent_sessions,
+    ACTIVE_MINUTES, LEASED, active_lease, ago, changed_files, check_shared, describe_lease, describe_running, drop_request,
+    duration, grant_lease, lease_note, lease_path, lease_requests, others_edits, pie_owner, pie_starter, recent_sessions,
     release_lease, request_lease, running_commands, session_id, session_label, session_names, set_session_name,
     sort_changes, take_lease,
 )
@@ -106,6 +107,22 @@ def cmd_status(ctx, args):
 
 
 OTHERS_MINUTES = 15  # another session's edits this recent may be half-written
+RESTARTING = re.compile(r"(^|\s)build\b.*\s--restart\b")
+
+
+def check_restarts(project, ignore=False):
+    """Before a UBT build with no editor open: the editor may only be closed for another session's `build
+    --restart`, whose editor comes back on the binaries this build would change under it. Refuse then, and while
+    another session holds the lease (--ignore-lease goes ahead)."""
+    if ignore or os.environ.get("UE_IGNORE_LEASE") == "1":
+        return
+    restart = next((r for r in running_commands(project)
+                    if r.get("session") != session_id() and RESTARTING.search(r.get("cmd", ""))), None)
+    if restart:
+        raise CliError(f"build refused: the editor is closed for another session's restart "
+                       f"({describe_running(project, restart)}); its editor comes back on these binaries. "
+                       "`ue wait lease` (or wait for it), or pass --ignore-lease", LEASED)
+    check_shared(project, "build (UBT, no editor open)", destructive=False)
 
 
 def cmd_build(ctx, args):
@@ -137,6 +154,7 @@ def cmd_build(ctx, args):
     has_csharp = csharp_layout(ctx.project) is not None
     pending_file = os.path.join(state_dir(ctx.project), "pending-reopen.json")
     if not running:
+        check_restarts(ctx.project, getattr(args, "ignore_lease", False))
         code = ubt_build(ctx, args) or (uat_user_solution(ctx, args.limit) if has_csharp else 0)
         pending = read_json(pending_file)
         if pending and args.restart and not code:  # the editor a failed `--restart` closed: reopen it now
@@ -503,18 +521,20 @@ def cmd_lease(ctx, args):
     if args.action == "take":
         if not args.what:
             raise CliError('say what the editor is for: ue lease take --for "map rebuild + PIE"')
-        lease, renewed = take_lease(ctx.project, args.what, args.minutes)
-        print(("renewed: " if renewed else "taken: ") + describe_lease(ctx.project, lease)
-              + "; `ue lease release` when done")
+        lease, how = take_lease(ctx.project, args.what, args.minutes)
+        print(f"{how}: " + describe_lease(ctx.project, lease) + "; `ue lease release` when done"
+              + ("; that gives back the lease it is inside of" if how == "nested" else ""))
         others = recent_sessions(ctx.project, ACTIVE_MINUTES, exclude=session_id())
         if others:
             print("  other sessions active in the last few minutes (they see it in `ue status`): "
                   + ", ".join(session_label(ctx.project, s) for s in others))
         return 0
     if args.action == "release":
-        held = release_lease(ctx.project, force=args.force)
+        held, back = release_lease(ctx.project, force=args.force)
         print(f"released ({held.get('what')}, held {duration(time.time() - held['since'])})" if held
               else "no lease was held")
+        if back:
+            print(f"  the lease it was inside of is held again: {describe_lease(ctx.project, back)}")
         waiting = lease_requests(ctx.project)
         if waiting:
             print(f"  {session_label(ctx.project, waiting[0]['session'])} asked for it ({waiting[0]['what']}): "
@@ -571,15 +591,24 @@ def yield_lease(ctx, args):
     sys.stdout.flush()
     started = time.time()
     deadline = started + (getattr(args, "timeout", None) or 4 * 3600)
+    mine = {k: v for k, v in held.items() if k != "busy"} if held and held["session"] == me else None
+
+    def restored(lease):  # back as it was before the yield: a lease this one was inside of comes back with it
+        if not mine:
+            return lease
+        lease = dict(mine, until=max(mine["until"], lease["until"]))
+        write_json(lease_path(ctx.project), lease)
+        return lease
     while time.time() < deadline:
         now_held = active_lease(ctx.project)
         if now_held and now_held["session"] == me:
-            print(f"the lease is yours again after {duration(time.time() - started)}: {describe_lease(ctx.project, now_held)}")
+            print(f"the lease is yours again after {duration(time.time() - started)}: "
+                  + describe_lease(ctx.project, restored(now_held)))
             return 0
         if not now_held:
             lease, _ = take_lease(ctx.project, what, args.minutes)
             print(f"the editor is free again after {duration(time.time() - started)}; taken: "
-                  + describe_lease(ctx.project, lease))
+                  + describe_lease(ctx.project, restored(lease)))
             return 0
         time.sleep(2)
     raise CliError(f"the lease did not come back within {duration(time.time() - started)} (ue lease; --timeout "
