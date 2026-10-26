@@ -348,6 +348,9 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
   defaults and graph text, DataTable rows, map actors. Use it to review your own asset edits before
   committing, and to understand someone else's commit (`ue diff X <sha>~1 --to <sha>`). Perforce revisions work
   too: `#have` (the default in a Perforce workspace), `#head`, `#3`, `@1234` (`ue diff X @1233 --to @1234`).
+  World Partition actor files (`__ExternalActors__/...`) are refused: diff their map, which lists the changed
+  actors. If `ue changes` warns that an actor belongs to a Tether diff copy, do not save that level; reopen it
+  with `ue map open <map> --discard` (ask first: it drops the level's unsaved edits).
 - `ue find <regex> [--class StaticMesh] [--under /Game/x]` (or a path: `ue find "/Game/X/Presets/*"`) to locate assets; `ue refs <asset>` before deleting
   or renaming one (what uses it), `--deps` for what it uses.
 - `ue api <Class> [regex]` before writing editor Python: real method signatures and property names in a
