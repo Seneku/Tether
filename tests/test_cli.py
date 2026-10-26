@@ -3268,6 +3268,38 @@ class UnrealRacingRound2(unittest.TestCase):
             self.assertIn("granted by holder", ue.lease_messages(p)[0])
             self.assertEqual(ue.lease_messages(p), [])  # said once
 
+    def test_an_idle_lease_lapses_while_another_session_waits(self):  # UnrealRacing 2026-10-26: 1.9 h queued at an idle editor
+        p, t = self.project.uproject, time.time()
+        with unittest.mock.patch.dict(os.environ, {"UE_SESSION": "holder"}):
+            ue.take_lease(p, "rebuild + shots", 40, now=t)
+            ue.note_lease_active(p, now=t + 60)  # a command ended a minute in
+        self.assertEqual(ue.active_lease(p, now=t + 600)["session"], "holder")  # idle, but nobody waits
+        with unittest.mock.patch.dict(os.environ, {"UE_SESSION": "asker"}):
+            ue.request_lease(p, "PIE suites", 10, now=t + 120)
+        self.assertEqual(ue.active_lease(p, now=t + 60 + 170)["session"], "holder")  # under LEASE_IDLE
+        self.assertIsNone(ue.active_lease(p, now=t + 60 + ue.LEASE_IDLE * 60 + 1))  # lapsed: the asker may take it
+        with unittest.mock.patch.dict(os.environ, {"UE_SESSION": "holder"}):
+            with unittest.mock.patch.object(ue.share, "holder_pie_running", return_value=True):
+                self.assertEqual(ue.active_lease(p, now=t + 900)["session"], "holder")  # its PIE test still runs
+            note = ue.lease_messages(p, now=t + 900)
+            self.assertIn("lapsed", note[0])
+            self.assertIn("asker", note[0])
+            self.assertEqual(ue.lease_messages(p, now=t + 901), [])  # said once
+            ue.take_lease(p, "unsaved hand edits", 30, now=t + 1000, hold=True)
+        self.assertEqual(ue.active_lease(p, now=t + 2500)["session"], "holder")  # --hold never lapses
+
+    def test_a_release_holds_while_another_process_reads_the_lease(self):  # Windows: no delete while a reader has it open
+        p = self.project.uproject
+        with unittest.mock.patch.dict(os.environ, {"UE_SESSION": "holder"}):
+            ue.take_lease(p, "PIE suites", 15)
+            with unittest.mock.patch.object(ue.share.os, "remove", side_effect=PermissionError("in use")), \
+                    unittest.mock.patch.object(ue.share.time, "sleep"):
+                held, back = ue.release_lease(p)
+        self.assertEqual((held["what"], back), ("PIE suites", None))
+        self.assertIsNone(ue.active_lease(p))  # released, though the file could not be deleted
+        with unittest.mock.patch.dict(os.environ, {"UE_SESSION": "asker"}):
+            self.assertEqual(ue.take_lease(p, "rebuild", 15)[1], "taken")
+
     def test_find_with_a_path_glob(self):
         ctx = FakeCtx("9 assets under /Game/UDS\n/Game/UDS/Presets/P_Rain  DataAsset\n/Game/UDS/Presets/P_Snow  "
                       "DataAsset\n/Game/UDS/Blueprints/BP_Sky  Blueprint")

@@ -181,6 +181,23 @@ def lease_path(project):
     return os.path.join(state_dir(project), "lease.json")
 
 
+def drop_lease_file(project):
+    """Delete lease.json. On Windows a delete fails while any other process has the file open (Python opens files
+    without delete sharing), and with several sessions polling it in `ue wait lease` one is often reading it: the
+    release used to fail silently and the lease stayed held (UnrealRacing 2026-10-26). Retry, then overwrite it
+    with an expired lease, which a reader does not block."""
+    path = lease_path(project)
+    for attempt in range(5):
+        try:
+            os.remove(path)
+            return
+        except FileNotFoundError:
+            return
+        except OSError:
+            time.sleep(0.05 * (attempt + 1))
+    write_json(path, {"until": 0})
+
+
 def current_lease(lease, now):
     """The innermost lease of a stack still running: a session's lease taken again for something else (a script it
     runs) sits on top of the first, under "outer", which comes back when the inner one is released or runs out."""
@@ -191,16 +208,50 @@ def current_lease(lease, now):
     return None
 
 
+def holder_pie_running(project, sid):
+    """Whether an editor of this project is in a PIE session that session `sid` started (`ue pie start`/`pie do`):
+    a PIE test runs for minutes between its holder's `ue` commands (a script polling for the test's result file)."""
+    record = read_json(pie_owner_path(project)) or {}
+    if record.get("session") != sid or not record.get("time"):
+        return False
+    folder = os.path.join(state_dir(project), "editors")
+    for name in os.listdir(folder) if os.path.isdir(folder) else []:
+        beacon = read_json(os.path.join(folder, name)) if name.endswith(".json") else None
+        if isinstance(beacon, dict) and beacon.get("pie") and beacon.get("pie_since") \
+                and -5 <= beacon["pie_since"] - record["time"] <= 60 and pid_alive(beacon.get("pid")):
+            return True
+    return False
+
+
+def lease_idle(project, lease, now):
+    """Seconds the holder of `lease` (the file's top level) has left the editor idle while another session waits
+    for it, or 0: no `ue` command of the holder's running and no PIE session it started, since its last command
+    ended (or it took the lease). A lease taken with --hold never idles, nor one taken before 0.35 (no "lapse")."""
+    if lease.get("hold") or not lease.get("lapse"):
+        return 0
+    sid = lease.get("session")
+    if not any(r["session"] != sid for r in lease_requests(project, now)):
+        return 0
+    idle = now - max(lease.get("active", 0), lease.get("since", 0))
+    if idle < LEASE_IDLE * 60:
+        return 0
+    if any(r.get("session") == sid for r in running_commands(project)) or holder_pie_running(project, sid):
+        return 0
+    return idle
+
+
 def active_lease(project, now=None):
     """The editor lease if one is held and not expired, else None. A lease whose time ran out while its holder's
-    `ue` command is still running (a long `ue py` stage) is still held: it lasts LEASE_KEEP min past that command."""
+    `ue` command is still running (a long `ue py` stage) is still held: it lasts LEASE_KEEP min past that command.
+    A lease whose holder has left the editor idle for LEASE_IDLE min while another session waits has lapsed
+    (lease_idle): the editor goes to whoever waits, and the holder is told on its next command."""
     lease = read_json(lease_path(project))
     now = time.time() if now is None else now
     if not isinstance(lease, dict) or "until" not in lease:
         return None
     held = current_lease(lease, now)
     if held:
-        return held
+        return None if lease_idle(project, lease, now) else held
     busy = [r for r in running_commands(project) if r.get("session") == lease.get("session")]
     return dict(lease, until=now + LEASE_KEEP * 60, busy=busy[0]) if busy else None
 
@@ -290,10 +341,11 @@ def describe_running(project, row, now=None, names=None):
             f"{duration(now - row.get('since', now))} (pid {row.get('pid')})")
 
 
-def take_lease(project, what, minutes, now=None):
+def take_lease(project, what, minutes, now=None, hold=False):
     """Take (or renew) the lease for this session; refuse while another session holds it. Taken again by this
     session for something else (a script inside a session's lease takes its own), the new lease goes on top and
     the one before comes back when it is released: a script's `lease release` no longer drops its caller's lease.
+    hold: the lease never lapses while its holder is idle (lease_idle); a nested lease keeps its outer one's.
     Returns (lease, "taken" | "renewed" | "nested")."""
     now = time.time() if now is None else now
     held = active_lease(project, now)
@@ -307,6 +359,11 @@ def take_lease(project, what, minutes, now=None):
     else:
         lease = dict(held or {"session": me, "what": what, "since": now}, until=now + minutes * 60)
         how = "renewed" if held else "taken"
+    lease["active"] = now
+    if hold or (held and held.get("hold")):
+        lease["hold"] = True
+    else:
+        lease["lapse"] = True
     write_json(lease_path(project), lease)
     drop_request(project, me)  # asked for it earlier: answered
     return lease, how
@@ -325,10 +382,7 @@ def release_lease(project, force=False):
     if back:
         write_json(lease_path(project), back)
         return held, back
-    try:
-        os.remove(lease_path(project))
-    except OSError:
-        pass
+    drop_lease_file(project)
     return held, None
 
 
@@ -428,6 +482,33 @@ def grant_lease(project, to=None, now=None):
 
 REMIND_MINUTES = 10  # a request the lease holder was told about is said again after this
 LEASE_KEEP = 5       # a lease whose holder keeps running `ue` commands lasts this long past the last one
+LEASE_IDLE = 3       # ... but lapses after this long with the editor idle (no command, no PIE of its own) while
+                     # another session waits: holders thinking between commands kept sessions queued (UnrealRacing)
+
+
+def note_lease_active(project, now=None):
+    """At the end of each of this session's `ue` commands: the lease it holds was in use until now (lease_idle)."""
+    now = time.time() if now is None else now
+    lease = read_json(lease_path(project))
+    if isinstance(lease, dict) and lease.get("session") == session_id() and current_lease(lease, now):
+        write_json(lease_path(project), dict(lease, active=now))
+
+
+def lapsed_lease_note(project, now=None):
+    """A line for this session if the lease file still names it but the lease lapsed while it was idle, else None.
+    Said once: the file is then dropped (the editor is free)."""
+    now = time.time() if now is None else now
+    lease = read_json(lease_path(project))
+    if not isinstance(lease, dict) or lease.get("session") != session_id() or not current_lease(lease, now):
+        return None
+    idle = lease_idle(project, lease, now)
+    if not idle:
+        return None
+    waiting = [session_label(project, r["session"]) for r in lease_requests(project, now) if r["session"] != lease["session"]]
+    drop_lease_file(project)
+    return (f"note: your editor lease ({lease.get('what')}) lapsed: the editor sat idle {duration(idle)} while "
+            f"{', '.join(waiting)} waited. `ue lease take` again (or `ue lease request` to queue); take it with "
+            "--hold for work a hand-over would lose, and run long steps as one script")
 
 
 def lease_messages(project, now=None):
@@ -436,6 +517,9 @@ def lease_messages(project, now=None):
     while it waits (`ue status` and `ue who` list them all)."""
     now = time.time() if now is None else now
     me, held, out = session_id(), active_lease(project, now), []
+    lapsed = None if held else lapsed_lease_note(project, now)
+    if lapsed:
+        out.append(lapsed)
     if held and held["session"] == me:
         if held.get("granted_by") and not held.get("told"):
             out.append(f"note: the editor lease is yours now, granted by {session_label(project, held['granted_by'])} "

@@ -9,7 +9,7 @@ import time
 from . import core
 from .core import UE_SCRIPT, CliError, crash_summary, find_project, live_editors, recent_crash, stall_report
 from .transport import Ctx
-from .share import (LEASE_MINUTES, cmd_stats, keep_lease, lease_messages, record_activity, record_stat, start_running,
+from .share import (LEASE_MINUTES, cmd_stats, keep_lease, lease_messages, note_lease_active, record_activity, record_stat, start_running,
                     stop_running)
 from .editor import cmd_build, cmd_close, cmd_crash, cmd_git, cmd_lease, cmd_open, cmd_status, cmd_who
 from .calls import (
@@ -300,6 +300,10 @@ def build_parser():
     s.add_argument("--for", "--reason", dest="what", help="with take/request: what the editor is for, as the other sessions will see it")
     s.add_argument("--minutes", type=float, default=LEASE_MINUTES, help=f"with take: how long ({LEASE_MINUTES}); "
                                                                          "take again to renew")
+    s.add_argument("--hold", action="store_true", help="with take: never lapses while you are idle (a lease lapses "
+                                                       "after 3 min with no command of yours and no PIE of yours "
+                                                       "running while another session waits); for work in the editor "
+                                                       "a hand-over would lose")
     s.add_argument("--as", dest="name", help="a name for this session that the others see (kept)")
     s.add_argument("--force", action="store_true", help="with release: release another session's lease")
     s.add_argument("--back", action="store_true", help="with yield: ask for the lease again and wait until it is "
@@ -1136,6 +1140,7 @@ def main(argv=None):
             stop_running(running)
             try:  # a lease is kept LEASE_KEEP min past the end of its holder's last command, not its start
                 keep_lease(find_project(args.project))
+                note_lease_active(find_project(args.project))  # and counts as idle from there (LEASE_IDLE)
             except CliError:
                 pass
     if envelope:

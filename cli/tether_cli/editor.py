@@ -521,7 +521,7 @@ def cmd_lease(ctx, args):
     if args.action == "take":
         if not args.what:
             raise CliError('say what the editor is for: ue lease take --for "map rebuild + PIE"')
-        lease, how = take_lease(ctx.project, args.what, args.minutes)
+        lease, how = take_lease(ctx.project, args.what, args.minutes, hold=args.hold)
         print(f"{how}: " + describe_lease(ctx.project, lease) + "; `ue lease release` when done"
               + ("; that gives back the lease it is inside of" if how == "nested" else ""))
         others = recent_sessions(ctx.project, ACTIVE_MINUTES, exclude=session_id())
