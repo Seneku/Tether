@@ -17,7 +17,7 @@ from .core import (
 )
 from .transport import catalog, py_json, resolve_toolset
 from .build import csharp_changes, csharp_layout, csharp_reload_build, layout_patch_note, reflection_patch_refusal
-from .calls import SAVE_FIX, flush_editor_log, metres_to_cm, save_failures, scoped_cvars
+from .calls import flush_editor_log, metres_to_cm, save_failures, save_hint, scoped_cvars
 from .share import (
     active_lease, check_shared, clear_pie_start, describe_lease, pie_owner, record_pie_start, session_id,
 )
@@ -650,8 +650,30 @@ LIGHTING_DONE = re.compile(r"LogStaticLightingSystem: (?:Warning: )?(Illuminatio
                            r".*Skipping Lighting Build.*|Failed to (?:initialize|connect to) Swarm.*)")
 
 
-DIRTY_PACKAGES = ("import json\nU = unreal.EditorLoadingAndSavingUtils\n"
-                  "print(json.dumps([p.get_name() for p in U.get_dirty_map_packages() + U.get_dirty_content_packages()]))")
+# The unsaved packages before and after some work, compared in the editor: a World Partition level can have thousands
+# unsaved, more names than a `ue py` reply carries. The mark is kept on the sys module until dirty_since takes it.
+DIRTY_NOW = ("{{p.get_name() for p in unreal.EditorLoadingAndSavingUtils.get_dirty_map_packages() + "
+             "unreal.EditorLoadingAndSavingUtils.get_dirty_content_packages()}}")
+DIRTY_MARK = "import sys\nsys.__dict__.setdefault('_tether_dirty_marks', {{}})[{key!r}] = " + DIRTY_NOW + "\nprint(0)"
+DIRTY_SINCE = ("import json, sys\n_b = sys.__dict__.get('_tether_dirty_marks', {{}}).pop({key!r}, None)\n_n = " + DIRTY_NOW
+               + "\n_new = None if _b is None else sorted(p for p in _n - _b if not p.startswith('/Temp/'))\n"
+               "print(json.dumps({{'new': _new and _new[:{cap}], 'count': len(_new or []), "
+               "'held': [p for p in {also!r} if p in _n]}}))")
+
+
+def dirty_mark(ctx):
+    """Note the unsaved packages now, in the editor; dirty_since(ctx, key) tells what joined them."""
+    key = f"{os.getpid()}-{time.time():.6f}"
+    ctx.tether("py", code=DIRTY_MARK.format(key=key))
+    return key
+
+
+def dirty_since(ctx, key, also=(), cap=100):
+    """{new: packages unsaved since the mark (at most cap; /Temp left out; None if the editor lost the mark), count,
+    held: those of `also` that are unsaved now}."""
+    return py_json(ctx, DIRTY_SINCE.format(key=key, also=list(also), cap=cap))
+
+
 NAV_DATA_PACKAGES = ("import json\nw = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_editor_world()\n"
                      "print(json.dumps(sorted({a.get_package().get_name() for a in "
                      "unreal.GameplayStatics.get_all_actors_of_class(w, unreal.NavigationData)})))")
@@ -804,7 +826,7 @@ def cmd_world(ctx, args):
         raise CliError("ue world build <what>: one of nav, lighting, hlod, minimap, nav-wp, resave or a builder class")
     what = args.what[0].lower()
     if what == "nav":
-        dirty_before = set(py_json(ctx, DIRTY_PACKAGES))
+        mark = dirty_mark(ctx)
         started = time.time()
         rebuild_navigation(ctx, min(args.wait, NAV_LOCK_WAIT))
         building ="unreal.NavigationSystemV1.is_navigation_being_built(unreal.get_editor_subsystem(" \
@@ -829,12 +851,14 @@ def cmd_world(ctx, args):
             raise CliError(f"not saved: a bounds volume still has no navmesh after {min(args.wait, NAV_SETTLE):g}s "
                            "(still generating, or the volume misses the floor). Run it again, or `ue save` to keep "
                            "the map as it is", 4)
-        dirty_after = py_json(ctx, DIRTY_PACKAGES)
-        changed = [p for p in dirty_after if p not in dirty_before and not p.startswith("/Temp/")]
         # The navmesh lives in the map (or its nav-data actor's package). A map that was already unsaved before the
         # build, e.g. because a nav agent change replaced RecastNavMesh-Default, holds it too: save it as well.
         nav_maps = py_json(ctx, NAV_DATA_PACKAGES) if args.save else []
-        held = [p for p in nav_maps if p in dirty_after and p not in changed]
+        since = dirty_since(ctx, mark, nav_maps, cap=150)
+        changed = since["new"] or []
+        if since["count"] > len(changed):
+            print(f"note: {since['count']} packages changed; only the first {len(changed)} are named and saved here")
+        held = [p for p in since["held"] if p not in changed]
         if held and args.save:
             print(f"also saving {', '.join(held)}: it holds the navmesh and had unsaved changes from before the build")
             changed += held
@@ -1659,9 +1683,11 @@ def pie_run(ctx, args):
     for pattern, line in rejected[:5]:
         print(f"BAD  /{pattern}/  {line.split(']', 2)[-1].strip()[:140]}")
         failures.append(f"rejected pattern /{pattern}/ appeared")
-    for line in save_failures(lines):  # the script saved, or thought it did
+    saves = save_failures(lines)  # the script saved, or thought it did
+    for line in saves:
         print(f"save failed: {line}")
-        failures.append("a save failed (" + SAVE_FIX.split(":")[0].lower() + "?)")
+    if saves:
+        failures.append(f"a save failed ({save_hint(ctx.project, saves)[0]})")
     print(("PASS" if not failures else "FAIL") + f" in {time.time() - started:.1f}s"
           + ("" if not failures else ": " + "; ".join(dict.fromkeys(failures))))
     return 1 if failures else 0

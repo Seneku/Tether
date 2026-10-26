@@ -313,7 +313,7 @@ def cmd_py(ctx, args):
     if failed:  # the script went on as if it had saved: say so and fail, while the editor still holds the work
         for line in failed:
             print(f"save failed: {line}", file=sys.stderr)
-        print("note: the work is still in the editor, unsaved. " + SAVE_FIX, file=sys.stderr)
+        print("note: the work is still in the editor, unsaved. " + save_hint(ctx.project, failed)[1], file=sys.stderr)
         return 1
     return 0
 
@@ -323,6 +323,27 @@ SAVE_FAILED = re.compile(r"cannot|can't|could not|couldn't|unable|fail|read.?onl
 SAVE_FIX = ("A file is read-only: git-lfs leaves `lockable` files (*.uasset, *.umap) read-only after a commit. "
             "`ue save --writable` makes them writable and saves (or `git lfs lock <file>` where there is a lock "
             "server); `ue changes` lists what is unsaved")
+SAVE_DIFF_COPY = ("A package that failed is one of Tether's diff copies (/Temp/Tether/diff/...): an actor of the level "
+                  "belongs to a staged copy of its own file (`ue changes` names it). Do not save the level: that can "
+                  "drop the actor from __ExternalActors__. `ue map open <map> --discard` reloads it from its files")
+SAVE_OTHER = "`ue log` has the engine's reasons; `ue changes` lists what is unsaved"
+GAME_PACKAGE = re.compile(r"/Game/[\w/.-]+")
+
+
+def save_hint(project, failed):
+    """(short cause, advice) for save failures: the git-lfs advice only when a failed file is read-only."""
+    text = "\n".join(failed)
+    if "/Temp/Tether/diff/" in text:
+        return "an actor bound to a Tether diff copy", SAVE_DIFF_COPY
+    if re.search(r"read.?only", text, re.I):
+        return "a file is read-only", SAVE_FIX
+    content = os.path.join(os.path.dirname(project), "Content")
+    for package in dict.fromkeys(GAME_PACKAGE.findall(text)):
+        base = os.path.join(content, *package.split(".")[0][len("/Game/"):].split("/"))
+        for path in (base + ".uasset", base + ".umap"):
+            if os.path.isfile(path) and not os.access(path, os.W_OK):
+                return "a file is read-only", SAVE_FIX
+    return "see ue log", SAVE_OTHER
 SAVE_DIALOG = re.compile(r"Message dialog closed, result: \w+, title: [^,]*, text: (.*?(?:save|read-only|read only).*)$",
                          re.I)
 
@@ -330,12 +351,18 @@ SAVE_DIALOG = re.compile(r"Message dialog closed, result: \w+, title: [^,]*, tex
 def save_failures(lines):
     """Lines in which the engine said a package was not saved (LogSavePackage and friends; "Cannot remove ... as it
     is read only!" comes without a severity; through the editor's save helpers, a message dialog that an unattended
-    editor answers and logs), timestamps stripped, at most 10."""
+    editor answers and logs, its package list on the lines after it), timestamps stripped, at most 10."""
     found = []
-    for line in lines:
+    for i, line in enumerate(lines):
         dialog = SAVE_DIALOG.search(line)
-        if dialog and dialog.group(1).strip() not in found:
-            found.append(dialog.group(1).strip())
+        if dialog:
+            text = dialog.group(1).strip()
+            for more in lines[i + 1:i + 6]:  # "The following assets failed to save correctly:" then one per line
+                if more.startswith("[") or not more.strip():
+                    break
+                text += " " + more.strip()
+            if text not in found:
+                found.append(text)
         m = LOG_LINE.match(line)
         if m and m.group(1) in SAVE_LOGS and (m.group(2) in ("Error", "Fatal", "Warning") or SAVE_FAILED.search(m.group(3))):
             if m.group(1) != "LogFileManager" or re.search(r"read.?only|delete|move|denied", m.group(3), re.I):
@@ -713,9 +740,9 @@ def cmd_save(ctx, args):
     suspect = None if getattr(args, "anyway", False) else suspect_map(ctx.project, ctx.beacon)
     name = suspect["map"].rsplit("/", 1)[-1] if suspect else None
     if suspect and not args.paths:  # a save of everything writes the map only when it has unsaved changes
-        dirty = py_json(ctx, "import json\njson.dumps([p.get_name() for p in "
-                             "unreal.EditorLoadingAndSavingUtils.get_dirty_map_packages()])")
-        suspect = suspect if any(d.rsplit("/", 1)[-1] == name for d in dirty) else None
+        dirty = py_json(ctx, "import json\njson.dumps(any(p.get_name().rsplit('/', 1)[-1] == " + repr(name)
+                        + " for p in unreal.EditorLoadingAndSavingUtils.get_dirty_map_packages()))")  # thousands with WP
+        suspect = suspect if dirty else None
     if suspect and (not args.paths or any(p.split(".")[0].rsplit("/", 1)[-1] == name for p in args.paths)):
         raise CliError(f"{suspect['map']} loaded broken in this editor (`ue map open` found: "
                        f"{'; '.join(suspect['problems'][:3])}); saving it would write that state. Restart the editor "

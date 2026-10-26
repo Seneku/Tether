@@ -634,6 +634,44 @@ def _dirty_packages():
     return maps, content
 
 
+# "PersistentLevel" in a package's name table: an external (World Partition / One File Per Actor) actor's package
+_LEVEL_NAME_ENTRY = b"\x10\x00\x00\x00PersistentLevel\x00"
+_EXTERNAL_COPY = ("{name} is a copy of a World Partition actor package (one file per actor): loading it would bind the "
+                  "live level's actor to the copy, and a level save could then drop the actor from __ExternalActors__. "
+                  "Diff its map instead (ue diff /Game/Maps/<map>)")
+
+
+def _staged_actor_package(path):
+    """Is this /Temp/Tether/diff/... asset a staged copy of an external actor's package? Read from its file, before
+    anything loads it."""
+    if not path.startswith("/Temp/Tether/diff/"):
+        return False
+    rest = path.split(".")[0][len("/Temp/"):]
+    base = os.path.join(unreal.Paths.convert_relative_path_to_full(unreal.Paths.project_saved_dir()), *rest.split("/"))
+    for ext in (".uasset", ".umap"):
+        if os.path.isfile(base + ext):
+            with open(base + ext, "rb") as f:
+                return ext == ".uasset" and _LEVEL_NAME_ENTRY in f.read()
+    return False
+
+
+def _diff_bound_actors():
+    """The edited level's actors whose package is one of Tether's diff copies: a copy of an external actor's package,
+    loaded beside its level (Tether before 0.35.1 allowed it), takes the live actor over. Saving the level then
+    writes its references to the /Temp package and deletes the actor's own file. [(label, package)]"""
+    found = []
+    for actor in unreal.get_editor_subsystem(unreal.EditorActorSubsystem).get_all_level_actors():
+        package = _try(lambda: actor.get_package().get_name(), "")
+        if package.startswith("/Temp/Tether/"):
+            found.append((_actor_label(actor), package))
+    return found
+
+
+_BOUND_FIX = ("do not save the level: the save can drop {them} from __ExternalActors__. `ue map open <this map> "
+              "--discard` reloads it from its files (dropping its other unsaved edits); if a save already happened, "
+              "restore the actor files from revision control")
+
+
 _MISSING = object()
 # Bookkeeping that differs between any two loads and says nothing about the asset's content.
 _DIFF_NOISE = {"actorGuid", "actorInstanceGuid", "contentBundleGuid", "externalDataLayerAsset", "bIsEditorPreviewActor",
@@ -1812,7 +1850,7 @@ def _clean_copy(asset):
     package = asset.get_outermost().get_name()
     dirty = {p.get_name() for p in unreal.EditorLoadingAndSavingUtils.get_dirty_content_packages()}
     path = _package_file(package)
-    if package in dirty or not package.startswith("/Game/") or not os.path.isfile(path):
+    if package in dirty or not package.startswith("/Game/") or "/__External" in package or not os.path.isfile(path):
         return asset
     import hashlib
     with open(path, "rb") as f:
@@ -7195,9 +7233,11 @@ class TetherCore(_Base):
         if _game_world() is not None:
             raise RuntimeError("PIE is running; stop it first (changes are about the edited level)")
         maps, content = _dirty_packages()
-        # World Partition saves actors as their own packages; group those under their level.
-        actor_packages = [p for p in content if "/__ExternalActors__/" in p]
-        assets = [p for p in content if p not in actor_packages]
+        # World Partition saves actors as their own packages (the engine lists them with the maps); group those
+        # under their level.
+        actor_packages = [p for p in maps + content if "/__ExternalActors__/" in p]
+        maps = [p for p in maps if "/__ExternalActors__/" not in p]
+        assets = [p for p in content if "/__ExternalActors__/" not in p]
         world = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_editor_world()
         level = world.get_path_name().split(".")[0] if world else None
         cap = lambda names: ", ".join(names[:limit]) + (f", +{len(names) - limit} more" if len(names) > limit else "")
@@ -7210,6 +7250,11 @@ class TetherCore(_Base):
             lines.append("  assets: " + cap(assets))
         if actor_packages:
             lines.append(f"  {len(actor_packages)} World Partition actor package(s)")
+        bound = _diff_bound_actors()
+        if bound:
+            lines.append(f"  WARNING: {len(bound)} actor(s) of {level} belong to Tether diff copies, not their own "
+                         f"files ({cap([f'{label} -> {package}' for label, package in bound])}): "
+                         + _BOUND_FIX.format(them="them"))
         base = _LEVELS.get(level)
         if level and base is not None and (maps or actor_packages):
             now = {a.get_path_name(): a for a in _authored_actors()}
@@ -7330,6 +7375,13 @@ class TetherCore(_Base):
         problems, new_files, notes = vcs.prepare(list(files.values()), writable=writable)
         blocked = todo if vcs.refused_all else \
             [p for p in todo if any(os.path.basename(files[p]) in problem for problem in problems)]
+        bound = _diff_bound_actors() if any(p in maps for p in todo) else []
+        if bound:  # the level's save would write references to /Temp and delete those actors' own files
+            level = [p for p in todo if p in maps]
+            blocked += [p for p in level if p not in blocked]
+            problems.append(f"{', '.join(level)}: {len(bound)} actor(s) belong to Tether diff copies "
+                            f"({', '.join(f'{label} -> {package}' for label, package in bound[:5])}); "
+                            + _BOUND_FIX.format(them="them"))
         todo = [p for p in todo if p not in blocked]
         packages = [unreal.find_package(p) for p in todo]
         saved = bool(packages) and unreal.EditorLoadingAndSavingUtils.save_packages([p for p in packages if p], False)
@@ -7627,6 +7679,9 @@ class TetherCore(_Base):
         """
         if _LEGACY:
             raise RuntimeError("needs UE 5.8+ (Epic's ToolsetLibrary)")
+        for path in (old, new):
+            if _staged_actor_package(path):
+                raise RuntimeError(_EXTERNAL_COPY.format(name=path))
         a, b = _resolve(old), _resolve(new)
         roots = (a.get_outermost().get_name(), b.get_outermost().get_name())
         out = []

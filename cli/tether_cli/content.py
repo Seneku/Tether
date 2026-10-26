@@ -1346,9 +1346,12 @@ def map_picture(data, size, centre, half, grid=None, numbers=True):
     return canvas, legend, numbered
 
 
-MAP_STATE = ("import json\nU = unreal.EditorLoadingAndSavingUtils\n"
-             "json.dumps({'maps': [p.get_name() for p in U.get_dirty_map_packages()], "
-             "'assets': len(U.get_dirty_content_packages())})")
+# Unsaved map packages; World Partition actor packages are counted, not named (a level can have thousands unsaved)
+MAP_STATE = ("import json\nU = unreal.EditorLoadingAndSavingUtils\n_m = [p.get_name() for p in U.get_dirty_map_packages()]\n"
+             "_x = [p for p in _m if '/__External' in p]\n"
+             "json.dumps({'maps': [p for p in _m if p not in _x], 'actors': len(_x), "
+             "'assets': len(U.get_dirty_content_packages()), 'level': unreal.get_editor_subsystem("
+             "unreal.UnrealEditorSubsystem).get_editor_world().get_path_name().split('.')[0]})")
 
 
 def map_open(ctx, args):
@@ -1362,12 +1365,14 @@ def map_open(ctx, args):
     if risk:
         print(f"note: this editor {risk}", file=sys.stderr)
     state = py_json(ctx, MAP_STATE)
-    if state["maps"] and not (args.save or args.discard):
-        raise CliError(f"unsaved changes in {', '.join(state['maps'])}: pass --save or --discard (ue changes lists "
+    unsaved = state["maps"] + ([f"{state['actors']} World Partition actor package(s) of {state.get('level')}"]
+                               if state.get("actors") else [])
+    if unsaved and not (args.save or args.discard):
+        raise CliError(f"unsaved changes in {', '.join(unsaved)}: pass --save or --discard (ue changes lists "
                        "them, ue diff <asset> shows what changed)")
-    if state["maps"] and args.save:
+    if unsaved and args.save:
         ctx.tether("py", code="unreal.EditorLoadingAndSavingUtils.save_dirty_packages(True, False)")
-        print(f"saved {', '.join(state['maps'])}")
+        print(f"saved {', '.join(unsaved)}")
     target = args.path.split(".")[0]
     if not str(ctx.tether("py", code=f"unreal.EditorAssetLibrary.does_asset_exist({target!r})")).strip().endswith("True"):
         raise CliError(f"no map at {target} (ue find {target.rsplit('/', 1)[-1]})")
@@ -1376,7 +1381,7 @@ def map_open(ctx, args):
                                         ".get_path_name().split('.')[0]")).strip().strip("'")
     if loaded != target:  # load_level answers True even when nothing was loaded
         raise CliError(f"could not load {target}: the editor is on {loaded} (ue log)")
-    print(f"opened {target}" + (f" (unsaved edits to {', '.join(state['maps'])} dropped)" if state["maps"] and args.discard
+    print(f"opened {target}" + (f" (unsaved edits to {', '.join(unsaved)} dropped)" if unsaved and args.discard
                                  else "")
           + (f"; {state['assets']} unsaved asset(s) stay unsaved in memory" if state["assets"] else ""))
     return check_map_load(ctx, target)

@@ -11,7 +11,7 @@ from .core import (
 )
 from .images import window_png
 from .build import compact_diagnostics, editor_env, print_diagnostics
-from .assets import ini_value
+from .assets import diff_copy_references, ini_value
 
 
 def jobs_dir(project):
@@ -41,6 +41,12 @@ def cmd_job(ctx, args):
         write_json(os.path.join(folder, f"{args.id}.json"), dict(meta, child=child, exit=code, ended=time.time()))
         return 0
     if args.action in ("start", "cook", "package"):
+        stale = diff_copy_references(ctx.project) if args.action != "start" else []
+        if stale:  # the cook would fail late on "... still has its external package set to (/Temp/Tether/diff/...)"
+            raise CliError(f"{len(stale)} content file(s) reference Tether's diff copies (/Temp/Tether/diff/...), which "
+                           f"the cook rejects: {', '.join(stale[:5])}. A level was saved while an actor of it was bound "
+                           "to a diff copy, so that actor's own file is gone and these still point at the copy: restore "
+                           "the actor's file from revision control, or rebuild or remove the reference and save")
         if args.action == "package":
             platform = args.platform or host_platform()
             config = getattr(args, "config", None) or "Development"

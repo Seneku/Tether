@@ -28,7 +28,7 @@ from .content import (
 )
 from .fab import cmd_fab
 from .jobs import cmd_game, cmd_job, cmd_package
-from .play import DIRTY_PACKAGES, cmd_audio, cmd_gpu, cmd_mem, cmd_sound, cmd_soak, cmd_ui, cmd_wait, cmd_world, wait_compile
+from .play import cmd_audio, cmd_gpu, cmd_mem, cmd_sound, cmd_soak, cmd_ui, cmd_wait, cmd_world, dirty_mark, dirty_since, wait_compile
 from .transport import py_json
 from .playtest import bp_command, cmd_budget, cmd_input, package_command, perf_command, pie_command
 from .hooks import cmd_hook
@@ -90,7 +90,7 @@ def gpu_ab(ctx, args):
     last command (the state to leave behind)."""
     import contextlib
     import io
-    dirty_before = set(py_json(ctx, DIRTY_PACKAGES) or [])
+    mark = dirty_mark(ctx)
     runs = {"A": [], "B": []}
     profile = argparse.Namespace(**{k: v for k, v in vars(args).items() if k not in ("ab", "restore", "rounds")})
     for _ in range(max(1, args.rounds)):
@@ -133,9 +133,9 @@ def gpu_ab(ctx, args):
         print("passes (B - A):")
         for name, d in moved:
             print(f"  {d:+7.2f} ms  {name[:100]}")
-    left = sorted(set(py_json(ctx, DIRTY_PACKAGES) or []) - dirty_before)
-    if left:
-        print(f"note: {len(left)} package(s) left unsaved by the switch: {', '.join(left[:6])}"
+    left = dirty_since(ctx, mark, cap=6)
+    if left["count"]:
+        print(f"note: {left['count']} package(s) left unsaved by the switch: {', '.join(left['new'])}"
               + ("" if args.restore else " (--restore \"<command>\" puts a state back; ue changes)"))
     ctx.data = {"A": a_ms, "B": b_ms, "delta": b_ms - a_ms, "kinds": dict(deltas), "runs": runs}
     return 0

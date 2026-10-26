@@ -483,10 +483,44 @@ def package_file(project, package):
     return base + ".uasset"
 
 
+# "PersistentLevel" in a package's name table (length 16 with its terminator): the outer of a World Partition / One
+# File Per Actor actor package's actor. A map holds it too; no other asset in three projects' 9,000 did.
+LEVEL_NAME_ENTRY = b"\x10\x00\x00\x00PersistentLevel\x00"
+EXTERNAL_PACKAGE = ("{name} is a World Partition actor package (one file per actor): Tether does not load copies of "
+                    "those, as the copy's actor resolves into the live level and takes the actor over (a level save "
+                    "can then drop it from __ExternalActors__). Diff its map instead: `ue diff /Game/Maps/<map> [rev]` "
+                    "lists the actors that changed")
+
+
+def is_actor_package(data, ext):
+    """Is this package an external actor's (its actor's outer is a level in another package)?"""
+    return ext.lower() != ".umap" and LEVEL_NAME_ENTRY in data
+
+
+def diff_copy_references(project):
+    """Content-relative maps and World Partition actor files that reference Tether's diff copies: what a level save
+    leaves when an actor was bound to one (Tether before 0.35.1). A cook fails on them. About 4 s for 5,600 files."""
+    content, found = os.path.join(os.path.dirname(project), "Content"), []
+    for folder, _, names in os.walk(content):
+        external = "__ExternalActors__" in folder or "__ExternalObjects__" in folder
+        for name in names:
+            if name.endswith(".umap") or (external and name.endswith(".uasset")):
+                try:
+                    with open(os.path.join(folder, name), "rb") as f:
+                        if b"/Temp/Tether/" in f.read():
+                            found.append(os.path.relpath(os.path.join(folder, name), content).replace("\\", "/"))
+                except OSError:
+                    pass
+    return found
+
+
 def stage_copy(project, data, name, ext):
     """Put a package's bytes under Saved/Tether/diff (mounted as /Temp/) and return its asset's object path.
-    Named by content hash, so the same version is loaded once per editor session."""
+    Named by content hash, so the same version is loaded once per editor session. Refuses an external actor's
+    package: loading the copy would rebind the live actor to it."""
     import hashlib
+    if is_actor_package(data, ext):
+        raise CliError(EXTERNAL_PACKAGE.format(name=name))
     tag = hashlib.sha1(data).hexdigest()[:12]
     name = re.sub(r"[^A-Za-z0-9_]", "_", re.split(r"[#@]", name)[0]) or "Asset"  # P4V's temp files: BP_X#3
     folder = os.path.join(os.path.dirname(project), "Saved", "Tether", "diff", tag)
@@ -607,6 +641,8 @@ def cmd_diff(ctx, args):
         old_file, new_file = args.files
         named = args.as_path or old_file
         name, ext = os.path.splitext(os.path.basename(named))
+        if any(re.search(r"[/\\]__External(?:Actors|Objects)__[/\\]", p or "") for p in (args.as_path, new_file)):
+            raise CliError(EXTERNAL_PACKAGE.format(name=args.as_path or new_file))
         with open(old_file, "rb") as f:
             old = stage_copy(project, f.read(), name, ext or ".uasset")
         live = content_package(project, new_file) if os.path.isfile(new_file) else None
@@ -623,6 +659,8 @@ def cmd_diff(ctx, args):
         file = package_file(project, package or "")
         if not file:
             raise CliError(f"{target}: not a /Game/... asset of this project (or a file under its Content)")
+        if re.search(r"/__External(?:Actors|Objects)__/", package):
+            raise CliError(EXTERNAL_PACKAGE.format(name=package))
         p4 = uses_p4(project, rev, to)
         rev = rev or ("#have" if p4 else "HEAD")
         top = None if p4 else run_git(project, "rev-parse", "--show-toplevel").strip()

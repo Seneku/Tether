@@ -858,6 +858,38 @@ class Validate(unittest.TestCase):
         with open(os.path.join(root, "Saved", "Tether", "diff", tag, "BP_X.uasset"), "rb") as f:
             self.assertEqual(f.read(), b"v1")
 
+    def test_actor_packages_are_never_staged(self):
+        # UnrealRacing: a loaded copy of 3MDIC43SSQ2X1VGJQTW71G.uasset took the live NRCityCell_Skyline_0 over
+        actor = b"\xc1\x83\x2a\x9e" + b"\x10\x00\x00\x00PersistentLevel\x00\x12\x34\x56\x78" + b"\x06\x00\x00\x00Level\x00"
+        with self.assertRaisesRegex(ue.CliError, "World Partition actor package"):
+            ue.stage_copy(self.project.uproject, actor, "3MDIC43SSQ2X1VGJQTW71G", ".uasset")
+        self.assertFalse(os.path.isdir(os.path.join(self.project.root, "Saved", "Tether", "diff")))
+        self.assertRegex(ue.stage_copy(self.project.uproject, actor, "L_Bay", ".umap"), "/L_Bay[.]L_Bay$")  # a map holds it too
+        self.assertFalse(ue.is_actor_package(b"...PersistentLevel.NRCityCell_0...", ".uasset"))  # a soft path's sub-path
+        ctx = FakeCtx()
+        ctx.project, ctx.beacon = self.project.uproject, {}
+        args = argparse.Namespace(files=None, asset="/Game/__ExternalActors__/Maps/L_Bay/3M/DI/C43SSQ2X1VGJQTW71G", rev=None,
+                                  to=None, as_path=None, limit=20)
+        with self.assertRaisesRegex(ue.CliError, "Diff its map instead"):
+            ue.cmd_diff(ctx, args)
+        live = self.project.write("Content/__ExternalActors__/Maps/L_Bay/3M/X.uasset", "x")
+        args = argparse.Namespace(files=[live, live], asset=None, rev=None, to=None, as_path=None, limit=20)
+        with self.assertRaisesRegex(ue.CliError, "World Partition actor package"):
+            ue.cmd_diff(ctx, args)
+        self.assertEqual(ctx.calls, [])  # nothing reached the editor
+
+    def test_cook_refuses_references_to_diff_copies(self):
+        self.project.write("Content/__ExternalActors__/Maps/L_Bay/A/B/BUILDER.uasset",
+                           "NRCityBuilder_0 ... /Temp/Tether/diff/b5c6e7d7160f/3MDIC43SSQ2X1VGJQTW71G")
+        self.project.write("Content/__ExternalActors__/Maps/L_Bay/A/C/FINE.uasset", "PersistentLevel")
+        self.project.write("Content/Maps/L_Bay.umap", "map")
+        self.project.write("Content/Docs/Note.uasset", "/Temp/Tether/diff/ named in a plain asset is not scanned")
+        self.assertEqual(ue.diff_copy_references(self.project.uproject), ["__ExternalActors__/Maps/L_Bay/A/B/BUILDER.uasset"])
+        ctx = FakeCtx()
+        ctx.project = self.project.uproject
+        with self.assertRaisesRegex(ue.CliError, "1 content file.*reference Tether's diff copies.*BUILDER.uasset"):
+            ue.cmd_job(ctx, argparse.Namespace(action="cook"))
+
     @unittest.skipUnless(__import__("shutil").which("git"), "git not installed")
     def test_git_changes(self):
         root = self.project.root
@@ -2190,9 +2222,10 @@ class Fixes0192(unittest.TestCase):
                 self.calls.append((tool, kwargs))
                 return replies[tool]
         ctx = Ctx()
-        dirty = iter([[], ["/Game/Maps/Spire"], ["/Game/Maps/Spire"]])
+        since = {"new": ["/Game/Maps/Spire"], "count": 1, "held": ["/Game/Maps/Spire"]}
+        reply = lambda c, code: ["/Game/Maps/Spire"] if "NavigationData" in code else since  # noqa: E731
         args = argparse.Namespace(action="build", what=["nav"], save=save, wait=0, limit=20)
-        with unittest.mock.patch.object(ue.play, "py_json", side_effect=lambda c, code: next(dirty)), \
+        with unittest.mock.patch.object(ue.play, "py_json", side_effect=reply), \
                 unittest.mock.patch.object(ue.play, "rebuild_navigation"), \
                 unittest.mock.patch.object(ue.play.time, "sleep"), unittest.mock.patch("builtins.print"):
             try:
@@ -3693,7 +3726,7 @@ class UnrealRacingRound4(unittest.TestCase):
                                                     "mat MI_X UseWindows=true", "--restore", "mat MI_X --reset UseWindows"])
         with unittest.mock.patch.object(ue.cli, "run_line", side_effect=lambda c, l: (ran.append(l), (0, ""))[1]), \
                 unittest.mock.patch.object(ue.cli, "wait_compile"), unittest.mock.patch.object(ue.cli, "cmd_gpu", side_effect=gpu), \
-                unittest.mock.patch.object(ue.cli, "py_json", side_effect=[[], ["/Game/MI_X"]]), \
+                unittest.mock.patch.object(ue.play, "py_json", return_value={"new": ["/Game/MI_X"], "count": 1, "held": []}), \
                 unittest.mock.patch.object(ue.cli.time, "sleep"), contextlib.redirect_stdout(io.StringIO()) as out:
             self.assertEqual(ue.gpu_command(ctx, args), 0)
         self.assertEqual(ran, ["mat MI_X UseWindows=false", "mat MI_X UseWindows=true"] * 2 + ["mat MI_X --reset UseWindows"])
@@ -3704,6 +3737,35 @@ class UnrealRacingRound4(unittest.TestCase):
         self.assertIn("1 package(s) left unsaved by the switch: /Game/MI_X", text)
         with self.assertRaisesRegex(ue.CliError, "--restore goes with --ab"):
             ue.gpu_command(ctx, ue.parse_command(ue.build_parser(), ["gpu", "--restore", "x"]))
+
+    def test_dirty_packages_are_compared_in_the_editor(self):
+        # UnrealRacing: ~6k unsaved packages made the whole list (444,279 chars) overflow a ue py reply
+        class Package:
+            def __init__(self, name):
+                self.name = name
+
+            def get_name(self):
+                return self.name
+
+        dirty = [Package(f"/Game/__ExternalActors__/Maps/L/{i:05d}") for i in range(6000)]
+        utils = types.SimpleNamespace(get_dirty_map_packages=lambda: [], get_dirty_content_packages=lambda: list(dirty))
+        unreal = types.SimpleNamespace(EditorLoadingAndSavingUtils=utils)
+        sent = []
+
+        class Ctx(FakeCtx):
+            def tether(self, tool, **kwargs):
+                sent.append(kwargs["code"])
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    exec(kwargs["code"], {"unreal": unreal})
+                return out.getvalue()
+        ctx = Ctx()
+        mark = ue.dirty_mark(ctx)
+        dirty += [Package("/Game/MI_X"), Package("/Temp/Untitled_1"), Package("/Game/Maps/L")]
+        since = ue.dirty_since(ctx, mark, ["/Game/Maps/L", "/Game/Other"])
+        self.assertEqual(since, {"new": ["/Game/MI_X", "/Game/Maps/L"], "count": 2, "held": ["/Game/Maps/L"]})
+        self.assertLess(max(len(code) for code in sent), 2000)
+        self.assertIsNone(ue.dirty_since(ctx, mark)["new"])  # a mark is taken once
 
     def test_run_line_captures_and_refuses_nesting(self):
         code, out = ue.run_line(FakeCtx(), "ue gpu --ab a b")
@@ -4250,6 +4312,31 @@ class Round031(unittest.TestCase):
         self.assertIn("save failed: LogSavePackage: Cannot remove 'D:/G/Content/M_Light.uasset' as it is read only!", text)
         self.assertNotIn("unrelated", text)
         self.assertIn("ue save --writable", text)
+
+    # 215
+    def test_save_failure_dialog_keeps_its_package_list(self):
+        lines = [stamped("Message dialog closed, result: Ok, title: Packages Failed To Save, text: The following assets "
+                         "failed to save correctly:").rstrip("\n"),
+                 "/Temp/Tether/diff/92846921b942/WHYBJASWY127KGT0KVXXSF",
+                 stamped("LogContentValidation: Enabled validators:").rstrip("\n")]
+        failed = ue.save_failures(lines)
+        self.assertEqual(failed, ["The following assets failed to save correctly: "
+                                  "/Temp/Tether/diff/92846921b942/WHYBJASWY127KGT0KVXXSF"])
+        self.assertEqual(ue.save_hint(self.p, failed)[0], "an actor bound to a Tether diff copy")
+
+    def test_save_hint_names_the_cause(self):
+        diff_copy = ["The following packages failed to save: /Temp/Tether/diff/b5c6e7d7160f/3MDIC43SSQ2X1VGJQTW71G"]
+        self.assertEqual(ue.save_hint(self.p, diff_copy)[0], "an actor bound to a Tether diff copy")
+        self.assertIn("ue map open <map> --discard", ue.save_hint(self.p, diff_copy)[1])
+        self.assertEqual(ue.save_hint(self.p, ["LogSavePackage: Error: Failed to save /Game/Maps/L_Bay"]),
+                         ("see ue log", ue.SAVE_OTHER))  # its file is writable (or missing): no git-lfs advice
+        path = self.project.write("Content/Maps/L_Bay.umap", "map")
+        os.chmod(path, 0o444)
+        try:
+            self.assertEqual(ue.save_hint(self.p, ["LogSavePackage: Error: Failed to save /Game/Maps/L_Bay"]),
+                             ("a file is read-only", ue.SAVE_FIX))
+        finally:
+            os.chmod(path, 0o666)
 
     def test_save_passes_writable_only_when_asked(self):
         ctx = self.ctx(reply="saved 1 package: /Game/L")
