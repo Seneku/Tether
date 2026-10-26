@@ -175,6 +175,17 @@ its panel's text in front ("Tether probe panel GARAGE"); a floating Content Brow
 layout (%LOCALAPPDATA%/UnrealEngine/Editor/EditorLayout.json) had made the selftest's menu check fail; and a
 failed selftest step list reports its FAIL line.
 
+**Done in 0.35.0** (UnrealRacing's notes 216-217, the shared editor's queue):
+- 216: while another session has a request open, a lease lapses after `LEASE_IDLE` = 3 min with no `ue` command of
+  its holder's running and no PIE session it started (a PIE test script polling for its result keeps it); the
+  holder is told once on its next command, and `ue lease take --hold` opts out. Each command's end marks the lease
+  in use. Leases taken before 0.35 never lapse. Measured on UnrealRacing: 1.9 of the 4.6 h that sessions spent
+  queued were at an editor idle under a held lease.
+- 217: `ue lease release` deleted lease.json and ignored a failure; on Windows the delete fails while any other
+  session's `ue wait lease` has the file open, so the command said "released" and the lease stayed held (seen
+  live with four sessions waiting). It now retries, then overwrites the file with an expired lease.
+- The skill tells agents to think and edit before taking the lease and to run the editor work as one script.
+
 **Done in 0.34.3** (UnrealRacing's notes 210-214):
 - 210: the lease was not lost to the restart (it is one file per project, not per editor pid) but to
   `tests/city/run_city_check.sh`, run inside the holder's lease: a script runs as its caller's session, so its

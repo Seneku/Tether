@@ -25,7 +25,10 @@ command and runs `ue lease grant` when done), rather than passing `--ignore-leas
 returns once it is yours or free and PIE has stopped. Asked for yours? Grant it when you reach a stopping point.
 A lease lasts at least 5 minutes past the end of its holder's last `ue` command, and is held while one of its
 commands runs (a long `ue py` stage), so it does not run out mid-task; `status`, `who` and `lease` show "busy:
-<command> for N min" for a command in flight (a busy editor, not a hung one). A test script that runs `ue` with its
+<command> for N min" for a command in flight (a busy editor, not a hung one). But while someone waits, a lease lapses
+after 3 minutes with no `ue` command of yours and no PIE session of yours running: do the thinking and editing
+before you take it, run the editor work as one script, and release it when done (`take --hold` only for work in the
+editor that a hand-over would lose, e.g. unsaved edits you are still making). A test script that runs `ue` with its
 output thrown away never sees requests: call `ue lease yield --back` between suites (hands the lease to a waiting
 request, then waits to get it back; `ue lease pending` exits 0 when someone waits). A script you run inside your
 own lease can take and release its own: its lease goes on top of yours, and its release gives yours back. Work that
