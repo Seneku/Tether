@@ -527,7 +527,10 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
 - Audio in PIE: `ue audio` lists what is playing (needs `ue open --headless --sound`, which stays silent);
   `expect-sound <regex>` as a `ue pie do` step checks a sound fires. `ue audio --log 10` (or `--do steps.txt`)
   records how each sound that started was actually played (3D or 2D, attenuation, class) and flags stereo sounds
-  played in 3D: trust it over asset settings when code builds attenuation at runtime.
+  played in 3D: trust it over asset settings when code builds attenuation at runtime. To hear what the mix did
+  (a crossfade, a voice that zeroes everything): `ue audio --bounce 10` (or `-f steps.txt`) writes PIE's master
+  submix (or `--submix X`) to a WAV with the speakers silent and prints level per second, active channels, bands,
+  dropouts to exact silence and clipping.
 - Character animation logic: `ue anim graph /Game/.../ABP_Hero` (state machines, what each state plays,
   transition rules and blend times); `ue anim player` shows the live anim instance in PIE.
 - AI built on StateTree: `ue statetree /Game/AI/ST_Enemy` prints the whole tree as text (states, enter conditions,

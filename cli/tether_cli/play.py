@@ -952,6 +952,8 @@ def active_sounds(ctx):
 def cmd_audio(ctx, args):
     if getattr(args, "match", None) == "mix":
         return audio_mix(ctx, args)
+    if getattr(args, "bounce", None) is not None:
+        return audio_bounce(ctx, args)
     if getattr(args, "log", None) or getattr(args, "do", None):
         args.log = args.log or 10
         return audio_log(ctx, args)
@@ -2803,6 +2805,160 @@ def audio_log(ctx, args):
         print(f"{len(unattenuated)} attached sound(s) with no attenuation: intended (UI, music)? otherwise give them one")
     print("fire-and-forget sounds (PlaySoundAtLocation, no component) are not in this log: ue audio lists them while they play")
     ctx.data = data
+    return 0
+
+
+MIX_CHANNELS = {1: ["mono"], 2: ["L", "R"], 6: ["FL", "FR", "FC", "LFE", "BL", "BR"],
+                8: ["FL", "FR", "FC", "LFE", "BL", "BR", "SL", "SR"]}
+BANDS = ((0, 250, "<250 Hz"), (250, 2000, "250-2k"), (2000, 8000, "2k-8k"), (8000, 1e9, ">8k"))
+
+
+def bounce_stats(path, rows=30):
+    """Level over time of a 16-bit PCM .wav of a mix (stdlib only): per row (1 s, longer past `rows` seconds) the RMS
+    and peak of the loudest channel in dBFS (None = exact silence) and the brightness; which channels carry sound;
+    the energy per band; dropouts (runs of 50 ms or more of exact silence with sound on both sides) and clipped
+    samples (the engine clamps the mix to 16 bits)."""
+    import array
+    import operator
+    import wave
+    with wave.open(path, "rb") as f:
+        channels, width, rate, frames = f.getnchannels(), f.getsampwidth(), f.getframerate(), f.getnframes()
+        if width != 2:
+            raise CliError(f"{path}: {8 * width}-bit samples (16-bit only)")
+        data = array.array("h")
+        data.frombytes(f.readframes(frames))
+    if sys.byteorder == "big":
+        data.byteswap()
+    names = MIX_CHANNELS.get(channels) or [f"ch{i + 1}" for i in range(channels)]
+    per = [data[c::channels] for c in range(channels)]
+    live = [c for c in range(channels) if any(per[c])]
+
+    def db(value):
+        return round(20 * math.log10(value / 32768), 1) if value > 0 else None
+
+    def level(start, end):
+        rms = max((math.sqrt(sum(map(operator.mul, per[c][start:end], per[c][start:end])) / max(1, end - start))
+                   for c in live), default=0)
+        return db(rms), db(max((max(map(abs, per[c][start:end]), default=0) for c in live), default=0))
+
+    seconds = frames / rate if rate else 0
+    step = max(1, math.ceil(seconds / rows)) * rate
+    size = 2048
+    hann = [0.5 - 0.5 * math.cos(2 * math.pi * i / (size - 1)) for i in range(size)]
+    bands = [0.0] * len(BANDS)
+    table = []
+    for start in range(0, frames, step):
+        end = min(frames, start + step)
+        if end - start < rate // 10 and table:
+            break
+        rms, peak = level(start, end)
+        weighted = magnitude = 0.0
+        if rms is not None and rms > -70 and end - start >= size:
+            for j in range(4):  # four windows across the row
+                at = start + (end - start - size) * (2 * j + 1) // 8
+                mono = [sum(per[c][at + i] for c in live) / len(live) for i in range(size)]
+                mean = sum(mono) / size
+                spectrum = fft([(v - mean) * hann[i] for i, v in enumerate(mono)])
+                for k in range(1, size // 2):
+                    amp = abs(spectrum[k])
+                    hz = k * rate / size
+                    weighted += amp * hz
+                    magnitude += amp
+                    bands[next(i for i, (lo, hi, _) in enumerate(BANDS) if lo <= hz < hi)] += amp * amp
+        bright = round(weighted / magnitude) if magnitude else None
+        table.append({"t": round(start / rate, 2), "rms_db": rms, "peak_db": peak, "bright_hz": bright})
+    block = max(1, rate // 100)  # 10 ms
+    silent = [not any(data[i * channels:(i + block) * channels]) for i in range(0, frames, block)]
+    dropouts, run = [], None
+    for i, quiet in enumerate(silent + [False]):
+        if quiet and run is None:
+            run = i
+        elif not quiet and run is not None:
+            if run > 0 and i < len(silent) and i - run >= 5:  # sound before and after it
+                dropouts.append([round(run * block / rate, 2), round(i * block / rate, 2)])
+            run = None
+    rms, peak = level(0, frames)
+    total = sum(bands)
+    return {"seconds": round(seconds, 2), "channels": channels, "rate": rate, "rms_db": rms, "peak_db": peak,
+            "sound_on": [names[c] for c in live], "silent_channels": [names[c] for c in range(channels) if c not in live],
+            "bands": {name: round(100 * value / total) for (_, _, name), value in zip(BANDS, bands)} if total else {},
+            "rows": table, "row_seconds": step // rate, "dropouts": dropouts,
+            "clipped": data.count(32767) + data.count(-32768)}
+
+
+def audio_bounce(ctx, args):
+    """`ue audio --bounce N`: record PIE's mix (the master submix, or --submix) into a WAV with the speakers silent
+    (the editor mutes the master submix's output, which comes after the recording), then show its level over time."""
+    if not (ctx.beacon or {}).get("pie"):
+        raise CliError("PIE is not running (ue pie start)")
+    seconds = args.bounce or (0 if args.do else 10)
+    if not 0 <= seconds <= 300:
+        raise CliError("--bounce takes 0 to 300 seconds")
+    out = os.path.abspath(args.out) if args.out else os.path.join(
+        state_dir(ctx.project), "audio", "bounce", time.strftime("bounce-%Y%m%d-%H%M%S.wav"))
+    out += "" if out.lower().endswith(".wav") else ".wav"
+    folder, name = os.path.dirname(out), os.path.basename(out)[:-4]
+    os.makedirs(folder, exist_ok=True)
+    if os.path.exists(out):
+        os.remove(out)  # the engine writes the file on a background task: wait for this one, not an old one
+    started = ctx.tether("audio_bounce", action="start", seconds=max(seconds, 10.0), submix=args.submix or "",
+                         folder=folder, name=name)
+    started = json.loads(started) if isinstance(started, str) else started
+    began = time.time()
+    try:
+        if args.do:
+            pie_do(ctx, argparse.Namespace(script=[], file=args.do, reject=None, warmup=0, keep=True,
+                                           keep_going=False, quiet=False))
+        time.sleep(seconds)
+    finally:
+        mark = log_end(ctx.project)
+        stopped = ctx.tether("audio_bounce", action="stop", seconds=0, submix="", folder=folder, name=name)
+        stopped = json.loads(stopped) if isinstance(stopped, str) else stopped
+        if not stopped.get("muted"):  # PIE plays aloud here: give the editor's own mutes a tick to come back first
+            time.sleep(0.3)
+            ctx.tether("audio_bounce", action="unmute", seconds=0, submix="", folder="", name="")
+    if stopped.get("ended"):
+        raise CliError(f"PIE ended after {time.time() - began:.1f} s of the bounce: nothing was written")
+    deadline, size = time.time() + 15, -1
+    while time.time() < deadline:  # written on a background task
+        now = os.path.getsize(out) if os.path.isfile(out) else -1
+        if now > 44 and now == size:
+            break
+        if now < 0 and any("No audio data" in line for line in new_log_lines(ctx, mark)):
+            deadline = 0
+        size = now
+        time.sleep(0.25)
+    else:
+        raise CliError(f"nothing was recorded: no sound played through {started['submix']} during the bounce (a submix "
+                       "runs only while something is routed through it; `ue audio` lists what plays)", 4)
+    stats = bounce_stats(out)
+    print(f"bounce: {stats['seconds']:g} s of {started['submix']}, {stats['channels']} channel(s) at {stats['rate']} Hz "
+          f"-> {out}")
+    for note in started.get("notes") or []:
+        print("  " + note)
+    if not stats["sound_on"]:
+        print(f"  ! exact silence: nothing reached {started['submix']} (were sounds playing? `ue audio` lists them; "
+              "a sound routed to a submix that does not reach this one is not in it)")
+    else:
+        print(f"  level: peak {stats['peak_db']} dBFS, rms {stats['rms_db']} dBFS (loudest channel); sound on "
+              + " ".join(stats["sound_on"]) + (f", silent: {' '.join(stats['silent_channels'])}" if stats["silent_channels"] else ""))
+        if stats["bands"]:
+            print("  energy by band: " + ", ".join(f"{k} {v}%" for k, v in stats["bands"].items()))
+        print(f"  per {stats['row_seconds']} s: rms / peak dBFS, brightness")
+        for row in stats["rows"]:
+            if row["rms_db"] is None:
+                print(f"  {row['t']:>6.1f}s  exact silence")
+                continue
+            bright = f"{row['bright_hz'] / 1000:.1f}k" if row["bright_hz"] else "-"
+            print(f"  {row['t']:>6.1f}s  {row['rms_db']:>6} {row['peak_db']:>6}  {bright:>5}")
+        if stats["dropouts"]:
+            print(f"  ! {len(stats['dropouts'])} dropout(s) to exact silence with sound on both sides (the whole mix "
+                  "zeroed: a voice or effect producing NaN or zeros?): "
+                  + ", ".join(f"{a:g}-{b:g} s" for a, b in stats["dropouts"][:8])
+                  + (f" +{len(stats['dropouts']) - 8} more" if len(stats["dropouts"]) > 8 else ""))
+        if stats["clipped"]:
+            print(f"  ! {stats['clipped']} sample(s) at full scale: the mix went over 0 dBFS and was clipped")
+    ctx.data = dict(stats, file=out, submix=started["submix"])
     return 0
 
 

@@ -357,6 +357,11 @@ def cmd_selftest(ctx, args):
           ok=lambda c, o: c == 0 and "sound(s) playing" in o)
     check("audio --log", ["audio", "--log", "1"], skip=None if launch.get("sound", not launch.get("headless")) else
           "no audio device (ue open --headless --sound)", ok=lambda c, o: c == 0 and "audio log, " in o)
+    if launch.get("sound", not launch.get("headless")):  # something to bounce: a 7 s engine loop, played 2D
+        ue("pie", "run", "-c", "import unreal\nunreal.GameplayStatics.spawn_sound2d(tether.world(), "
+                               "unreal.load_asset('/Engine/VREditor/Sounds/VR_object_grabbed_loop'))")
+    check("audio --bounce", ["audio", "--bounce", "1"], skip=None if launch.get("sound", not launch.get("headless")) else
+          "no audio device (ue open --headless --sound)", ok=lambda c, o: c == 0 and "sound on " in o)
     check("anim", ["anim", "player"], ok=lambda c, o: c == 0 and ("skeletal mesh" in o or "anim instance" in o
                                                                    or "mesh " in o))
     fixture = (ue("py", "hasattr(unreal, 'TetherProbeUILibrary')")[1].splitlines() or [""])[-1] == "True"

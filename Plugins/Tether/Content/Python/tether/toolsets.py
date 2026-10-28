@@ -1484,6 +1484,64 @@ _SOUND_SKIP = {"World", "MapBuildDataRegistry", "Texture2D", "TextureCube", "Tex
                "MaterialInstanceConstant", "MaterialFunction", "StaticMesh", "SkeletalMesh", "Skeleton", "PhysicsAsset",
                "AnimSequence", "AnimMontage", "BlendSpace", "Font", "LandscapeLayerInfoObject"}
 _AUDIO_LOG = {"handle": None}
+_AUDIO_BOUNCE = {"watch": None}
+
+
+def _ini_value(paths, section, key):
+    """The last `key=` in `[section]` across these ini files (later files override), or None."""
+    value = None
+    for path in paths:
+        try:
+            with open(path, encoding="utf-8-sig", errors="replace") as f:
+                text = f.read()
+        except OSError:
+            continue
+        block = re.search(r"^\[" + re.escape(section) + r"\]\s*$(.*?)(?=^\[|\Z)", text, re.M | re.S)
+        hits = re.findall(r"^" + re.escape(key) + r"=(.*)$", block.group(1), re.M) if block else []
+        if hits:
+            value = hits[-1].strip().strip('"')
+    return value
+
+
+def _master_submix():
+    """The submix the audio device outputs through (AudioSettings.MasterSubmix: config only, not visible to Python)."""
+    config = unreal.Paths.convert_relative_path_to_full(unreal.Paths.project_config_dir())
+    path = _ini_value([os.path.join(config, "DefaultEngine.ini"), os.path.join(config, "Windows", "WindowsEngine.ini")],
+                      "/Script/Engine.AudioSettings", "MasterSubmix")
+    return unreal.load_asset(path or "/Engine/EngineSounds/Submixes/MasterSubmixDefault.MasterSubmixDefault")
+
+
+def _pie_sound_off():
+    """Whether PIE starts muted (Play settings, 'Enable Game Sound' off): an -ini: override on the command line (`ue open
+    --sound` sets one), else the user's EditorPerProjectUserSettings.ini. LevelEditorPlaySettings is not in Python."""
+    override = re.search(r"LevelEditorPlaySettings\]:EnableGameSound=(\w+)", unreal.SystemLibrary.get_command_line() or "", re.I)
+    if override:
+        return override.group(1).lower() == "false"
+    saved = os.path.join(unreal.Paths.convert_relative_path_to_full(unreal.Paths.project_saved_dir()), "Config")
+    folders = [d for d in _try(lambda: os.listdir(saved), []) if d.endswith("Editor")]
+    value = _ini_value([os.path.join(saved, d, "EditorPerProjectUserSettings.ini") for d in folders],
+                       "/Script/UnrealEd.LevelEditorPlaySettings", "EnableGameSound")
+    return (value or "").lower() == "false"
+
+
+def _unmute_when_pie_ends():
+    """After a bounce in a PIE session that started muted, the master submix stays silent until PIE ends; then its
+    output goes back to 1 (the editor's own volume rules mute it again). The callback keeps its own handle, so a
+    module reload cannot strand it."""
+    handle = []
+
+    def tick(_delta):
+        if _game_world() is not None:
+            return
+        unreal.unregister_slate_post_tick_callback(handle[0])
+        if _AUDIO_BOUNCE.get("watch") is handle[0]:
+            _AUDIO_BOUNCE["watch"] = None
+        world = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_editor_world()
+        master = _try(_master_submix)
+        if master is not None and world is not None:
+            master.set_submix_output_volume(world, 1.0)
+    handle.append(unreal.register_slate_post_tick_callback(tick))
+    return handle[0]
 
 
 def _wave_row(registry, package):
@@ -5662,6 +5720,82 @@ class TetherCore(_Base):
                                "seconds": round(time.time() - state.get("start", time.time()), 1)})
         return json.dumps({"recording": state.get("handle") is not None, "starts": len(state.get("starts", [])),
                            "ended": state.get("ended")})
+
+    @_tool
+    @staticmethod
+    def audio_bounce(action: str = "status", seconds: float = 10.0, submix: str = "", folder: str = "",
+                     name: str = "") -> str:
+        """Record what PIE plays into a WAV without sound from the speakers. Mutes the master submix's output (a
+        submix records before its output volume), lifts the mutes that apply before the mix (an unfocused editor's
+        app volume, via au.DisableAppVolume; PIE's 'Enable Game Sound' off, via a zero-length camera fade with audio,
+        which resets the device's transient volume), and records the master submix or `submix`.
+
+        Args:
+            action: 'start'; 'stop' (writes folder/name.wav, puts au.DisableAppVolume back, and leaves the master
+                submix muted until PIE ends if PIE started muted); 'unmute' (the master submix's output back to 1);
+                or 'status'.
+            seconds: Expected length: the buffer is reserved for it; the recording runs until 'stop'.
+            submix: A submix asset name or path to record instead of the master submix.
+            folder: Where 'stop' writes the WAV (absolute).
+            name: The WAV's file name, without .wav.
+
+        Returns:
+            JSON: start {submix, muted, notes}; stop {file, submix, muted, ended (PIE ended first: no file)}.
+        """
+        state = _AUDIO_BOUNCE
+        world = _game_world()
+        if action == "unmute":
+            master = _master_submix()
+            master.set_submix_output_volume(world or unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_editor_world(), 1.0)
+            return json.dumps({"unmuted": master.get_name()})
+        if action == "status":
+            return json.dumps({"recording": state.get("world") is not None, "submix": state.get("submix"),
+                               "muted_until_pie_ends": state.get("watch") is not None})
+        if action == "start":
+            if world is None:
+                raise RuntimeError("PIE is not running (ue pie start)")
+            master = _master_submix()
+            target = None
+            if submix:
+                registry = unreal.AssetRegistryHelpers.get_asset_registry()
+                found = [d for d in registry.get_assets_by_class(unreal.TopLevelAssetPath("/Script/Engine", "SoundSubmix"))
+                         if submix in (str(d.asset_name), str(d.package_name))]
+                if not found:
+                    raise RuntimeError(f"no SoundSubmix named {submix} (`ue audio mix` lists them)")
+                target = found[0].get_asset()
+            muted, notes = _pie_sound_off(), []
+            state.update(world=world, submix=(target or master).get_name(), muted=muted,
+                         app_volume=unreal.SystemLibrary.get_console_variable_int_value("au.DisableAppVolume"))
+            master.set_submix_output_volume(world, 0.0)  # first: the speakers stay silent once the sources are heard
+            unreal.SystemLibrary.execute_console_command(world, "au.DisableAppVolume 1")
+            if muted:
+                camera = unreal.GameplayStatics.get_player_camera_manager(world, 0)
+                if camera is not None:  # stopping a fade that faded audio sets the transient volume back to 1
+                    camera.start_camera_fade(0.0, 0.0, 0.01, unreal.LinearColor(0, 0, 0, 1), True, False)
+                    camera.stop_camera_fade()
+                else:
+                    notes.append("PIE started muted ('Enable Game Sound' off) and has no player camera to lift that "
+                                 "mute with: the recording may be silent")
+            unreal.AudioMixerLibrary.start_recording_output(world, max(1.0, seconds), target)
+            state["target"] = target
+            return json.dumps({"submix": state["submix"], "muted": muted, "notes": notes})
+        if action == "stop":
+            if state.get("world") is None:
+                raise RuntimeError("no bounce is recording")
+            target, ended = state.get("target"), world is None or world != state["world"]
+            if ended:  # the device's recording ended with the PIE world's audio; nothing to write
+                world = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_editor_world()
+            else:
+                unreal.AudioMixerLibrary.stop_recording_output(world, unreal.AudioRecordingExportType.WAV_FILE, name,
+                                                               folder, target)
+            unreal.SystemLibrary.execute_console_command(world, f"au.DisableAppVolume {state.get('app_volume') or 0}")
+            if state.get("muted") and state.get("watch") is None:
+                state["watch"] = _unmute_when_pie_ends()
+            out = {"file": None if ended else os.path.join(folder, name + ".wav"), "submix": state.get("submix"),
+                   "muted": state.get("muted"), "ended": ended}
+            state.update(world=None, target=None)
+            return json.dumps(out)
+        raise RuntimeError(f"unknown action {action} (start, stop, unmute, status)")
 
     @_tool
     @staticmethod

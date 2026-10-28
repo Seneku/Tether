@@ -844,10 +844,15 @@ def build_parser():
     s.add_argument("--no-wait", action="store_true", help="with builders: start the job and return")
     s.add_argument("--wait", type=float, default=1800, help="seconds to wait for nav or lighting (1800)")
     s = add("audio", cmd_audio, "sounds playing in PIE: sound, owner, distance, volume, attenuation; `audio mix`: classes and "
-                                "submixes; --log N: what started over N seconds, as the mixer resolved it")
+                                "submixes; --log N: what started over N seconds, as the mixer resolved it; --bounce N: a "
+                                "WAV of what PIE played, with level per second, and no sound from the speakers")
     s.add_argument("match", nargs="?", help="regex filter")
     s.add_argument("--log", type=float, metavar="SECONDS", help="record the sounds that start over N seconds of PIE")
-    s.add_argument("--do", metavar="STEPS", help="with --log: play a ue pie do step file while recording")
+    s.add_argument("--bounce", type=float, nargs="?", const=0, metavar="SECONDS",
+                   help="record N seconds of PIE's mix to a WAV (10; with --do: while the steps run, then N more)")
+    s.add_argument("-f", "--do", metavar="STEPS", help="with --log or --bounce: play a ue pie do step file while recording")
+    s.add_argument("--submix", help="with --bounce: record this submix instead of the master")
+    s.add_argument("--out", metavar="PATH", help="with --bounce: where to write the WAV (default Saved/Tether/audio/bounce/)")
     s = add("soak", cmd_soak, "long PIE run (a step file in a loop, or wandering): memory trend, fps, errors, crashes")
     s.add_argument("--minutes", type=float, default=5, help="how long (5)")
     s.add_argument("-f", "--file", help="a `ue pie do` step file to loop (default: wander the player)")

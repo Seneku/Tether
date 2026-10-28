@@ -2188,6 +2188,88 @@ class Round14(unittest.TestCase):
         self.assertNotIn("(2D)", text)
         self.assertIn("1 cut off at once", text)
 
+    @staticmethod
+    def write_mix(path, rate=8000, seconds=3):
+        """An 8-channel mix like the engine's: a 1 kHz tone at -6 dBFS on FL/FR, zeroed from 1.4 to 1.6 s, and
+        clipped to full scale for the last half second."""
+        import math
+        import struct
+        import wave
+        amp = int(32767 * 10 ** (-6 / 20))
+        frames = []
+        for i in range(rate * seconds):
+            t = i / rate
+            v = int(amp * math.sin(2 * math.pi * 1000 * t))
+            if 1.4 <= t < 1.6:
+                v = 0
+            elif t >= seconds - 0.5:
+                v = max(-32768, min(32767, v * 4))
+            frames.append(struct.pack("<8h", v, v, 0, 0, 0, 0, 0, 0))
+        with wave.open(path, "wb") as f:
+            f.setnchannels(8)
+            f.setsampwidth(2)
+            f.setframerate(rate)
+            f.writeframes(b"".join(frames))
+
+    def test_bounce_stats_levels_dropouts_and_clipping(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "mix.wav")
+            self.write_mix(path)
+            stats = ue.bounce_stats(path)
+        self.assertEqual((stats["sound_on"], stats["silent_channels"][:2]), (["FL", "FR"], ["FC", "LFE"]))
+        self.assertEqual(stats["dropouts"], [[1.4, 1.6]])
+        self.assertGreater(stats["clipped"], 0)
+        self.assertEqual(len(stats["rows"]), 3)
+        first = stats["rows"][0]
+        self.assertEqual(first["peak_db"], -6.0)
+        self.assertAlmostEqual(first["rms_db"], -9.0, delta=0.2)  # a sine's RMS is 3 dB under its peak
+        self.assertAlmostEqual(first["bright_hz"], 1000, delta=60)
+        self.assertGreater(stats["bands"]["250-2k"], 90)
+
+    def test_audio_bounce_records_then_restores(self):
+        calls = []
+        with tempfile.TemporaryDirectory() as folder:
+            out_path = os.path.join(folder, "take.wav")
+
+            def tether(tool, action, **kw):
+                calls.append(action)
+                if action == "start":
+                    return {"submix": "MasterSubmixDefault", "muted": muted, "notes": []}
+                if action == "stop":
+                    self.write_mix(os.path.join(kw["folder"], kw["name"] + ".wav"))
+                    return {"file": out_path, "submix": "MasterSubmixDefault", "muted": muted, "ended": False}
+                return {"unmuted": "MasterSubmixDefault"}
+            for muted in (False, True):
+                calls.clear()
+                ctx = types.SimpleNamespace(beacon={"pie": True}, data=None, project=None, tether=tether)
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out), unittest.mock.patch("time.sleep"), \
+                        unittest.mock.patch("tether_cli.play.log_end", return_value=0):
+                    ue.audio_bounce(ctx, argparse.Namespace(bounce=2, do=None, submix=None, out=out_path))
+                # aloud PIE gets its master back after the editor's own mutes return; muted PIE keeps it until PIE ends
+                self.assertEqual(calls, ["start", "stop"] + ([] if muted else ["unmute"]))
+            text = out.getvalue()
+        self.assertIn("bounce: 3 s of MasterSubmixDefault, 8 channel(s) at 8000 Hz", text)
+        self.assertIn("sound on FL FR", text)
+        self.assertIn("! 1 dropout(s) to exact silence", text)
+        self.assertIn("1.4-1.6 s", text)
+        self.assertIn("clipped", text)
+
+    def test_audio_bounce_of_nothing_fails_fast(self):
+        ctx = types.SimpleNamespace(beacon={"pie": True}, data=None, project=None, tether=lambda tool, action, **kw: (
+            {"submix": "MasterSubmixDefault", "muted": True, "notes": []} if action == "start" else
+            {"file": None, "muted": True, "ended": False}))
+        with tempfile.TemporaryDirectory() as folder, unittest.mock.patch("time.sleep"), \
+                unittest.mock.patch("tether_cli.play.log_end", return_value=0), \
+                unittest.mock.patch("tether_cli.play.new_log_lines",
+                                    return_value=["LogAudioMixer: Warning: No audio data. Did you call Start Recording Output?"]):
+            started = time.time()
+            with self.assertRaises(ue.CliError) as err:
+                ue.audio_bounce(ctx, argparse.Namespace(bounce=1, do=None, submix=None, out=os.path.join(folder, "x")))
+        self.assertLess(time.time() - started, 5)
+        self.assertEqual(err.exception.code, 4)
+        self.assertIn("no sound played through MasterSubmixDefault", str(err.exception))
+
     def test_py_warns_on_additive_set_editor_properties(self):
         code = "a = unreal.load_asset('/Game/A/AS_Slam')\na.set_editor_properties({'additive_anim_type': t})"
         self.assertTrue(any("recompressed" in n for n in ue.py_pitfalls(code)))
