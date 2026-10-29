@@ -22,8 +22,8 @@ ANNOTATIONS = {"gridSpacing": 500, "gridExtent": 10000, "gridHeight": 0, "maxLab
 
 def pie_screenshot(ctx, args, pose=None):
     """The PIE world as the player sees it. Epic's CaptureViewport renders the *editor* world even during
-    PIE (from whatever pose it is given), so take a HighResShot in the PIE world and collect the file.
-    With --actor/--at/--look-at/--rot, a spectator shot: the player's view moves to a camera at that pose for
+    PIE (from whatever pose it is given), so take the game viewport's next frame (`shot`) and collect the file;
+    --res is a HighResShot, whose frames render with the game stopped. With --actor/--at/--look-at/--rot, a spectator shot: the player's view moves to a camera at that pose for
     the one shot, then comes back (the game keeps running)."""
     if args.annotate:
         raise CliError("--annotate works outside PIE, or in Simulate (ue pie start --simulate)")
@@ -38,7 +38,12 @@ def pie_screenshot(ctx, args, pose=None):
         if client:  # a multiplayer client plays in a window of its own: capture that window, not the host's
             return client_window_shot(ctx, client)
         return hud_screenshot(ctx)
-    return highres_shot(ctx, getattr(args, "res", None) or "1", pie=True)
+    if getattr(args, "res", None):
+        print("note: --res is a HighResShot, rendered with the game stopped: no camera motion while moving things keep "
+              "their velocity, so motion blur, TSR and other effects built over frames differ from play (without "
+              "--res: the frame as played)", file=sys.stderr)
+        return highres_shot(ctx, args.res, pie=True)
+    return frame_shot(ctx, "shot")
 
 
 def spectator(args):
@@ -399,15 +404,13 @@ def png_crop(raw, rect, scale=1.0):
     return png_bytes(width, height, rgb)
 
 
-def hud_screenshot(ctx, cache=None):
-    """The PIE viewport as the player sees it, UMG HUD included. HighResShot renders the scene only; `shot showui`
-    grabs the whole editor window (UI and all), so take that and crop it to the game viewport, located through
-    Epic's Slate inspector."""
-    size = str(ctx.tether("py", code="s = unreal.WidgetLayoutLibrary.get_viewport_size(unreal.get_editor_subsystem("
-                                     "unreal.UnrealEditorSubsystem).get_game_world())\nf'{s.x:.0f} {s.y:.0f}'"))
-    view_w, view_h = (int(v) for v in size.strip().strip("'").split())
+def frame_shot(ctx, command):
+    """PNG bytes of a console screenshot in PIE: `shot` reads back the game viewport's next frame as the game drew it
+    (the game keeps running, so motion blur and temporal AA look as in play; UMG is not in it), `shot showui` grabs
+    the whole editor window."""
+    what = "window screenshot" if "showui" in command else "screenshot"
     start = log_end(ctx.project)
-    ctx.tether("console", command="shot showui", pie=True)
+    ctx.tether("console", command=command, pie=True)
     taken = re.compile(r'Screenshot "([^"]+)" taken with size: (\d+) x (\d+)')
     folder = os.path.join(os.path.dirname(ctx.project), "Saved", "Screenshots")
     deadline, path = time.time() + 15, None
@@ -421,11 +424,22 @@ def hud_screenshot(ctx, cache=None):
             path = max(names, key=os.path.getmtime) if names else None
         time.sleep(0.2)
     if not path:
-        raise CliError("the window screenshot did not appear within 15 s (ue log --level Warning)", 4)
+        raise CliError(f"the {what} did not appear within 15 s (ue log --level Warning)", 4)
     time.sleep(0.3)  # the file is written after the log line
     with open(path, "rb") as f:
         raw = f.read()
     os.remove(path)  # it moves to Saved/Tether/shots (or -o)
+    return raw
+
+
+def hud_screenshot(ctx, cache=None):
+    """The PIE viewport as the player sees it, UMG HUD included. `shot` reads back the scene only; `shot showui`
+    grabs the whole editor window (UI and all), so take that and crop it to the game viewport, located through
+    Epic's Slate inspector."""
+    size = str(ctx.tether("py", code="s = unreal.WidgetLayoutLibrary.get_viewport_size(unreal.get_editor_subsystem("
+                                     "unreal.UnrealEditorSubsystem).get_game_world())\nf'{s.x:.0f} {s.y:.0f}'"))
+    view_w, view_h = (int(v) for v in size.strip().strip("'").split())
+    raw = frame_shot(ctx, "shot showui")
     if cache and cache.get("rect"):  # a film: the viewport stays put, so locate it once
         return png_crop(raw, cache["rect"])
     text, is_error = ctx.mcp.call("SlateInspectorToolset.SlateInspectorToolset", "Snapshot",
@@ -630,7 +644,7 @@ def cmd_look(ctx, args):
 GAME_TIME = ("w = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_game_world()\n"
              "{set}print(unreal.GameplayStatics.get_time_seconds(w), unreal.GameplayStatics.get_global_time_dilation(w))")
 SET_DILATION = "unreal.GameplayStatics.set_global_time_dilation(w, {})\n"
-SHOT_SECONDS = 1.5  # what one capture costs in real time, with margin: HighResShot, then the file in the log
+SHOT_SECONDS = 1.5  # what one capture costs in real time, with margin: the shot, then the file in the log
 
 
 def game_clock(ctx, dilation=None):

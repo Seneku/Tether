@@ -427,6 +427,8 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
   `player.control` and getters like `player.GetVelocity()`.
 - When `ue py` prints `engine: ...` lines, that is why a call returned None (e.g. Editor Scripting refusing in PIE).
 - UI checks: `ue shot --hud` in PIE captures the game view with its UMG HUD (plain `ue shot` has the 3D view only).
+  A PIE `ue shot` is the frame as played (motion blur included); `--res` is a HighResShot rendered with the game
+  stopped, so judge motion blur, TSR and other effects built over frames without `--res`.
   After static meshes were rebuilt in place (a generator's bake), `ue shot` waits for builds still running and
   renders a few frames at the view first, saying so: an offscreen editor renders only when asked, and shots right
   after a bake showed missing meshes and wrong materials. `--res` in a hand-opened editor whose viewport takes no

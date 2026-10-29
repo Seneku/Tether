@@ -3135,6 +3135,21 @@ class ShooterDominationRound2(unittest.TestCase):
         with self.assertRaises(ue.CliError):
             ue.shot_frames(ctx, ue.shot_args(frames=1), False, lambda: tile)
 
+    def test_pie_shot_is_a_played_frame_and_res_a_highresshot(self):
+        # HighResShot renders its frames with the game stopped: a chase cam's motion blur came out on the car,
+        # not on the road (UnrealRacing's note 220), so a plain PIE shot is the frame as played.
+        taken = []
+        with unittest.mock.patch.object(ue.images, "frame_shot", lambda c, cmd: taken.append(cmd) or b"png"), \
+                unittest.mock.patch.object(ue.images, "highres_shot",
+                                           lambda c, spec, pie: taken.append((spec, pie)) or b"png"):
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                ue.pie_screenshot(FakeCtx(), ue.shot_args())
+                self.assertEqual(err.getvalue(), "")
+                ue.pie_screenshot(FakeCtx(), ue.shot_args(res="2560x1440"))
+        self.assertEqual(taken, ["shot", ("2560x1440", True)])
+        self.assertIn("motion blur", err.getvalue())
+
     def test_python_only_plugin_update(self):
         uplugin = '{\n\t"Version": %d,\n\t"VersionName": "0.%d.0",\n\t"Modules": []\n}\n'
         for side, version in (("src", 33), ("dst", 32)):
