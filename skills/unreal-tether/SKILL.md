@@ -44,9 +44,10 @@ you did not touch says who last edited it ("edited by spire ... (not you)"): lea
 builders wrote, read from the session transcripts), and names the ones another session also wrote since their
 last commit (stage your hunks with `git add -p`), the ones it wrote, and the ones it cannot place.
 Starting from nothing: `ue new project Folder/Name --cpp [--template VehicleAdv]` makes a project from an engine
-template (Build.cs ready for 5.8, a game mode) and runs `ue init`; `ue template add Vehicles` copies template
-content (cars, LevelPrototyping, mannequins) to the /Game path its packages expect. `ue init --claude-plugin`
-makes later sessions in that folder load Tether (no plugin there: no `ue` on PATH, no edit hooks).
+template (Build.cs ready for 5.8, a game mode, the redirects that keep the template's Blueprints on its renamed
+C++ classes) and runs `ue init`; `ue template add Vehicles` copies template content (cars, LevelPrototyping,
+mannequins) to the /Game path its packages expect. `ue init --claude-plugin` makes later sessions in that folder
+load Tether (no plugin there: no `ue` on PATH, no edit hooks).
 
 With several editors open, each session keeps talking to the one it opened or used last (`--pid` changes
 that), so an editor the user opens mid-session does not take your commands. A new session starts on the editor
@@ -369,6 +370,8 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
   and the values involved (`ue pie watch`).
 - After renaming or removing C++ functions, properties or classes (and `ue build --restart`), run
   `ue bp check` (or `ue bp check /Game/Some/Folder`): it lists only Blueprints that no longer compile, with why.
+  "missing or NULL parent class: /Script/Old.Class" means a renamed C++ class or module needs a redirect
+  ([CoreRedirects] in DefaultEngine.ini); `ue open` reports no error for it, and PIE falls back to defaults.
 - `ue table /Game/Path/DT_X` shows rows; `--export rows.json|.csv`, edit, then `--import rows.json
   --dry-run` to see the diff and `--import rows.json --save` to apply (upsert; `--prune` deletes missing
   rows).

@@ -3307,13 +3307,102 @@ class UnrealRacingRound(unittest.TestCase):
         self.assertIn("PublicIncludePaths.Add(ModuleDirectory);", build)
         self.assertTrue(os.path.isfile(os.path.join(folder, "Source", "Racer", "RacerGameMode.h")))
         with open(os.path.join(folder, "Config", "DefaultEngine.ini"), encoding="utf-8") as f:
-            self.assertIn("GlobalDefaultGameMode=/Script/Racer.RacerGameMode", f.read())
+            ini = f.read()
+        self.assertIn("GlobalDefaultGameMode=/Script/Racer.RacerGameMode", ini)
+        self.assertTrue(ini.endswith('\n\n[/Script/Engine.Engine]\n'
+                                     '+ActiveGameNameRedirects=(OldGameName="TP_Blank",NewGameName="/Script/Racer")\n'
+                                     '+ActiveGameNameRedirects=(OldGameName="/Script/TP_Blank",NewGameName="/Script/Racer")\n'))
+        self.assertNotIn("ActiveClassRedirects", ini)  # its game mode is ours, not a renamed template class
         self.assertFalse(os.path.exists(os.path.join(folder, "Media")))
         self.assertTrue(os.path.isfile(os.path.join(folder, "Content", "Vehicles", "SportsCar", "SKM_Car.uasset")))
         self.assertTrue(os.path.isfile(os.path.join(folder, "Content", "__ExternalActors__", "Vehicles", "Maps", "A.uasset")))
         self.assertEqual(ctx._project, os.path.join(folder, "Racer.uproject"))
         with self.assertRaises(ue.CliError):
             ue.new_project(ctx, ue.build_parser().parse_args(["new", "project", folder]))  # not empty
+
+    def test_new_project_redirects_template_classes(self):
+        # The template's Blueprints name /Script/TP_FirstPerson and its classes; without the wizard's redirects
+        # Wildpack's GameMode Blueprint lost its C++ parent and PIE fell back to a default pawn.
+        engine = self.fake_engine()
+        templates = os.path.join(engine, "Templates")
+        files = {"TP_FirstPerson/TP_FirstPerson.uproject": json.dumps({"Modules": [{"Name": "TP_FirstPerson"}]}),
+                 "TP_FirstPerson/Config/DefaultEngine.ini": "[/Script/Engine.Engine]\nNearClipPlane=5.000000\n\n"
+                                                            "[/Script/AndroidFileServerEditor.AndroidFileServerRuntime"
+                                                            "Settings]\nbEnablePlugin=True\n",
+                 "TP_FirstPerson/Config/TemplateDefs.ini": "",
+                 "TP_FirstPerson/Source/TP_FirstPerson/TP_FirstPerson.Build.cs": "\t\tPCHUsage = PCHUsageMode.Default;\n",
+                 "TP_FirstPerson/Source/TP_FirstPerson/TP_FirstPerson.h": "#pragma once\n",  # the module's: no class
+                 "TP_FirstPerson/Source/TP_FirstPerson/Variant_Shooter/ShooterNPC.h": '#include "ShooterNPC.generated.h"\n',
+                 "TP_FirstPersonBP/Config/DefaultEngine.ini": "[/Script/Engine.Engine]\nNearClipPlane=5.000000\n",
+                 "TP_FirstPersonBP/Config/TemplateDefs.ini": ""}
+        for kind in ("Character", "GameMode", "PlayerController"):
+            files[f"TP_FirstPerson/Source/TP_FirstPerson/TP_FirstPerson{kind}.h"] = \
+                f'#include "TP_FirstPerson{kind}.generated.h"\n'
+        for rel, text in files.items():
+            os.makedirs(os.path.dirname(os.path.join(templates, rel)), exist_ok=True)
+            with open(os.path.join(templates, rel), "w", encoding="utf-8") as f:
+                f.write(text)
+        made = os.path.join(self.project.root, "made")
+        ctx = types.SimpleNamespace(_project=None)
+        with unittest.mock.patch.dict(os.environ, {"UE_ROOT": engine}), \
+                unittest.mock.patch.object(ue.setup, "cmd_init", return_value=0), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            for args in (["Arena", "--cpp"], ["Plaza"]):
+                folder = os.path.join(made, args[0])
+                self.assertEqual(ue.new_project(ctx, ue.build_parser().parse_args(
+                    ["new", "project", folder, "--template", "FirstPerson"] + args[1:])), 0)
+        self.assertIn("redirects in Config/DefaultEngine.ini: /Script/TP_FirstPerson -> /Script/Arena, 3 renamed class(es)",
+                      out.getvalue())
+        with open(os.path.join(made, "Arena", "Config", "DefaultEngine.ini"), encoding="utf-8") as f:
+            self.assertEqual(f.read(), (  # the block ShooterDomination's DefaultEngine.ini got from the 5.8 wizard
+                '[/Script/Engine.Engine]\nNearClipPlane=5.000000\n\n'
+                '+ActiveGameNameRedirects=(OldGameName="TP_FirstPerson",NewGameName="/Script/Arena")\n'
+                '+ActiveGameNameRedirects=(OldGameName="/Script/TP_FirstPerson",NewGameName="/Script/Arena")\n\n'
+                '+ActiveClassRedirects=(OldClassName="TP_FirstPersonPlayerController",NewClassName="ArenaPlayerController")\n'
+                '+ActiveClassRedirects=(OldClassName="TP_FirstPersonGameMode",NewClassName="ArenaGameMode")\n'
+                '+ActiveClassRedirects=(OldClassName="TP_FirstPersonCharacter",NewClassName="ArenaCharacter")\n\n'
+                '[/Script/AndroidFileServerEditor.AndroidFileServerRuntimeSettings]\nbEnablePlugin=True\n'))
+        with open(os.path.join(made, "Plaza", "Config", "DefaultEngine.ini"), encoding="utf-8") as f:
+            self.assertEqual(f.read(), "[/Script/Engine.Engine]\nNearClipPlane=5.000000\n")  # no module to redirect
+        self.assertEqual(ue.ini_append("[A]\nx=1\n[B]\ny=2", "B", ["z=3"]), "[A]\nx=1\n[B]\ny=2\n\nz=3\n")
+        self.assertEqual(ue.ini_append("[A]\n\n[B]\n", "A", ["z=3"]), "[A]\nz=3\n\n[B]\n")
+
+    def test_bp_check_names_parents_that_did_not_load(self):
+        # The compiler only says "missing or NULL parent class" (and the editor's registry then says None); the
+        # package file still names the parent. BP_Enemy must not get BP_EnemySpawner's message either.
+        log = os.path.join(self.project.root, "Saved", "Logs", "Game.log")
+        errors = {"BP_Enemy": "Blueprint  BP_Enemy  has missing or NULL parent class.",  # spaced as the engine logs it
+                  "BP_EnemySpawner": "Blueprint  BP_EnemySpawner  has missing or NULL parent class.",
+                  "ABP_Manny": "Could not find a function named \"HasWallJumped\" in 'ABP_Manny'."}
+
+        def fstring(value):  # as a package stores it: the length (with the NUL), then the characters
+            return (len(value) + 1).to_bytes(4, "little") + value.encode() + b"\x00"
+        for name, cls in (("BP_Enemy", "CombatEnemy"), ("BP_EnemySpawner", "CombatEnemySpawner")):
+            with open(self.project.write(f"Content/AI/{name}.uasset"), "wb") as f:
+                f.write(fstring("ParentClass") + b"\x18\xdd\xa5[" + fstring("Player")  # name table entries and hashes
+                        + fstring("NativeParentClass") + fstring("/Script/CoreUObject.Class'/Script/Engine.Actor'")
+                        + fstring("ParentClass") + fstring(f"/Script/CoreUObject.Class'/Script/TP_ThirdPerson.{cls}'"))
+
+        class Editor(FakeCtx):
+            def tether(self, tool, **kwargs):
+                self.calls.append((tool, kwargs))
+                with open(log, "a", encoding="utf-8") as f:
+                    f.writelines(stamped(f"LogBlueprint: Error: [AssetLog] C:/P/Content/AI/{name}.uasset: [Compiler] "
+                                         f"{text}\n") for name, text in errors.items())
+                return json.dumps({"checked": 4, "problems": [{"path": f"/Game/AI/{n}", "status": "error"} for n in errors]})
+        ctx = Editor()
+        ctx.project = self.project.uproject
+        args = argparse.Namespace(warnings=False, limit=30, timeout_given=True)
+        with unittest.mock.patch.object(ue.assets, "flush_editor_log"), \
+                unittest.mock.patch.object(ue.assets, "log_end", return_value=0), \
+                unittest.mock.patch.object(ue.assets, "log_path", return_value=log), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(ue.bp_check(ctx, "/Game", args), 1)
+        self.assertIn("ERROR /Game/AI/BP_Enemy\n  E Blueprint BP_Enemy has missing or NULL parent class: "
+                      "/Script/TP_ThirdPerson.CombatEnemy\nERROR /Game/AI/BP_EnemySpawner\n", out.getvalue())
+        self.assertIn("ERROR /Game/AI/ABP_Manny\n  E Could not find a function named", out.getvalue())
+        self.assertIn("note: parent classes in /Script/TP_ThirdPerson did not load", out.getvalue())
+        self.assertEqual([tool for tool, _ in ctx.calls], ["bp_check"])  # read from the files: no editor round trip
 
     def test_template_pack_needs(self):
         engine = self.fake_engine()

@@ -380,11 +380,26 @@ def cmd_template(ctx, args):
     return 0
 
 
+def ini_append(text, section, lines):
+    """An .ini file's `text` with `lines` added at the end of [section] after a blank line, or in a new [section] at
+    the end of the file: where the editor's new-project wizard writes the values it adds."""
+    rows, header = text.rstrip("\n").split("\n"), f"[{section}]"
+    start = next((i + 1 for i, row in enumerate(rows) if row.strip() == header), None)
+    if start is None:
+        return (text.rstrip("\n") + "\n\n" if text.strip() else "") + "\n".join([header] + lines) + "\n"
+    after = next((i for i in range(start, len(rows)) if rows[i].startswith("[")), len(rows))
+    end = after
+    while end > start and not rows[end - 1].strip():
+        end -= 1
+    return "\n".join(rows[:end] + ([""] if end > start else []) + lines + ([""] if after < len(rows) else [])
+                     + rows[after:]) + "\n"
+
+
 def new_project(ctx, args):
     """`ue new project <Folder/Name> [--cpp] [--template ThirdPerson] [--engine 5.8]`: a project from one of the
-    engine's templates as the wizard makes it (names replaced, its shared content packs copied), plus what a
-    session would otherwise discover by failing: the module root on the include path, a C++ game mode set as
-    the default, then `ue init`."""
+    engine's templates as the wizard makes it (names replaced, with the redirects that keep the template's
+    Blueprints on its renamed C++ classes, its shared content packs copied), plus what a session would otherwise
+    discover by failing: the module root on the include path, a C++ game mode set as the default, then `ue init`."""
     import shutil
     import uuid
     folder = os.path.abspath(args.path)
@@ -413,6 +428,7 @@ def new_project(ctx, args):
     def renamed(text):
         text = text.replace(old.upper(), name.upper()).replace(old.lower(), name.lower())
         return re.sub(re.escape(old), name, text, flags=re.I)
+    classes = []  # (template class, project class): the wizard's rule, a renamed header with a .generated.h
     for here, dirs, files in os.walk(source):
         dirs[:] = [d for d in dirs if d not in TEMPLATE_SKIP]
         rel = os.path.relpath(here, source)
@@ -426,6 +442,8 @@ def new_project(ctx, args):
                     text = renamed(fh.read())
                 with open(target, "w", encoding="utf-8") as fh:
                     fh.write(text)
+                if f.endswith(".h") and renamed(f) != f and '.generated.h"' in text.lower():
+                    classes.append((f[:-2], renamed(f)[:-2]))
             else:
                 shutil.copy2(os.path.join(here, f), target)
     descriptor = read_json(os.path.join(source, f"{template}.uproject")) or {"FileVersion": 3}
@@ -441,6 +459,9 @@ def new_project(ctx, args):
             text = re.sub(r"(PCHUsage = [^;]+;\n)", r"\1\n\t\tPublicIncludePaths.Add(ModuleDirectory);\n", text, count=1)
         with open(build, "w", encoding="utf-8") as f:
             f.write(text)
+        ini = os.path.join(folder, "Config", "DefaultEngine.ini")
+        with open(ini, encoding="utf-8") as f:
+            text = f.read()
         mode = os.path.join(module_dir, f"{name}GameMode.h")
         if not any(f.endswith("GameMode.h") for f in os.listdir(module_dir)):
             with open(mode, "w", encoding="utf-8") as f:
@@ -449,15 +470,20 @@ def new_project(ctx, args):
                         f": public AGameModeBase\n{{\n\tGENERATED_BODY()\n}};\n")
             with open(mode[:-2] + ".cpp", "w", encoding="utf-8") as f:
                 f.write(f'#include "{name}GameMode.h"\n')
-            ini = os.path.join(folder, "Config", "DefaultEngine.ini")
-            with open(ini, encoding="utf-8") as f:
-                text = f.read()
             line = f"GlobalDefaultGameMode=/Script/{name}.{name}GameMode"
             section = "[/Script/EngineSettings.GameMapsSettings]"
             text = text.replace(section, f"{section}\n{line}", 1) if section in text else \
                 text.rstrip("\n") + f"\n\n{section}\n{line}\n"
-            with open(ini, "w", encoding="utf-8") as f:
-                f.write(text)
+        # The template's Blueprints still name /Script/<template> and its classes, so redirect them as the wizard
+        # does, in its order (it finds the classes A-Z and writes each above the last). Blueprint templates need
+        # none: no /Script/TP_ path in their packages, nor in the shared packs.
+        game = [f'+ActiveGameNameRedirects=(OldGameName="{n}",NewGameName="/Script/{name}")'
+                for n in (old, f"/Script/{old}")]
+        moved = [f'+ActiveClassRedirects=(OldClassName="{a}",NewClassName="{b}")'
+                 for a, b in sorted(classes, reverse=True)]
+        text = ini_append(text, "/Script/Engine.Engine", game + [""] + moved if moved else game)
+        with open(ini, "w", encoding="utf-8") as f:
+            f.write(text)
     game_ini = os.path.join(folder, "Config", "DefaultGame.ini")
     with open(game_ini, "a", encoding="utf-8") as f:
         f.write(f"\n[/Script/EngineSettings.GeneralProjectSettings]\nProjectID={uuid.uuid4().hex.upper()}\n"
@@ -466,6 +492,9 @@ def new_project(ctx, args):
         json.dump(descriptor, f, indent="\t")
         f.write("\n")
     print(f"created {folder} from {template} (engine {args.engine})")
+    if args.cpp and os.path.isdir(module_dir):
+        print(f"  redirects in Config/DefaultEngine.ini: /Script/{old} -> /Script/{name}, "
+              f"{len(classes)} renamed class(es)")
     defs = os.path.join(source, "Config", "TemplateDefs.ini")
     with open(defs, encoding="utf-8-sig", errors="replace") as f:
         wanted = re.findall(r'^SharedContentPacks=\(MountName="(\w+)",DetailLevels=\("?(\w+)', f.read(), re.M)

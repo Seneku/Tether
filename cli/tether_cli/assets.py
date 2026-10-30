@@ -102,6 +102,21 @@ def read_graph(ctx, source, bp, graph):
 
 
 COMPILER_LINE = re.compile(r"(?:LogBlueprint|LogK2Compiler|BlueprintLog)\w*: (Error|Warning): (.*)")
+ORPHAN = re.compile(r"Blueprint\s+(\S+)\s+has missing or NULL parent class")  # its parent class did not load
+SAVED_PARENT = re.compile(rb"\x0c\x00\x00\x00ParentClass\x00.{4}[^'\x00]*'([^'\x00]+)'", re.S)
+
+
+def saved_parent(project, package):
+    """The parent class a /Game Blueprint was saved with (its ParentClass asset registry tag), read from its file:
+    once the parent fails to load, the editor's registry says None."""
+    if not package.startswith("/Game/"):
+        return None
+    try:
+        with open(os.path.join(os.path.dirname(project), "Content", *package[6:].split("/")) + ".uasset", "rb") as f:
+            found = SAVED_PARENT.search(f.read())
+    except OSError:
+        return None
+    return found.group(1).decode("utf-8", "replace") if found else None
 
 
 def bp_check(ctx, path, args):
@@ -120,13 +135,24 @@ def bp_check(ctx, path, args):
     count = result.get("checked", 0)
     print(f"{count} Blueprint{'' if count == 1 else 's'} under {path} compiled in {time.time() - started:.1f}s: "
           + (f"{len(problems)} with problems" if problems else "all clean"))
+    # The compiler names neither the parent that did not load nor why (a C++ module or class renamed without a
+    # redirect, as `ue new project` did before 0.36.2); the package file still names it.
+    orphaned = {m.group(1) for _, text in messages for m in [ORPHAN.search(text)] if m}
+    parents = {p["path"]: saved_parent(ctx.project, p["path"]) for p in problems[: args.limit]
+               if p["path"].rsplit("/", 1)[-1] in orphaned}
     for problem in problems[: args.limit]:
         name = problem["path"].rsplit("/", 1)[-1]
         print(f"{'ERROR' if problem['status'] == 'error' else 'WARN '} {problem['path']}")
+        own = re.compile(rf"(?<!\w){re.escape(name)}(?:_C)?(?!\w)")  # BP_Enemy's lines, not BP_EnemySpawner's
         mine = [f"  {sev[0]} " + re.sub(r"\s+", " ", re.sub(r"^\[AssetLog\] .*?: \[Compiler\] ", "", text.strip()))
-                for sev, text in messages if name in text]
+                for sev, text in messages if own.search(text)]
+        parent = parents.get(problem["path"])
         for line in list(dict.fromkeys(mine))[:5] or ["  (no compiler message in the log; open it in the editor)"]:
-            print(line[:300])
+            print((f"{line.rstrip('.')}: {parent}" if parent and ORPHAN.search(line) else line)[:300])
+    lost = sorted({p.split(".")[0] for p in parents.values() if p and p.startswith("/Script/")})
+    if lost:
+        print(f"note: parent classes in {', '.join(lost)} did not load: a C++ module or class renamed without a "
+              "redirect? ([CoreRedirects] in Config/DefaultEngine.ini)")
     return 1 if any(p["status"] == "error" for p in problems) else 0
 
 
