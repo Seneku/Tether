@@ -105,6 +105,23 @@ def _find_log():
     return None
 
 
+def _check_bind():
+    """Epic's server binds its port before Python starts, and only logs a failure: when another editor took the
+    port first, the beacon must not name it, or the CLI reaches that editor for this one's pid."""
+    port, path = _state.get("port"), _state.get("log")
+    if not port or not path or _state.get("started_port"):  # a server this module started binds later
+        return
+    try:
+        with open(path, "rb") as f:
+            failed = f"unable to bind to 127.0.0.1:{port}".encode() in f.read()
+    except OSError:
+        return
+    if failed:
+        _state["port"], _state["mcp_error"] = None, f"its MCP server could not bind port {port} (another editor has it)"
+        unreal.log_warning(f"Tether: the MCP server could not bind port {port}; another editor has it, so the ue CLI "
+                           "cannot reach this editor")
+
+
 def _headless():
     return bool(re.search(r"(^|\s)-(nullrhi|RenderOffscreen)\b", _command_line(), re.I))
 
@@ -170,6 +187,7 @@ def _snapshot():
         "project": unreal.Paths.convert_relative_path_to_full(unreal.Paths.get_project_file_path()),
         "engine": unreal.SystemLibrary.get_engine_version(),
         "mcp_port": _state["port"],
+        "mcp_error": _state.get("mcp_error"),
         "map": level,
         "pie": game is not None,
         "pie_since": _state["pie_since"],
@@ -273,6 +291,7 @@ def start():
         _find_log()
     except Exception:
         pass
+    _check_bind()
     for other in _others():
         unreal.log_warning(
             f"Tether: another editor is open on this project (pid {other.get('pid')}, "

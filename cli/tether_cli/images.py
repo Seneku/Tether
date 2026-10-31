@@ -256,9 +256,26 @@ def pie_client_target(ctx):
     return int(m.group(1)) if m else 0
 
 
+PIE_LIVE = "unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_game_world() is not None"
+
+
+class PieEnded(CliError):
+    """PIE ended under a capture: nothing more to capture."""
+
+
+def pie_alive(ctx):
+    """Raise PieEnded unless PIE is still running. Epic's Slate inspector Screenshot asserts, taking the editor down,
+    on a widget that is no longer in a window: the PIE viewport just after PIE ended (UnrealRacing's note 223).
+    Checked right before each such call; the two calls are still apart, which Python cannot close."""
+    if not str(ctx.tether("py", code=PIE_LIVE)).strip().endswith("True"):
+        raise PieEnded("PIE has ended: no capture (the Slate inspector would crash the editor on the PIE viewport "
+                       "it removed)", 4)
+
+
 def client_window_shot(ctx, client):
     """PNG of a multiplayer PIE client's own window (the game view and its UMG HUD), through the Slate inspector."""
     import base64
+    pie_alive(ctx)
     text, failed = ctx.mcp.call("SlateInspectorToolset.SlateInspectorToolset", "Snapshot",
                                 {"ref": "", "maxDepth": 3, "bIncludeSourceLocations": False})
     snapshot = unwrap(text) if not failed else ""
@@ -267,6 +284,7 @@ def client_window_shot(ctx, client):
                 if f"NetMode: Client {client}]" in l and SNAPSHOT_REF.search(l)), None)
     if ref is None:
         raise CliError(f"no PIE window for client {client} (is it a separate window? ue ui lists the windows)")
+    pie_alive(ctx)
     text, failed = ctx.mcp.call("SlateInspectorToolset.SlateInspectorToolset", "Screenshot", {"ref": ref})
     value = unwrap(text) if not failed else None
     value = value.get("returnValue", value) if isinstance(value, dict) else None
@@ -367,6 +385,7 @@ def widget_capture(ctx, cache):
     if not found:
         return None
     ref, (box_w, box_h), dpi = found
+    pie_alive(ctx)
     text, failed = ctx.mcp.call("SlateInspectorToolset.SlateInspectorToolset", "Screenshot", {"ref": ref})
     value = unwrap(text) if not failed else None
     value = value.get("returnValue", value) if isinstance(value, dict) else None
@@ -901,6 +920,17 @@ def cmd_shot(ctx, args):
     if launch.get("headless") and not launch.get("render"):
         raise CliError("this editor runs headless with -nullrhi and cannot render; "
                        "reopen it with `ue open --headless --render` (or windowed)")
+    from .play import unthrottled
+    # A background editor with "Use Less CPU when in Background" ticks Slate a few times a second, and the editor
+    # ticks a viewport (and with it the edit modes, whose previews a shot shows) only when Slate ticked it within
+    # 0.25 s: lifted for the shot, with a moment of full-rate ticks first (UnrealRacing's note 222)
+    with unthrottled(ctx) as lifted:
+        if lifted:
+            time.sleep(0.5)
+        return take_shot(ctx, args, launch)
+
+
+def take_shot(ctx, args, launch):
     if getattr(args, "window", None):
         if any(getattr(args, k, None) for k in ("actor", "at", "look_at", "rot", "frames", "burst", "res", "view",
                                                 "baseline", "compare", "hud")):

@@ -430,7 +430,8 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
   `player.control` and getters like `player.GetVelocity()`.
 - When `ue py` prints `engine: ...` lines, that is why a call returned None (e.g. Editor Scripting refusing in PIE).
 - UI checks: `ue shot --hud` in PIE captures the game view with its UMG HUD (plain `ue shot` has the 3D view only).
-  A PIE `ue shot` is the frame as played (motion blur included); `--res` is a HighResShot rendered with the game
+  An editor `ue shot` lifts "Use Less CPU when in Background" for the capture, so edit modes tick and their
+  previews are current. A PIE `ue shot` is the frame as played (motion blur included); `--res` is a HighResShot rendered with the game
   stopped, so judge motion blur, TSR and other effects built over frames without `--res`.
   After static meshes were rebuilt in place (a generator's bake), `ue shot` waits for builds still running and
   renders a few frames at the view first, saying so: an offscreen editor renders only when asked, and shots right
@@ -439,7 +440,9 @@ If something behaves unexpectedly, `ue doctor` checks the setup (engine, plugins
   A headless editor's PIE viewport is a part of its main window, which can be small (the project's saved
   resolution sets it): `ue open --headless --render --size 2560x1440` gives a viewport big enough to read menus.
 - To see what happened between checks: `ue pie do -f steps.txt --film 0.25` adds a contact sheet of the game's view
-  (with HUD), four frames a second with times on them; read that one image instead of many screenshots.
+  (with HUD), four frames a second with times on them; read that one image instead of many screenshots. When the
+  game ends PIE, filming stops and `--keep-going` skips the steps left (a Slate capture of the PIE viewport being
+  removed crashes the editor).
 - A side view during play (an enemy's wind-up, a door from outside): `ue shot --at x,y,z --look-at Enemy_1` in PIE
   takes one spectator shot from there and puts the player's view back.
 - Engine traps worth knowing (`ue py` warns about the first two):

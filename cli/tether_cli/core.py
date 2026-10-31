@@ -350,11 +350,17 @@ def engine_root(project):
     raise CliError(f"cannot find engine '{assoc}'; set UE_ROOT", 2)
 
 
-def pick_port(project):
-    """Stable per-project port (so two editors never fight over 8000), skipping busy ones."""
+def pick_port(project, skip=()):
+    """Stable per-project port (so two editors never fight over 8000), skipping busy ones: those that answer, and
+    those other editors on the project were given, an editor still booting included (it binds its port partway
+    through startup, and a `ue open --second` meanwhile took the same one)."""
     base = 18000 + zlib.crc32(os.path.normcase(os.path.abspath(project)).encode()) % 1000  # = the plugin's
+    claimed = set(skip) | {b.get("mcp_port") for b in live_editors(project)}
+    launch = read_json(os.path.join(state_dir(project), "launch.json")) or {}
+    if launch.get("port") and pid_alive(launch.get("pid")):
+        claimed.add(launch["port"])
     for port in range(base, base + 50):
-        if not port_open(port):
+        if port not in claimed and not port_open(port):
             return port
     raise CliError("no free port near %d" % base)
 

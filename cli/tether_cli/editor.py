@@ -330,7 +330,7 @@ def cmd_open(ctx, args):
         if has_csharp and uat_user_solution(ctx, args.limit):
             raise CliError("C# build failed; not launching (fix the errors above, or pass --no-build)")
     exe = editor_executable(engine_root(ctx.project))
-    port = pick_port(ctx.project)
+    port = pick_port(ctx.project, getattr(args, "_taken_ports", ()))
     cmd = [exe, ctx.project] + ([args.map] if args.map else []) + [
         "-nosplash", "-ModelContextProtocolStartServer", f"-ModelContextProtocolPort={port}",
         "-TetherLaunched"]  # marks the editors the CLI started, so it never closes one the user opened
@@ -401,6 +401,17 @@ def cmd_open(ctx, args):
             # this editor's own log: a second editor on the project writes <Project>_2.log
             own = beacon.get("log") if beacon.get("log") and os.path.isfile(beacon["log"]) else newest_log(ctx.project, started)
             boot = log_file_lines(own) if own else read_new_log(ctx.project, from_start=True)
+            if not remote and any(f"unable to bind to 127.0.0.1:{port}" in line for line in boot):
+                # another editor took the port first: what answers on it is that editor, not this one
+                taken = tuple(getattr(args, "_taken_ports", ())) + (port,)
+                proc.kill()
+                if len(taken) >= 3:
+                    raise CliError(f"the editor could not bind an MCP port ({', '.join(map(str, taken))} were taken "
+                                   "as it started)", 4)
+                print(f"note: port {port} was taken by another editor as this one started; starting again on another")
+                time.sleep(2)  # let it exit and close its log
+                args._taken_ports, args.no_build = taken, True
+                return cmd_open(ctx, args)
             errors = filter_log(boot, level="Error")
             print(f"ready in {time.time() - started:.1f}s | map {beacon.get('map')} | "
                   f"{len(errors)} errors at boot" + (" (ue log --since start --level Error)" if errors else ""))
@@ -443,7 +454,14 @@ def cmd_close(ctx, args):
     launched = [b for b in live_editors(ctx.project) if b.get("launched_by_tether")]
     if explicit or not launched:
         return close_editor(ctx, args, explicit)
-    os.environ["UE_EDITOR_PID"] = str(launched[0]["pid"])  # with the user's editor open too: the one ue open started
+    # With the user's editor open too: the one ue open started. Of several, the one this session uses (its own
+    # --second editor), and never another session's own editor
+    chosen = (ctx.beacon or {}).get("pid")
+    launched = [b for b in launched if b.get("pid") == chosen] or \
+               [b for b in launched if b.get("owner") in (None, actor_id())]
+    if not launched:
+        return close_editor(ctx, args, explicit)
+    os.environ["UE_EDITOR_PID"] = str(launched[0]["pid"])
     try:
         return close_editor(ctx, args, explicit)
     finally:

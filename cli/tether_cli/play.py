@@ -23,7 +23,7 @@ from .share import (
 )
 from .images import (
     cmd_shot, contact_sheet, draw_text, crop_pixels, front_level_viewport, hud_screenshot, image_diff, level_tab_hidden,
-    png_read, png_write, shot_args, slate_entries, widget_capture,
+    PieEnded, png_read, png_write, shot_args, slate_entries, widget_capture,
 )
 from .assets import mcp_tool
 from .editor import pie_starter_lines
@@ -1118,7 +1118,8 @@ def cmd_soak(ctx, args):
 def unthrottled(ctx):
     """Lift "Use Less CPU when in Background" for a while. A headless or background editor otherwise runs PIE at a
     few frames per second, game time included. Set directly, not with set_props: an editor setting is not level
-    work, and a transaction would put it in the undo history (`ue undo` would then "undo" the restore)."""
+    work, and a transaction would put it in the undo history (`ue undo` would then "undo" the restore). Yields
+    whether it lifted anything."""
     throttle = ("s = unreal.find_object(None, '/Script/UnrealEd.Default__EditorPerformanceSettings')\n"
                 "s.set_editor_property('bThrottleCPUWhenNotForeground', {})\n"
                 "s.get_editor_property('bThrottleCPUWhenNotForeground')")
@@ -1127,7 +1128,7 @@ def unthrottled(ctx):
     if throttled:
         ctx.tether("py", code=throttle.format(False))
     try:
-        yield
+        yield throttled
     finally:
         if throttled:
             ctx.tether("py", code=throttle.format(True))
@@ -1751,7 +1752,10 @@ def start_film(ctx, args):
                     state["how"] = "window"
                     captured = (hud_screenshot(own, state["hud"]), None)
                 state["frames"].append((time.time() - state["t0"],) + tuple(captured))
-            except Exception:  # noqa: BLE001 - PIE ending under it, a slow frame: keep the rest of the film
+            except PieEnded:  # nothing left to film; another capture could crash the editor (note 223)
+                state["ended"] = time.time() - state["t0"]
+                break
+            except Exception:  # noqa: BLE001 - a slow or failed frame: keep the rest of the film
                 state["errors"] += 1
             state["stop"].wait(max(0.0, args.film - (time.time() - began)))
     state["thread"] = threading.Thread(target=loop, daemon=True)
@@ -1794,7 +1798,7 @@ def finish_film(ctx, args, state):
     slow = f" (asked {args.film:g}s; a {state['how']} capture takes about that long)" if actual > args.film * 1.5 else ""
     note = "" if state["how"] == "window" else "; canvas-drawn text (AHUD, debug messages) is not in widget captures"
     print(f"film: {len(taken)} frame(s), one every {actual:.2f}s{slow}" + (f", {len(tiles)} on the sheet" if len(taken) > len(tiles) else "")
-          + f" -> {path}" + note)
+          + f" -> {path}" + note + (f"; filming stopped when PIE ended (+{state['ended']:.1f}s)" if "ended" in state else ""))
 
 
 def shot_step_args(rest, hud):
@@ -2057,6 +2061,11 @@ def pie_do(ctx, args):
             if not ok:
                 failures.append(f"step {number} failed")
                 if not args.keep_going:
+                    break
+                if number < len(steps) and ctx.tether("pie", action="status") != "running":
+                    # the game ended PIE (a quit, a crash in play): the steps left have nothing to act on
+                    print(f"   PIE has ended: the {len(steps) - number} step(s) left were not run")
+                    failures.append("PIE ended")
                     break
     finally:
         for name in held:

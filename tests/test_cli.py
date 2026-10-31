@@ -608,6 +608,58 @@ class Editors(unittest.TestCase):
         ue.write_json(os.path.join(ue.state_dir(project.uproject), "editors", f"{pid}.json"),
                       dict({"pid": pid, "heartbeat": time.time(), "started": 0}, **fields))
 
+    def test_ports_other_editors_were_given_are_not_picked(self):
+        # A `ue open --second` took the port of a shared editor still booting (not listening yet), and its
+        # commands then reached that editor (UnrealRacing, 2026-10-31)
+        project = Project()
+        try:
+            launch = os.path.join(ue.state_dir(project.uproject), "launch.json")
+            with unittest.mock.patch.object(ue.core, "port_open", return_value=False):
+                base = ue.pick_port(project.uproject)
+                self.beacon(project, os.getpid(), mcp_port=base)
+                self.assertEqual(ue.pick_port(project.uproject), base + 1)
+                ue.write_json(launch, {"port": base + 1, "pid": os.getppid()})  # booting: no beacon yet
+                self.assertEqual(ue.pick_port(project.uproject), base + 2)
+                self.assertEqual(ue.pick_port(project.uproject, skip=(base + 2,)), base + 3)
+                ue.write_json(launch, {"port": base + 1, "pid": 999999})  # that launch is gone
+                self.assertEqual(ue.pick_port(project.uproject), base + 1)
+        finally:
+            project.close()
+
+    def test_close_takes_this_sessions_own_editor_not_the_first_one_started(self):
+        # `ue close` after `ue open --second` closed the shared editor (the first ue open had started)
+        project = Project()
+        try:
+            self.beacon(project, os.getppid(), launched_by_tether=True, started=100)  # the shared editor
+            self.beacon(project, os.getpid(), launched_by_tether=True, started=200, owner=ue.actor_id())
+            closed = []
+            editor = sys.modules["tether_cli.editor"]
+            ctx = types.SimpleNamespace(project=project.uproject, beacon={"pid": os.getpid()})
+            with unittest.mock.patch.object(editor, "close_editor",
+                                            side_effect=lambda *a: closed.append(os.environ.get("UE_EDITOR_PID"))), \
+                    unittest.mock.patch.dict(os.environ, {"UE_EDITOR_PID": ""}):
+                os.environ.pop("UE_EDITOR_PID")
+                ue.cmd_close(ctx, argparse.Namespace())
+                ctx.beacon = {"pid": os.getppid()}  # the session uses the shared one: that one
+                ue.cmd_close(ctx, argparse.Namespace())
+                self.beacon(project, os.getpid(), launched_by_tether=True, started=200, owner="other")
+                ctx.beacon = {"pid": 12345}  # the user's own editor; the other ue-open one is another session's
+                ue.cmd_close(ctx, argparse.Namespace())
+            self.assertEqual(closed, [str(os.getpid()), str(os.getppid()), str(os.getppid())])
+        finally:
+            project.close()
+
+    def test_an_editor_that_could_not_bind_its_port_is_not_reached_through_it(self):
+        ctx = ue.Ctx(argparse.Namespace(project=None, timeout=5, port=None))
+        transport = sys.modules["tether_cli.transport"]
+        beacon = {"pid": 7, "mcp_port": None, "mcp_error": "its MCP server could not bind port 18662"}
+        with unittest.mock.patch.object(transport, "chosen_editor", return_value=beacon), \
+                unittest.mock.patch.object(transport, "port_from_log", return_value=18662), \
+                unittest.mock.patch.dict(os.environ, {"UE_MCP_PORT": ""}):
+            ctx._project = "x.uproject"
+            with self.assertRaisesRegex(ue.CliError, "could not bind port 18662.*ue close --force"):
+                ctx.port
+
     def test_prefers_the_users_editor_then_honours_an_explicit_pid(self):
         project = Project()
         try:
@@ -3150,6 +3202,17 @@ class ShooterDominationRound2(unittest.TestCase):
         self.assertEqual(taken, ["shot", ("2560x1440", True)])
         self.assertIn("motion blur", err.getvalue())
 
+    def test_no_slate_capture_once_pie_has_ended(self):  # 223: Epic's Screenshot asserts on the removed PIE viewport
+        ue.pie_alive(FakeCtx("True"))
+        with self.assertRaises(ue.PieEnded):
+            ue.pie_alive(FakeCtx("False"))
+        sent = []
+        ctx = FakeCtx("False")
+        ctx.mcp = types.SimpleNamespace(call=lambda *a: sent.append(a[1]))
+        with self.assertRaises(ue.PieEnded):
+            ue.widget_capture(ctx, {"widget": (("r1", (800, 600), 1.0), 800, 525)})
+        self.assertEqual(sent, [])
+
     def test_python_only_plugin_update(self):
         uplugin = '{\n\t"Version": %d,\n\t"VersionName": "0.%d.0",\n\t"Modules": []\n}\n'
         for side, version in (("src", 33), ("dst", 32)):
@@ -3815,6 +3878,28 @@ class UnrealRacingRound3(unittest.TestCase):
         self.assertEqual(steps[-1], "key W up")
         self.assertNotIn("key E up", steps[4:])
         self.assertIn("released W (still down", out.getvalue())
+
+    def test_steps_stop_when_the_game_ended_pie(self):  # 223: a shot step on a PIE being torn down crashed the editor
+        calls, status = [], iter(["running", "stopped"])
+
+        class Ctx:
+            project = "x.uproject"
+
+            def tether(self, tool, **kw):
+                calls.append((tool, kw))
+                if tool == "pie":
+                    return next(status)
+                return {"ok": "fail" not in kw["step"], "detail": "d"}
+
+        args = argparse.Namespace(script=["expect a.x = 1", "expect fail.x = 1", "shot", "expect a.y = 1"], file=None,
+                                  reject=None, warmup=0, keep=False, keep_going=True)
+        with unittest.mock.patch.object(ue, "log_end", return_value=0), \
+                unittest.mock.patch.object(ue.play, "cmd_shot") as shot, \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(ue.pie_do(Ctx(), args), 1)
+        shot.assert_not_called()
+        self.assertEqual([kw["step"] for tool, kw in calls if tool == "pie_step"], ["expect a.x = 1", "expect fail.x = 1"])
+        self.assertIn("PIE has ended: the 2 step(s) left were not run", out.getvalue())
 
     def test_split_key_steps_reach_a_focused_umg_screen(self):  # 209
         calls, sent = [], []

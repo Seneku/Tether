@@ -213,6 +213,9 @@ class Ctx:
         beacon = self.beacon
         if (beacon or {}).get("mcp_port"):
             return beacon["mcp_port"]
+        if (beacon or {}).get("mcp_error"):  # its log names a port another editor answers on
+            raise CliError(f"editor pid {beacon.get('pid')}: {beacon['mcp_error']}, so nothing can reach it; "
+                           "`ue close --force` ends it, then `ue open` again", 2)
         return port_from_log(self.project) or 8000
 
     @property
