@@ -103,8 +103,8 @@ These keep Tether cheap for agents. [docs/DESIGN.md](docs/DESIGN.md) §7 has the
 ## Pull requests
 
 - Keep each PR to one focused change, and explain what it does and why.
-- Update `README.md`, the skill (`skills/unreal-tether/SKILL.md`) and `docs/DESIGN.md` when
-  behaviour or commands change. The skill is what agents read, so keep it accurate and short.
+- Update `docs/COMMANDS.md` (the command reference), the skill (`skills/unreal-tether/SKILL.md`) and
+  `docs/DESIGN.md` when behaviour or commands change, and `README.md` when a whole area is added. The skill is what agents read, so keep it accurate and short.
 - Match the style of the surrounding code.
 
 By contributing, you agree that your contributions are licensed under the [MIT License](LICENSE).
