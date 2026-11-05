@@ -2021,13 +2021,17 @@ class _Vcs:
             problems = problems[:5] + [f"+{len(problems) - 5} more"]
         return problems, want
 
+    def vet(self, packages):
+        """Before editing known packages: raise if they can't be edited (see judge), else the files to check out."""
+        problems, want = self.judge(packages)
+        if problems:
+            raise RuntimeError("; ".join(problems) + ". Nothing was changed")
+        return want
+
     def reserve(self, packages):
         """Before editing known packages: raise if they can't be edited (see judge), else check them out now."""
         if self.checkouts:
-            problems, want = self.judge(packages)
-            if problems:
-                raise RuntimeError("; ".join(problems) + ". Nothing was changed")
-            self.check_out(want)
+            self.check_out(self.vet(packages))
 
     def snapshot(self):
         """What is unsaved and how deep the undo history is, before a tool runs (see claim)."""
@@ -2035,11 +2039,13 @@ class _Vcs:
         undo = None if _LEGACY else unreal.ToolsetLibrary.get_active_undo_count()
         return set(maps) | set(content), undo, len(_UNDO)
 
-    def claim(self, before):
+    def claim(self, before, named=()):
         """After a tool ran: check out the files of the packages it newly modified, or undo the change and
-        raise if it can't be kept (see judge)."""
+        raise if it can't be kept (see judge). `named`: packages the caller knows it edited, claimed even when they
+        were unsaved before it ran (Epic's read_graph_dsl can mark a Blueprint modified), if they are unsaved now."""
         maps, content = _dirty_packages()
-        packages = sorted((set(maps) | set(content)) - before[0])
+        dirty = set(maps) | set(content)
+        packages = sorted((dirty - before[0]) | (dirty & set(named)))
         if not packages:
             return
         problems, want = self.judge(packages)
@@ -7426,6 +7432,46 @@ class TetherCore(_Base):
         elif level and base is None:
             lines.append(f"  level {level}: no baseline yet (it is taken when a map loads)")
         return "\n".join(lines)
+
+    @_tool
+    @staticmethod
+    def guard_open(packages: str = "", token: str = "") -> str:
+        """Open the revision-control guard around edits made through Epic's toolsets, which can't be wrapped from here.
+        Packages named are refused now if they could not be submitted, before anything changes. Close it with guard_close.
+
+        Args:
+            packages: Comma-separated packages about to be edited, where known.
+            token: Session token from Saved/Tether/editors/<pid>.token (the ue CLI sends it).
+
+        Returns:
+            The mark to pass to guard_close; empty when the provider has no check-outs (no need to close).
+        """
+        _authorize(token)
+        vcs = _Vcs()
+        if not vcs.checkouts:
+            return ""
+        named = [p.strip() for p in packages.split(",") if p.strip()]
+        vcs.vet(named)  # the check-out waits for guard_close: an edit that fails should leave no lock behind
+        dirty, undo, mine = vcs.snapshot()
+        return json.dumps({"dirty": sorted(dirty), "undo": undo, "mine": mine, "named": named})
+
+    @_tool
+    @staticmethod
+    def guard_close(mark: str, token: str = "") -> str:
+        """After edits made through Epic's toolsets: check out what they modified since guard_open, or undo them and fail
+        if they can't be kept (a file someone else holds, one behind the depot, more than the bulk limit).
+
+        Args:
+            mark: What guard_open returned.
+            token: Session token from Saved/Tether/editors/<pid>.token (the ue CLI sends it).
+
+        Returns:
+            "claimed" when the edits were kept.
+        """
+        _authorize(token)
+        state = json.loads(mark)
+        _Vcs().claim((set(state["dirty"]), state["undo"], state["mine"]), state["named"])
+        return "claimed"
 
     @_tool
     @staticmethod

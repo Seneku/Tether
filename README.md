@@ -277,12 +277,13 @@ avoid conflicts is to find out who holds a file before working on it, not at sub
 - **Every edit claims its files.** Any Tether command that changes the editor's content (`ue set`, `bp edit`,
   `mat`, `spawn`, `ue py` code, ...) checks out the files of the packages it modified as soon as it returns, so
   teammates see them locked while the work goes on. With One File Per Actor maps that is the actor's own file.
+  `ue call` does the same for Epic's tools, except the ones named as reads (`get_`, `list_`, `read_`, ...).
 - **Edits that could not be submitted are undone.** If an edit touched a file someone else has checked out, or
   one behind the depot (someone submitted a newer revision: binary files don't merge), the command undoes it
   (its editor transactions, then a reload from disk of the assets it modified) and fails, naming the holder:
   `error: actor Crate1 (15G2LQ2749XAOZKMYEXXB3) is checked out by bob. Nothing was changed (the edit was undone)`.
   `ue set --assets`, `ue lint --fix`, `ue mv` and `ue move-pack` check their targets, and the assets that
-  reference them, before changing anything.
+  reference them, before changing anything; `ue bp edit`, `ue bp --apply` and `ue table --import` check their asset.
 - **Bulk changes need `--bulk`.** One command may check out at most 20 files (`Config/Tether/vcs.json`:
   `{"bulk_limit": 20}`), so an agent's sweep can't lock half the project by accident; above that it is undone or
   refused with the count. Tell the team, then rerun with `--bulk`.

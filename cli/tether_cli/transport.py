@@ -1,4 +1,5 @@
 """Talking to the editor: Epic's MCP server (5.8+), Python remote execution (5.4-5.7), the toolset catalog."""
+import contextlib
 import json
 import os
 import re
@@ -164,6 +165,24 @@ class RemoteExec:
     def close(self):
         if self.rex:
             self.rex.stop()
+
+
+@contextlib.contextmanager
+def claiming(ctx, *packages):
+    """Edits through Epic's toolsets, under the revision-control guard Tether's own tools run in: their calls reach the
+    editor without passing through Tether. Packages named are refused first if they could not be submitted (held by
+    someone else, behind the depot); afterwards what changed is checked out, or undone with an error."""
+    try:
+        mark = ctx.tether("guard_open", packages=",".join(packages))
+    except CliError as exc:
+        if str(exc) != "Unknown tool guard_open":
+            raise
+        mark = ""  # a project's plugin from before 0.36.4
+    try:
+        yield
+    finally:  # an edit that failed part way may have changed something too
+        if mark:  # a reply that is JSON comes back decoded
+            ctx.tether("guard_close", mark=mark if isinstance(mark, str) else json.dumps(mark))
 
 
 def transport(project):

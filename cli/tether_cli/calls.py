@@ -18,7 +18,7 @@ from .core import (
 from .fabfiles import fab_origin, listing_url, project_fab
 from .share import LEASED, ago, lease_note, others_edits, pie_owner, session_label, session_names
 from .build import map_baseline_path, mark_suspect_map, suspect_map
-from .transport import catalog, fill_args, py_json, resolve_toolset, schema, signature
+from .transport import catalog, claiming, fill_args, py_json, resolve_toolset, schema, signature
 
 
 def cmd_tools(ctx, args):
@@ -84,11 +84,23 @@ def cmd_call(ctx, args):
     name = tool["name"].rsplit(".", 1)[-1]
     if toolset == TETHER and name in GATED and not call_args.get("token"):  # fill_args blanks it to ""
         call_args["token"] = ctx.token(ctx.beacon)
-    text, is_error = ctx.mcp.call(toolset, name, call_args)
-    if is_error:
-        raise CliError(compact_error(text))
+    with claiming(ctx) if call_edits(toolset, name) else contextlib.nullcontext():
+        text, is_error = ctx.mcp.call(toolset, name, call_args)
+        if is_error:
+            raise CliError(compact_error(text))
     emit(args, unwrap(text))
     return 0
+
+
+# Reads by their names, across Epic's snake_case and PascalCase toolsets. They stay outside the revision-control guard:
+# one can mark what it reads as modified (read_graph_dsl), and a read should not lock a file or fail on a teammate's.
+READ_TOOL = re.compile(r"^(?:[Gg]et|[Ll]ist|[Rr]ead|[Ff]ind|[Ss]earch|[Dd]escribe|[Qq]uery|[Ii]s|[Hh]as|[Cc]an)(?:_|[A-Z]|$)")
+UNGUARDED_TOOLSETS = ("SlateInspector", "AutomationTest")  # they drive the UI and run tests, and can stop on a dialog
+
+
+def call_edits(toolset, tool):
+    """Does `ue call` run this tool under the revision-control guard? Tether's own are guarded in the editor."""
+    return toolset != TETHER and not READ_TOOL.match(tool) and not any(t in toolset for t in UNGUARDED_TOOLSETS)
 
 
 PY_PITFALLS = [  # (pattern in `ue py` code, what goes wrong): engine behaviour that cost real sessions time

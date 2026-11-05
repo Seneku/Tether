@@ -2,6 +2,7 @@
 import argparse
 import contextlib
 import io
+import itertools
 import json
 import os
 import re
@@ -4417,6 +4418,108 @@ class Batch030(unittest.TestCase):
                 unittest.mock.patch.object(ue.calls, "schema", return_value=tools):
             with self.assertRaisesRegex(ue.CliError, "arguments are key=value \\(not 'list'\\)"):
                 ue.cmd_call(Ctx(), args)
+
+    def guarded_edit(self, run, reply=None, fail=None):
+        """Run an edit through Epic's tools with a fake editor: (what reached the editor, in order, the error or None)."""
+        order, test = [], self
+
+        class Ctx(FakeCtx):
+            def tether(self, tool, **kwargs):
+                order.append(tool if tool != "guard_open" else f"guard_open {kwargs['packages']}")
+                if fail and tool in fail:
+                    raise ue.CliError(fail[tool])
+                if tool == "guard_close":
+                    test.assertEqual(json.loads(kwargs["mark"]), {"dirty": []})  # the tool takes text
+                return "ok" if tool != "guard_open" else {"dirty": []} if reply is None else reply  # as unwrap decodes it
+
+        def tool(ctx, toolset, name, payload):
+            order.append(name)
+            if fail and name in fail:
+                raise ue.CliError(fail[name])
+            return []
+
+        args = argparse.Namespace(array=False, category=None, instance_editable=False, parent=None, save=False)
+        with unittest.mock.patch.object(ue.assets, "mcp_tool", side_effect=tool), \
+                unittest.mock.patch.object(ue.assets, "py_json", return_value="BS_UP_TO_DATE"), \
+                contextlib.redirect_stdout(io.StringIO()):
+            try:
+                run(Ctx(), args)
+            except ue.CliError as exc:
+                return order, str(exc)
+        return order, None
+
+    def test_bp_edit_goes_under_the_revision_control_guard(self):
+        order, error = self.guarded_edit(lambda c, a: ue.bp_edit(c, "/Game/B/BP_A", ["add-function", "Open"], a))
+        self.assertEqual(order, ["guard_open /Game/B/BP_A", "add_function_graph", "guard_close"])
+        self.assertIsNone(error)
+
+    def test_bp_edit_on_a_blueprint_someone_holds_changes_nothing(self):
+        held = "BP_A is checked out by bob. Nothing was changed"
+        order, error = self.guarded_edit(lambda c, a: ue.bp_edit(c, "/Game/B/BP_A", ["add-function", "Open"], a),
+                                         fail={"guard_open": held})
+        self.assertEqual(order, ["guard_open /Game/B/BP_A"])
+        self.assertEqual(error, held)
+
+    def test_bp_edit_that_fails_part_way_is_still_claimed(self):
+        order, error = self.guarded_edit(lambda c, a: ue.bp_edit(c, "/Game/B/BP_A", ["add-function", "Open"], a),
+                                         fail={"add_function_graph": "no"})
+        self.assertEqual(order, ["guard_open /Game/B/BP_A", "add_function_graph", "guard_close"])
+        self.assertEqual(error, "no")
+
+    def test_no_check_out_provider_or_an_old_plugin_has_nothing_to_close(self):
+        edit = lambda c, a: ue.bp_edit(c, "/Game/B/BP_A", ["add-function", "Open"], a)  # noqa: E731
+        self.assertEqual(self.guarded_edit(edit, reply="")[0], ["guard_open /Game/B/BP_A", "add_function_graph"])
+        order, error = self.guarded_edit(edit, fail={"guard_open": "Unknown tool guard_open"})
+        self.assertEqual(order, ["guard_open /Game/B/BP_A", "add_function_graph"])
+        self.assertIsNone(error)
+
+    def test_graph_apply_is_guarded_from_before_its_first_read(self):
+        # read_graph_dsl can mark the Blueprint modified, so the guard has to open ahead of it
+        def apply(ctx, args):
+            ctx.project = self.project.uproject
+            path = self.project.write("Saved/graph.dsl", "code")
+            args.__dict__.update(docs=False, blueprint="/Game/B/BP_A", graph="EventGraph", rest=[], apply=path, diff=False)
+            with unittest.mock.patch.object(ue.assets, "read_graph", return_value="text"), \
+                    unittest.mock.patch.object(ue.assets, "snapshot_path", return_value=self.project.write("Saved/s.dsl", "x")), \
+                    unittest.mock.patch.object(ue.assets, "mcp_tool", side_effect=real_tool(ue.assets.mcp_tool)), \
+                    unittest.mock.patch.object(ue.assets.time, "time", side_effect=itertools.count(0, 10)):
+                ue.cmd_bp(ctx, args)
+
+        def real_tool(tool):
+            def listing(ctx, toolset, name, payload):
+                return ["EventGraph"] if name == "list_graphs" else tool(ctx, toolset, name, payload)
+            return listing
+
+        order, error = self.guarded_edit(apply)
+        self.assertIsNone(error)
+        self.assertEqual(order[:2], ["guard_open /Game/B/BP_A", "read_graph_dsl"])
+        self.assertLess(order.index("write_graph_dsl"), order.index("guard_close"))
+
+    def test_table_import_is_guarded(self):
+        def run(ctx, args):
+            path = self.project.write("Saved/rows.json", json.dumps({"New": {"Cost": 1}}))
+            args.__dict__.update(table="/Game/D/DT_Items", export=None, dry_run=False, prune=False, limit=20)
+            args.import_file = path
+            with unittest.mock.patch.object(ue.assets, "table_rows", side_effect=[{}, {"New": {"Cost": 1}}]):
+                ue.cmd_table(ctx, args)
+
+        order, error = self.guarded_edit(run)
+        self.assertIsNone(error)
+        self.assertEqual(order[:2], ["guard_open /Game/D/DT_Items", "add_rows"])
+        self.assertEqual(order[-1], "guard_close")
+
+    def test_call_guards_epic_tools_that_edit_but_not_reads(self):
+        for toolset, tool in [("editor_toolset.toolsets.blueprint.BlueprintTools", "add_variable"),
+                              ("editor_toolset.toolsets.blueprint.BlueprintTools", "create"),
+                              ("EditorToolset.EditorAppToolset", "Issue"), ("x.Y", "listener_add"), ("x.Y", "Getaway")]:
+            self.assertTrue(ue.call_edits(toolset, tool), tool)
+        for toolset, tool in [("editor_toolset.toolsets.blueprint.BlueprintTools", "read_graph_dsl"),
+                              ("editor_toolset.toolsets.blueprint.BlueprintTools", "list_variables"),
+                              ("EditorToolset.EditorAppToolset", "IsPIERunning"),
+                              ("PhysicsAssetToolset", "GetBodyNames"),
+                              ("SlateInspectorToolset.SlateInspectorToolset", "Click"),
+                              (ue.TETHER, "set_props")]:
+            self.assertFalse(ue.call_edits(toolset, tool), tool)
 
     def test_level_tab_brought_forward_only_when_hidden(self):
         rows = ue.slate_entries("\n".join([

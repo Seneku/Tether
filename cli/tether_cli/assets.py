@@ -10,7 +10,7 @@ from .core import (
     log_path,
     p4_exe, p4_options, p4_workspace, read_json, run_git, run_p4, short, state_dir, unwrap, write_json,
 )
-from .transport import py_json, resolve_toolset
+from .transport import claiming, py_json, resolve_toolset
 from .calls import flush_editor_log
 
 
@@ -192,6 +192,19 @@ def bp_edit(ctx, path, ops, args):
         raise CliError(f"unknown edit '{op}' (add-var, set-default, add-component, add-function, add-dispatcher, remove-var)")
     if len(rest) < need[op]:
         raise CliError(f"{op} needs {need[op]} argument(s)")
+    with claiming(ctx, package):
+        lines = bp_edit_step(ctx, package, cdo, ref, op, rest, args)
+        status = bp_compile_status(ctx, package)
+    for line in lines:
+        print(line)
+    print(f"{package}: {status}" + ("" if args.save else " (unsaved: --save, or ue save)"))
+    if args.save:
+        ctx.tether("save", paths=package)
+    return 1 if status.startswith("COMPILE ERROR") else 0
+
+
+def bp_edit_step(ctx, package, cdo, ref, op, rest, args):
+    """The edit itself; the lines to print about it."""
     lines = []
     if op == "add-var":
         name, kind, default = rest[0], rest[1], (rest[2] if len(rest) > 2 else None)
@@ -242,13 +255,7 @@ def bp_edit(ctx, path, ops, args):
     elif op == "remove-var":
         mcp_tool(ctx, "blueprint", "remove_variable", dict(ref, name=rest[0]))
         lines.append(f"removed variable {rest[0]}")
-    status = bp_compile_status(ctx, package)
-    for line in lines:
-        print(line)
-    print(f"{package}: {status}" + ("" if args.save else " (unsaved: --save, or ue save)"))
-    if args.save:
-        ctx.tether("save", paths=package)
-    return 1 if status.startswith("COMPILE ERROR") else 0
+    return lines
 
 
 def cmd_bp(ctx, args):
@@ -280,11 +287,12 @@ def cmd_bp(ctx, args):
         with open(args.apply, encoding="utf-8-sig") as f:
             code = f.read()
         graph = {"graph": {"refPath": f"{bp}:{names[0]}"}}
-        previous = mcp_tool(ctx, "blueprint", "read_graph_dsl", graph)
-        mcp_tool(ctx, "blueprint", "write_graph_dsl", dict(graph, code=code))
-        deadline = time.time() + 5  # the write can land a tick later; reading at once may see the old graph
-        while mcp_tool(ctx, "blueprint", "read_graph_dsl", graph) == previous and time.time() < deadline:
-            time.sleep(0.25)
+        with claiming(ctx, bp.split(".")[0]):
+            previous = mcp_tool(ctx, "blueprint", "read_graph_dsl", graph)
+            mcp_tool(ctx, "blueprint", "write_graph_dsl", dict(graph, code=code))
+            deadline = time.time() + 5  # the write can land a tick later; reading at once may see the old graph
+            while mcp_tool(ctx, "blueprint", "read_graph_dsl", graph) == previous and time.time() < deadline:
+                time.sleep(0.25)
         print(f"applied {os.path.basename(args.apply)} to {names[0]} (compiled)")
     changed = 0
     source = bp if args.apply else graph_source(ctx, bp)
@@ -416,12 +424,13 @@ def cmd_table(ctx, args):
         print(f"  ... +{len(lines) - args.limit} more (--limit)")
     if args.dry_run or not (added or updates or removed):
         return 0
-    if added:
-        mcp_tool(ctx, "data_table", "add_rows", {"data_table": {"refPath": dt}, "row_names": added})
-    if updates:
-        mcp_tool(ctx, "data_table", "set_rows", {"data_table": {"refPath": dt}, "values": json.dumps(updates)})
-    if removed:
-        mcp_tool(ctx, "data_table", "remove_rows", {"data_table": {"refPath": dt}, "row_names": removed})
+    with claiming(ctx, dt.split(".")[0]):
+        if added:
+            mcp_tool(ctx, "data_table", "add_rows", {"data_table": {"refPath": dt}, "row_names": added})
+        if updates:
+            mcp_tool(ctx, "data_table", "set_rows", {"data_table": {"refPath": dt}, "values": json.dumps(updates)})
+        if removed:
+            mcp_tool(ctx, "data_table", "remove_rows", {"data_table": {"refPath": dt}, "row_names": removed})
     after = table_rows(ctx, dt)
     stale = [n for n, row in wanted.items() if any(after.get(n, {}).get(k) != v for k, v in row.items())]
     if stale:

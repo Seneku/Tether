@@ -1,4 +1,5 @@
 """Unit tests for the pure parts of the in-editor toolset (Plugins/Tether), with `unreal` stubbed out."""
+import json
 import os
 import sys
 import types
@@ -268,6 +269,57 @@ class RevisionControl(unittest.TestCase):
         error, calls = self.claim({}, limit=1)
         self.assertEqual(calls, [])
         self.assertIn("this changed 2 files, more than the bulk limit of 1", error)
+
+    def guard(self, states=None, provider="Perforce"):
+        """guard_open and guard_close (for edits through Epic's tools) with a fake provider: (open, close, source control)."""
+        files = {"/Game/A": self.path("A.uasset"), "/Game/B": self.path("B.uasset")}
+        sc = FakeSourceControl(provider, states)
+        self.vcs_class = toolsets._Vcs
+        self.patched(_Vcs=lambda real=toolsets._Vcs: real(sc), _authorize=lambda token: None, _LEGACY=True,
+                     _package_file=lambda package, is_map=False: files.get(package, ""), _bulk_limit=lambda: 20,
+                     _package_label=lambda package: package)
+        self.addCleanup(toolsets._GUARD.update, claimed=0)
+        return toolsets._RAW["guard_open"].__wrapped__, toolsets._RAW["guard_close"].__wrapped__, sc
+
+    def test_guard_refuses_a_named_package_someone_holds_before_any_edit(self):
+        guard_open, _, sc = self.guard({"A.uasset": {"is_checked_out_other": True, "checked_out_other": "bob @ "}})
+        self.patched(_dirty_packages=lambda: ([], []))
+        with self.assertRaisesRegex(RuntimeError, "/Game/A is checked out by bob. Nothing was changed"):
+            guard_open("/Game/A")
+        self.assertEqual(sc.calls, [])
+
+    def test_guard_claims_only_after_the_edit(self):
+        guard_open, guard_close, sc = self.guard()
+        self.patched(_dirty_packages=lambda: ([], ["/Game/Old"]))
+        mark = guard_open("/Game/A")
+        self.assertEqual(sc.calls, [])  # an edit that fails leaves no lock behind
+        self.assertEqual(json.loads(mark)["dirty"], ["/Game/Old"])
+        self.patched(_dirty_packages=lambda: ([], ["/Game/Old", "/Game/A"]))
+        guard_close(mark)
+        self.assertEqual(sc.calls, [("checkout", ["A.uasset"])])
+
+    def test_guard_claims_a_named_package_already_unsaved_but_not_an_unchanged_one(self):
+        guard_open, guard_close, sc = self.guard()
+        self.patched(_dirty_packages=lambda: ([], ["/Game/A"]))  # read_graph_dsl marked it modified, or the user did
+        mark = guard_open("/Game/A,/Game/B")
+        guard_close(mark)
+        self.assertEqual(sc.calls, [("checkout", ["A.uasset"])])
+
+    def test_guard_undoes_an_unnamed_package_it_could_not_keep(self):  # ue call: which asset a tool edits isn't known
+        guard_open, guard_close, sc = self.guard({"A.uasset": {"is_checked_out_other": True, "checked_out_other": "bob @ "}})
+        self.patched(_dirty_packages=lambda: ([], []))
+        mark = guard_open("")
+        self.patched(_dirty_packages=lambda: ([], ["/Game/A"]))
+        self.addCleanup(setattr, self.vcs_class, "revert", self.vcs_class.revert)
+        self.vcs_class.revert = lambda vcs, before: "Nothing was changed (the edit was undone)"
+        with self.assertRaisesRegex(RuntimeError, "/Game/A is checked out by bob. Nothing was changed \\(the edit was undone\\)"):
+            guard_close(mark)
+        self.assertEqual(sc.calls, [])
+
+    def test_guard_has_nothing_to_do_without_check_outs(self):
+        guard_open, _, sc = self.guard(provider="Git")
+        self.assertEqual(guard_open("/Game/A"), "")
+        self.assertEqual(sc.calls, [])
 
     def test_guard_takes_bulk_off_a_positional_token(self):
         seen = {}
