@@ -628,3 +628,25 @@ nav, hero-placing cliffs, tuning scatter and turning scattered rocks into foliag
   still mapped its pid to 18662, so `--pid <second>` commands (close included) reached the other session's editor and
   were refused by its lease. Pick the port after checking it is free (or retry on a bind failure), and have the beacon
   record the port the editor actually bound. Done (0.36.3): `ue open` no longer picks a port another editor on the project was given (its beacon's, or the one launch.json gives an editor still booting); an editor whose log says its port would not bind is killed and started again on another (up to three tries); the beacon of an editor whose server could not bind has no `mcp_port` and an `mcp_error`, and a command to it says so (`ue close --force` ends it) instead of reaching the other editor. Verified in Sandbox with a listener taking the port as a `--second` editor booted: relaunched on the next port, answering as its own pid; with `--no-wait`, the beacon's `mcp_error` and the refusal. Found on the way: `ue close` after `ue open --second` closed the first editor `ue open` had started (here the shared one) instead of the session's own; it now closes the editor the session uses, never another session's own
+
+- `key --slate Up` / `key --slate Down` in a step file press nothing and report ok (UnrealRacing, 2026-11-04): the split-step
+  regex in play.py (`(?:--(slate|game) )?(\S+) (down|up|tap)\b`, case-insensitive) reads it as key "--slate", state "Up". Left
+  and Right are fine, so a menu walk half works; `ui-key Up` is the workaround. Require a key name not starting with `--`.
+- `shot` steps in `pie do` refuse `--frames` / `--interval` (`ue shot --frames` has them), so a timed contact sheet of an event
+  a step file waits for needs `pie do` and `ue shot` by hand. Also: `ue shot --frames` in PIE overwrites the game's time
+  dilation (0.33x while capturing, "time dilation 0.2 put back"), which changes what a slow-motion moment looks like; and its
+  path line was easy to lose with `tail -1` since the timing line prints after it.
+- `ue savegame <slot> Name=value` can't write a plain `UPROPERTY()` (UnrealRacing, 2026-11-05): the error is clear and the
+  docs say so, but most save games use exactly those (`CarId`, `OwnedCars` here), and reading them already works through a
+  text export. Setting a save's owned car took a hand-written byte patch of the GVAS file. Writing back through
+  `FProperty::ImportText` would cover them, arrays included, and would give arrays a way to be set at all.
+- `ue git stage --mine` named the wrong session for assets a script imported (UnrealRacing, 2026-11-05): the 8 files under
+  Content/NR/Audio/Music came from polish-review's `ue py -f Scripts/audio/music_bank.py`, but its dry run listed them as
+  "another session wrote them last (photo-finish)". Run from photo-finish, `--mine` would have staged 203 MB the user wanted
+  kept out of git (no harm done: that session's commit left them out, and the folder is git-ignored now). `ue py` knows who asked
+  for the run, so files written during one could go to that session ahead of any session merely running a command; when two
+  overlap, "several sessions" is the honest answer. Also worth a size line: `--mine` staging a large file should say so.
+- Commit check for a shared checkout: `ue build --check --overlay` takes the live Source/ under the overlay, so another
+  session's unfinished files come along and it can't prove a partial commit builds. UnrealRacing's polish-review session
+  scripted its own on 2026-11-05 (index exported to a folder, UBT on the game target). `ue build --check --index` could do it: export the index's
+  Source, Config, .uproject and plugin descriptors to the shadow folder, rewriting only changed files, and build that.
