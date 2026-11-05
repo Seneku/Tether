@@ -2676,6 +2676,51 @@ class SharedEditor(unittest.TestCase):
             ue.cmd_wait(types.SimpleNamespace(beacon={}), argparse.Namespace(what="4", clock="game"))
 
 
+class SkillCore(unittest.TestCase):
+    """SKILL.md is read in full on first use, so it holds the rules and points at references/ for the rest."""
+
+    FOLDER = os.path.join(os.path.dirname(ue.CLI_DIR), "skills", "unreal-tether")
+    MAX_BYTES = 13 * 1024  # it was 6 KB in October and 60 KB by November; move detail to references/, not here
+
+    # What must never need a second file to learn: each is a thing an agent can do once and regret.
+    RULES = [
+        "do not close or restart theirs (`ue build --restart` included) without asking",  # the user's editor
+        "ue lease take --for", "ue lease release", "rather than passing `--ignore-lease`", "ue lease grant",  # leases
+        "tell the user, don't work around it", "ask the user before rerunning with `--bulk`",  # Perforce refusals
+        "tell the user rather than making files writable yourself",
+        "claiming, buying and downloading are always theirs",  # Fab
+        "Never click, type or press keys in the Fab tab or the store page",
+        "Never run Build.bat while an editor is open", "ask the user before discarding",  # builds
+        "Stop PIE before editing C#", "never Epic's `StartPIE`",
+        "build_from_static_mesh_descriptions", "fill_data_table_from_json_string", "do not run it again",  # traps
+        "never run without a filter", "ask before editing a user's real save",
+        "blocked by modal", "5 another session holds the editor lease",
+    ]
+
+    def setUp(self):
+        with open(os.path.join(self.FOLDER, "SKILL.md"), encoding="utf-8") as f:
+            self.core = f.read()
+        self.flat = " ".join(self.core.split())  # rules wrap across lines
+
+    def test_core_stays_small(self):
+        size = len(self.core.encode("utf-8"))
+        self.assertLessEqual(size, self.MAX_BYTES, f"SKILL.md is {size} bytes: move area detail to references/")
+
+    def test_safety_rules_are_in_the_core(self):
+        self.assertEqual([rule for rule in self.RULES if rule not in self.flat], [])
+
+    def test_reference_files_and_the_core_point_at_each_other(self):
+        linked = set(re.findall(r"references/([\w-]+\.md)", self.core))
+        self.assertEqual(linked, set(os.listdir(os.path.join(self.FOLDER, "references"))))
+
+    def test_core_names_every_command(self):
+        # Reference files are read on demand, so a command the core does not name is one nobody finds.
+        parser = ue.build_parser()
+        commands = next(a.choices for a in parser._actions if isinstance(a, argparse._SubParsersAction))
+        missing = [c for c in commands if c != "hook" and not re.search(rf"(?<![\w-]){re.escape(c)}(?![\w-])", self.core)]
+        self.assertEqual(missing, [])
+
+
 class TerrainRound(unittest.TestCase):
     """0.21: project skill copies, grids and heightmaps, foliage masks, water, wait compile."""
 
@@ -2701,6 +2746,18 @@ class TerrainRound(unittest.TestCase):
         with open(path, "w", encoding="utf-8", newline="") as f:
             f.write(text)
         self.assertIsNone(ue.project_skill_update(self.project.uproject))  # current now
+
+    def test_project_skill_copy_gets_its_reference_files(self):
+        self.assertEqual(ue.project_skill_references(self.project.uproject), [])  # no copy of the skill: nothing to do
+        self.project.write(".claude/skills/unreal-tether/SKILL.md", "old copy\n")
+        stale = ue.project_skill_references(self.project.uproject)
+        names = {os.path.basename(path) for path, _ in stale}
+        self.assertIn("shared-editors.md", names)
+        for path, text in stale:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8", newline="") as f:  # CRLF, as a Windows checkout has it
+                f.write(text.replace("\n", "\r\n"))
+        self.assertEqual(ue.project_skill_references(self.project.uproject), [])  # current now, line ends aside
 
     def test_grids_png16_r16_u8_and_flip(self):
         values = [0, 1000, 65535, 32768]
