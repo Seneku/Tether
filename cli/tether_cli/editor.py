@@ -468,9 +468,32 @@ def cmd_close(ctx, args):
         os.environ.pop("UE_EDITOR_PID", None)
 
 
+SHUTDOWN_HANG_S = 10  # a clean exit logs its way out in 3-6 s; this long with no new line means it is stuck
+
+
+def wait_for_exit(pid, log, offset, timeout=30):
+    """Wait for a quitting editor to go, up to `timeout`. True when it is stuck in engine shutdown: past the point
+    where it could still ask to save (its log says it is exiting), and its log has stopped growing. An editor closed
+    within seconds of booting does this about one time in three on 5.8.4: every thread waits at 0% CPU and it never
+    exits. Waiting for its asset registry write before quitting did not help, and 15 s of uptime costs more than the
+    hang, so end it instead."""
+    deadline = time.time() + timeout
+    size, grew = None, time.time()
+    while time.time() < deadline and pid_alive(pid):
+        time.sleep(0.25)
+        now = os.path.getsize(log) if log and os.path.isfile(log) else None
+        if now != size:
+            size, grew = now, time.time()
+        elif now is not None and time.time() - grew >= SHUTDOWN_HANG_S and pid_alive(pid) and any(
+                "LogExit: Preparing to exit" in line for line in log_file_lines(log, offset)):
+            return True
+    return False
+
+
 def close_editor(ctx, args, explicit):
     beacon = ctx.beacon
     pid = (beacon or {}).get("pid")
+    stuck = False
     if not pid_alive(pid):
         print("not running")
         return 0
@@ -496,16 +519,18 @@ def close_editor(ctx, args, explicit):
             # the user's own editors load: put the user's back
             layout = user_layout_file() if beacon.get("launched_by_tether") and beacon.get("headless") else None
             before = read_bytes(layout)
+            log = beacon.get("log")
+            offset = os.path.getsize(log) if log and os.path.isfile(log) else 0
             ctx.tether("py", code="unreal.SystemLibrary.quit_editor()")
-            deadline = time.time() + 30
-            while time.time() < deadline and pid_alive(pid):
-                time.sleep(0.25)
+            stuck = wait_for_exit(pid, log, offset)
             if before is not None and read_bytes(layout) != before:
                 with open(layout, "wb") as f:
                     f.write(before)
     if pid_alive(pid):
-        if not (args.force or args.discard):
+        if not (args.force or args.discard or stuck):
             raise CliError("editor did not exit within 30s (modal dialog open?); retry with --force", 4)
+        if stuck:
+            print("stuck in engine shutdown with nothing unsaved; ending it")
         subprocess.run(["taskkill", "/PID", str(pid), "/F"] if os.name == "nt" else ["kill", "-9", str(pid)],
                        capture_output=True)
         # Not a crash: forget its beacon (its own exit cleanup never ran) and note the exit like a clean one.

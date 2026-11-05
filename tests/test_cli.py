@@ -5217,6 +5217,47 @@ class Round033(unittest.TestCase):
             with open(layout) as f:
                 self.assertEqual(f.read(), want, headless)
 
+    def test_waiting_for_exit_says_stuck_only_past_the_point_it_could_prompt(self):
+        log = self.project.write("Saved/Logs/Quit.log", "before the quit: LogExit: Preparing to exit\n")
+        offset = os.path.getsize(log)
+        with open(log, "a") as f:
+            f.write("LogCore: Engine exit requested\n")
+        with unittest.mock.patch("tether_cli.editor.pid_alive", return_value=True), \
+                unittest.mock.patch("tether_cli.editor.SHUTDOWN_HANG_S", 0.3):
+            # Still before the exit (a modal could be up): keeps waiting for the whole timeout, reports not stuck
+            self.assertFalse(ue.editor.wait_for_exit(4242, log, offset, timeout=1))
+            with open(log, "a") as f:
+                f.write("LogExit: Preparing to exit.\n")
+            started = time.time()
+            self.assertTrue(ue.editor.wait_for_exit(4242, log, offset, timeout=20))
+            self.assertLess(time.time() - started, 5)
+            self.assertFalse(ue.editor.wait_for_exit(4242, None, 0, timeout=0.5))  # no log: the plain timeout
+        with unittest.mock.patch("tether_cli.editor.pid_alive", return_value=False):
+            self.assertFalse(ue.editor.wait_for_exit(4242, log, offset))  # gone: done at once
+
+    def test_closing_an_editor_stuck_in_shutdown_ends_it_without_force(self):
+        for stuck, code in ((True, 0), (False, 4)):
+            ctx = FakeCtx("0")
+            ctx.project, ctx.beacon = self.p, {"pid": 4242, "launched_by_tether": True, "headless": True}
+            args = argparse.Namespace(force=False, save=False, discard=False, ignore_lease=False)
+            out = io.StringIO()
+            with unittest.mock.patch("tether_cli.editor.pid_alive", return_value=True), \
+                    unittest.mock.patch("tether_cli.editor.check_shared"), \
+                    unittest.mock.patch("tether_cli.editor.user_layout_file", return_value=None), \
+                    unittest.mock.patch("tether_cli.editor.wait_for_exit", return_value=stuck), \
+                    unittest.mock.patch("tether_cli.editor.forget_beacon"), \
+                    unittest.mock.patch("tether_cli.editor.subprocess.run") as run, \
+                    contextlib.redirect_stdout(out):
+                if code:  # not stuck, so a modal may be up: unsaved work could still be in play
+                    with self.assertRaises(ue.CliError) as raised:
+                        ue.close_editor(ctx, args, None)
+                    self.assertEqual(raised.exception.code, code)
+                    run.assert_not_called()
+                else:
+                    self.assertEqual(ue.close_editor(ctx, args, None), 0)
+                    run.assert_called_once()
+                    self.assertIn("terminated", out.getvalue())
+
     def test_ui_brings_the_level_tab_forward_when_the_message_log_hides_it(self):
         hidden = "\n".join(['window "Sandbox - Unreal Editor" [pos=0,0 size=0,0] [ref=w1]',
                             '  tab "L_TetherProbe" [pos=0,0 size=0,0] [ref=t2]',
