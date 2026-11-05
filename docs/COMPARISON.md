@@ -69,6 +69,46 @@ game), and a restart compiles the same code as doing it by hand: it saves the ha
   limit was refused until `--bulk`. This re-check also found `ue bp edit` not checking out unsaved edits, fixed in 0.36.4.
 - **`ue selftest`:** 137 passed, 0 failed, 3 skipped, in 194 s. 384 unit tests passed.
 
+### C++ head to head
+
+T4 and a reflection change, run the same day for the first time on Epic's side, with no C# involved. UE 5.8.4, plugin
+3.1.1 and Tether 0.36.5 on `Sandbox/`, editor headless, no other Unreal editor open. The Epic arm calls
+`LiveCodingToolset.CompileLiveCoding` over raw MCP rather than through a live agent, and needs that toolset enabled
+(Epic's documented `AllToolsets` setup leaves it out). Body-change timings are from 5 runs per arm, one arm after the
+other; the error is from one run per arm, and the rest from one or two.
+
+| Step | Epic | Tether |
+|---|---|---|
+| Body change, `.cpp` only: session's first / later (median) | 8.07 s / 4.83 s | 9.64 s / 5.93 s |
+| Output of a successful compile | 698 B of paths and linker lines | 25 B |
+| Compile error | 2.13 s · 159 B · `Result: CompileNotStarted`, "Live coding failed, please see Live console" | 2.37 s · 171 B · `SandboxProbe.cpp:10: C2065 'MissingCounter': undeclared identifier` |
+| New `UFUNCTION` or `UPROPERTY`, plain compile | 16.5–17.2 s · `Result: Success`, patched live, with a warning that packaging may fail | 0.22–0.24 s · exit 3, names the changed declaration and says a restart is required (`--live` patches anyway) |
+| Restart to apply it | no tool: nothing in Epic's catalog restarts the editor or runs a full build | `ue build --restart`: 54.8–55.1 s, zero clicks |
+| Next call after the restart | HTTP 404, "Unknown session id" | worked |
+
+- **Compile speed is not an advantage.** Both drive the same Live Coding compile, and `ue build` was about 1 s slower
+  here; the cause of that second was not looked into. Rewriting the header as well as the `.cpp` raised both arms to
+  11–17 s. The restart figures include a 22 s compile check and a 2.5 s C# build that a C++-only project would not have.
+- **The compile error is the clearest gap.** Epic's own log tool did not find it: `GetLogEntries` returned nothing for
+  `MissingCounter` or `C2065`, and the `LogLiveCoding` category (2.1 KB) and an `error|fail` search (2.4 KB) did not
+  name it. It was in `%LOCALAPPDATA%\UnrealBuildTool\Log.txt` (144 lines), which an agent with file access can read if
+  it knows to look there. `LiveCodingConsole.log` did not contain it.
+- **The patch itself worked.** The new `UPROPERTY` read back correctly from the class default object after Epic's
+  compile. Tether's refusal is a safety choice, based on an earlier crash from a new `UFUNCTION` on a world subsystem;
+  whether Epic's patch causes trouble later was not tested.
+
+**What an agent reads for T1, T2 and T4:**
+
+| | Tether | Epic plugin |
+|---|---|---|
+| Skill | 12.3 KB core, plus up to 17.4 KB for the two references these tasks touch | 7.2 KB |
+| Tool discovery and output | ~0.5 KB | 71.4 KB: T1 49.9, T2 17.3, T4 4.2 |
+| **Total** | **13–30 KB** (about 3–8k tokens) | **~79 KB** (about 20k tokens) |
+
+T1 and T2 sizes are from the replay above and T4's from this run. Epic's total leaves out whatever an agent spends
+finding the error afterwards. Most of it is discovery, a one-time cost per session: for T1 alone, ~57 KB against
+~12.5 KB.
+
 ## Setup
 
 - **Project:** `Sandbox/` (UE 5.8.3) with the UnrealSharp coin feature. The editor runs headless on
@@ -99,13 +139,14 @@ game), and a restart compiles the same code as doing it by hand: it saves the ha
 | T1 read state | 1 call · 0.2 s · 145 B | 6 calls · 2.1 s · 49.9 KB (49.7 KB of it is skill and schema discovery) |
 | T2 set + move | 1 call · 0.2 s · 18 B | 4 calls · 1.3 s · 17.4 KB (17.1 KB of it is the `ActorTools` schema) |
 | T3 C# change + PIE verify | 5 calls · 3.0 s · 466 B (reload 1.1 s) | **Failed:** 8 calls · 8.5 s · 30.1 KB, and the change never loaded (see note 2) |
-| T4 C++ error loop | 3 calls · 10.3 s · 156 B; exact error line (`SandboxProbe.cpp:10: C2065 'MissingCounter'`) | not run |
+| T4 C++ error loop | 3 calls · 10.3 s · 156 B; exact error line (`SandboxProbe.cpp:10: C2065 'MissingCounter'`) | not run in this round; see [C++ head to head](#c-head-to-head) |
 | T5 restart + next query | 2 calls · 22.4 s · 815 B; next query worked at once (377 ms), no reconnect | not run; Epic has no restart tool |
 
 Epic's times are per-call tool time taken from the session transcript. Tether's are process wall clock,
 which includes Python start-up.
 
-T4 and T5 were not run for Epic: T1–T3 already settled the comparison.
+T4 and T5 were not run for Epic in this round. Both were run on 2026-11-05: see
+[C++ head to head](#c-head-to-head) and [Behaviour](#re-check-2026-11-05).
 
 ## Notes
 
