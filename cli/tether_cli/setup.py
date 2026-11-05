@@ -276,6 +276,28 @@ def project_skill_update(project):
     return path, text.replace("\n", newline)
 
 
+def project_skill_references(project):
+    """The reference files SKILL.md points to, for a project with its own copy of the skill: [(path, text)] of those
+    missing or different there. Without them the copy's links lead nowhere."""
+    folder = os.path.dirname(os.path.join(os.path.dirname(project), SKILL_REL))
+    source = os.path.join(os.path.dirname(CLI_DIR), "skills", "unreal-tether", "references")
+    if not os.path.isfile(os.path.join(folder, "SKILL.md")) or not os.path.isdir(source):
+        return []
+    stale = []
+    for name in sorted(os.listdir(source)):
+        path = os.path.join(folder, "references", name)
+        with open(os.path.join(source, name), encoding="utf-8") as f:
+            theirs = f.read()
+        try:
+            with open(path, encoding="utf-8") as f:  # universal newlines: a CRLF copy is not a stale one
+                if f.read() == theirs:
+                    continue
+        except OSError:
+            pass
+        stale.append((path, theirs))
+    return stale
+
+
 # ---------------------------------------------------------------- new projects and template content
 
 TEMPLATE_SKIP = {"Media", "Binaries", "Intermediate", "Saved", "Build", "DerivedDataCache"}
@@ -619,7 +641,8 @@ def init_project(ctx, args):
     else:
         ini = None
     skill = project_skill_update(project)
-    if not changes and not copies and not skill:
+    skill_refs = project_skill_references(project)
+    if not changes and not copies and not skill and not skill_refs:
         print("already set up: plugins enabled, Tether reachable")
         return 0
     for line in changes:
@@ -627,6 +650,9 @@ def init_project(ctx, args):
     if skill:
         print(("would " if args.dry_run else "") + f"update {SKILL_REL.replace(os.sep, '/')} (the project's copy of "
               f"the skill) to Tether {tether_version()}, keeping its own first paragraph")
+    if skill_refs:
+        print(("would " if args.dry_run else "") + f"update {len(skill_refs)} reference file(s) beside the project's "
+              "copy of the skill")
     for name, source, target, exists in copies:
         versions = (f" (the project has {tether_version(target)}, this CLI {tether_version(source)})"
                     if exists and name == "Tether" else "")
@@ -637,6 +663,10 @@ def init_project(ctx, args):
     if skill:
         with open(skill[0], "w", encoding="utf-8", newline="") as f:
             f.write(skill[1])
+    for path, text in skill_refs:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            f.write(text)
     if not changes and not copies:
         return 0  # only the skill: nothing for the editor to load
     if ini:

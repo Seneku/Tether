@@ -264,8 +264,8 @@ The plugin's hooks stay silent outside Unreal projects, and never block a tool c
    ue call tether.level_summary
    ```
 
-3. **For other agents:** `skills/unreal-tether/SKILL.md` is a plain-Markdown guide to the workflow;
-   point your agent at it.
+3. **For other agents:** `skills/unreal-tether/SKILL.md` is a plain-Markdown guide to the workflow, with area
+   detail in `references/` beside it; point your agent at it.
 
 ## Revision control (Perforce and others)
 
