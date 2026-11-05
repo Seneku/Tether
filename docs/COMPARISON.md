@@ -1,6 +1,73 @@
 # Tether vs Epic's official Claude Code plugin
 
-Head-to-head on the same five tasks, run in the same Claude Code session on 2026-10-11.
+Head-to-head on the same five tasks, run in the same Claude Code session on 2026-10-11. It was re-checked on
+2026-11-05: see [Re-check](#re-check-2026-11-05) for what still holds and what changed. The sections after that one
+are the original run.
+
+## Re-check, 2026-11-05
+
+UE 5.8.4, plugin 3.1.1 and Tether 0.36.3 on the same machine and `Sandbox/`, with the MCP port now :18873. The Epic
+arm replays the original calls over raw MCP rather than through a live agent; its discovery sizes match the original
+run. Timings are medians of 3–20 runs with no other Unreal editor open.
+
+**What an agent reads for T1–T3:**
+
+| | Tether | Epic plugin |
+|---|---|---|
+| Skill | 12.3 KB core, plus up to 26.8 KB for the three references these tasks touch | 7.2 KB |
+| Tool discovery and output | ~1 KB | ~94 KB (the original ~97 KB) |
+| **Total** | **13–40 KB** | **~101 KB** |
+
+The original's 629 B against 97 KB left the skills out, which was close to fair while Tether's was 6 KB. It had
+reached 60.8 KB by November (~62 KB against ~101 KB, and more than Epic on the first task) before being split into a
+core and references. Once Epic's schemas are loaded, its calls are as small as `ue`'s: T1's read and T2's set return
+239 B (the move call not counted) against Tether's 314 B for T1 and T2. The gap is discovery, a one-time cost per
+session, and it grows with each toolset an agent needs (Niagara's system toolset alone is 278 KB).
+
+**Timings:**
+
+| Loop | Result | Original |
+|---|---|---|
+| Read state: same script as a commandlet / `ue py -f` | 11.6 s, 1,935 log lines / 0.33 s | ~24 s (mid-size game) / 0.85 s |
+| `ue status`, `level_summary`, `props` | 0.20 s, 0.24 s, 0.29 s | 37–78 ms in earlier figures (`DESIGN.md` §1) |
+| 20 reads in one `ue batch` | 0.64 s (0.03 s each) | |
+| C++ body change, the session's first / later | 8–17 s / 5.1 s | 13.7 s / 4.4–4.7 s |
+| C# reload through `ue build` | 0.58 s (0.39–1.19 s) | 0.6–1.2 s |
+| `ue build --restart`, new UFUNCTION, with compile check | 51 s (140 s with a cold game target) | not comparable: 24 s, before the check existed and on an older build |
+| The same with `--no-check` | 34.6 s | |
+| `ue build --restart`, no code change | 22 s, or 30 s when the close hangs (below) | 22.4 s |
+| First `ue` call after a restart | 0.48 s (0.39–1.04 s) | 377 ms |
+| Editor ready, headless / `--render` | 14.9 s / 16.1 s | |
+| `ue open --second` | 12.8 s | |
+| PIE start, single / 2 clients, headless | 1.07 s / 1.21 s | 0.8 s / |
+| `ue shot` in an offscreen editor | 1.34 s | |
+| `ue test`, 32 tests | 1.67 s | ~1 s |
+
+The README used to set 24 s against a 53 s manual restart. Those were different projects (Sandbox and the mid-size
+game), and a restart compiles the same code as doing it by hand: it saves the hands, not the build.
+
+**Behaviour:**
+
+- **T3 (C#):** still fails on Epic's side. `CompileLiveCoding` returned `Result: NoChanges`, and every coin in the next
+  PIE logged "no score subsystem" (see note 6 below). Tether's reload and PIE check passed, with the new cap live.
+- **Restart with a live MCP session (T5, now tested for Epic's server):** the old session gets HTTP 404, "Unknown
+  session id ... client should reinitialize". The next `ue` call simply worked. How Claude Code reacts to that 404
+  was not tested; field reports say it needs a manual `/mcp reconnect` (`DESIGN.md` §5.2).
+- **Editor gone:** `ue status`, `ue log` and `ue crash` answered in ~0.2 s after a `taskkill`. A hung game thread
+  answered `ue status` in 0.25 s; `ue log` took 10 s, waiting to flush.
+- **Several sessions:** with a lease held, a second session's `build --restart`, `close`, `pie start` and `save` were
+  refused with exit 5, and its reads worked. Epic's `StartPIE` over MCP went straight through the lease. 8 parallel
+  readers made 120 calls with no failures, at 0.33 s median against 0.23 s alone. `ue open --second` was isolated from
+  the shared editor, but refuses while another session holds the lease unless given `--force`.
+- **Closing right after boot:** an editor told to quit within seconds of booting often hangs in shutdown, at 0% CPU on
+  every thread, after "Preparing to exit" and its asset registry write (2 of 10 to 6 of 8 by run; 0 of 10 after 15 s
+  of uptime; only `Sandbox/` tested). The cause inside the shutdown is not identified, and waiting for that write
+  before quitting did not help. `ue close` used to wait out 30 s, or fail with exit 4 without `--discard`. It now ends
+  the editor after 10 s of silence: a stuck close takes ~12 s instead of 31 s, and a clean one 4–5 s.
+- **Headless dialogs:** `EditorDialog.show_message` returned its default in 0.35 s without blocking.
+- **Perforce (local rig):** an edit in a map another user held was undone and named them, and a bulk edit over the
+  limit was refused until `--bulk`. This re-check also found `ue bp edit` not checking out unsaved edits, fixed in 0.36.4.
+- **`ue selftest`:** 137 passed, 0 failed, 3 skipped, in 194 s. 384 unit tests passed.
 
 ## Setup
 

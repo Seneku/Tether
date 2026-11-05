@@ -3,7 +3,7 @@ r"""PIE smoke test for the coin feature: walk the player pawn through every coin
 As a pass/fail check (from Sandbox/, after `ue py -f Scripts/place_coins.py`):
     ue pie run Scripts/coin_smoke.py --expect "Coin run started" --expect "score \d+, 5 coins" \
         --reject "no score subsystem"
-Or by hand while PIE runs:  ue py -f Scripts/coin_smoke.py
+Or by hand while PIE runs:  ue py -f Scripts/coin_smoke.py --allow-pie
 """
 import unreal
 

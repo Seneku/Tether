@@ -20,7 +20,7 @@ It works with Claude Code out of the box. Any agent that can run a shell command
 
 ```
 $ ue status
-Sandbox | ready | UE 5.8.3-58210709 | pid 16348 | map /Temp/Untitled_1 | mcp :18873 up | heartbeat 0.6s ago
+Sandbox | ready | UE 5.8.4-58902052 | pid 16348 | map /Temp/Untitled_1 | mcp :18873 up | heartbeat 0.6s ago
 $ ue call tether.level_summary
 /Temp/Untitled_1: 74 actors, 11 classes, PIE off
 LandscapeStreamingProxy x64, WorldDataLayers x1, WorldPartitionMiniMap x1, DirectionalLight x1, ...
@@ -38,18 +38,24 @@ costs a full editor restart. Tether keeps one editor running and talks to it.
 
 | Loop | Without Tether | With Tether |
 |---|---|---|
-| Run editor Python / read project state | ~24 s headless commandlet, ~1,900 log lines | **37 ms – 0.85 s**, a few lines |
-| C++ function-body change | Live Coding by hand; the real error only appears in a separate UBT log | **~4.5 s** Live Coding via `ue build`, one-line diagnostics |
-| Reflection / `Build.cs` change | ~53 s restart plus manual clicks | **24 s** automated `ue build --restart`, zero clicks |
-| C# change ([UnrealSharp](https://github.com/UnrealSharp/UnrealSharp)) | no agent-callable reload; restart the editor | **0.6–1.2 s** hot reload via `ue build` |
-| Run a project's automation tests | separate headless test run, thousands of log lines | **~1 s** for a small suite in the live editor: one summary line plus `file:line` per failure |
+| Run editor Python / read project state | 12–24 s headless commandlet, ~1,900 log lines | **0.2–0.85 s**, a few lines (~0.03 s each in `ue batch`) |
+| C++ function-body change | Live Coding by hand; the real error only appears in a separate UBT log | **~5 s** Live Coding via `ue build`, one-line diagnostics (the session's first: 8–17 s) |
+| Reflection / `Build.cs` change | close, rebuild and reopen by hand | **~50 s** automated `ue build --restart`, compile-checked first, zero clicks (~35 s with `--no-check`, 20–30 s when no code changed) |
+| C# change ([UnrealSharp](https://github.com/UnrealSharp/UnrealSharp)) | no agent-callable reload; restart the editor | **0.4–1.2 s** hot reload via `ue build` |
+| Run a project's automation tests | separate headless test run, thousands of log lines | **~2 s** for a small suite in the live editor: one summary line plus `file:line` per failure |
 
-In a head-to-head on the same tasks against Epic's official Claude Code plugin, the agent read **629 B**
-of tool output with Tether and **~97 KB** with Epic's plugin. Epic's tools also could not reload C#: they
-reported success while the old code kept running. See [docs/COMPARISON.md](docs/COMPARISON.md).
+A restart saves no compile time: it builds the same code as doing it by hand. What it saves is the hands, and it
+keeps the editor open when the build would fail.
 
-Numbers come from the author's machine (Windows 11, UE 5.8.3). They cover the bundled `Sandbox/` project
-and a private mid-size C++/Blueprint game. Methodology is in [docs/DESIGN.md](docs/DESIGN.md).
+In a head-to-head on the same three tasks against Epic's official Claude Code plugin, an agent reads **at most
+~40 KB** with Tether (the skill, the references those tasks touch, ~1 KB of tool output) and **~101 KB** with Epic's
+plugin (its skill, ~94 KB of tool discovery and output). The gap is discovery: once Epic's schemas are loaded, a
+call returns about as little as `ue` does. Epic's tools also could not reload C#: `CompileLiveCoding` reported
+`NoChanges`, and the next PIE lost the C# subsystem. See [docs/COMPARISON.md](docs/COMPARISON.md).
+
+Numbers come from the author's machine (Windows 11, UE 5.8.4), re-measured on the bundled `Sandbox/` project on
+2026-11-05. The 24 s commandlet and 0.85 s read are from a private mid-size C++/Blueprint game in October, on 5.8.3.
+Methodology is in [docs/DESIGN.md](docs/DESIGN.md).
 
 ## What it does
 
@@ -141,8 +147,8 @@ Fab content you already have and never buys anything. [More](docs/COMMANDS.md#se
 - **No stuck dialogs.** Headless editors answer modal dialogs with their default and log them. A windowed editor
   blocked on a modal fails at once, naming it. Revision control prompts are handled silently.
 - **Works when the editor doesn't.** `ue status`, `ue log` and `ue crash` read files, so they still answer when
-  the editor is hung or gone. `ue doctor` checks the whole setup, and `ue selftest` checks every capability
-  against the running editor in about 35 s.
+  the editor is hung or gone (`ue log` first gives a hung editor up to 10 s to flush). `ue doctor` checks the whole
+  setup, and `ue selftest` checks every capability against the running editor in about 3 minutes.
 
 ## How it works
 
