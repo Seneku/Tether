@@ -17,7 +17,7 @@ from .core import (
 )
 from .transport import catalog, py_json, resolve_toolset
 from .build import csharp_changes, csharp_layout, csharp_reload_build, layout_patch_note, reflection_patch_refusal
-from .calls import flush_editor_log, metres_to_cm, save_failures, save_hint, scoped_cvars
+from .calls import flush_editor_log, metres_to_cm, save_edited, save_failures, save_hint, scoped_cvars
 from .share import (
     active_lease, check_shared, clear_pie_start, describe_lease, pie_owner, record_pie_start, session_id,
 )
@@ -863,7 +863,7 @@ def cmd_world(ctx, args):
             print(f"also saving {', '.join(held)}: it holds the navmesh and had unsaved changes from before the build")
             changed += held
         if changed and args.save:
-            print(ctx.tether("save", paths=",".join(changed)))
+            save_edited(ctx, ",".join(changed))
         elif changed:
             print(f"{len(changed)} package(s) changed, unsaved (--save, or ue save): " + ", ".join(changed[:5]))
         return 0

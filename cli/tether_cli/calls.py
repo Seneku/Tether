@@ -748,6 +748,22 @@ def read_log_from(ctx, start):
         return []
 
 
+def save_failed(out):
+    """Does the save tool's report name a package it did not write?"""
+    return out.startswith("save failed") or any(line.startswith("not saved (") for line in out.splitlines())
+
+
+def save_edited(ctx, paths):
+    """A command's --save: Tether's save (it checks files out, marks adds, and respects the editor lease), failing
+    the command if a package was not written."""
+    start = log_end(ctx.project)
+    out = ctx.tether("save", paths=paths)
+    print(out)
+    if save_failed(out):
+        note = held_by_other_editor(ctx, start)
+        raise CliError("the edit is still in the editor, unsaved" + (f". {note}" if note else ""))
+
+
 def cmd_save(ctx, args):
     suspect = None if getattr(args, "anyway", False) else suspect_map(ctx.project, ctx.beacon)
     name = suspect["map"].rsplit("/", 1)[-1] if suspect else None
@@ -763,7 +779,7 @@ def cmd_save(ctx, args):
     # writable only when asked: a plugin copy older than 0.31 has no such parameter
     out = ctx.tether("save", paths=",".join(args.paths), **({"writable": True} if getattr(args, "writable", False) else {}))
     print(out)
-    failed = out.startswith("save failed") or any(line.startswith("not saved (") for line in out.splitlines())
+    failed = save_failed(out)
     marked = suspect_map(ctx.project, ctx.beacon) if getattr(args, "anyway", False) and not failed else None
     if marked:  # saved on purpose: the next load is the one to compare with
         mark_suspect_map(ctx.project, ctx.beacon["pid"], marked["map"], None)

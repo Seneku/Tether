@@ -11,7 +11,7 @@ from .core import (
     p4_exe, p4_options, p4_workspace, read_json, run_git, run_p4, short, state_dir, unwrap, write_json,
 )
 from .transport import claiming, py_json, resolve_toolset
-from .calls import flush_editor_log
+from .calls import flush_editor_log, save_edited
 
 
 def cmd_move_pack(ctx, args):
@@ -199,7 +199,7 @@ def bp_edit(ctx, path, ops, args):
         print(line)
     print(f"{package}: {status}" + ("" if args.save else " (unsaved: --save, or ue save)"))
     if args.save:
-        ctx.tether("save", paths=package)
+        save_edited(ctx, package)
     return 1 if status.startswith("COMPILE ERROR") else 0
 
 
@@ -317,8 +317,7 @@ def cmd_bp(ctx, args):
         print("no changes since the last read" if args.diff else
               "graph unchanged: the text matched what was there, or did not apply (ue log --level Log --grep DSL)")
     if args.save:
-        mcp_tool(ctx, "AssetTools", "save_assets", {"asset_paths": [bp.split(".")[0]]})
-        print("saved")
+        save_edited(ctx, bp.split(".")[0])
     return 0
 
 
@@ -435,9 +434,9 @@ def cmd_table(ctx, args):
     stale = [n for n, row in wanted.items() if any(after.get(n, {}).get(k) != v for k, v in row.items())]
     if stale:
         raise CliError("rows did not take every value (check column names and types): " + ", ".join(stale[:5]))
+    print("applied" + ("" if args.save else " (unsaved; --save, or save in the editor)"))
     if args.save:
-        mcp_tool(ctx, "AssetTools", "save_assets", {"asset_paths": [dt.split(".")[0]]})
-    print("applied" + (" and saved" if args.save else " (unsaved; --save, or save in the editor)"))
+        save_edited(ctx, dt.split(".")[0])
     return 0
 
 
@@ -1892,7 +1891,7 @@ def cmd_data(ctx, args):
         else:
             print(f"{len(changes)} asset(s) changed" + ("" if args.save else "; not saved (ue save, or --save)"))
             if args.save:
-                print(ctx.tether("save", paths=",".join(r["asset"] for r, _ in changes)))
+                save_edited(ctx, ",".join(r["asset"] for r, _ in changes))
         return 0
     if args.csv:
         names = differ + equal

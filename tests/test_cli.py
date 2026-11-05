@@ -2362,7 +2362,9 @@ class Fixes0192(unittest.TestCase):
         args = argparse.Namespace(action="build", what=["nav"], save=save, wait=0, limit=20)
         with unittest.mock.patch.object(ue.play, "py_json", side_effect=reply), \
                 unittest.mock.patch.object(ue.play, "rebuild_navigation"), \
+                unittest.mock.patch.object(ue.calls, "log_end", return_value=0), \
                 unittest.mock.patch.object(ue.play.time, "sleep"), unittest.mock.patch("builtins.print"):
+            ctx.project = None
             try:
                 return ue.cmd_world(ctx, args), ctx.calls
             except ue.CliError as exc:
@@ -4507,6 +4509,60 @@ class Batch030(unittest.TestCase):
         self.assertIsNone(error)
         self.assertEqual(order[:2], ["guard_open /Game/D/DT_Items", "add_rows"])
         self.assertEqual(order[-1], "guard_close")
+
+    def saved_edit(self, reply, run=None):
+        """`ue bp edit --save` with the save tool answering `reply`: (the edit's exit code or the error, what it printed)."""
+        order = []
+
+        class Ctx(FakeCtx):
+            project = self.project.uproject
+
+            def tether(self, tool, **kwargs):
+                order.append((tool, kwargs.get("paths")))
+                return reply if tool == "save" else ""
+
+        args = argparse.Namespace(array=False, category=None, instance_editable=False, parent=None, save=True)
+        run = run or (lambda c, a: ue.bp_edit(c, "/Game/B/BP_A", ["add-function", "Open"], a))
+        with unittest.mock.patch.object(ue.assets, "mcp_tool", return_value=[]), \
+                unittest.mock.patch.object(ue.assets, "py_json", return_value="BS_UP_TO_DATE"), \
+                unittest.mock.patch.object(ue.calls, "held_by_other_editor", return_value=None), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            try:
+                result = run(Ctx(), args)
+            except ue.CliError as exc:
+                result = str(exc)
+        self.assertIn(("save", "/Game/B/BP_A"), order)
+        return result, out.getvalue()
+
+    def test_bp_edit_save_says_what_it_saved(self):
+        result, out = self.saved_edit("saved 1 package: /Game/B/BP_A")
+        self.assertEqual(result, 0)
+        self.assertIn("saved 1 package: /Game/B/BP_A", out)
+
+    def test_bp_edit_save_fails_when_the_package_was_not_written(self):
+        for reply in ("save failed (see ue log)", "nothing saved\nnot saved (1): BP_A.uasset is read-only"):
+            result, out = self.saved_edit(reply)
+            self.assertEqual(result, "the edit is still in the editor, unsaved")
+            self.assertIn(reply, out)  # the reason is in the save's own report
+
+    def test_graph_and_table_saves_go_through_tethers_save(self):
+        def graph(ctx, args):
+            args.__dict__.update(docs=False, blueprint="/Game/B/BP_A", graph="EventGraph", rest=[], apply=None, diff=False)
+            with unittest.mock.patch.object(ue.assets, "mcp_tool", return_value=["EventGraph"]), \
+                    unittest.mock.patch.object(ue.assets, "graph_source", return_value="/Game/B/BP_A.BP_A"), \
+                    unittest.mock.patch.object(ue.assets, "read_graph", return_value="text"), \
+                    unittest.mock.patch.object(ue.assets, "snapshot_path", return_value=self.project.write("Saved/s.dsl", "x")):
+                return ue.cmd_bp(ctx, args)
+
+        def table(ctx, args):
+            path = self.project.write("Saved/rows.json", json.dumps({"New": {"Cost": 1}}))
+            args.__dict__.update(table="/Game/B/BP_A", export=None, dry_run=False, prune=False, limit=20, import_file=path)
+            with unittest.mock.patch.object(ue.assets, "table_rows", side_effect=[{}, {"New": {"Cost": 1}}]):
+                return ue.cmd_table(ctx, args)
+
+        for run in (graph, table):
+            self.assertEqual(self.saved_edit("saved 1 package: /Game/B/BP_A", run)[0], 0)
+            self.assertEqual(self.saved_edit("save failed (see ue log)", run)[0], "the edit is still in the editor, unsaved")
 
     def test_call_guards_epic_tools_that_edit_but_not_reads(self):
         for toolset, tool in [("editor_toolset.toolsets.blueprint.BlueprintTools", "add_variable"),
