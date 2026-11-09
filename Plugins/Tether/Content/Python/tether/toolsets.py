@@ -609,6 +609,21 @@ def _try(fn, default=None):
         return default
 
 
+def _replication_reader():
+    """fn(blueprint, variable_name) -> a Blueprint variable's replication mode, or None. 5.8: Epic's Python
+    BlueprintTools; 5.9: the C++ BlueprintToolset (BlueprintToolsets plugin), whose UFUNCTIONs Python reaches only
+    through its default object's call_method."""
+    cls = getattr(unreal, "BlueprintToolset", None)
+    if cls is not None:
+        cdo = unreal.get_default_object(cls)
+        return lambda bp, name: cdo.call_method("GetVariableReplication", (bp, name))
+    try:
+        from editor_toolset.toolsets import blueprint as epic
+        return epic.BlueprintTools.get_variable_replication
+    except (ImportError, AttributeError):
+        return None
+
+
 def _record_undo(before, label):
     """Note an editor-transacted change of ours for `ue undo`, if the editor recorded it."""
     if _LEGACY:
@@ -5240,13 +5255,13 @@ class TetherCore(_Base):
                          if cls is not None and not cls.get_path_name().startswith("/Script/") else None)
         if current is not None and not isinstance(current, unreal.Blueprint):
             current = None
-        from editor_toolset.toolsets import blueprint as epic
+        replication = _replication_reader()
         while current is not None:  # Blueprint parents first
             chain.append({"name": current.get_name(), "native": False, "blueprint": current.get_path_name().split(".")[0]})
             for name in _try(lambda: unreal.BlueprintEditorLibrary.list_member_variable_names(current), []) or []:
                 if "/" in str(name) or "." in str(name):  # inherited native members come as paths
                     continue
-                mode = _try(lambda: epic.BlueprintTools.get_variable_replication(current, str(name)))
+                mode = _try(lambda: replication(current, str(name))) if replication else None
                 if mode is not None and "none" not in str(mode).lower():
                     bp_vars.append({"blueprint": current.get_name(), "name": str(name),
                                     "replication": str(mode).split(".")[-1].split(":")[0].lower()})

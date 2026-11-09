@@ -10,7 +10,7 @@ import re
 import shutil
 import time
 
-from .core import CliError, editor_live, human_bytes, queue_deletes, read_json, state_dir, write_json
+from .core import CliError, editor_live, engine_root, human_bytes, queue_deletes, read_json, state_dir, write_json
 from .transport import py_json
 from .share import check_shared
 from .assets import folder_packages
@@ -27,6 +27,16 @@ SETTINGS = {  # ue fab settings key: (property, ini key, allowed values or None)
     "mode": ("experienceMode", "ExperienceMode", ["Standard", "Performance"]),
 }
 SETTINGS_OBJECT = "/Script/Fab.Default__FabSettings"
+
+
+def fab_plugin_found(project):
+    """Whether the Fab plugin is installed for this project: in the engine (5.8 ships it), Marketplace or the project.
+    The UE 5.9 Preview ships without it."""
+    root = engine_root(project)
+    places = [os.path.join(os.path.dirname(os.path.abspath(project)), "Plugins")]
+    if root:
+        places += [os.path.join(root, "Engine", "Plugins"), os.path.join(root, "Engine", "Plugins", "Marketplace")]
+    return not root or any(os.path.isfile(os.path.join(p, "Fab", "Fab.uplugin")) for p in places)
 
 
 def project_name(project):
@@ -566,6 +576,10 @@ def fab_settings(ctx, args):
                 raise CliError(f"cache: {value} is not a folder (Fab falls back to its default for missing ones)")
         changes[key] = value
     live = editor_live(ctx.project)
+    if live and not fab_plugin_found(ctx.project):  # no settings object to go through: the ini still holds them
+        print("note: this engine has no Fab plugin (the UE 5.9 Preview ships without it): the settings below are "
+              "the project's stored ones, used once the plugin is installed")
+        live = False
     ini = settings_ini(ctx.project)
     if changes:
         if live:  # through the settings object, which saves its own config on every change

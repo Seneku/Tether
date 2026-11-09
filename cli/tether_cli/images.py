@@ -10,7 +10,7 @@ from .core import (
     CliError, compact_error, compile_cpu, editor_mode, log_end, log_path, parse_res, read_json, stamped_name, state_dir,
     unwrap, write_json, zlib,
 )
-from .transport import py_json
+from .transport import at_least, py_json
 from .calls import flush_editor_log
 
 
@@ -509,9 +509,19 @@ def thumb_difference(png_a, png_b, size=(32, 20)):
 
 
 def capture_viewport(ctx, pose, annotations=None, ui=False):
-    """PNG bytes of the level viewport rendered from `pose` (Epic's CaptureViewport)."""
-    text, is_error = ctx.mcp.call("EditorToolset.EditorAppToolset", "CaptureViewport",
+    """PNG bytes of the level viewport rendered from `pose`: Epic's CaptureViewport, which 5.9 moved to
+    SceneCaptureToolset.CaptureEditorViewport (same arguments and result)."""
+    toolset, tool = ("EditorToolset.EditorAppToolset", "CaptureViewport")
+    if at_least(ctx, 5, 9):  # 5.9 refuses the location/scale names 5.8 accepted: FTransform's own field names
+        toolset, tool = "SceneCaptureToolset.SceneCaptureToolset", "CaptureEditorViewport"
+        if pose:
+            pose = {"translation": pose.get("location", pose.get("translation")), "rotation": pose["rotation"],
+                    "scale3D": pose.get("scale", pose.get("scale3D", {"x": 1, "y": 1, "z": 1}))}
+    text, is_error = ctx.mcp.call(toolset, tool,
                                   {"captureTransform": pose, "annotations": annotations or NO_ANNOTATIONS, "bShowUI": ui})
+    if is_error and "SceneCapture" in toolset and re.search(r"(?i)unknown toolset|no toolset|not found", text):
+        raise CliError("UE 5.9 captures the viewport through Epic's SceneCaptureToolset plugin: `ue init` enables it, "
+                       "then restart the editor")
     if is_error:
         hint = " (the viewport is not rendering: minimised window or -nullrhi?)" if "zero size" in text else ""
         raise CliError(compact_error(text) + hint)

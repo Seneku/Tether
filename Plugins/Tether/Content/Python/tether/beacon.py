@@ -53,8 +53,11 @@ def _ensure_mcp_server():
     auto-start setting is off by default, so it would serve nothing. TETHER_NO_MCP=1 opts out."""
     command_line = _command_line()
     match = re.search(r"ModelContextProtocolPort=(\d+)", command_line)
-    # The settings class has no Python wrapper (MinimalAPI); its default object answers by property name.
-    settings = unreal.find_object(None, "/Script/ModelContextProtocolEngine.Default__ModelContextProtocolSettings")
+    # The settings class has no Python wrapper (MinimalAPI); its default object answers by property name. 5.9 moved
+    # it from the ModelContextProtocolEngine module to ModelContextProtocol (a class redirect does not reach the CDO),
+    # and its BaseEditorPerProjectUserSettings.ini turns auto-start on (port 8000).
+    settings = (unreal.find_object(None, "/Script/ModelContextProtocol.Default__ModelContextProtocolSettings")
+                or unreal.find_object(None, "/Script/ModelContextProtocolEngine.Default__ModelContextProtocolSettings"))
     if settings is None:
         return int(match.group(1)) if match else None  # no MCP plugin (UE < 5.8): remote execution instead
     try:

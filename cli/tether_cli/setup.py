@@ -12,6 +12,7 @@ from .core import (
     pick_port, pid_alive, port_open,
     read_json, recent_crash, run_git, running_editors, stall_report, state_dir, subprocess,
 )
+from .transport import engine_version
 from .build import csharp_layout
 
 
@@ -173,8 +174,11 @@ REQUIRED_PLUGINS = ["PythonScriptPlugin", "ModelContextProtocol", "EditorToolset
 # whether the feature is on unless the .uproject turns it off).
 FEATURE_TOOLSETS = [("NiagaraToolsets", "Niagara", True), ("PCGToolset", "PCG", False),
                     ("StateTreeToolset", "StateTree", False)]
+# 5.9 moved Epic's Blueprint editing (ue bp) into BlueprintToolsets and viewport capture (ue shot) into SceneCaptureToolset
+REQUIRED_PLUGINS_59 = ["BlueprintToolsets", "SceneCaptureToolset"]
 ALL_TOOLSETS = {"EditorToolset", "AutomationTestToolset", "SlateInspectorToolset", "ConfigSettingsToolset",
-                "NiagaraToolsets", "PCGToolset", "StateTreeToolset"}  # what Epic's AllToolsets plugin brings
+                "NiagaraToolsets", "PCGToolset", "StateTreeToolset",
+                "BlueprintToolsets", "SceneCaptureToolset"}  # what Epic's AllToolsets plugin brings (the last two: 5.9)
 
 
 def tether_plugins_dir():
@@ -600,6 +604,8 @@ def init_project(ctx, args):
     data = json.loads(text)
     remote = ctx.transport == "remote"
     base = ["PythonScriptPlugin", "Tether"] if remote else REQUIRED_PLUGINS  # MCP and toolsets are 5.8+
+    if not remote and (engine_version(project) or (0, 0)) >= (5, 9):
+        base = base + REQUIRED_PLUGINS_59
     wanted = base + (["TetherUnrealSharp"] if args.unrealsharp or csharp_layout(project) else [])
     entries = data.setdefault("Plugins", [])
     enabled = {e.get("Name"): e.get("Enabled", False) for e in entries}

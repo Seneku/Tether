@@ -10,7 +10,7 @@ from .core import (
     log_path,
     p4_exe, p4_options, p4_workspace, read_json, run_git, run_p4, short, state_dir, unwrap, write_json,
 )
-from .transport import claiming, py_json, resolve_toolset
+from .transport import at_least, claiming, py_json, resolve_toolset
 from .calls import flush_editor_log, save_edited
 
 
@@ -75,15 +75,73 @@ def text_diff(before, after, label):
 
 
 def mcp_tool(ctx, toolset_query, tool, payload):
+    """Call one of Epic's editor tools by its 5.8 Python name (`blueprint`/`data_table`, snake_case tool and
+    arguments). On 5.9 they are C++ tools with PascalCase names and camelCase arguments: see epic59."""
+    if toolset_query in EPIC59_TOOLSETS and at_least(ctx, 5, 9):
+        toolset, tool, payload, after = epic59(toolset_query, tool, payload)
+        text, is_error = ctx.mcp.call(toolset, tool, payload)
+        if is_error:
+            if toolset.startswith("BlueprintToolsets.") and re.search(r"(?i)unknown toolset|no toolset", text):
+                raise CliError("UE 5.9 edits Blueprints through Epic's BlueprintToolsets plugin: `ue init` enables it, "
+                               "then restart the editor")
+            raise CliError(compact_error(text))
+        return after(unwrap(text))
     text, is_error = ctx.mcp.call(resolve_toolset(ctx, toolset_query), tool, payload)
     if is_error:
         raise CliError(compact_error(text))
     return unwrap(text)
 
 
+EPIC59_TOOLSETS = {"blueprint": "BlueprintToolsets.BlueprintToolset", "data_table": "EditorToolset.DataTableToolset"}
+BLUEPRINT_DSL = "BlueprintToolsets.BlueprintDslToolset"
+
+
+def camel(name, value=None):
+    """5.8 Python argument name -> 5.9 C++ one: type_name -> typeName, instance_editable (a bool) -> bInstanceEditable."""
+    head, *rest = name.split("_")
+    tail = "".join(p[:1].upper() + p[1:] for p in rest)
+    if isinstance(value, bool):
+        return "b" + head[:1].upper() + head[1:] + tail
+    return head + tail
+
+
+def epic59(toolset_query, tool, payload):
+    """(toolset, tool, arguments, result adapter) on 5.9 for a 5.8 Python tool call. Epic's Python BlueprintTools
+    became BlueprintToolsets (C++), its graph DSL tools BlueprintDslToolset (Read/Write by asset path and scope;
+    the Python read_graph_dsl now refuses plain Blueprints), and the Python data_table tools
+    EditorToolset.DataTableToolset."""
+    def same(value):
+        return value
+    if tool in ("read_graph_dsl", "write_graph_dsl"):
+        asset, _, graph = payload["graph"]["refPath"].rpartition(":")
+        args = {"assetPath": asset, "scope": graph}
+        if tool == "write_graph_dsl":
+            return BLUEPRINT_DSL, "Write", dict(args, dsl=payload["code"]), same
+        return BLUEPRINT_DSL, "Read", args, lambda v: v.get("dsl", "") if isinstance(v, dict) else v
+    if tool == "get_graph_dsl_docs":
+        return BLUEPRINT_DSL, "Docs", {}, same
+    args, options = {}, {}
+    for key, value in payload.items():
+        if key == "container_type":  # 5.9 moved it into the Add*Variable options
+            options["containerType"] = value.capitalize() if value.isupper() else value
+            continue
+        args[camel(key, value)] = value
+    if options:
+        args["options"] = options
+    after = same
+    if tool == "list_variables":  # 5.9 lists {name, bWritable}
+        def after(value):
+            return [v.get("name", v) if isinstance(v, dict) else v for v in value or []]
+    pascal = "".join(p[:1].upper() + p[1:] for p in tool.split("_"))
+    return EPIC59_TOOLSETS[toolset_query], pascal, args, after
+
+
 def graph_source(ctx, bp):
-    """Where to read a Blueprint's graphs from. Epic's read_graph_dsl marks the Blueprint modified, so one with
-    no unsaved changes is read from a copy of its file (loaded as /Temp/...) and stays clean."""
+    """Where to read a Blueprint's graphs from. 5.8's read_graph_dsl marks the Blueprint modified, so one with
+    no unsaved changes is read from a copy of its file (loaded as /Temp/...) and stays clean. 5.9's
+    BlueprintDslToolset.Read leaves it clean: the Blueprint itself."""
+    if at_least(ctx, 5, 9):
+        return bp
     package = bp.split(".")[0]
     dirty = ctx.tether("py", code=f"{package!r} in [p.get_name() for p in "
                                   "unreal.EditorLoadingAndSavingUtils.get_dirty_content_packages()]")

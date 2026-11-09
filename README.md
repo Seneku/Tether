@@ -190,7 +190,8 @@ from both loses work: close one. `TETHER_NO_MCP=1` in the editor's environment s
 ## Requirements
 
 - Unreal Engine 5.8 or later for everything; 5.4–5.7 for a subset (see [Older engines](#older-engines-ue-5457)).
-  A launcher install is fine; no source build needed.
+  A launcher install is fine; no source build needed. The 5.9 Preview passes `ue selftest` on a Blueprint-only
+  project. Epic changed a lot of its agent tooling in 5.9; see [docs/UE59.md](docs/UE59.md).
 - Python 3 on `PATH`, for the CLI. It uses the standard library only.
 - Windows is the tested platform. macOS and Linux are supported by the CLI (engine discovery,
   `Build.sh`/`RunUAT.sh`, the editor binary, clang diagnostics, detached launch), and the unit tests

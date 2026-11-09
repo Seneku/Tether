@@ -33,6 +33,42 @@ def fab_tab_open(snapshot):
     return bool(FAB_TAB.search(snapshot or ""))
 
 
+# Epic announced a Fab toolset for 5.9 that can "install free or purchased assets" (not in the Preview build).
+# Any Fab tool that could buy, claim or add to the library is refused; searching and listing stay allowed.
+FAB_STORE_TOOL = re.compile(r"(?i)purchase|buy|claim|acquire|checkout|install|add.*librar|entitle|license|download|import")
+FAB_STORE_GUARD = ("Tether never runs Fab tools that could buy, claim or add assets to the library (a purchase "
+                   "needs the user's explicit approval). Ask the user to do this step in Fab themselves")
+
+
+def fab_store_call(toolset, tool):
+    return "fab" in str(toolset).lower() and bool(FAB_STORE_TOOL.search(str(tool)))
+
+
+class StaleSession(Exception):
+    """The editor no longer knows the session id: 5.8 answers with a JSON-RPC error, 5.9 with a bare 404."""
+
+
+def inline_images(text, images):
+    """5.9 returns images as MCP image blocks, leaving `urn:toolresult:...` strings where 5.8 put the image struct
+    in the result. Put {data, mimeType} back in those places (in order), so readers see 5.8's shape."""
+    try:
+        value = json.loads(text)
+    except ValueError:
+        return text
+    queue = list(images)
+
+    def walk(v):
+        if isinstance(v, str) and v.startswith("urn:toolresult:") and queue:
+            image = queue.pop(0)
+            return {"data": image.get("data", ""), "mimeType": image.get("mimeType", "image/png")}
+        if isinstance(v, dict):
+            return {k: walk(x) for k, x in v.items()}
+        if isinstance(v, list):
+            return [walk(x) for x in v]
+        return v
+    return json.dumps(walk(value))
+
+
 class Mcp:
     def __init__(self, port, timeout):
         self.port, self.timeout, self.session, self.next_id = port, timeout, None, 0
@@ -55,6 +91,11 @@ class Mcp:
             raise CliError(f"editor MCP server not reachable on :{self.port} ({exc.__class__.__name__})", 2)
         finally:
             conn.close()
+        if not raw.strip() and resp.status >= 400:  # 5.9 answers errors with a status and no body
+            if resp.status == 404 and self.session:
+                raise StaleSession()
+            raise CliError(f"editor MCP server answered HTTP {resp.status} {resp.reason}"
+                           + (" (protocol version or headers refused?)" if resp.status == 400 else ""), 2)
         self.session = resp.getheader("Mcp-Session-Id") or self.session
         if "text/event-stream" in (resp.getheader("Content-Type") or ""):
             data = [l[5:].strip() for l in raw.splitlines() if l.startswith("data:")]
@@ -63,7 +104,10 @@ class Mcp:
 
     def request(self, method, params=None, retry=True):
         self.next_id += 1
-        msg = self._post({"jsonrpc": "2.0", "id": self.next_id, "method": method, "params": params or {}})
+        try:
+            msg = self._post({"jsonrpc": "2.0", "id": self.next_id, "method": method, "params": params or {}})
+        except StaleSession:
+            msg = {"error": {"message": "Unknown session id"}}
         if msg and "error" in msg:
             if retry and method != "initialize" and "Unknown session id" in str(msg["error"].get("message")):
                 self.session = None  # a cached session the editor no longer knows (restarted, expired)
@@ -94,6 +138,8 @@ class Mcp:
         return self
 
     def call(self, toolset, tool, args):
+        if fab_store_call(toolset, tool):
+            raise CliError(FAB_STORE_GUARD)
         if tool in SLATE_INPUT and "SlateInspector" in toolset and time.time() - self.slate_checked > 2:
             text, failed = self.call(toolset, "Snapshot", {"ref": "", "maxDepth": 120, "bIncludeSourceLocations": False})
             if not failed and fab_tab_open(text):
@@ -101,7 +147,11 @@ class Mcp:
             self.slate_checked = time.time()
         res = self.request("tools/call", {"name": "call_tool", "arguments": {
             "toolset_name": toolset, "tool_name": tool, "arguments": args}})
-        text = "".join(c.get("text", "") for c in res.get("content", []) if c.get("type") == "text")
+        content = res.get("content", [])
+        text = "".join(c.get("text", "") for c in content if c.get("type") == "text")
+        images = [c for c in content if c.get("type") == "image"]
+        if images and "urn:toolresult:" in text:
+            text = inline_images(text, images)
         return text, bool(res.get("isError"))
 
 
@@ -191,7 +241,13 @@ def transport(project):
     forced = os.environ.get("UE_TRANSPORT", "").lower()
     if forced in ("mcp", "remote"):
         return forced
-    beacon = chosen_editor(project) or {}
+    version = engine_version(project)
+    return "remote" if version and version < (5, 8) else "mcp"
+
+
+def engine_version(project, beacon=None):
+    """(major, minor) of the running editor (its beacon), else of the project's engine association; None if unknown."""
+    beacon = beacon if beacon is not None else (chosen_editor(project) or {})
     version = beacon.get("engine", "")
     if not version:
         try:
@@ -199,8 +255,14 @@ def transport(project):
                 version = json.load(f).get("EngineAssociation", "")
         except (OSError, ValueError):
             version = ""
-    match = re.match(r"(\d+)\.(\d+)", version)
-    return "remote" if match and (int(match.group(1)), int(match.group(2))) < (5, 8) else "mcp"
+    match = re.match(r"(\d+)\.(\d+)", version or "")
+    return (int(match.group(1)), int(match.group(2))) if match else None
+
+
+def at_least(ctx, major, minor):
+    """Whether the editor `ctx` talks to is engine major.minor or later (unknown counts as older)."""
+    version = engine_version(ctx.project, ctx.beacon or {})
+    return bool(version) and version >= (major, minor)
 
 
 class Ctx:
@@ -338,11 +400,26 @@ def schema(ctx, toolset):
     cached = read_json(path)
     if cached and cached.get("pid") == pid and pid_alive(pid):  # a dead editor's list is stale
         return cached["tools"]
-    res = ctx.mcp.request("tools/call", {"name": "describe_toolset", "arguments": {"toolset_name": toolset}})
-    data = unwrap("".join(c.get("text", "") for c in res.get("content", [])))
-    tools = {t["name"].rsplit(".", 1)[-1]: t for t in (data.get("tools", []) if isinstance(data, dict) else [])}
+    tools = {t["name"].rsplit(".", 1)[-1]: t for t in describe(ctx, toolset)}
     write_json(path, {"pid": pid, "tools": tools})
     return tools
+
+
+def describe(ctx, toolset):
+    """A toolset's tool descriptors with their schemas. 5.9 replaced the meta tool describe_toolset with
+    describe_toolsets (schemas only with include_schemas) and describe_tools."""
+    if at_least(ctx, 5, 9):
+        res = ctx.mcp.request("tools/call", {"name": "describe_toolsets", "arguments": {
+            "toolset_names": [toolset], "include_schemas": True}})
+        data = unwrap("".join(c.get("text", "") for c in res.get("content", [])))
+        data = data if isinstance(data, dict) else {}
+        if not data.get("toolsets") and data.get("errors"):
+            raise CliError(f"{toolset}: " + "; ".join(str(v) for v in data["errors"].values()))
+        entry = (data.get("toolsets") or {}).get(toolset) or next(iter((data.get("toolsets") or {}).values()), {})
+        return entry.get("tools", []) if isinstance(entry, dict) else []
+    res = ctx.mcp.request("tools/call", {"name": "describe_toolset", "arguments": {"toolset_name": toolset}})
+    data = unwrap("".join(c.get("text", "") for c in res.get("content", [])))
+    return data.get("tools", []) if isinstance(data, dict) else []
 
 
 TOOLSET_PLUGINS = {"niagara": "NiagaraToolsets", "pcg": "PCGToolset", "slateinspector": "SlateInspectorToolset",

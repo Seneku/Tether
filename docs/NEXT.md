@@ -175,6 +175,31 @@ its panel's text in front ("Tether probe panel GARAGE"); a floating Content Brow
 layout (%LOCALAPPDATA%/UnrealEngine/Editor/EditorLayout.json) had made the selftest's menu check fail; and a
 failed selftest step list reports its FAIL line.
 
+**Done in 0.37.0** (UE 5.9 Preview; analysis and measurements in [UE59.md](UE59.md)): B1-B9 there. Each fix is gated
+on the engine version, so 5.8 keeps its old paths.
+- **Schemas:** 5.9 replaced the meta tool `describe_toolset` with `describe_toolsets`; `ue tools`/`ue call` use the
+  new one on 5.9.
+- **Stale sessions:** a stale MCP session gets a bare 404 on 5.9, and `ue` now reconnects. Before, the call
+  returned empty with exit 0. A body-less 400 or 5xx now raises an error instead of returning empty.
+- **Image results:** 5.9 returns images as MCP image blocks. They are folded back into the result where 5.9 leaves
+  a `urn:toolresult:` string, so `shot --at`, `shot --hud` and the window/client shots keep working.
+- **MCP settings:** the beacon finds 5.9's moved MCP settings object. 5.9 also turns auto-start on (:8000).
+- **Shot and look:** `ue shot`/`look` capture through SceneCaptureToolset's CaptureEditorViewport, which takes an
+  FTransform's own field names.
+- **Blueprints and data tables:**
+  - `ue bp` (read, edit, check, docs, apply), `ue class`, `ue diff` and `ue table` map Epic's 5.8 Python
+    tool names and arguments onto 5.9's C++ BlueprintToolsets and DataTableToolset.
+  - Graph text comes from BlueprintDslToolset.Read. That read leaves the Blueprint clean, so there is no /Temp
+    copy on 5.9.
+  - `ue net` reads Blueprint replication through BlueprintToolset's default object.
+- **`ue init`:** on 5.9 it also enables BlueprintToolsets and SceneCaptureToolset.
+- **Fab:**
+  - `ue fab settings` falls back to the stored ini when the engine has no Fab plugin.
+  - Any Fab tool that could buy, claim, install or add to the library is refused by `ue call` and by the
+    pre-MCP hook. This is ahead of Epic's announced Fab toolset.
+- **Verified:** `ue selftest` on a Blueprint-only 5.9 project went from 113/7/16 to 127 passed, 0 failed, 13
+  skipped; `ue table` import, export and prune checked by hand. 19 new unit tests.
+
 **Done in 0.35.0** (UnrealRacing's notes 216-217, the shared editor's queue):
 - 216: while another session has a request open, a lease lapses after `LEASE_IDLE` = 3 min with no `ue` command of
   its holder's running and no PIE session it started (a PIE test script polling for its result keeps it); the

@@ -9,7 +9,7 @@ from .core import (
     CliError, chosen_editor, editor_label, editor_live, editor_process, live_editors, find_project, pid_alive, project_of, read_json, stall_report, state_dir,
     write_json,
 )
-from .transport import FAB_GUARD, SLATE_INPUT, Mcp, fab_tab_open
+from .transport import FAB_GUARD, FAB_STORE_GUARD, SLATE_INPUT, Mcp, fab_store_call, fab_tab_open
 from .build import classify_changes, csharp_changes, csharp_layout
 from .share import record_edit
 from .assets import project_overview
@@ -34,8 +34,18 @@ def hook_pre_edit(payload):
 
 
 def hook_pre_mcp(payload):
-    """Deny Slate input while a Fab tab is open, and Epic's StartPIE while saved C# is not hot-reloaded."""
-    return hook_fab_input(payload) or hook_start_pie(payload)
+    """Deny Fab store tools, Slate input while a Fab tab is open, and Epic's StartPIE while saved C# is not
+    hot-reloaded."""
+    return hook_fab_store(payload) or hook_fab_input(payload) or hook_start_pie(payload)
+
+
+def hook_fab_store(payload):
+    """Deny any Fab tool that could buy, claim, install or add to the library (5.9's announced Fab toolset)."""
+    args = payload.get("tool_input") or {}
+    toolset, tool = args.get("toolset_name", ""), args.get("tool_name") or payload.get("tool_name") or ""
+    if fab_store_call(toolset or payload.get("tool_name", ""), tool):
+        return FAB_STORE_GUARD
+    return None
 
 
 def hook_fab_input(payload):
