@@ -19,8 +19,8 @@ from .images import camera_at, cmd_shot, shot_args
 from .jobs import cmd_package, package_staleness, packaged_executable
 from .play import frame_stats, read_profile_csv
 from .play import (
-    cmd_mem, cmd_perf, cmd_pie, insights_exe, insights_export, parse_res, pie_do, pie_viewport_size, res_cvars,
-    res_percentage, unthrottled,
+    cmd_mem, cmd_perf, cmd_pie, insights_exe, insights_export, parse_res, pie_do, pie_guard, pie_viewport_size,
+    res_cvars, res_percentage, unthrottled,
 )
 
 
@@ -289,6 +289,8 @@ def pie_watch(ctx, args):
         raise CliError("give values to watch: ue pie watch player.Health BP_Enemy_C_1.State BP_Enemy_C_1 "
                        "(an actor alone: its location)")
     was_running = ctx.tether("pie", action="status") == "running"
+    if was_running:
+        pie_guard(ctx, "pie watch")
     if not was_running:
         code = cmd_pie(ctx, argparse.Namespace(action="start", simulate=False, warmup=args.warmup, limit=0, script=None))
         if code:
@@ -319,7 +321,10 @@ def pie_watch(ctx, args):
     for line in lines:
         print("  " + line)
     ctx.data = {"csv": path, "samples": len(samples), "seconds": span, "values": summary}
-    if getattr(args, "baseline", None):
+    if getattr(args, "baseline", None) and code:  # a failed run is no baseline for the next ones to match
+        print(f"baseline not recorded: the run failed (exit {code}); fix it, then run again to record "
+              f"{args.baseline}")
+    elif getattr(args, "baseline", None):
         target = baseline_path(ctx.project, args.baseline)
         os.makedirs(os.path.dirname(target), exist_ok=True)
         with open(target, "w", encoding="utf-8") as f:
@@ -487,6 +492,8 @@ def pie_record(ctx, args):
     if editor_mode(ctx.project, ctx.beacon).get("headless"):
         print("note: this editor is headless, so nobody can play in it; open one with `ue open` (no --headless)")
     was_running = ctx.tether("pie", action="status") == "running"
+    if was_running:
+        pie_guard(ctx, "pie record")
     if not was_running:
         code = cmd_pie(ctx, argparse.Namespace(action="start", simulate=False, warmup=args.warmup, limit=0, script=None))
         if code:
@@ -974,7 +981,7 @@ def pie_command(ctx, args):
         in_tests = bool(args.file) and os.path.normcase(os.path.abspath(args.file)).startswith(os.path.normcase(plays))
         if args.baseline or args.compare:
             watch_args.baseline, watch_args.compare = args.baseline, args.compare
-        elif in_tests:
+        elif in_tests and not args.watch:  # the file's own `# watch:` line; `--watch X` is a one-off look (Wildpack 11)
             name = os.path.splitext(os.path.basename(args.file))[0]
             recorded = os.path.isfile(baseline_path(ctx.project, name))
             watch_args.baseline, watch_args.compare = (None, name) if recorded else (name, None)
@@ -1015,6 +1022,7 @@ def pie_loop(ctx, args):
         raise CliError('--every N "cmd; cmd": the commands to run every N seconds')
     if not (ctx.beacon or {}).get("pie"):
         raise CliError("PIE is not running (ue pie start)")
+    pie_guard(ctx, "pie loop")
     seconds = args.seconds or 0
     start = log_end(ctx.project)
     result = ctx.tether("pie_loop", action="start", script=words[0], seconds=seconds,

@@ -1021,12 +1021,50 @@ def build_parser():
     return p
 
 
+def py_script_words(parser, raw):
+    """`ue py -f script.py --no-level`: words after the script that are not `ue`'s own options are the script's
+    (its sys.argv[1:]), flags included; argparse refused them as unknown options (Wildpack note 3). They go after
+    a `--`, in their order; `ue` options among them (--allow-pie, --json, --timeout N, ...) stay `ue`'s."""
+    try:
+        at = raw.index("py")
+    except ValueError:
+        return raw
+    file_at = next((i for i in range(at + 1, len(raw) - 1) if raw[i] in ("-f", "--file")), None)
+    if file_at is None or "--" in raw[at:]:
+        return raw
+    sub = next(a for a in parser._actions if isinstance(a, argparse._SubParsersAction)).choices["py"]
+    known = {}
+    for action in list(sub._actions) + list(parser._actions):
+        for flag in action.option_strings:
+            known[flag] = action.nargs
+    keep, script, i, tail = [], [], 0, raw[file_at + 2:]
+    while i < len(tail):
+        word = tail[i]
+        flag = word.split("=", 1)[0]
+        if flag in known and flag not in ("-f", "--file", "-h", "--help"):
+            keep.append(word)
+            nargs = known[flag]
+            if "=" not in word and nargs is None and i + 1 < len(tail):  # one value
+                keep.append(tail[i + 1])
+                i += 1
+            elif "=" not in word and nargs == "?" and i + 1 < len(tail) and not tail[i + 1].startswith("-"):
+                keep.append(tail[i + 1])
+                i += 1
+        else:
+            script.append(word)
+        i += 1
+    if not any(w.startswith("-") for w in script):
+        return raw  # nothing argparse would refuse: as before
+    return raw[:file_at + 2] + keep + ["--"] + script
+
+
 def parse_command(parser, raw):
     """Parsed arguments for one ue command line, with the global options' defaults filled in."""
     command = []
     if "job" in raw and "--" in raw[raw.index("job"):]:  # `ue job start [opts] -- <program> <args...>`
         cut = raw.index("--", raw.index("job"))
         raw, command = raw[:cut], raw[cut + 1:]
+    raw = py_script_words(parser, raw)
     args = parser.parse_args(raw)
     args.job_command = command
     args.timeout_given = hasattr(args, "timeout")

@@ -6,6 +6,7 @@ import re
 import sys
 import time
 
+from .core import VIEW_MODES  # (defined in core so calls can name them)
 from .core import (
     CliError, compact_error, compile_cpu, editor_mode, log_end, log_path, parse_res, read_json, stamped_name, state_dir,
     unwrap, write_json, zlib,
@@ -70,16 +71,6 @@ def spectator_capture(ctx):
 
 
 # --view: (the editor's ViewModeIndex member, the game's `viewmode` name)
-VIEW_MODES = {
-    "lit": ("LIT", "Lit"), "unlit": ("UNLIT", "Unlit"), "wireframe": ("WIREFRAME", "Wireframe"),
-    "lightingonly": ("LIGHTING_ONLY", "LightingOnly"), "detaillighting": ("LIT_DETAIL_LIGHTING", "Lit_DetailLighting"),
-    "shadercomplexity": ("SHADER_COMPLEXITY", "ShaderComplexity"), "quadoverdraw": ("QUAD_OVERDRAW", "QuadOverdraw"),
-    "lightcomplexity": ("LIGHT_COMPLEXITY", "LightComplexity"), "lods": ("LOD_COLORATION", "LODColoration"),
-    "nanite": ("VISUALIZE_NANITE", "VisualizeNanite"), "lumen": ("VISUALIZE_LUMEN", "VisualizeLumen"),
-    "shadowcasters": ("SHADOW_CASTERS", "ShadowCasters"), "collision": ("COLLISION_VISIBILITY", "CollisionVis"),
-    "lightmapdensity": ("LIGHTMAP_DENSITY", "LightmapDensity"),
-    "vsm": ("VISUALIZE_VIRTUAL_SHADOW_MAP", "VisualizeVirtualShadowMap"),
-}
 VIEW_SET = """import json
 A = unreal.AutomationLibrary
 old = [A.get_editor_active_viewport_view_mode().name, A.get_editor_active_viewport_wireframe_opacity()]

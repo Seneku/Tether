@@ -433,7 +433,20 @@ def game_command(ctx, args, role, index, port, log):
     view = ["-nullrhi", "-nosound"] if headless else ["-windowed", "-ResX=960", "-ResY=540", f"-WinX={60 + index * 40}",
                                                        f"-WinY={60 + index * 40}"]
     return base + ([url] if url else []) + mode + [f"-port={port}", "-log", f"-abslog={log}", "-unattended", "-nosplash",
-                                 "-NoVerifyGC"] + view + extra.split()
+                                 "-NoVerifyGC"] + view + split_args(extra)
+
+
+def split_args(text):
+    """Words of --server-args/--client-args as a shell would split them, quotes kept together (`-ExecCmds="t.MaxFPS
+    60"` is one argument; str.split broke it in two, Wildpack note 12) and backslashes kept (Windows paths). The
+    quotes go; Popen quotes the whole word again, `"-ExecCmds=t.MaxFPS 60"`, which UE's FParse::Value reads."""
+    import shlex
+    lex = shlex.shlex(text, posix=True)
+    lex.whitespace_split, lex.escape, lex.commenters = True, "", ""
+    try:
+        return list(lex)
+    except ValueError as e:  # an unclosed quote
+        raise CliError(f"--server-args/--client-args: {e}: {text[:80]}") from None
 
 
 def read_game_log(path):

@@ -217,8 +217,8 @@ def holder_pie_running(project, sid):
     folder = os.path.join(state_dir(project), "editors")
     for name in os.listdir(folder) if os.path.isdir(folder) else []:
         beacon = read_json(os.path.join(folder, name)) if name.endswith(".json") else None
-        if isinstance(beacon, dict) and beacon.get("pie") and beacon.get("pie_since") \
-                and -5 <= beacon["pie_since"] - record["time"] <= 60 and pid_alive(beacon.get("pid")):
+        if isinstance(beacon, dict) and beacon.get("pie") and record_matches(record, beacon.get("pie_since")) \
+                and pid_alive(beacon.get("pid")):
             return True
     return False
 
@@ -341,6 +341,40 @@ def describe_running(project, row, now=None, names=None):
             f"{duration(now - row.get('since', now))} (pid {row.get('pid')})")
 
 
+def refused_path(project):
+    return os.path.join(state_dir(project), "lease-refused.json")
+
+
+def note_refused(project, now=None):
+    """Remember that this session's `lease take` was just refused: the next gated command says so."""
+    rows = read_json(refused_path(project)) or {}
+    rows = {k: v for k, v in rows.items() if isinstance(v, (int, float)) and v > time.time() - 3600}
+    rows[session_id()] = time.time() if now is None else now
+    try:
+        write_json(refused_path(project), rows)
+    except OSError:
+        pass
+
+
+def refused_note(project, now=None):
+    """" (your `ue lease take` was refused N s ago)" when this session's last take failed in the last 15 min."""
+    now = time.time() if now is None else now
+    when = (read_json(refused_path(project)) or {}).get(session_id())
+    if isinstance(when, (int, float)) and 0 <= now - when <= 900:
+        return f" (your `ue lease take` was refused {ago(now - when)}: a pipe may have hidden its exit code)"
+    return ""
+
+
+def clear_refused(project):
+    rows = read_json(refused_path(project)) or {}
+    if session_id() in rows:
+        rows.pop(session_id())
+        try:
+            write_json(refused_path(project), rows)
+        except OSError:
+            pass
+
+
 def take_lease(project, what, minutes, now=None, hold=False):
     """Take (or renew) the lease for this session; refuse while another session holds it. Taken again by this
     session for something else (a script inside a session's lease takes its own), the new lease goes on top and
@@ -351,13 +385,18 @@ def take_lease(project, what, minutes, now=None, hold=False):
     held = active_lease(project, now)
     me = session_id()
     if held and held["session"] != me:
+        note_refused(project, now)
         raise CliError(f"the editor is {describe_lease(project, held, now)}; wait, or ask that session to run "
-                       "`ue lease release`", LEASED)
+                       "`ue lease release`. Exit 5: in a script, `ue lease take ... || exit` on its own line (after "
+                       "`| tail` an `&&` still runs, and the next commands would act on that session's editor)",
+                       LEASED)
     held = {k: v for k, v in held.items() if k != "busy"} if held else None
-    if held and held.get("what") != what:
+    if held and held.get("what") != what and not held.get("granted_by"):
         lease, how = {"session": me, "what": what, "since": now, "until": now + minutes * 60, "outer": held}, "nested"
-    else:
+    else:  # a lease handed over (`lease grant`, `wait lease`) is taken as this session's own: renewed, not nested
         lease = dict(held or {"session": me, "what": what, "since": now}, until=now + minutes * 60)
+        if held and held.get("granted_by"):
+            lease = dict({k: v for k, v in lease.items() if k != "granted_by"}, what=what)
         how = "renewed" if held else "taken"
     lease["active"] = now
     if hold or (held and held.get("hold")):
@@ -366,6 +405,7 @@ def take_lease(project, what, minutes, now=None, hold=False):
         lease["lapse"] = True
     write_json(lease_path(project), lease)
     drop_request(project, me)  # asked for it earlier: answered
+    clear_refused(project)
     return lease, how
 
 
@@ -399,7 +439,7 @@ def check_shared(project, action, destructive, ignore=False, now=None):
     me = session_id()
     if held and held["session"] != me:
         raise CliError(f"{action} refused: the editor is {describe_lease(project, held, now)}. Wait for "
-                       "`ue lease release`, or pass --ignore-lease", LEASED)
+                       "`ue lease release`, or pass --ignore-lease" + refused_note(project, now), LEASED)
     if destructive and not held:
         others = recent_sessions(project, ACTIVE_MINUTES, exclude=me, now=now)
         if others:
@@ -409,6 +449,36 @@ def check_shared(project, action, destructive, ignore=False, now=None):
             raise CliError(f"{action} refused: other sessions used this editor in the last {ACTIVE_MINUTES} min "
                            f"({who}). Take the lease first (`ue lease take --for \"...\"`) so they see it, or pass "
                            "--ignore-lease", LEASED)
+
+
+def check_pie_shared(project, beacon, action, now=None):
+    """Before `action` acts on a PIE session that is already running (a step file, `pie run`, `pie stop`, `exec`,
+    input): refuse while another session holds the lease, or when another session started that PIE and used the
+    editor in the last ACTIVE_MINUTES (UnrealRacing 2026-11-06 and 11-12: a refused `lease take` hidden by a pipe,
+    then a step file ran inside, and stopped, the holder's own test). Returns a note for a PIE another session
+    started and left (no lease, not seen lately), else None. --ignore-lease skips it."""
+    if not (beacon or {}).get("pie") or os.environ.get("UE_IGNORE_LEASE") == "1" or own_editor(project):
+        return None
+    now = time.time() if now is None else now
+    me = session_id()
+    owner = pie_owner(project, beacon)
+    held = active_lease(project, now)
+    if held and held["session"] != me:
+        raise CliError(f"{action} refused: PIE is running ({owner or 'owner unknown'}) and the editor is "
+                       f"{describe_lease(project, held, now)}. Wait for `ue lease release`, or pass --ignore-lease"
+                       + refused_note(project, now), LEASED)
+    record = read_json(pie_owner_path(project)) or {}
+    starter = record.get("session")
+    if not owner or owner == "started by hand in the editor" or not starter or starter == me:
+        return None
+    recent = recent_sessions(project, ACTIVE_MINUTES, exclude=me, now=now)
+    if starter in recent:
+        raise CliError(f"{action} refused: the running PIE was {owner}, which used the editor "
+                       f"{ago(now - recent[starter]['time'])} ({recent[starter]['cmd'][:60]}). Take the lease "
+                       "(`ue lease take --for \"...\" || exit`), or pass --ignore-lease" + refused_note(project, now),
+                       LEASED)
+    return f"note: this PIE session was {owner}; acting on it anyway (that session has been quiet " \
+           f"{ACTIVE_MINUTES}+ min)"
 
 
 def own_editor(project):
@@ -824,7 +894,25 @@ def pie_owner(project, beacon):
     if not beacon or not beacon.get("pie") or not beacon.get("pie_since"):
         return None
     record = read_json(pie_owner_path(project)) or {}
-    # `pie start` records itself just before asking for PIE, which then takes a moment (longer on a busy editor).
-    if record.get("time") and -5 <= beacon["pie_since"] - record["time"] <= 60:
+    if record_matches(record, beacon["pie_since"]):
         return f"started by {session_label(project, record['session'])}"
     return "started by hand in the editor"
+
+
+def record_matches(record, pie_since):
+    """Whether the PIE session that began at `pie_since` is the one `record` (pie-owner.json) asked for. After a
+    start `ue` reads the session's own start time back (confirm_pie_start) and matches on it; before that, `pie
+    start` recorded itself just before asking for PIE, which then takes a moment (longer on a busy editor), and a
+    start that took over a minute read as "started by hand" (a kept PIE then didn't keep its holder's lease)."""
+    if not record.get("time") or not pie_since:
+        return False
+    if record.get("pie_since"):
+        return abs(record["pie_since"] - pie_since) < 1
+    return -5 <= pie_since - record["time"] <= 60
+
+
+def confirm_pie_start(project, pie_since):
+    """After a `pie start` that went through: note the session's own start time (the beacon's pie_since)."""
+    record = read_json(pie_owner_path(project)) or {}
+    if record.get("time") and pie_since and not record.get("pie_since") and pie_since >= record["time"] - 5:
+        write_json(pie_owner_path(project), dict(record, pie_since=pie_since))

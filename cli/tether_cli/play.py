@@ -19,7 +19,8 @@ from .transport import catalog, py_json, resolve_toolset
 from .build import csharp_changes, csharp_layout, csharp_reload_build, layout_patch_note, reflection_patch_refusal
 from .calls import flush_editor_log, metres_to_cm, save_edited, save_failures, save_hint, scoped_cvars
 from .share import (
-    active_lease, check_shared, clear_pie_start, describe_lease, pie_owner, record_pie_start, session_id,
+    active_lease, check_pie_shared, check_shared, clear_pie_start, confirm_pie_start, describe_lease, pie_owner,
+    record_pie_start, session_id,
 )
 from .images import (
     cmd_shot, contact_sheet, draw_text, crop_pixels, front_level_viewport, hud_screenshot, image_diff, level_tab_hidden,
@@ -578,6 +579,8 @@ def cmd_ui(ctx, args):
     if ctx.transport != "remote" and not (ctx.beacon or {}).get("pie"):
         raise CliError("PIE is not running (ue pie start)")
     action = args.action or "show"
+    if action in ("click", "type", "key") and (ctx.beacon or {}).get("pie"):  # input into a PIE: whose is it?
+        pie_guard(ctx, f"ui {action}")
     if action == "click":
         print(ui_click(ctx, " ".join(args.rest), getattr(args, "event", False), getattr(args, "near", None)))
         return 0
@@ -1625,6 +1628,8 @@ def pie_run(ctx, args):
                                                      limit=0, script=None))
         if code_start:
             return code_start
+    else:
+        pie_guard(ctx, "pie run")
     failures = []
     # A fresh namespace per run: `ue py`'s persistent one keeps globals such as a `world` from an earlier PIE
     # session, which is dead now. tether.world() / tether.player() give the targeted PIE world and its pawn.
@@ -1928,6 +1933,8 @@ def pie_do(ctx, args):
         code = cmd_pie(ctx, argparse.Namespace(action="start", simulate=False, warmup=args.warmup, limit=0, script=None))
         if code:
             return code
+    else:
+        pie_guard(ctx, "pie do")
 
     def tool(step):
         result = ctx.tether("pie_step", step=step)
@@ -1989,7 +1996,8 @@ def pie_do(ctx, args):
         if verb == "click":
             event = rest.startswith("--event ")
             return True, ui_click(ctx, rest[len("--event "):].strip() if event else rest, event)
-        split = re.fullmatch(r"(?:--(slate|game) )?(\S+) (down|up|tap)\b(.*)", rest, re.I) if verb == "key" else None
+        # (?!--): `key --slate Up` read as key "--slate", state "Up", and pressed nothing (UnrealRacing 2026-11-04)
+        split = re.fullmatch(r"(?:--(slate|game) )?(?!--)(\S+) (down|up|tap)\b(.*)", rest, re.I) if verb == "key" else None
         if split:  # a key held across steps, or tapped, for the game or a focused UMG screen
             forced, key, action, tail = split.group(1), split.group(2), split.group(3).lower(), split.group(4)
             if action == "up" and key in slate_keys:
@@ -2152,6 +2160,29 @@ def hud_gone_note(ctx):
             "to appear (ue ui; ue log --since pie --level Warning). A stop and start often brings it back")
 
 
+def pie_guard(ctx, action):
+    """Before acting on a PIE session already running: refuse if it is another session's (share.check_pie_shared),
+    or print the note on one another session left."""
+    note = check_pie_shared(ctx.project, dict(getattr(ctx, "beacon", None) or {}, pie=True), action)
+    if note:
+        print(note)
+
+
+def confirm_started(ctx, seconds=4.0):
+    """After a PIE start: read the session's start time back from the beacon, so who started it stays known
+    however long the start took (share.record_matches)."""
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        try:
+            beacon = chosen_editor(ctx.project) or {}
+        except CliError:
+            return
+        if beacon.get("pie") and beacon.get("pie_since"):
+            confirm_pie_start(ctx.project, beacon["pie_since"])
+            return
+        time.sleep(0.25)
+
+
 def cmd_pie(ctx, args):
     """Play-In-Editor through Epic's EditorAppToolset, reporting only what went wrong."""
     if args.action == "run":
@@ -2162,7 +2193,11 @@ def cmd_pie(ctx, args):
         index = int(args.script[0]) if args.script else -1
         print(pie_net(ctx, "target", target=index))
         return 0
+    already = None  # PIE that `pie start` found running: (who started it, the note on it)
     if args.action == "stop":
+        note = check_pie_shared(ctx.project, ctx.beacon, "pie stop")  # before the record of who started it goes
+        if note:
+            print(note)
         clear_pie_start(ctx.project)
         if (ctx.beacon or {}).get("pie"):
             record_hud(ctx)
@@ -2173,6 +2208,8 @@ def cmd_pie(ctx, args):
             raise CliError(refusal, 3)
         if not (ctx.beacon or {}).get("pie"):  # PIE already running stays whoever's it was
             record_pie_start(ctx.project)
+        else:
+            already = (pie_owner(ctx.project, ctx.beacon), check_pie_shared(ctx.project, ctx.beacon, "pie start"))
     # Said last (below the OK line and any status), where an output filter or a quick read does not lose it
     layout_note = layout_patch_note(ctx.project, ctx.beacon) if args.action == "start" else None
     if args.action == "start" and getattr(args, "game", None):
@@ -2226,6 +2263,12 @@ def cmd_pie(ctx, args):
     elif args.action == "stop":
         text, is_error = ctx.mcp.call(toolset, "StopPIE", {})
         pie_throttle(ctx, "restore")
+        # StopPIE asks for the end on a later tick. A `pie do` straight after found PIE still running, took it as
+        # already started and played on in the old session, its state included (Wildpack note 4, 2026-10-31).
+        deadline = time.time() + 20
+        while not is_error and time.time() < deadline \
+                and unwrap(ctx.mcp.call(toolset, "IsPIERunning", {})[0]) is True:
+            time.sleep(0.2)
     else:
         text, is_error = ctx.mcp.call(toolset, "IsPIERunning", {})
         if is_error:
@@ -2277,6 +2320,16 @@ def cmd_pie(ctx, args):
         note = hud_gone_note(ctx)
         if note:
             print("note: " + note)
+    if args.action == "start" and already is None:
+        confirm_started(ctx)
+    elif args.action == "start":
+        owner, note = already
+        print(f"WARNING: PIE was already running ({owner or 'owner unknown'}): this plays on in that session, with "
+              "the state it was left in" + (" and its client/net settings, not the ones asked for"
+                                           if getattr(args, "clients", None) or getattr(args, "game", None) else "")
+              + ". `ue pie stop` first for a fresh one")
+        if note:
+            print(note)
     if layout_note:
         print("WARNING: " + layout_note)
     return 0

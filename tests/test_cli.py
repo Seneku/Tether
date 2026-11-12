@@ -5381,3 +5381,98 @@ class Perforce(unittest.TestCase):
             plain = ue.Ctx(argparse.Namespace())
             plain._project = self.project.uproject
             self.assertEqual(plain.token({}), "secret")
+
+
+class Round038(unittest.TestCase):
+    """0.38: UnrealRacing rows 226-232 and bullets, Wildpack's notes 3-13."""
+
+    def setUp(self):
+        self.project = Project()
+
+    def tearDown(self):
+        self.project.close()
+
+    def as_(self, sid):
+        return unittest.mock.patch.dict(os.environ, {"UE_SESSION": sid})
+
+    def test_another_sessions_lease_guards_its_running_pie(self):  # 232
+        p, beacon = self.project.uproject, {"pie": True, "pie_since": time.time()}
+        with self.as_("holder"):
+            ue.take_lease(p, "contact test", 15)
+            self.assertIsNone(ue.check_pie_shared(p, beacon, "pie do"))
+        with self.as_("other"):
+            with self.assertRaises(ue.CliError) as e:
+                ue.check_pie_shared(p, beacon, "pie stop")
+            self.assertEqual(e.exception.code, ue.LEASED)
+            self.assertIn("pie stop refused", str(e.exception))
+            with unittest.mock.patch.dict(os.environ, {"UE_IGNORE_LEASE": "1"}):
+                self.assertIsNone(ue.check_pie_shared(p, beacon, "pie stop"))
+            self.assertIsNone(ue.check_pie_shared(p, {"pie": False}, "exec"))  # no PIE: nothing to guard
+
+    def test_a_pie_another_active_session_started_is_refused(self):  # 232, no lease held
+        p, now = self.project.uproject, time.time()
+        with self.as_("starter"):
+            ue.record_pie_start(p, now=now - 30)
+            ue.record_activity(p, ["ue", "pie", "do", "-f", "contact.txt"], now=now - 20)
+        beacon = {"pie": True, "pie_since": now - 28}
+        with self.as_("other"):
+            with self.assertRaises(ue.CliError) as e:
+                ue.check_pie_shared(p, beacon, "exec", now=now)
+            self.assertIn("started by starter", str(e.exception))
+            note = ue.check_pie_shared(p, beacon, "exec", now=now + ue.ACTIVE_MINUTES * 60 + 60)
+            self.assertIn("acting on it anyway", note)  # that session went quiet: a note, not a refusal
+        with self.as_("starter"):
+            self.assertIsNone(ue.check_pie_shared(p, beacon, "exec", now=now))
+
+    def test_a_slow_start_keeps_its_owner_once_confirmed(self):  # kept PIE read as "started by hand"
+        p, now = self.project.uproject, time.time()
+        with self.as_("holder"):
+            ue.record_pie_start(p, now=now - 200)
+        beacon = {"pie": True, "pie_since": now - 100}  # PIE came up 100 s after the request
+        self.assertEqual(ue.pie_owner(p, beacon), "started by hand in the editor")
+        ue.confirm_pie_start(p, now - 100)
+        self.assertEqual(ue.pie_owner(p, beacon), "started by holder")
+        self.assertEqual(ue.pie_owner(p, {"pie": True, "pie_since": now}), "started by hand in the editor")
+
+    def test_a_refused_take_is_named_by_the_next_refusal(self):  # 232 (2)
+        p = self.project.uproject
+        with self.as_("holder"):
+            ue.take_lease(p, "garage", 15)
+        with self.as_("other"):
+            with self.assertRaises(ue.CliError) as e:
+                ue.take_lease(p, "my test", 15)
+            self.assertIn("|| exit", str(e.exception))
+            with self.assertRaises(ue.CliError) as e:
+                ue.check_shared(p, "pie start", destructive=False)
+            self.assertIn("your `ue lease take` was refused", str(e.exception))
+
+    def test_a_granted_lease_taken_again_is_renewed_not_nested(self):
+        p = self.project.uproject
+        with self.as_("holder"):
+            ue.take_lease(p, "map rebuild", 15)
+        with self.as_("asker"):
+            ue.request_lease(p, "build --restart", 10)
+        with self.as_("holder"):
+            ue.grant_lease(p)
+        with self.as_("asker"):
+            lease, how = ue.take_lease(p, "pieces round 3", 30)
+            self.assertEqual((how, lease["what"]), ("renewed", "pieces round 3"))
+            self.assertNotIn("outer", lease)
+            self.assertEqual(ue.release_lease(p)[1], None)  # one release frees it
+        self.assertIsNone(ue.active_lease(p))
+
+    def test_game_args_keep_quoted_words_together(self):  # Wildpack 12
+        self.assertEqual(ue.split_args(r'-ExecCmds="t.MaxFPS 60" -abslog=C:\x\y.log -foo'),
+                         ["-ExecCmds=t.MaxFPS 60", r"-abslog=C:\x\y.log", "-foo"])
+        self.assertEqual(ue.split_args(""), [])
+        with self.assertRaises(ue.CliError):
+            ue.split_args('-ExecCmds="unclosed')
+
+    def test_py_script_flags_reach_the_script(self):  # Wildpack 3
+        parser = ue.build_parser()
+        args = ue.parse_command(parser, ["py", "-f", "build.py", "--no-level", "--allow-pie", "3"])
+        self.assertEqual((args.file, args.code, args.allow_pie), ("build.py", ["--no-level", "3"], True))
+        args = ue.parse_command(parser, ["py", "-f", "build.py", "a", "b"])
+        self.assertEqual(args.code, ["a", "b"])
+        args = ue.parse_command(parser, ["py", "-f", "build.py", "--", "--no-level"])
+        self.assertEqual(args.code, ["--no-level"])

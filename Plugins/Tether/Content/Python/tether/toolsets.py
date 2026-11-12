@@ -475,8 +475,20 @@ def _component_named(actor, comps, ref):
 
 
 def _point_and_extent(ref, pie):
-    """An actor's (or component owner's) visible bounds centre and extent."""
-    obj = _resolve(ref, pie)
+    """An actor's (or component owner's) visible bounds centre and extent. In PIE, 'player'/'pawn'/'controller'
+    (and 'player.<component>') mean what they do in steps: `shot --look-at player` matched every actor with
+    "player" in its name and failed as ambiguous (UnrealRacing row 228)."""
+    game = _game_world() if pie else None
+    if game is not None and ref.lower().split(".")[0] in ("player", "pawn", "controller"):
+        controller = unreal.GameplayStatics.get_player_controller(game, 0)
+        pawn = unreal.GameplayStatics.get_player_pawn(game, 0)
+        if pawn is None:
+            raise RuntimeError("the player has no pawn in this PIE session")
+        obj = _pie_object(ref, pawn, controller)
+        if isinstance(obj, unreal.Controller):
+            obj = pawn
+    else:
+        obj = _resolve(ref, pie)
     actor = obj if isinstance(obj, unreal.Actor) else (obj.get_owner() if isinstance(obj, unreal.ActorComponent) else None)
     if actor is None:
         raise RuntimeError(f"'{ref}' is not an actor or component")
@@ -930,7 +942,9 @@ def _player_target(ref):
     return _pie_object(ref, pawn, controller)
 
 
-def _pie_point(ref, pawn, controller):
+def _pie_point(ref, pawn, controller, location=False):
+    """'x,y,z', or an actor's (component's) bounds centre; with location, the actor's own location (`at`: the
+    bounds centre of an 8 m digger arm moved as it swung, Wildpack note 10)."""
     nums = _numbers(ref)
     if nums is not None:
         if len(nums) != 3:
@@ -938,6 +952,8 @@ def _pie_point(ref, pawn, controller):
         return unreal.Vector(*nums)
     obj = _pie_object(ref, pawn, controller)
     actor = obj if isinstance(obj, unreal.Actor) else obj.get_owner()
+    if location:
+        return obj.get_world_location() if isinstance(obj, unreal.SceneComponent) else actor.get_actor_location()
     return _visible_bounds(actor, True)[0]
 
 
@@ -8192,7 +8208,7 @@ class TetherCore(_Base):
         ok, detail = True, ""
         if verb == "at":
             where, _, offset = rest.partition(" ")
-            base = _pie_point(where, pawn, controller)
+            base = _pie_point(where, pawn, controller, location=True)
             point = base + unreal.Vector(*(_numbers(offset) or [0, 0, 0])) if offset else base
             pawn.set_actor_location(point, False, True)
             loc = pawn.get_actor_location()

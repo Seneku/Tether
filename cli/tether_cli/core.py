@@ -1436,3 +1436,16 @@ def project_of(path):
             return None
         here = parent
     return None
+
+
+# `ue shot --view` modes: name -> (unreal.ViewModeIndex suffix, the editor's `viewmode` console name)
+VIEW_MODES = {
+    "lit": ("LIT", "Lit"), "unlit": ("UNLIT", "Unlit"), "wireframe": ("WIREFRAME", "Wireframe"),
+    "lightingonly": ("LIGHTING_ONLY", "LightingOnly"), "detaillighting": ("LIT_DETAIL_LIGHTING", "Lit_DetailLighting"),
+    "shadercomplexity": ("SHADER_COMPLEXITY", "ShaderComplexity"), "quadoverdraw": ("QUAD_OVERDRAW", "QuadOverdraw"),
+    "lightcomplexity": ("LIGHT_COMPLEXITY", "LightComplexity"), "lods": ("LOD_COLORATION", "LODColoration"),
+    "nanite": ("VISUALIZE_NANITE", "VisualizeNanite"), "lumen": ("VISUALIZE_LUMEN", "VisualizeLumen"),
+    "shadowcasters": ("SHADOW_CASTERS", "ShadowCasters"), "collision": ("COLLISION_VISIBILITY", "CollisionVis"),
+    "lightmapdensity": ("LIGHTMAP_DENSITY", "LightmapDensity"),
+    "vsm": ("VISUALIZE_VIRTUAL_SHADOW_MAP", "VisualizeVirtualShadowMap"),
+}

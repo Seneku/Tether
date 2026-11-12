@@ -312,6 +312,13 @@ def cmd_open(ctx, args):
         # Its own MCP port, beacon and log; nobody else's default; outside the shared editor's lease. Headless:
         # a second window of the same project on the user's screen would only confuse.
         args.headless, args.no_build = True, True  # the binaries are the open editor's: nothing can be rebuilt
+    if not second:  # the shared editor: not while another session holds it or is opening one (row 226)
+        check_shared(ctx.project, "open", destructive=False)
+        opening = [r for r in running_commands(ctx.project) if r.get("session") != session_id()
+                   and re.match(r"ue(\s+--?\w[\w-]*(\s+[^-\s]\S*)?)*\s+open(\s|$)", str(r.get("cmd", "")))]
+        if opening and os.environ.get("UE_IGNORE_LEASE") != "1":
+            raise CliError(f"open refused: {describe_running(ctx.project, opening[0])} is starting the shared editor; "
+                           "wait for it (`ue status`), or pass --ignore-lease for a second one anyway", LEASED)
     has_csharp = csharp_layout(ctx.project) is not None
     if not live_editors(ctx.project):
         done, _ = flush_deletes(ctx.project)

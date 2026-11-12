@@ -13,10 +13,10 @@ from .core import (
     human_bytes, log_end, log_ignore_entries,
     live_editors, log_ignore_path, log_path, pid_alive, PY_OUTPUT, summarize_log, write_json,
     port_open,
-    read_json, read_json_retry, read_new_log, session_id, short, state_dir, unwrap,
+    read_json, read_json_retry, read_new_log, session_id, short, state_dir, unwrap, VIEW_MODES,
 )
 from .fabfiles import fab_origin, listing_url, project_fab
-from .share import LEASED, ago, lease_note, others_edits, pie_owner, session_label, session_names
+from .share import LEASED, ago, check_pie_shared, lease_note, others_edits, pie_owner, session_label, session_names
 from .build import map_baseline_path, mark_suspect_map, suspect_map
 from .transport import catalog, claiming, fill_args, py_json, resolve_toolset, schema, signature
 
@@ -1035,7 +1035,8 @@ def cmd_actors(ctx, args):
 def cmd_exec(ctx, args, after=None):
     """A console command and the log lines it produced. `after` runs right after the command (before waiting for
     its output): `ue exec ... --shot` captures a short-lived effect on the next frame."""
-    note = lease_note(ctx.project)
+    pie = (ctx.beacon or {}).get("pie")  # a command into a running PIE: refused if it is another session's
+    note = check_pie_shared(ctx.project, ctx.beacon, "exec") if pie else lease_note(ctx.project)
     if note:
         print(note, file=sys.stderr)
     start = log_end(ctx.project)
@@ -1069,8 +1070,13 @@ def cmd_exec(ctx, args, after=None):
         print(f"screenshot: {path}")
     view = re.match(r"\s*viewmode\s+(\w+)", command, re.I)
     if view:  # `ue shot` sets its own view for each capture, so this one would not show in it
-        print(f"note: `ue shot` uses its own view (lit unless told), whatever the viewport shows: "
-              f"`ue shot --view {view.group(1).lower()}` takes the shot in that view and puts the old one back")
+        word = view.group(1).lower()
+        mode = word if word in VIEW_MODES else next((k for k, (_, name) in VIEW_MODES.items() if name.lower() == word),
+                                                    None)
+        print("note: `ue shot` uses its own view (lit unless told), whatever the viewport shows: "
+              + (f"`ue shot --view {mode}` takes the shot in that view and puts the old one back" if mode else
+                 f"`--view` has no {word} ({', '.join(sorted(VIEW_MODES))}); for a buffer view in PIE set "
+                 "`r.BufferVisualizationTarget <Name>` and `ShowFlag.VisualizeBuffer 1`, then `ue shot`"))
     return 0
 
 

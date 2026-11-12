@@ -66,10 +66,13 @@ command's options and `ue help` lists them all. Most tasks have a command: look 
 - Other Claude sessions may share this editor (`ue who` lists who ran what in the last 15 min). Before anything
   that takes the editor away from them (a map rebuild, a long PIE run, `ue build --restart`, `ue close`), run
   `ue lease take --for "map rebuild + PIE"` and `ue lease release` when done.
-- While another session holds the lease, `build --restart`, `close`, `pie start`, a UBT build with no editor open
-  and anything that writes to disk (`save`, `import`, `mv`, `rm`, `--save`) refuse with exit 5 and say who holds it.
-  Wait, or `ue lease request --for "why"`, rather than passing `--ignore-lease`; `ue wait lease` then returns once
-  it is yours or free. `lease take` exits 5 too, so chain with `&&`, not `;`.
+- While another session holds the lease, `open`, `build --restart`, `close`, `pie start`, a UBT build with no
+  editor open and anything that writes to disk (`save`, `import`, `mv`, `rm`, `--save`) refuse with exit 5 and say
+  who holds it. So do `pie do`/`run`/`stop`/`watch`/`record`/`loop`, `exec` and `ui click|type|key` aimed at a PIE
+  that is running, and at a PIE another active session started. Wait, or `ue lease request --for "why"`, rather
+  than passing `--ignore-lease`; `ue wait lease` then returns once it is yours or free. `lease take` exits 5 too:
+  in a script put `ue lease take --for "..." || exit` on its own line. Never pipe it (`| tail` hides the exit
+  code, and an `&&` after the pipe still runs).
 - Asked for yours? `ue lease grant` when you reach a stopping point. While someone waits, a lease lapses after
   3 minutes with no `ue` command of yours and no PIE session of yours running: do the thinking and editing before
   you take it, and run the editor work as one script. Test scripts that hide `ue` output never see requests: call

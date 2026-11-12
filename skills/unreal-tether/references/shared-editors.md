@@ -14,10 +14,13 @@ go to the user's; `ue --pid <pid> ...` picks the other, and saving the same asse
 Other Claude sessions may share this editor (`ue who` lists who ran what in the last 15 min, and who started PIE).
 Before anything that takes the editor away from them (a map rebuild, a long PIE run, `ue build --restart`,
 `ue close`), run `ue lease take --for "map rebuild + PIE"` and `ue lease release` when done; `ue status` shows the
-lease to everyone. While another session holds it, `build --restart`, `close`, `pie start`, a UBT build with no
-editor open, and anything that writes to disk (`save`, `import`, `mv`, `rm`, `--save`) refuse with exit 5 and say
-who holds it and for what (edits in memory go ahead, with a note; `lease take` exits 5 too, so chain with `&&`, not
-`;`): wait, or `ue lease request --for "why"` (the holder sees it on its next
+lease to everyone. While another session holds it, `open`, `build --restart`, `close`, `pie start`, a UBT build
+with no editor open, and anything that writes to disk (`save`, `import`, `mv`, `rm`, `--save`) refuse with exit 5
+and say who holds it and for what. Commands that act on a running PIE (`pie do`/`run`/`stop`/`watch`/`record`/
+`loop`, `exec`, `ui click|type|key`) refuse too, and also when another session started that PIE and ran a `ue`
+command in the last 5 min; read-only ones (`pie status`, `log`, `shot`) go ahead. Edits in memory go ahead, with a
+note. `lease take` exits 5 too: put `ue lease take --for "..." || exit` on its own line, never in a pipe (the next
+refused command then says "your `ue lease take` was refused N s ago"). Wait, or `ue lease request --for "why"` (the holder sees it on its next
 command and runs `ue lease grant` when done), rather than passing `--ignore-lease`; `ue wait lease` then
 returns once it is yours or free and PIE has stopped. Asked for yours? Grant it when you reach a stopping point.
 A lease lasts at least 5 minutes past the end of its holder's last `ue` command, and is held while one of its
