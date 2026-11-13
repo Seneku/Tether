@@ -22,7 +22,11 @@ command in the last 5 min; read-only ones (`pie status`, `log`, `shot`) go ahead
 note. `lease take` exits 5 too: put `ue lease take --for "..." || exit` on its own line, never in a pipe (the next
 refused command then says "your `ue lease take` was refused N s ago"). Wait, or `ue lease request --for "why"` (the holder sees it on its next
 command and runs `ue lease grant` when done), rather than passing `--ignore-lease`; `ue wait lease` then
-returns once it is yours or free and PIE has stopped. Asked for yours? Grant it when you reach a stopping point.
+returns once it is yours or free and PIE has stopped, and no session ahead of yours in the queue is still around (a
+`ue` command running or one in the last 2 min): a free editor goes in queue order. Asking again keeps your place.
+The user sees every project's editors, lease, queue, running commands and jobs in `ue dash` (a page on
+127.0.0.1:8765; `ue dash --once` prints it) and can reorder the queue, drop a request, grant the editor to one, or
+end the lease there; a holder whose lease was taken is told on its next command. Asked for yours? Grant it when you reach a stopping point.
 A lease lasts at least 5 minutes past the end of its holder's last `ue` command, and is held while one of its
 commands runs (a long `ue py` stage), so it does not run out mid-task; `status`, `who` and `lease` show "busy:
 <command> for N min" for a command in flight (a busy editor, not a hung one). But while someone waits, a lease lapses

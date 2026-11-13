@@ -518,10 +518,100 @@ def request_lease(project, what, minutes, now=None):
     Returns the lease it is waiting on, or None when the editor is free (take it instead)."""
     now = time.time() if now is None else now
     me = session_id()
-    rows = [r for r in lease_requests(project, now) if r["session"] != me]
-    rows.append({"session": me, "what": what, "minutes": minutes, "time": now})
+    rows = lease_requests(project, now)
+    mine = next((r for r in rows if r["session"] == me), None)
+    if mine:  # asking again keeps its place in the queue (the user may have moved it up in `ue dash`)
+        mine.update(what=what, minutes=minutes, time=now)
+    else:
+        rows.append({"session": me, "what": what, "minutes": minutes, "time": now})
     write_json(requests_path(project), rows)
     return active_lease(project, now)
+
+
+PRESENT_MINUTES = 2  # a queued session with no command running and none this recent has gone: it loses its turn
+
+
+def ahead_in_queue(project, sid, now=None):
+    """The first request ahead of session `sid`'s (all of them if it has none) whose session is still around (a `ue`
+    command running, or one in the last PRESENT_MINUTES), else None: a free editor goes in queue order."""
+    now = time.time() if now is None else now
+    rows = lease_requests(project, now)
+    mine = next((n for n, r in enumerate(rows) if r["session"] == sid), len(rows))
+    if not rows[:mine]:
+        return None
+    running = {r.get("session") for r in running_commands(project)}
+    recent = recent_sessions(project, PRESENT_MINUTES, now=now)
+    return next((r for r in rows[:mine] if r["session"] in running or r["session"] in recent), None)
+
+
+def move_request(project, sid, where, now=None):
+    """Reorder the queue (`ue dash`): move session `sid`'s request "up", "down", to the "top" or the "bottom". The
+    first request is the one `ue lease grant` and a lapsed lease hand the editor to. Returns the new order."""
+    rows = lease_requests(project, now)
+    i = next((n for n, r in enumerate(rows) if r["session"] == sid), None)
+    if i is None:
+        raise CliError(f"no request from {sid} (it may have been granted or dropped)")
+    row = rows.pop(i)
+    j = {"up": max(0, i - 1), "down": min(len(rows), i + 1), "top": 0, "bottom": len(rows)}.get(where)
+    if j is None:
+        raise CliError(f"unknown move {where!r}: up, down, top or bottom")
+    rows.insert(j, row)
+    write_json(requests_path(project), rows)
+    return rows
+
+
+def revoked_path(project):
+    return os.path.join(state_dir(project), "lease-revoked.json")
+
+
+def note_revoked(project, lease, by, to=None, now=None):
+    """Tell a holder on its next command that its lease was taken away (`ue dash`: ended, or handed on)."""
+    if not lease or not lease.get("session"):
+        return
+    rows = read_json(revoked_path(project)) or {}
+    rows[lease["session"]] = {"what": lease.get("what"), "by": by, "to": to, "time": time.time() if now is None else now}
+    write_json(revoked_path(project), rows)
+
+
+def revoked_note(project):
+    """The line for this session if its lease was taken away since its last command (said once), else None."""
+    rows = read_json(revoked_path(project)) or {}
+    me = session_id()
+    row = rows.pop(me, None) if isinstance(rows, dict) else None
+    if not row:
+        return None
+    write_json(revoked_path(project), rows)
+    return (f"note: your editor lease ({row.get('what')}) was " + (f"handed to {session_label(project, row['to'])}"
+            if row.get("to") else "ended") + f" by {row.get('by')} {ago(time.time() - row.get('time', time.time()))}. "
+            "`ue lease request --for ...` queues you again")
+
+
+def hand_over(project, sid=None, by="user (ue dash)", now=None):
+    """Give the editor to session `sid`'s request (default: the first one) now, whoever holds it: the user's call
+    from `ue dash`. The holder is told on its next command; a command of its still running is not stopped."""
+    now = time.time() if now is None else now
+    rows = lease_requests(project, now)
+    pick = next((r for r in rows if r["session"] == sid), None) if sid else (rows[0] if rows else None)
+    if not pick:
+        raise CliError("no request for the editor" + (f" from {sid}" if sid else ""))
+    # (a lease that lapsed while its holder idled still names it: it is told too)
+    held = active_lease(project, now) or current_lease(read_json(lease_path(project)), now)
+    lease = {"session": pick["session"], "what": pick["what"], "since": now,
+             "until": now + (pick.get("minutes") or LEASE_MINUTES) * 60, "granted_by": by}
+    write_json(lease_path(project), lease)
+    drop_request(project, pick["session"])
+    if held and held["session"] != pick["session"]:
+        note_revoked(project, held, by, to=pick["session"], now=now)
+    return lease
+
+
+def end_lease(project, by="user (ue dash)", now=None):
+    """End the lease whoever holds it, nested leases included (`ue dash`). Returns the lease ended, or None."""
+    held = active_lease(project, now)
+    if held:
+        drop_lease_file(project)
+        note_revoked(project, held, by, now=now)
+    return held
 
 
 def drop_request(project, sid):
@@ -590,6 +680,9 @@ def lease_messages(project, now=None):
     lapsed = None if held else lapsed_lease_note(project, now)
     if lapsed:
         out.append(lapsed)
+    revoked = revoked_note(project) if os.path.isfile(revoked_path(project)) else None
+    if revoked:
+        out.append(revoked)
     if held and held["session"] == me:
         if held.get("granted_by") and not held.get("told"):
             out.append(f"note: the editor lease is yours now, granted by {session_label(project, held['granted_by'])} "

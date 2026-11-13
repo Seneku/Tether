@@ -77,6 +77,8 @@ command's options and `ue help` lists them all. Most tasks have a command: look 
   3 minutes with no `ue` command of yours and no PIE session of yours running: do the thinking and editing before
   you take it, and run the editor work as one script. Test scripts that hide `ue` output never see requests: call
   `ue lease yield --back` between suites.
+- The user watches and orders the queue in `ue dash` (a local page; `--once` prints it): it can move your request,
+  hand the editor on or end your lease. Told yours was taken? Stop editor work and `ue lease request` again.
 - Need another map or a throwaway import while others use the editor? `ue open --second` starts your own headless
   editor; `ue close` it as soon as you are done: while it runs, the shared editor cannot save the packages it loaded.
 - A build error in a file you did not touch says who last edited it: leave it to that session. Committing from a

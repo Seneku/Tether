@@ -34,6 +34,7 @@ from .playtest import bp_command, cmd_budget, cmd_input, package_command, perf_c
 from .hooks import cmd_hook
 from .setup import cmd_doctor, cmd_init, cmd_reload, cmd_template, new_project, tether_version
 from .selftest import cmd_ci, cmd_selftest
+from .dash import DASH_PORT, cmd_dash, register_project
 
 
 def build_command(ctx, args):
@@ -321,6 +322,15 @@ def build_parser():
     s = add("who", cmd_who, "sessions that used this editor recently, their last command, the lease, who started PIE")
     s.add_argument("--minutes", type=float, default=15, help="how far back (15)")
     s.add_argument("--as", dest="name", help="a name for this session that the others see (kept)")
+    s = add("dash", cmd_dash, "a local status page for every project's editors, lease, queue, running commands and "
+                              "jobs; the queue can be reordered from it (--once: the same as text)")
+    s.add_argument("projects", nargs="*", help="projects to add: a .uproject, its folder, or a folder of projects "
+                                               "(the ones `ue` ran on are listed anyway)")
+    s.add_argument("--once", action="store_true", help="print the status of every project and exit (no server)")
+    s.add_argument("--listen", type=int, default=DASH_PORT, help=f"the page's local port ({DASH_PORT})")
+    s.add_argument("--no-open", action="store_true", help="don't open the browser")
+    s.add_argument("--stop", action="store_true", help="stop the dashboard server")
+    s.add_argument("--serve", action="store_true", help=argparse.SUPPRESS)
     s = add("git", cmd_git, "stage --mine: stage the changed files this session wrote last (the edit hook's record), "
                             "naming those another session also wrote")
     s.add_argument("action", choices=["stage"])
@@ -1123,7 +1133,7 @@ def cmd_batch(ctx, args):
 
 
 # Commands that only look at the sharing state: running them does not count as using the editor.
-UNRECORDED = {"help", "hook", "status", "who", "lease", "doctor"}
+UNRECORDED = {"help", "hook", "status", "who", "lease", "doctor", "dash"}
 
 
 def main(argv=None):
@@ -1143,6 +1153,7 @@ def main(argv=None):
     else:
         try:  # who ran what, for `ue who` and the shared-editor checks
             record_activity(find_project(args.project), ["ue"] + (sys.argv[1:] if argv is None else list(argv)))
+            register_project(find_project(args.project))  # for `ue dash`
             running = start_running(find_project(args.project), ["ue"] + (sys.argv[1:] if argv is None else list(argv)))
             for line in lease_messages(find_project(args.project)):  # requests for this session's lease, a grant
                 print(line, file=sys.stderr)

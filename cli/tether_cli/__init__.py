@@ -26,6 +26,7 @@ Modules, lowest layer first (each imports only from those above it):
   hooks      Claude Code hooks
   setup      ue init, reload, doctor
   selftest   ue selftest, ue ci
+  dash       ue dash: the status page for every project's editors, lease and queue
   cli        argument parsing, ue batch, main()
 
 Everything is re-exported here, so `import tether_cli` reaches any name; patch a name in the module that
@@ -49,4 +50,5 @@ from .playtest import *  # noqa: F401,F403
 from .hooks import *  # noqa: F401,F403
 from .setup import *  # noqa: F401,F403
 from .selftest import *  # noqa: F401,F403
+from .dash import *  # noqa: F401,F403
 from .cli import *  # noqa: F401,F403

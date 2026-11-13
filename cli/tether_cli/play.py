@@ -20,7 +20,7 @@ from .build import csharp_changes, csharp_layout, csharp_reload_build, layout_pa
 from .calls import flush_editor_log, metres_to_cm, save_edited, save_failures, save_hint, scoped_cvars
 from .share import (
     active_lease, check_pie_shared, check_shared, clear_pie_start, confirm_pie_start, describe_lease, pie_owner,
-    record_pie_start, session_id,
+    record_pie_start, session_id, ahead_in_queue, session_label,
 )
 from .images import (
     cmd_shot, contact_sheet, draw_text, crop_pixels, front_level_viewport, hud_screenshot, image_diff, level_tab_hidden,
@@ -2485,6 +2485,9 @@ def wait_lease(ctx, args):
         elif pie:
             owner = pie_owner(ctx.project, beacon)
             why = "PIE is running" + (f" ({owner})" if owner else "")
+        elif not held and ahead_in_queue(ctx.project, session_id()):  # a free editor goes in queue order
+            ahead = ahead_in_queue(ctx.project, session_id())
+            why = f"the editor is free but {session_label(ctx.project, ahead['session'])} is ahead in the queue ({ahead['what']})"
         else:
             waited = f" after {(time.time() - started) / 60:.0f} min" if time.time() - started > 60 else ""
             print(f"the editor lease is yours{waited}: {held['what']} (until {time.strftime('%H:%M', time.localtime(held['until']))})"

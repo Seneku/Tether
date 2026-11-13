@@ -21,7 +21,12 @@ import tether_cli as ue  # noqa: E402
 _NAME_PATCH = unittest.mock.patch("tether_cli.core.process_name", return_value=None)
 
 
+_REGISTRY = tempfile.TemporaryDirectory()
+
+
 def setUpModule():
+    # `ue dash`'s list of projects: the throwaway ones the tests make stay out of the machine's
+    os.environ["TETHER_REGISTRY"] = os.path.join(_REGISTRY.name, "projects.json")
     # Tests stand in for editors with real pids (this process, its parent); don't let the image-name check
     # (python.exe is not an editor) call them dead. Beacons.test_* exercises that check itself.
     _NAME_PATCH.start()
@@ -5476,3 +5481,176 @@ class Round038(unittest.TestCase):
         self.assertEqual(args.code, ["a", "b"])
         args = ue.parse_command(parser, ["py", "-f", "build.py", "--", "--no-level"])
         self.assertEqual(args.code, ["--no-level"])
+
+
+class Dash(unittest.TestCase):
+    """0.39: `ue dash`, the status page, and the queue the user can reorder from it."""
+
+    def setUp(self):
+        self.project = Project()
+        self.env = unittest.mock.patch.dict(os.environ, {"UE_SESSION": "menu"})
+        self.env.start()
+
+    def tearDown(self):
+        self.env.stop()
+        self.project.close()
+
+    def as_session(self, sid):
+        return unittest.mock.patch.dict(os.environ, {"UE_SESSION": sid})
+
+    def queue(self, *sids, now=None):
+        for sid in sids:
+            with self.as_session(sid):
+                ue.request_lease(self.project.uproject, f"{sid}'s work", 10, now=now)
+        return [r["session"] for r in ue.lease_requests(self.project.uproject)]
+
+    def test_move_request_and_asking_again_keeps_the_place(self):
+        p = self.project.uproject
+        with self.as_session("holder"):
+            ue.take_lease(p, "rebuild", 15)
+        self.assertEqual(self.queue("a", "b", "c"), ["a", "b", "c"])
+        order = lambda rows: [r["session"] for r in rows]
+        self.assertEqual(order(ue.move_request(p, "c", "top")), ["c", "a", "b"])
+        self.assertEqual(order(ue.move_request(p, "c", "down")), ["a", "c", "b"])
+        self.assertEqual(order(ue.move_request(p, "a", "bottom")), ["c", "b", "a"])
+        self.assertEqual(order(ue.move_request(p, "c", "up")), ["c", "b", "a"])  # already first
+        with self.assertRaises(ue.CliError):
+            ue.move_request(p, "nobody", "up")
+        with self.as_session("a"):
+            ue.request_lease(p, "a, updated", 20)  # asking again: same place, new reason
+        rows = ue.lease_requests(p)
+        self.assertEqual(order(rows), ["c", "b", "a"])
+        self.assertEqual((rows[2]["what"], rows[2]["minutes"]), ("a, updated", 20))
+        with self.as_session("holder"):
+            self.assertEqual(ue.grant_lease(p)["session"], "c")  # grant takes the first
+
+    def test_hand_over_and_end_tell_the_holder(self):
+        p = self.project.uproject
+        with self.as_session("holder"):
+            ue.take_lease(p, "rebuild", 15)
+        self.queue("a", "b")
+        lease = ue.hand_over(p, "b")
+        self.assertEqual((lease["session"], lease["what"], lease["granted_by"]), ("b", "b's work", "user (ue dash)"))
+        self.assertEqual([r["session"] for r in ue.lease_requests(p)], ["a"])
+        with self.as_session("holder"):
+            lines = ue.lease_messages(p)
+            self.assertTrue(any("was handed to b by user (ue dash)" in l for l in lines), lines)
+            self.assertEqual(ue.lease_messages(p), [])  # said once
+            with self.assertRaises(ue.CliError):
+                ue.take_lease(p, "rebuild", 15)  # it's b's now
+        with self.as_session("b"):
+            self.assertTrue(any("granted by user (ue dash)" in l for l in ue.lease_messages(p)))
+        self.assertEqual(ue.end_lease(p)["session"], "b")
+        self.assertIsNone(ue.active_lease(p))
+        with self.as_session("b"):
+            self.assertTrue(any("was ended by user (ue dash)" in l for l in ue.lease_messages(p)))
+        self.assertIsNone(ue.end_lease(p))
+        with self.assertRaises(ue.CliError):
+            ue.hand_over(p, "nobody")
+
+    def test_hand_over_tells_a_holder_whose_lease_lapsed(self):
+        p, t = self.project.uproject, time.time()
+        with self.as_session("holder"):
+            ue.take_lease(p, "rebuild", 30, now=t - 600)  # idle 10 min while "a" waits: lapsed
+        self.queue("a", now=t - 300)
+        self.assertIsNone(ue.active_lease(p, now=t))
+        ue.hand_over(p, "a", now=t)
+        with self.as_session("holder"):
+            self.assertTrue(any("was handed to a" in l for l in ue.lease_messages(p)))
+
+    def test_queued_waits_show_on_their_queue_row(self):
+        p = self.project.uproject
+        self.queue("a")
+        rows = [{"session": "a", "cmd": "ue --timeout 3000 wait lease", "since": time.time(), "pid": 1},
+                {"session": "b", "cmd": "ue py -f build.py", "since": time.time(), "pid": 2}]
+        with unittest.mock.patch.object(ue.dash, "running_commands", return_value=rows):
+            row = ue.project_snapshot(p)
+        self.assertTrue(row["queue"][0]["waiting"])
+        self.assertEqual([r["cmd"] for r in row["running"]], ["ue py -f build.py"])
+
+    def test_a_free_editor_goes_in_queue_order(self):
+        p, t = self.project.uproject, time.time()
+        self.queue("a", "b", now=t)
+        self.assertIsNone(ue.ahead_in_queue(p, "a", now=t))  # first in line
+        ue.record_activity(p, ["ue", "wait", "lease"], now=t)  # (as "menu")
+        with self.as_session("a"):
+            ue.record_activity(p, ["ue", "wait", "lease"], now=t)
+        self.assertEqual(ue.ahead_in_queue(p, "b", now=t)["session"], "a")
+        self.assertEqual(ue.ahead_in_queue(p, "menu", now=t)["session"], "a")  # no request: behind them all
+        self.assertIsNone(ue.ahead_in_queue(p, "b", now=t + ue.PRESENT_MINUTES * 60 + 5))  # a has gone quiet
+        ue.move_request(p, "b", "top")
+        self.assertIsNone(ue.ahead_in_queue(p, "b", now=t))
+
+    def test_snapshot_and_text(self):
+        p, t = self.project.uproject, time.time()
+        ue.set_session_name(p, "spire", sid="holder")
+        with self.as_session("holder"):
+            ue.take_lease(p, "map rebuild + PIE", 15, now=t - 60)
+            ue.record_activity(p, ["ue", "world", "build", "nav"], now=t - 30)
+        self.queue("a", now=t - 120)
+        snap = ue.snapshot([p], now=t)
+        row = snap["projects"][0]
+        self.assertEqual((row["name"], row["lease"]["label"], row["lease"]["what"]),
+                         ("Game", "spire (holder)", "map rebuild + PIE"))
+        self.assertEqual([q["session"] for q in row["queue"]], ["a"])
+        self.assertEqual(row["activity"][0]["cmd"], "ue world build nav")
+        text = "\n".join(ue.describe_snapshot(snap))
+        self.assertIn("lease: spire (holder): map rebuild + PIE (14 min left", text)
+        self.assertIn("queue 1. a: a's work (waiting 2 min)", text)
+        json.dumps(snap)  # the page's /api/state
+
+    def test_queue_action_only_for_listed_projects(self):
+        p = self.project.uproject
+        self.queue("a", "b")
+        listed = lambda: [p]
+        self.assertIn("moved b's request top", ue.queue_action(listed, {"project": p, "action": "top", "session": "b"}))
+        self.assertEqual([r["session"] for r in ue.lease_requests(p)], ["b", "a"])
+        ue.queue_action(listed, {"project": p, "action": "drop", "session": "a"})
+        self.assertEqual([r["session"] for r in ue.lease_requests(p)], ["b"])
+        with self.assertRaises(ue.CliError):
+            ue.queue_action(lambda: [], {"project": p, "action": "drop", "session": "b"})
+        with self.assertRaises(ue.CliError):
+            ue.queue_action(listed, {"project": p, "action": "explode"})
+
+    def test_registry(self):
+        p = self.project.uproject
+        ue.register_project(p, now=1000)
+        ue.register_project(p.upper() if os.name == "nt" else p, now=1001)  # within a minute: no write
+        self.assertEqual(ue.known_projects(), [os.path.abspath(p)])
+        self.assertEqual(ue.merge_projects([p]), [os.path.abspath(p)])
+        self.assertEqual(ue.projects_in([self.project.root]), [p])
+
+    def test_server_needs_the_page_token_to_change_the_queue(self):
+        import socket
+        import threading
+        import urllib.error
+        import urllib.request
+        p = self.project.uproject
+        self.queue("a", "b")
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            port = sock.getsockname()[1]
+        threading.Thread(target=ue.serve, args=(port, [p], 30), daemon=True).start()
+        for _ in range(50):
+            if ue.dash_running(port):
+                break
+            time.sleep(0.1)
+        base = f"http://127.0.0.1:{port}"
+        page = urllib.request.urlopen(base + "/").read().decode("utf-8")
+        token = re.search(r'const TOKEN = "([^"]+)"', page).group(1)
+        state = json.loads(urllib.request.urlopen(base + "/api/state").read())
+        self.assertIn(os.path.abspath(p), [r["project"] for r in state["projects"]])
+
+        def post(headers):
+            req = urllib.request.Request(base + "/api/queue", method="POST", headers=headers,
+                                         data=json.dumps({"project": p, "action": "top", "session": "b"}).encode())
+            try:
+                return urllib.request.urlopen(req).status
+            except urllib.error.HTTPError as exc:
+                exc.close()
+                return exc.code
+        self.assertEqual(post({"Content-Type": "application/json"}), 403)  # another web page can't
+        self.assertEqual(post({"X-Tether-Dash": "guess"}), 403)
+        self.assertEqual([r["session"] for r in ue.lease_requests(p)], ["a", "b"])
+        self.assertEqual(post({"X-Tether-Dash": token}), 200)
+        self.assertEqual([r["session"] for r in ue.lease_requests(p)], ["b", "a"])
