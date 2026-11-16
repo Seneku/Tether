@@ -11,7 +11,7 @@ import sys
 import threading
 import time
 
-from .core import CliError, UE_SCRIPT, editor_beacons, editor_process, find_project, read_json, state_dir, write_json
+from .core import CliError, UE_SCRIPT, editor_beacons, editor_process, find_project, read_json, read_json_retry, state_dir, write_json
 from .share import (
     active_lease, current_lease, drop_request, end_lease, hand_over, lease_requests, move_request, pie_owner,
     read_activity, running_commands, session_label, session_names,
@@ -35,28 +35,64 @@ def registry_path():
     return os.path.join(base, "Tether", "projects.json")
 
 
+def read_registry():
+    """The registry's rows, {} when there is none yet, None when it is there but can't be read right now (every
+    session's `ue` writes it, and on Windows a read that lands on another process's replace fails)."""
+    path = registry_path()
+    rows = read_json_retry(path)
+    if rows is None:
+        return None if os.path.exists(path) else {}
+    return rows if isinstance(rows, dict) else None
+
+
+_last_known = []
+
+
 def known_projects():
-    """The .uproject paths `ue` has run on (the ones still there), most recently used first."""
-    rows = read_json(registry_path()) or {}
-    rows = rows if isinstance(rows, dict) else {}
-    return [p for p, _ in sorted(rows.items(), key=lambda kv: -kv[1]) if os.path.isfile(p)]
+    """The .uproject paths `ue` has run on (the ones still there), most recently used first. A registry that can't
+    be read for the moment gives the last list read, not an empty one."""
+    global _last_known
+    rows = read_registry()
+    if rows is None:
+        return list(_last_known)
+    _last_known = [p for p, _ in sorted(rows.items(), key=lambda kv: -kv[1]) if os.path.isfile(p)]
+    return list(_last_known)
+
+
+def write_registry(rows):
+    """Write the whole file aside and swap it in, so a reader never sees it half written."""
+    path = registry_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(rows, f)
+    try:
+        for attempt in range(5):
+            try:
+                os.replace(tmp, path)
+                return
+            except PermissionError:  # Windows: another process has it open this instant
+                time.sleep(0.02 * (attempt + 1))
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
 
 
 def register_project(project, now=None):
     """Note that `ue` ran on this project (for `ue dash`). At most one write a minute per project."""
     now = time.time() if now is None else now
-    path, project = registry_path(), os.path.abspath(project)
+    project = os.path.abspath(project)
     try:
-        rows = read_json(path) or {}
-        rows = rows if isinstance(rows, dict) else {}
+        rows = read_registry()
+        if rows is None:
+            return  # unreadable this instant: writing now would drop every other project from it
         same = [k for k in rows if os.path.normcase(k) == os.path.normcase(project)]
         if same and now - rows[same[0]] < 60:
             return
         for k in same + [k for k in rows if not os.path.isfile(k)]:  # (and the projects since deleted)
             rows.pop(k, None)
         rows[project] = round(now)
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        write_json(path, rows)
+        write_registry(rows)
     except (OSError, ValueError):
         pass  # never fail a command over the dashboard's list
 

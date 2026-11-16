@@ -5620,6 +5620,27 @@ class Dash(unittest.TestCase):
         self.assertEqual(ue.merge_projects([p]), [os.path.abspath(p)])
         self.assertEqual(ue.projects_in([self.project.root]), [p])
 
+    def test_a_registry_caught_mid_write_loses_no_projects(self):
+        p = self.project.uproject
+        ue.register_project(p, now=1000)
+        path = ue.registry_path()
+        good = open(path, encoding="utf-8").read()
+        self.assertIn(os.path.abspath(p), ue.known_projects())
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(good[:5])  # what a reader saw while another `ue` rewrote it in place
+        try:
+            self.assertIn(os.path.abspath(p), ue.known_projects())  # the last list read, not none
+            with tempfile.TemporaryDirectory() as other:
+                q = os.path.join(other, "Other.uproject")
+                open(q, "w").write("{}")
+                ue.register_project(q, now=2000)  # mustn't replace the list with just itself
+                self.assertEqual(open(path, encoding="utf-8").read(), good[:5])
+        finally:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(good)
+        self.assertIn(os.path.abspath(p), ue.known_projects())
+        self.assertFalse([n for n in os.listdir(os.path.dirname(path)) if n.endswith(".tmp")])
+
     def test_server_needs_the_page_token_to_change_the_queue(self):
         import socket
         import threading
