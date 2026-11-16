@@ -9,7 +9,7 @@ import os
 import re
 import time
 
-from .core import (CliError, actor_id, chosen_editor, same_session, command_lines, pid_alive, process_ancestry, process_name, read_json, run_git,
+from .core import (CliError, actor_id, chosen_editor, same_session, command_lines, pid_alive, process_ancestry, process_name, read_json, read_json_retry, run_git,
                    session_id, state_dir, write_json)
 
 LEASE_MINUTES = 15      # default length of `ue lease take`
@@ -223,14 +223,16 @@ def holder_pie_running(project, sid):
     return False
 
 
-def lease_idle(project, lease, now):
+def lease_idle(project, lease, now, wanting=None):
     """Seconds the holder of `lease` (the file's top level) has left the editor idle while another session waits
     for it, or 0: no `ue` command of the holder's running and no PIE session it started, since its last command
-    ended (or it took the lease). A lease taken with --hold never idles, nor one taken before 0.35 (no "lapse")."""
+    ended (or it took the lease). A lease taken with --hold never idles, nor one taken before 0.35 (no "lapse").
+    `wanting`: a session asking for the editor right now (`lease take`) counts as waiting too, so `take` and
+    `request` agree (a request made the lease lapse and said "take it", and the take was then refused)."""
     if lease.get("hold") or not lease.get("lapse"):
         return 0
     sid = lease.get("session")
-    if not any(r["session"] != sid for r in lease_requests(project, now)):
+    if not (wanting and wanting != sid) and not any(r["session"] != sid for r in lease_requests(project, now)):
         return 0
     idle = now - max(lease.get("active", 0), lease.get("since", 0))
     if idle < LEASE_IDLE * 60:
@@ -240,18 +242,18 @@ def lease_idle(project, lease, now):
     return idle
 
 
-def active_lease(project, now=None):
+def active_lease(project, now=None, wanting=None):
     """The editor lease if one is held and not expired, else None. A lease whose time ran out while its holder's
     `ue` command is still running (a long `ue py` stage) is still held: it lasts LEASE_KEEP min past that command.
-    A lease whose holder has left the editor idle for LEASE_IDLE min while another session waits has lapsed
-    (lease_idle): the editor goes to whoever waits, and the holder is told on its next command."""
-    lease = read_json(lease_path(project))
+    A lease whose holder has left the editor idle for LEASE_IDLE min while another session waits (or is `wanting`
+    it now) has lapsed (lease_idle): the editor goes to whoever waits, and the holder is told on its next command."""
+    lease = read_json_retry(lease_path(project))  # rewritten at the end of every holder command
     now = time.time() if now is None else now
     if not isinstance(lease, dict) or "until" not in lease:
         return None
     held = current_lease(lease, now)
     if held:
-        return None if lease_idle(project, lease, now) else held
+        return None if lease_idle(project, lease, now, wanting) else held
     busy = [r for r in running_commands(project) if r.get("session") == lease.get("session")]
     return dict(lease, until=now + LEASE_KEEP * 60, busy=busy[0]) if busy else None
 
@@ -382,8 +384,13 @@ def take_lease(project, what, minutes, now=None, hold=False):
     hold: the lease never lapses while its holder is idle (lease_idle); a nested lease keeps its outer one's.
     Returns (lease, "taken" | "renewed" | "nested")."""
     now = time.time() if now is None else now
-    held = active_lease(project, now)
     me = session_id()
+    held = active_lease(project, now, wanting=me)
+    if not held:  # another session's lease that lapsed while it idled: it is told on its next command
+        lapsed = current_lease(read_json_retry(lease_path(project)), now)
+        if lapsed and lapsed.get("session") != me:
+            note_revoked(project, lapsed, f"{session_label(project, me)}'s `ue lease take` (it was idle "
+                                          f"{LEASE_IDLE}+ min)", to=me, now=now)
     if held and held["session"] != me:
         note_refused(project, now)
         raise CliError(f"the editor is {describe_lease(project, held, now)}; wait, or ask that session to run "

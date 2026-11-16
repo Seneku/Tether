@@ -329,7 +329,9 @@ def build_parser():
     s.add_argument("--once", action="store_true", help="print the status of every project and exit (no server)")
     s.add_argument("--listen", type=int, default=DASH_PORT, help=f"the page's local port ({DASH_PORT})")
     s.add_argument("--no-open", action="store_true", help="don't open the browser")
-    s.add_argument("--stop", action="store_true", help="stop the dashboard server")
+    s.add_argument("--stop", action="store_true", help="stop the dashboard server (and the tray icon)")
+    s.add_argument("--tray", action="store_true", help="Windows: an icon in the notification area: its colour says busy, queued, idle or quiet, hovering shows what runs, a click opens the page")
+    s.add_argument("--at-login", choices=["on", "off"], help="Windows: start the tray icon when you log in (on), or not any more (off)")
     s.add_argument("--serve", action="store_true", help=argparse.SUPPRESS)
     s = add("git", cmd_git, "stage --mine: stage the changed files this session wrote last (the edit hook's record), "
                             "naming those another session also wrote")
@@ -1140,7 +1142,8 @@ def main(argv=None):
     for stream in (sys.stdout, sys.stderr):  # Windows pipes default to cp1252; editor text is often not
         if (getattr(stream, "encoding", "") or "").lower() not in ("utf-8", "utf8") and hasattr(stream, "reconfigure"):
             stream.reconfigure(encoding="utf-8", errors="replace")
-    args = parse_command(build_parser(), undo_msys_paths(sys.argv[1:] if argv is None else argv))
+    given = undo_msys_paths(sys.argv[1:] if argv is None else list(argv))  # (recorded as given, for `ue who`)
+    args = parse_command(build_parser(), given)
     started, started_wall = time.perf_counter(), time.time()
     # --json: one JSON document for any command (its own JSON for those that have one, below).
     envelope = args.json and args.fn not in (cmd_call, cmd_test, cmd_selftest)
@@ -1152,9 +1155,9 @@ def main(argv=None):
         core.KEEP_TARGET = False
     else:
         try:  # who ran what, for `ue who` and the shared-editor checks
-            record_activity(find_project(args.project), ["ue"] + (sys.argv[1:] if argv is None else list(argv)))
+            record_activity(find_project(args.project), ["ue"] + given)
             register_project(find_project(args.project))  # for `ue dash`
-            running = start_running(find_project(args.project), ["ue"] + (sys.argv[1:] if argv is None else list(argv)))
+            running = start_running(find_project(args.project), ["ue"] + given)
             for line in lease_messages(find_project(args.project)):  # requests for this session's lease, a grant
                 print(line, file=sys.stderr)
         except CliError:

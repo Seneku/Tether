@@ -5,6 +5,7 @@ import json
 import os
 import re
 import sys
+import threading
 import time
 
 
@@ -210,9 +211,30 @@ def same_session(owner):
 
 
 def write_json(path, data):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    """Write the whole file aside and swap it in, so a reader never finds it half written: lease.json and the queue
+    are read by every waiting session every 2 s, and a read that caught an in-place rewrite took the lease for free
+    (or the dashboard's project list for empty). On Windows the swap fails while another process has the file open
+    (Python opens files without delete sharing): retry, then write in place as before."""
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    text = json.dumps(data)
+    tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(text)
+        for attempt in range(6):
+            try:
+                os.replace(tmp, path)
+                return
+            except PermissionError:
+                time.sleep(0.01 * (attempt + 1))
+    except OSError:
+        pass
+    finally:
+        if os.path.exists(tmp):
+            with contextlib.suppress(OSError):
+                os.remove(tmp)
     with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f)
+        f.write(text)
 
 
 def pid_alive(pid):
@@ -1325,16 +1347,21 @@ def chosen_editor(project):
     if live:
         targets = read_json(targets_path(project)) or {}
         sticky = target_pid(targets.get(actor_id()))
-        # a `ue open --second` editor is the default only for the session (or sub-agent) that opened it
-        shared = [b for b in live if b.get("owner") in (None, actor_id())] or live
-        choice = next((b for b in live if b.get("pid") == sticky), None)
-        if choice is None:
+        # A `ue open --second` editor is the default only for the session (or sub-agent) that opened it; another
+        # session's is never picked (`--pid` still can): with only that one open, the project has no shared editor,
+        # and `ue open` starts one next to it instead of adopting it (UnrealRacing 2026-11-13)
+        mine = [b for b in live if not b.get("owner") or same_session(b["owner"])]
+        shared = [b for b in mine if b.get("owner") in (None, actor_id())] or mine
+        choice = next((b for b in mine if b.get("pid") == sticky), None)
+        if choice is None and shared:
             used = others_targets(project, targets)
             choice = sorted(shared, key=lambda b: (-used.get(b.get("pid"), 0), bool(b.get("launched_by_tether")),
                                                    -b.get("started", 0)))[0]
-        if KEEP_TARGET:
-            remember_target(project, choice)
-        return choice
+        if choice is not None:
+            if KEEP_TARGET:
+                remember_target(project, choice)
+            return choice
+        return next((b for b in beacons if b not in live), None)  # the last shared one seen, for status
     return beacons[0] if beacons else None
 
 

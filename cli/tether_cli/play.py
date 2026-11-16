@@ -2480,13 +2480,15 @@ def wait_lease(ctx, args):
         held = active_lease(ctx.project)
         beacon = chosen_editor(ctx.project) or {}
         pie = bool(beacon.get("pie")) and editor_process(beacon.get("pid"))
+        # (the queue read once: it changes under us, and a second read that found nobody ahead any more crashed
+        # with a TypeError the moment another queued session took the lease)
+        ahead = None if held else ahead_in_queue(ctx.project, session_id())
         if held and held["session"] != session_id():
             why = f"the editor is {describe_lease(ctx.project, held)}"
         elif pie:
             owner = pie_owner(ctx.project, beacon)
             why = "PIE is running" + (f" ({owner})" if owner else "")
-        elif not held and ahead_in_queue(ctx.project, session_id()):  # a free editor goes in queue order
-            ahead = ahead_in_queue(ctx.project, session_id())
+        elif ahead:  # a free editor goes in queue order
             why = f"the editor is free but {session_label(ctx.project, ahead['session'])} is ahead in the queue ({ahead['what']})"
         else:
             waited = f" after {(time.time() - started) / 60:.0f} min" if time.time() - started > 60 else ""

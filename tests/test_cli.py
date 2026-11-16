@@ -3772,6 +3772,49 @@ class UnrealRacingRound3(unittest.TestCase):
         args = ue.build_parser().parse_args(["open", "--second"])
         self.assertTrue(args.second)
 
+    def test_another_sessions_second_editor_is_never_adopted(self):  # UnrealRacing 2026-11-13
+        p = self.project.uproject
+        self.beacon(os.getppid(), launched_by_tether=True, headless=True, started=200, owner="captures")
+        with unittest.mock.patch.dict(os.environ, {"UE_SESSION": "other"}):
+            self.assertIsNone(ue.chosen_editor(p))  # no shared editor: `ue open` starts one next to it
+            ue.remember_target(p, {"pid": os.getppid()})  # (a target picked before this fix)
+            self.assertIsNone(ue.chosen_editor(p))
+            with unittest.mock.patch.dict(os.environ, {"UE_EDITOR_PID": str(os.getppid())}):
+                self.assertEqual(ue.chosen_editor(p)["pid"], os.getppid())  # --pid still can
+        with unittest.mock.patch.dict(os.environ, {"UE_SESSION": "captures"}):
+            self.assertEqual(ue.chosen_editor(p)["pid"], os.getppid())
+
+    def test_take_and_request_agree_on_an_idle_lease(self):  # UnrealRacing 2026-11-16
+        p, t = self.project.uproject, time.time()
+        later = t + 60 + ue.LEASE_IDLE * 60 + 5
+        with unittest.mock.patch.dict(os.environ, {"UE_SESSION": "holder"}):
+            ue.take_lease(p, "structures", 30, now=t)
+            ue.note_lease_active(p, now=t + 60)
+        self.assertEqual(ue.active_lease(p, now=later)["session"], "holder")  # nobody waits: still held
+        with unittest.mock.patch.dict(os.environ, {"UE_SESSION": "asker"}):
+            self.assertIsNone(ue.request_lease(p, "road pass", 10, now=later))  # lapsed for a waiting session
+            ue.drop_request(p, "asker")  # (what `ue lease request` does before saying "take it")
+            lease, how = ue.take_lease(p, "road pass", 10, now=later + 1)  # was refused before the fix
+        self.assertEqual((lease["session"], how), ("asker", "taken"))
+        with unittest.mock.patch.dict(os.environ, {"UE_SESSION": "holder"}):
+            self.assertTrue(any("handed to asker" in m for m in ue.lease_messages(p)))
+
+    def test_looks_on_one_editor_take_turns(self):  # UnrealRacing 2026-11-14: two agents' looks swapped subjects
+        p = self.project.uproject
+        ctx = argparse.Namespace(project=p, beacon={"pid": 4242})
+        path = os.path.join(ue.state_dir(p), "look-4242.lock")
+        with ue.images.look_lock(ctx):
+            self.assertTrue(os.path.isfile(path))
+            with contextlib.redirect_stderr(io.StringIO()) as err, self.assertRaises(ue.CliError):
+                with ue.images.look_lock(ctx, wait=0.3, poll=0.05):
+                    pass
+            self.assertIn("waiting for another `ue look`", err.getvalue())
+        self.assertFalse(os.path.exists(path))
+        ue.write_json(path, {"pid": 2 ** 31 - 7, "time": time.time()})  # its look died
+        with ue.images.look_lock(ctx, wait=0.3, poll=0.05):
+            pass
+        self.assertFalse(os.path.exists(path))
+
     def test_lease_requests_are_said_once_then_reminded(self):
         p = self.project.uproject
         with unittest.mock.patch.dict(os.environ, {"UE_SESSION": "holder"}):
@@ -5598,6 +5641,23 @@ class Dash(unittest.TestCase):
         self.assertIn("lease: spire (holder): map rebuild + PIE (14 min left", text)
         self.assertIn("queue 1. a: a's work (waiting 2 min)", text)
         json.dumps(snap)  # the page's /api/state
+        tray = ue.tray_summary(snap)  # the tray icon's /api/tray
+        self.assertEqual((tray["state"], tray["queued"]), ("queued", 1))
+        self.assertLessEqual(len(tray["tip"]), 63)  # a NotifyIcon's text limit
+        self.assertIn("  lease: spire (holder): map rebuild + PIE (60s)", tray["lines"])
+        self.assertIn("  queue 1. a: a's work (2 min)", tray["lines"])
+
+    def test_tray_states(self):
+        p, t = self.project.uproject, time.time()
+        quiet = ue.tray_summary(ue.snapshot([p], now=t))
+        self.assertEqual((quiet["state"], quiet["tip"]), ("quiet", "Tether: quiet"))
+        with self.as_session("holder"):
+            ue.take_lease(p, "lights", 15, now=t)
+        busy = ue.tray_summary(ue.snapshot([p], now=t))
+        self.assertEqual((busy["state"], busy["tip"]), ("busy", "Tether: busy"))
+        cmd = ue.tray_command(8765)
+        self.assertTrue(os.path.isfile(cmd[cmd.index("-File") + 1]))  # the script ships next to ue.py
+        self.assertTrue(ue.dash.startup_shortcut().endswith(os.path.join("Startup", "Tether tray.lnk")))
 
     def test_queue_action_only_for_listed_projects(self):
         p = self.project.uproject
@@ -5661,6 +5721,7 @@ class Dash(unittest.TestCase):
         token = re.search(r'const TOKEN = "([^"]+)"', page).group(1)
         state = json.loads(urllib.request.urlopen(base + "/api/state").read())
         self.assertIn(os.path.abspath(p), [r["project"] for r in state["projects"]])
+        self.assertEqual(json.loads(urllib.request.urlopen(base + "/api/tray").read())["state"], "queued")
 
         def post(headers):
             req = urllib.request.Request(base + "/api/queue", method="POST", headers=headers,

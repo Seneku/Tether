@@ -8,7 +8,7 @@ import time
 
 from .core import VIEW_MODES  # (defined in core so calls can name them)
 from .core import (
-    CliError, compact_error, compile_cpu, editor_mode, log_end, log_path, parse_res, read_json, stamped_name, state_dir,
+    CliError, compact_error, compile_cpu, editor_mode, log_end, log_path, parse_res, pid_alive, read_json, stamped_name, state_dir,
     unwrap, write_json, zlib,
 )
 from .transport import at_least, py_json
@@ -616,6 +616,45 @@ STUDIO_REMOVE = ("sub = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
                  "        sub.destroy_actor(a)\n")
 
 
+LOOK_WAIT = 300  # how long a `ue look` waits for another one on the same editor
+LOOK_STALE = 600  # a look lock this old is a hung look's: taken over
+
+
+@contextlib.contextmanager
+def look_lock(ctx, wait=LOOK_WAIT, poll=0.5):
+    """Hold the editor's look lock (Saved/Tether/look-<pid>.lock): two looks at once (two agents of one session)
+    staged their subjects in the same spot and each removed the other's, so their shots showed the wrong props or
+    nothing (UnrealRacing 2026-11-14). A lock whose process has gone, or older than LOOK_STALE, is taken over."""
+    path = os.path.join(state_dir(ctx.project), f"look-{(ctx.beacon or {}).get('pid', 0)}.lock")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    deadline, told = time.time() + wait, False
+    while True:
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            with os.fdopen(fd, "w") as f:
+                json.dump({"pid": os.getpid(), "time": time.time()}, f)
+            break
+        except FileExistsError:
+            held = read_json(path) or {}
+            if not pid_alive(held.get("pid")) and held or time.time() - held.get("time", time.time()) > LOOK_STALE:
+                with contextlib.suppress(OSError):
+                    os.remove(path)  # (its look died, or hung)
+                continue
+            if time.time() >= deadline:
+                raise CliError(f"another `ue look` on this editor (pid {held.get('pid')}) is still running after "
+                               f"{wait}s", 4) from None
+            if not told:
+                print(f"waiting for another `ue look` on this editor (pid {held.get('pid')}) to finish",
+                      file=sys.stderr)
+                told = True
+            time.sleep(poll)
+    try:
+        yield
+    finally:
+        with contextlib.suppress(OSError):
+            os.remove(path)
+
+
 def cmd_look(ctx, args):
     """Render an asset from six angles into one contact sheet (front, right, back / left, top, three-quarter)."""
     import math
@@ -625,28 +664,29 @@ def cmd_look(ctx, args):
                        "`ue open --headless --render`")
     if (ctx.beacon or {}).get("pie"):
         raise CliError("stop PIE first (ue pie stop): the asset is staged in the editor level")
-    stage = ctx.tether("look_stage", asset=args.asset, action="place")
-    stage = json.loads(stage) if isinstance(stage, str) else stage
     tiles = []
-    try:
-        cx, cy, cz = stage["center"]
-        if getattr(args, "studio", False):
-            ctx.tether("py", code=STUDIO.format(cx=cx, cy=cy, cz=cz))
-            time.sleep(1.0)  # the sky light capture and the exposure settle over a few frames
-        distance = stage["radius"] * args.distance
-        for name, yaw, pitch in LOOK_VIEWS:
-            yr, pr = math.radians(yaw), math.radians(pitch)
-            forward = (math.cos(pr) * math.cos(yr), math.cos(pr) * math.sin(yr), math.sin(pr))
-            pose = {"location": {"x": cx - forward[0] * distance, "y": cy - forward[1] * distance,
-                                 "z": cz - forward[2] * distance},
-                    "rotation": {"pitch": pitch, "yaw": yaw, "roll": 0}, "scale": {"x": 1, "y": 1, "z": 1}}
-            tiles.append(png_read(capture_viewport(ctx, pose)))
-    finally:
-        with __import__("contextlib").suppress(CliError):
-            ctx.tether("look_stage", asset=args.asset, action="remove")
-        if getattr(args, "studio", False):
-            with __import__("contextlib").suppress(CliError):
-                ctx.tether("py", code=STUDIO_REMOVE)
+    with look_lock(ctx):  # one look at a time per editor: they share the staging spot, lights and studio
+        stage = ctx.tether("look_stage", asset=args.asset, action="place")
+        stage = json.loads(stage) if isinstance(stage, str) else stage
+        try:
+            cx, cy, cz = stage["center"]
+            if getattr(args, "studio", False):
+                ctx.tether("py", code=STUDIO.format(cx=cx, cy=cy, cz=cz))
+                time.sleep(1.0)  # the sky light capture and the exposure settle over a few frames
+            distance = stage["radius"] * args.distance
+            for name, yaw, pitch in LOOK_VIEWS:
+                yr, pr = math.radians(yaw), math.radians(pitch)
+                forward = (math.cos(pr) * math.cos(yr), math.cos(pr) * math.sin(yr), math.sin(pr))
+                pose = {"location": {"x": cx - forward[0] * distance, "y": cy - forward[1] * distance,
+                                     "z": cz - forward[2] * distance},
+                        "rotation": {"pitch": pitch, "yaw": yaw, "roll": 0}, "scale": {"x": 1, "y": 1, "z": 1}}
+                tiles.append(png_read(capture_viewport(ctx, pose)))
+        finally:
+            with contextlib.suppress(CliError):
+                ctx.tether("look_stage", asset=args.asset, action="remove")
+            if getattr(args, "studio", False):
+                with contextlib.suppress(CliError):
+                    ctx.tether("py", code=STUDIO_REMOVE)
     width, height, rgb = contact_sheet(tiles, columns=3, tile_width=args.tile)
     if args.output:
         path = os.path.abspath(args.output)
@@ -953,8 +993,22 @@ def take_shot(ctx, args, launch):
     pie, simulate = pose.pop("pie", False), pose.pop("simulate", False)
     if getattr(args, "clear", False):
         clear_view(ctx, pose, args.look_at or args.actor, pie)
+    # PIE in a --headless editor opened without --render --size has no game viewport, so no local player: the
+    # world looks like Simulate, and the shot is the level viewport's (grid, gizmo), not the game's
+    no_viewport = pie and simulate and launch.get("headless")
+    if no_viewport:  # unless PIE was started as Simulate (`ue pie start --simulate`)
+        from .share import pie_owner_path
+        no_viewport = "--simulate" not in str((read_json(pie_owner_path(ctx.project)) or {}).get("cmd", ""))
     if getattr(args, "hud", False) and not (pie and not simulate):
+        if no_viewport:
+            raise CliError("--hud needs the game viewport, and PIE in this headless editor has none (no local player: "
+                           "it looks like Simulate). Reopen it with `ue open --headless --render --size 1280x720`, "
+                           "or use Simulate's shot without --hud")
         raise CliError("--hud needs PIE (ue pie start): it shows the game's UMG HUD over the player's view")
+    if no_viewport:
+        print("note: PIE runs here without a game viewport (a headless editor opened without --render --size), so "
+              "this is the level viewport's frame of the game world, editor grid and gizmos included, not the "
+              "player's view; `ue open --headless --render --size 1280x720` gives PIE a game viewport", file=sys.stderr)
     if getattr(args, "res", None):
         parse_res(args.res)
         if getattr(args, "hud", False) or args.annotate or args.ui:

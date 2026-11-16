@@ -17,7 +17,7 @@ from .core import (
     subprocess, write_json,
 )
 from .share import (
-    ACTIVE_MINUTES, LEASED, active_lease, ago, changed_files, check_shared, describe_lease, describe_running, drop_request,
+    ACTIVE_MINUTES, LEASE_IDLE, LEASED, active_lease, ahead_in_queue, current_lease, ago, changed_files, check_shared, describe_lease, describe_running, drop_request,
     duration, grant_lease, lease_note, lease_path, lease_requests, others_edits, pie_owner, pie_starter, recent_sessions,
     release_lease, request_lease, running_commands, session_id, session_label, session_names, set_session_name,
     sort_changes, take_lease,
@@ -153,6 +153,17 @@ def cmd_build(ctx, args):
     changes = classify_changes(ctx.project)
     has_csharp = csharp_layout(ctx.project) is not None
     pending_file = os.path.join(state_dir(ctx.project), "pending-reopen.json")
+    if (not running or args.restart) and (changes is None or changes[0]):
+        # A UBT link replaces the game module's DLL, and every other editor on the project has it loaded, which
+        # Windows won't allow: a restart closed the shared editor, failed with LNK1104 and left everyone without
+        # one (UnrealRacing 2026-11-13, another session's --second editor)
+        others = [b for b in live_editors(ctx.project) if not running or b.get("pid") != beacon.get("pid")]
+        if others:
+            raise CliError(("build --restart" if running else "build") + " refused: "
+                           + "; ".join(f"editor {editor_label(b)}" for b in others)
+                           + (" has" if len(others) == 1 else " have") + " the game module loaded, so the link would "
+                           "fail (LNK1104)" + (" after this editor closed" if running else "")
+                           + ". Its owner closes it with `ue close` (`ue who`); then run this again", LEASED)
     if not running:
         check_restarts(ctx.project, getattr(args, "ignore_lease", False))
         code = ubt_build(ctx, args) or (uat_user_solution(ctx, args.limit) if has_csharp else 0)
@@ -286,10 +297,13 @@ def cmd_open(ctx, args):
               "next to a shared one)")
         second = False
     elif beacon and editor_process(beacon.get("pid")) and not second:  # attach to the open editor, the user's own included
-        print(f"already open ({editor_label(beacon)}); using it"
-              + ("" if beacon.get("owner") in (None, actor_id()) else
-                 " (another session's private editor: `ue open --second` starts your own)"))
+        print(f"already open ({editor_label(beacon)}); using it")
         return cmd_status(ctx, args)
+    elif not second and live_editors(ctx.project):  # only other sessions' own (--second) editors: never adopt one
+        print("note: the editors open are other sessions' own (--second): "
+              + ", ".join(editor_label(b) for b in live_editors(ctx.project))
+              + "; starting the shared editor next to them (while one runs, a C++ change can't be linked: its "
+              "owner closes it with `ue close`)")
     if second:
         # While it runs, Windows keeps the files of every package it loaded open, so the shared editor cannot save
         # those packages ("Error moving file"): not while that editor holds someone's unsaved work
@@ -595,8 +609,16 @@ def cmd_lease(ctx, args):
             raise CliError('say what you need the editor for: ue lease request --for "new UCLASSes: build --restart"')
         held = request_lease(ctx.project, args.what, args.minutes)
         if not held:
+            ahead = ahead_in_queue(ctx.project, session_id())
+            if ahead:  # a free editor goes in queue order: keep this request's place
+                print(f"queued: the editor is free, but {session_label(ctx.project, ahead['session'])} asked first "
+                      f"({ahead['what']}); `ue wait lease` returns when it is your turn")
+                return 0
+            lapsed = current_lease(read_json(lease_path(ctx.project)), time.time())
             drop_request(ctx.project, session_id())
-            raise CliError("nobody holds the lease: take it (ue lease take --for ...)")
+            raise CliError((f"{session_label(ctx.project, lapsed['session'])}'s lease lapsed (its editor was idle "
+                            f"{LEASE_IDLE}+ min while you wait): take it" if lapsed and lapsed.get("session") != session_id()
+                            else "nobody holds the lease: take it") + " (ue lease take --for ...)")
         print(f"asked: the editor is {describe_lease(ctx.project, held)}. That session sees your request on its next "
               "`ue` command; once it grants it, the lease is yours (`ue wait lease` returns then, or when the editor is free)")
         return 0

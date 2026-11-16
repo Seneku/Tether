@@ -11,7 +11,7 @@ import sys
 import threading
 import time
 
-from .core import CliError, UE_SCRIPT, editor_beacons, editor_process, find_project, read_json, read_json_retry, state_dir, write_json
+from .core import CliError, UE_SCRIPT, editor_beacons, editor_process, find_project, pid_alive, process_name, read_json, read_json_retry, state_dir, write_json
 from .share import (
     active_lease, current_lease, drop_request, end_lease, hand_over, lease_requests, move_request, pie_owner,
     read_activity, running_commands, session_label, session_names,
@@ -60,22 +60,7 @@ def known_projects():
 
 
 def write_registry(rows):
-    """Write the whole file aside and swap it in, so a reader never sees it half written."""
-    path = registry_path()
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = f"{path}.{os.getpid()}.tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(rows, f)
-    try:
-        for attempt in range(5):
-            try:
-                os.replace(tmp, path)
-                return
-            except PermissionError:  # Windows: another process has it open this instant
-                time.sleep(0.02 * (attempt + 1))
-    finally:
-        if os.path.exists(tmp):
-            os.remove(tmp)
+    write_json(registry_path(), rows)  # (written aside and swapped in: a reader never sees it half written)
 
 
 def register_project(project, now=None):
@@ -250,6 +235,118 @@ def describe_snapshot(snap):
     return out
 
 
+def tray_summary(snap, limit=14):
+    """What the tray icon shows (`ue dash --tray`): a state for its colour, a short line for its tooltip, and the
+    lines of the panel it opens on hover. busy: a `ue` command running (not a `wait lease`) or a lease held;
+    queued: that, and sessions waiting for an editor; idle: editors open, nothing running; quiet: no editor."""
+    now = snap["time"]
+    span = lambda t: f"{(now - t) / 60:.0f} min" if now - t >= 90 else f"{now - t:.0f}s"
+    running = queued = editors = 0
+    lines = []
+    for r in snap["projects"]:
+        if r.get("error"):
+            continue
+        live = [e for e in r["editors"] if e["alive"]]
+        if not (live or r["lease"] or r["queue"] or r["running"]):
+            continue
+        running += len(r["running"])
+        queued += len(r["queue"])
+        editors += len(live)
+        eds = ", ".join(f"{e['state']}" + (f" ({e['pie_owner']})" if e["pie_owner"] else "") for e in live)
+        lines.append(f"{r['name']}: " + (f"{len(live)} editor{'s' if len(live) > 1 else ''} {eds}" if live else "no editor"))
+        lease = r["lease"]
+        if lease:
+            lines.append(f"  lease: {lease['label']}: {lease['what']} ({span(lease['since'])})")
+        for c in r["running"][:3]:
+            lines.append(f"  running: {c['label']}: {c['cmd'][:60]} ({span(c['since'])})")
+        if len(r["running"]) > 3:
+            lines.append(f"  ... {len(r['running']) - 3} more running")
+        for n, q in enumerate(r["queue"][:3], 1):
+            lines.append(f"  queue {n}. {q['label']}: {q['what'][:50]} ({span(q['time'])})")
+        if len(r["queue"]) > 3:
+            lines.append(f"  ... {len(r['queue']) - 3} more queued")
+    held = any(r.get("lease") for r in snap["projects"] if not r.get("error"))
+    state = ("queued" if queued else "busy") if running or held or queued else "idle" if editors else "quiet"
+    words = {"busy": "busy", "queued": "busy", "idle": "idle", "quiet": "quiet"}[state]
+    parts = ([f"{running} running"] if running else []) + ([f"{queued} queued"] if queued else []) + \
+            ([f"{editors} editor{'s' if editors != 1 else ''}"] if editors else [])
+    tip = f"Tether: {words}" + (f" ({', '.join(parts)})" if parts else "")
+    if len(lines) > limit:
+        lines = lines[:limit - 1] + [f"... more in the dashboard"]
+    return {"state": state, "tip": tip[:63], "title": tip, "lines": lines or ["no editors open, nothing running"],
+            "running": running, "queued": queued, "editors": editors, "time": now}
+
+
+# ---------------------------------------------------------------- the tray icon (Windows)
+
+TRAY_SCRIPT = os.path.join(os.path.dirname(UE_SCRIPT), "tether_tray.ps1")
+
+
+def tray_file(port):
+    return os.path.join(os.path.dirname(registry_path()), f"tray-{port}.json")
+
+
+def tray_running(port):
+    """The pid of the tray icon for this port (it writes tray-<port>.json), or None."""
+    pid = (read_json(tray_file(port)) or {}).get("pid")
+    if not pid or not pid_alive(pid):
+        return None
+    name = process_name(pid)  # (a pid reused by another program is not the icon)
+    return pid if name is None or "powershell" in name.lower() else None
+
+
+def tray_command(port, python=None):
+    return ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-STA", "-WindowStyle", "Hidden",
+            "-File", TRAY_SCRIPT, "-Port", str(port), "-Python", python or sys.executable, "-Ue", UE_SCRIPT,
+            "-State", tray_file(port)]
+
+
+def start_tray(port):
+    if os.name != "nt":
+        raise CliError("the tray icon is Windows only: `ue dash` opens the page")
+    subprocess.Popen(tray_command(port), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL, close_fds=True, cwd=os.path.dirname(UE_SCRIPT),
+                     creationflags=subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW)
+    deadline = time.time() + 15
+    while time.time() < deadline:
+        pid = tray_running(port)
+        if pid:
+            return pid
+        time.sleep(0.3)
+    raise CliError(f"the tray icon did not start (its log: {tray_file(port)[:-5]}.log)")
+
+
+def startup_shortcut():
+    appdata = os.environ.get("APPDATA") or os.path.join(os.path.expanduser("~"), "AppData", "Roaming")
+    return os.path.join(appdata, "Microsoft", "Windows", "Start Menu", "Programs", "Startup", "Tether tray.lnk")
+
+
+def set_tray_at_login(on, port):
+    """A shortcut in the user's Startup folder that runs `ue dash --tray` with pythonw (no console flashes up)."""
+    if os.name != "nt":
+        raise CliError("--at-login is Windows only")
+    link = startup_shortcut()
+    if not on:
+        if os.path.exists(link):
+            os.remove(link)
+            return f"the tray icon no longer starts at login (removed {link})"
+        return "the tray icon was not set to start at login"
+    pythonw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+    target = pythonw if os.path.isfile(pythonw) else sys.executable
+    arguments = f'"{UE_SCRIPT}" dash --tray' + (f" --listen {port}" if port != DASH_PORT else "")
+    script = ("$s = (New-Object -ComObject WScript.Shell).CreateShortcut($env:TETHER_LINK); "
+              "$s.TargetPath = $env:TETHER_TARGET; $s.Arguments = $env:TETHER_ARGS; "
+              "$s.WorkingDirectory = $env:TETHER_DIR; $s.Description = 'Tether status icon (ue dash --tray)'; "
+              "$s.WindowStyle = 7; $s.Save()")
+    env = dict(os.environ, TETHER_LINK=link, TETHER_TARGET=target, TETHER_ARGS=arguments,
+               TETHER_DIR=os.path.dirname(UE_SCRIPT))
+    done = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script], env=env,
+                          capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW)
+    if done.returncode or not os.path.isfile(link):
+        raise CliError(f"could not write the Startup shortcut: {(done.stderr or done.stdout).strip()[:300]}")
+    return f"the tray icon starts at login ({link}; `ue dash --at-login off` removes it)"
+
+
 # ---------------------------------------------------------------- the server
 
 def dash_url(port):
@@ -318,6 +415,8 @@ def serve(port, extra, idle=DASH_IDLE):
             last[0] = time.time()
             if self.path == "/api/ping":
                 return self.send(200, {"tether_dash": True, "version": tether_version(), "pid": os.getpid()})
+            if self.path == "/api/tray":  # the tray icon's poll (it keeps the server up while it runs)
+                return self.send(200, tray_summary(snapshot(projects())))
             if self.path == "/api/state":
                 return self.send(200, snapshot(projects()))
             if self.path in ("/", "/index.html"):
@@ -370,12 +469,20 @@ def cmd_dash(ctx, args):
         return 0
     running = dash_running(args.listen)
     if args.stop:
+        tray = tray_running(args.listen)
+        if tray:
+            kill_tree(tray)
+            print(f"stopped the tray icon (pid {tray})")
         if not running:
             print("no dashboard running on port", args.listen)
             return 0
         kill_tree(running["pid"])
         print(f"stopped the dashboard (pid {running['pid']})")
         return 0
+    if getattr(args, "at_login", None):
+        print(set_tray_at_login(args.at_login == "on", args.listen))
+        if not args.tray:
+            return 0
     if not running:
         cmd = [sys.executable, UE_SCRIPT, "dash", "--serve", "--listen", str(args.listen)] + extra
         detach = ({"creationflags": subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
@@ -389,6 +496,11 @@ def cmd_dash(ctx, args):
         if not running:
             raise CliError(f"the dashboard did not start on port {args.listen} (another program on it? --listen N)")
     url = dash_url(args.listen)
+    if args.tray:
+        pid = tray_running(args.listen) or start_tray(args.listen)
+        print(f"tray icon: running (pid {pid}); dashboard: {url} (pid {running['pid']}, up while the icon runs; "
+              "`ue dash --stop` ends both)")
+        return 0
     print(f"dashboard: {url} (pid {running['pid']}; it stops {DASH_IDLE // 60} min after the last page closes; "
           "`ue dash --stop`)")
     if not args.no_open:
