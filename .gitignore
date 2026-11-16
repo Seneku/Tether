@@ -32,3 +32,6 @@ Sandbox/Script/**/Properties/launchSettings.json
 Sandbox/Content/Developers/
 Sandbox/Content/Collections/
 Sandbox/Build/
+
+# Built by `ue dash --tray` from cli/tether_tray_host.cs
+cli/Tether.exe

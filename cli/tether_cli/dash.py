@@ -292,19 +292,58 @@ def tray_running(port):
     if not pid or not pid_alive(pid):
         return None
     name = process_name(pid)  # (a pid reused by another program is not the icon)
-    return pid if name is None or "powershell" in name.lower() else None
+    return pid if name is None or any(n in name.lower() for n in ("powershell", "tether")) else None
 
 
-def tray_command(port, python=None):
+TRAY_HOST_SOURCE = os.path.join(os.path.dirname(UE_SCRIPT), "tether_tray_host.cs")
+TRAY_ICON = os.path.join(os.path.dirname(UE_SCRIPT), "tether.ico")
+
+
+def tray_host():
+    """cli/Tether.exe, compiled from tether_tray_host.cs when missing or older than it: it runs the tray script in its
+    own process, so Windows lists the icon as "Tether" rather than "Windows PowerShell". It sits next to ue.py, not
+    in %LOCALAPPDATA%, which a packaged app (the Claude desktop app) sees redirected to its own copy: Windows keys
+    the taskbar setting by the exe's path, so every launch must use the same file. None (run the script under
+    powershell.exe) when it can't be built."""
+    exe = os.path.join(os.path.dirname(UE_SCRIPT), "Tether.exe")
+    sources = [TRAY_HOST_SOURCE, TRAY_ICON]
+    try:
+        if os.path.exists(exe) and os.path.getmtime(exe) >= max(os.path.getmtime(s) for s in sources):
+            return exe
+    except OSError:
+        return None
+    windir = os.environ.get("WINDIR", r"C:\Windows")
+    csc = os.path.join(windir, "Microsoft.NET", "Framework64", "v4.0.30319", "csc.exe")
+    sma = glob.glob(os.path.join(windir, "Microsoft.NET", "assembly", "GAC_MSIL", "System.Management.Automation",
+                                 "*", "System.Management.Automation.dll"))
+    if not os.path.exists(csc) or not sma:
+        return exe if os.path.exists(exe) else None
+    os.makedirs(os.path.dirname(exe), exist_ok=True)
+    try:
+        done = subprocess.run([csc, "/nologo", "/target:winexe", "/optimize", f"/out:{exe}",
+                               f"/win32icon:{TRAY_ICON}", f"/reference:{sma[0]}", TRAY_HOST_SOURCE],
+                              capture_output=True, text=True, timeout=120,
+                              creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except (OSError, subprocess.TimeoutExpired):
+        done = None
+    if done is not None and done.returncode == 0:
+        return exe
+    return exe if os.path.exists(exe) else None  # (an older build still running holds the file: use it)
+
+
+def tray_command(port, python=None, host=None):
+    script = [TRAY_SCRIPT, "-Port", str(port), "-Python", python or sys.executable, "-Ue", UE_SCRIPT,
+              "-State", tray_file(port)]
+    if host:
+        return [host] + script
     return ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-STA", "-WindowStyle", "Hidden",
-            "-File", TRAY_SCRIPT, "-Port", str(port), "-Python", python or sys.executable, "-Ue", UE_SCRIPT,
-            "-State", tray_file(port)]
+            "-File"] + script
 
 
 def start_tray(port):
     if os.name != "nt":
         raise CliError("the tray icon is Windows only: `ue dash` opens the page")
-    subprocess.Popen(tray_command(port), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+    subprocess.Popen(tray_command(port, host=tray_host()), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                      stderr=subprocess.DEVNULL, close_fds=True, cwd=os.path.dirname(UE_SCRIPT),
                      creationflags=subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW)
     deadline = time.time() + 15

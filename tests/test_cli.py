@@ -5657,6 +5657,10 @@ class Dash(unittest.TestCase):
         self.assertEqual((busy["state"], busy["tip"]), ("busy", "Tether: busy"))
         cmd = ue.tray_command(8765)
         self.assertTrue(os.path.isfile(cmd[cmd.index("-File") + 1]))  # the script ships next to ue.py
+        hosted = ue.tray_command(8765, host="Tether.exe")  # Tether.exe runs the script, so Windows names the icon
+        self.assertEqual(hosted[:2], ["Tether.exe", cmd[cmd.index("-File") + 1]])
+        for shipped in (ue.dash.TRAY_HOST_SOURCE, ue.dash.TRAY_ICON):
+            self.assertTrue(os.path.isfile(shipped))
         self.assertTrue(ue.dash.startup_shortcut().endswith(os.path.join("Startup", "Tether tray.lnk")))
 
     def test_queue_action_only_for_listed_projects(self):
