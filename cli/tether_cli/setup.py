@@ -11,6 +11,7 @@ from .core import (
     log_path,
     pick_port, pid_alive, port_open,
     read_json, recent_crash, run_git, running_editors, stall_report, state_dir, subprocess,
+    p4_exe, p4_options, p4_workspace, run_p4,
 )
 from .transport import engine_version
 from .build import csharp_layout
@@ -248,7 +249,85 @@ def python_only_update(source, target):
     return True
 
 
-SKILL_REL = os.path.join(".claude", "skills", "unreal-tether", "SKILL.md")
+def plan_copy(source, target):
+    """What updating a plugin copy changes: ([(source file, target file)] to write, [target files] to delete).
+    Only the files that differ (line ends aside); build output in the copy is left alone."""
+    old, new = tree_files(target) if os.path.isdir(target) else {}, tree_files(source)
+    writes = [(os.path.join(source, *rel.split("/")), os.path.join(target, *rel.split("/")))
+              for rel in sorted(new) if old.get(rel) != new[rel]]
+    deletes = [os.path.join(target, *rel.split("/")) for rel in sorted(old) if rel not in new]
+    return writes, deletes
+
+
+def apply_copy(writes, deletes):
+    import shutil
+    for path in deletes:
+        if os.path.exists(path):  # (`p4 delete` has already removed the ones it opened)
+            os.remove(path)
+    for src, dst in writes:
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        shutil.copy2(src, dst)
+
+
+def new_p4_change(project, description):
+    """A new pending changelist's number, for the files `ue init` opens."""
+    exe = p4_exe()
+    form = subprocess.run([exe, *p4_options(project), "--field", f"Description={description}", "--field", "Files=",
+                           "change", "-o"], capture_output=True, cwd=os.path.dirname(project))
+    made = subprocess.run([exe, *p4_options(project), "change", "-i"], input=form.stdout, capture_output=True,
+                          cwd=os.path.dirname(project))
+    found = re.search(rb"Change (\d+) created", made.stdout)
+    if not found:
+        text = (made.stderr or form.stderr or made.stdout).decode("utf-8", "replace").strip()
+        raise CliError(f"p4 change: {text.splitlines()[-1] if text else 'failed'}")
+    return found.group(1).decode()
+
+
+def open_for_init(project, changing, adding, deleting):
+    """Before `ue init` changes any file: in a Perforce workspace, open what it will change in a new changelist
+    (edit, or delete for the files it removes; files already open elsewhere stay there). Anything left read-only
+    stops it with nothing changed. Returns (changelist or None, the files to `p4 add` once written)."""
+    existing = [p for p in changing + deleting if os.path.exists(p)]
+    change = None
+    if existing or adding:
+        if p4_workspace(project):
+            change = new_p4_change(project, "Tether: ue init (update the Tether plugin copy and project setup)")
+            edit = [p for p in existing if p not in deleting]
+            gone = [p for p in existing if p in deleting]
+            if edit:
+                run_p4(project, "edit", "-c", change, *edit, check=False)
+            if gone:
+                run_p4(project, "delete", "-c", change, *gone, check=False)
+    locked = [p for p in existing if os.path.exists(p) and not os.access(p, os.W_OK)]
+    if locked:
+        if change:
+            run_p4(project, "revert", "-c", change, "//...", check=False)
+            run_p4(project, "change", "-d", change, check=False)
+        here = os.path.dirname(project)
+        names = ", ".join(os.path.relpath(p, here) for p in locked[:4]) + (", ..." if len(locked) > 4 else "")
+        raise CliError(f"{len(locked)} file(s) `ue init` would change are read-only ({names}) and could not be "
+                       "checked out" + (" (opened elsewhere, or not in the depot?)" if change else "")
+                       + ": check them out in your version control, or clear the read-only flag, and run it again. "
+                       "Nothing was changed")
+    return change, [p for p in adding if not os.path.exists(p)]
+
+
+def close_for_init(project, change, added):
+    """After `ue init` wrote its files: add the new ones to its changelist and revert the ones left unchanged."""
+    if not change:
+        return
+    added = [p for p in added if os.path.exists(p)]
+    if added:
+        run_p4(project, "add", "-c", change, *added, check=False)
+    run_p4(project, "revert", "-a", "-c", change, "//...", check=False)
+    left = run_p4(project, "opened", "-c", change, check=False) or []
+    if not left:
+        run_p4(project, "change", "-d", change, check=False)
+        return
+    print(f"opened {len(left)} file(s) in Perforce changelist {change} (not submitted)")
+
+
+SKILL_REL =os.path.join(".claude", "skills", "unreal-tether", "SKILL.md")
 SKILL_PARTS = re.compile(r"\A(---.*?\n---[ \t]*\n.*?^# [^\n]*\n\s*\n)(.*?\n)(\s*\n.*)\Z", re.S | re.M)
 
 
@@ -666,13 +745,26 @@ def init_project(ctx, args):
               + os.path.relpath(target, os.path.dirname(project)) + versions)
     if args.dry_run:
         return 0
+    plans = [plan_copy(source, target) for name, source, target, exists in copies]
+    written = [dst for writes, _ in plans for _, dst in writes] + ([skill[0]] if skill else []) \
+        + [path for path, _ in skill_refs] + ([ini] if ini else []) \
+        + ([project] if any(not c.startswith("enable Python remote") for c in changes) else [])
+    change, adding = open_for_init(project, written, written, [p for _, deletes in plans for p in deletes])
+    try:
+        return init_write(project, args, data, text, changes, copies, plans, ini, ini_text, ini_section, skill,
+                          skill_refs)
+    finally:
+        close_for_init(project, change, adding)
+
+
+def init_write(project, args, data, text, changes, copies, plans, ini, ini_text, ini_section, skill, skill_refs):
     if skill:
         with open(skill[0], "w", encoding="utf-8", newline="") as f:
             f.write(skill[1])
-    for path, text in skill_refs:
+    for path, body in skill_refs:  # (not `text`: that is the .uproject's, written below)
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w", encoding="utf-8", newline="") as f:
-            f.write(text)
+            f.write(body)
     if not changes and not copies:
         return 0  # only the skill: nothing for the editor to load
     if ini:
@@ -693,10 +785,8 @@ def init_project(ctx, args):
     # Python only (the usual Tether update): the running editor reloads it without a restart
     python_only = not changes and all(exists and python_only_update(source, target)
                                       for name, source, target, exists in copies)
-    for name, source, target, exists in copies:
-        if exists:
-            shutil.rmtree(target)
-        shutil.copytree(source, target, ignore=shutil.ignore_patterns(*COPY_SKIP))
+    for writes, deletes in plans:
+        apply_copy(writes, deletes)
     running = editor_live(project)
     if running and python_only:
         print("next: `ue reload` (only the plugin's Python changed: no restart needed)")

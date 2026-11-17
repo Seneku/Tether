@@ -390,6 +390,72 @@ class Init(unittest.TestCase):
         self.assertIn(b"\r\n\t\"FileVersion\": 3", self.raw())
         self.assertEqual(self.run_init(), ["already set up: plugins enabled, Tether reachable"])
 
+    def stale_copy(self, read_only):
+        """An up-to-date init, then an older plugin copy: a changed file, a dropped one, build output."""
+        import stat
+        self.run_init()
+        copy = os.path.join(self.project.root, "Plugins", "Tether")
+        changed = os.path.join(copy, "Tether.uplugin")
+        dropped = os.path.join(copy, "Content", "Python", "old_module.py")
+        built = os.path.join(copy, "Binaries", "Win64", "keep.dll")
+        for path, body in ((changed, "{}"), (dropped, "x = 1\n"), (built, "dll")):
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(body)
+        files = [os.path.join(here, n) for here, _, names in os.walk(copy) for n in names]
+        if read_only:
+            for path in files:
+                os.chmod(path, stat.S_IREAD)
+        self.addCleanup(lambda: [os.chmod(p, stat.S_IREAD | stat.S_IWRITE) for p in files if os.path.exists(p)])
+        return changed, dropped, built
+
+    def test_update_rewrites_only_what_differs(self):
+        changed, dropped, built = self.stale_copy(read_only=False)
+        unchanged = os.path.join(os.path.dirname(changed), "Content", "Python", "init_unreal.py")
+        before = os.path.getmtime(unchanged)
+        self.run_init()
+        self.assertNotEqual(open(changed, encoding="utf-8").read(), "{}")
+        self.assertFalse(os.path.exists(dropped))
+        self.assertTrue(os.path.exists(built))  # build output is the editor's, not the copy's
+        self.assertEqual(os.path.getmtime(unchanged), before)
+
+    def test_read_only_copy_outside_perforce_stops_with_nothing_changed(self):
+        changed, dropped, built = self.stale_copy(read_only=True)
+        with unittest.mock.patch.object(ue.setup, "p4_workspace", return_value=False):
+            with self.assertRaises(ue.CliError) as caught:
+                self.run_init()
+        self.assertIn("read-only", str(caught.exception))
+        self.assertIn("Nothing was changed", str(caught.exception))
+        self.assertEqual(open(changed, encoding="utf-8").read(), "{}")
+        self.assertTrue(os.path.exists(dropped))
+
+    def test_read_only_copy_in_perforce_is_checked_out_in_its_own_changelist(self):
+        import stat
+        changed, dropped, built = self.stale_copy(read_only=True)
+        calls = []
+
+        def p4(project, verb, *argv, check=True):
+            calls.append((verb,) + argv)
+            if verb in ("edit", "delete"):
+                for path in argv[2:]:
+                    os.chmod(path, stat.S_IREAD | stat.S_IWRITE)  # what p4 edit does
+                    if verb == "delete":
+                        os.remove(path)
+            return [{"depotFile": "//x"}] if verb == "opened" else []
+
+        with unittest.mock.patch.object(ue.setup, "p4_workspace", return_value=True), \
+                unittest.mock.patch.object(ue.setup, "new_p4_change", return_value="42"), \
+                unittest.mock.patch.object(ue.setup, "run_p4", side_effect=p4):
+            out = self.run_init()
+        verbs = {c[0]: c for c in calls}
+        self.assertIn(changed, verbs["edit"])
+        self.assertEqual(verbs["edit"][1:3], ("-c", "42"))
+        self.assertIn(dropped, verbs["delete"])
+        self.assertNotIn(built, verbs["edit"])
+        self.assertEqual(verbs["revert"][1:4], ("-a", "-c", "42"))  # files left unchanged go back
+        self.assertNotEqual(open(changed, encoding="utf-8").read(), "{}")
+        self.assertIn("opened 1 file(s) in Perforce changelist 42 (not submitted)", out)
+
     def test_all_toolsets_covers_epic_toolsets(self):
         with open(self.project.uproject, "w", encoding="utf-8") as f:
             json.dump({"Plugins": [{"Name": "AllToolsets", "Enabled": True}]}, f)
