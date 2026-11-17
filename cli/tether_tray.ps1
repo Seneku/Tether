@@ -12,7 +12,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-if (-not $State) { $State = Join-Path $env:LOCALAPPDATA "Tether\tray-$Port.json" }
+if (-not $State) { $State = Join-Path $env:USERPROFILE ".tether\tray-$Port.json" }
 $LogFile = [IO.Path]::ChangeExtension($State, ".log")
 function Write-Log([string]$message) {
     try { Add-Content -LiteralPath $LogFile -Value ("{0:yyyy-MM-dd HH:mm:ss} {1}" -f (Get-Date), $message) } catch { }

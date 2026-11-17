@@ -16,7 +16,7 @@ static class TetherTrayHost {
     [STAThread]
     static int Main(string[] args) {
         if (args.Length < 1) return 2;
-        string log = Path.Combine(Environment.GetEnvironmentVariable("LOCALAPPDATA") ?? ".", "Tether", "tray-host.log");
+        string log = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".tether", "tray-host.log");
         try {
             InitialSessionState state = InitialSessionState.CreateDefault();
             state.ApartmentState = System.Threading.ApartmentState.STA;

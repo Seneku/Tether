@@ -5705,6 +5705,26 @@ class Dash(unittest.TestCase):
         self.assertIn(os.path.abspath(p), ue.known_projects())
         self.assertFalse([n for n in os.listdir(os.path.dirname(path)) if n.endswith(".tmp")])
 
+    def test_projects_in_the_old_appdata_registry_carry_over(self):
+        p = os.path.abspath(self.project.uproject)
+        with tempfile.TemporaryDirectory() as old:
+            legacy = os.path.join(old, "projects.json")
+            with open(legacy, "w", encoding="utf-8") as f:
+                json.dump({p: 1500}, f)
+            with unittest.mock.patch.object(ue.dash, "legacy_registry_path", lambda: legacy):
+                self.assertIn(p, ue.known_projects())
+                ue.register_project(p, now=1501)  # within the minute: no write
+                with tempfile.TemporaryDirectory() as other:
+                    q = os.path.join(other, "Other.uproject")
+                    open(q, "w").write("{}")
+                    ue.register_project(q, now=5000)  # writes the new registry, the old projects included
+                    rows = json.load(open(ue.registry_path(), encoding="utf-8"))
+                    self.assertIn(p, rows)
+                    self.assertIn(os.path.abspath(q), rows)
+        if os.name == "nt":
+            with unittest.mock.patch.dict(os.environ, {"TETHER_REGISTRY": ""}):
+                self.assertNotIn("AppData", ue.registry_path())  # what a packaged app's sessions see redirected
+
     def test_server_needs_the_page_token_to_change_the_queue(self):
         import socket
         import threading

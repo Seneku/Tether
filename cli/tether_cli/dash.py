@@ -28,21 +28,42 @@ WAITING = re.compile(r"\bwait\b.*\blease\b")  # `ue wait lease`, `ue --timeout 3
 # ---------------------------------------------------------------- which projects
 
 def registry_path():
+    """~/.tether/projects.json on Windows. Not %LOCALAPPDATA%: Windows redirects a packaged app's writes there (the
+    Claude desktop app, and so every session it runs) into the app's own copy, so a `ue dash` started at login or
+    from a terminal read a different file from the sessions' and listed none of their projects."""
     if os.environ.get("TETHER_REGISTRY"):  # tests
         return os.environ["TETHER_REGISTRY"]
-    base = os.environ.get("LOCALAPPDATA") if os.name == "nt" else None
-    base = base or os.environ.get("XDG_STATE_HOME") or os.path.join(os.path.expanduser("~"), ".local", "state")
+    if os.name == "nt":
+        return os.path.join(os.path.expanduser("~"), ".tether", "projects.json")
+    base = os.environ.get("XDG_STATE_HOME") or os.path.join(os.path.expanduser("~"), ".local", "state")
     return os.path.join(base, "Tether", "projects.json")
+
+
+def legacy_registry_path():
+    """Where the registry was before 0.40.2 (Windows), read for the projects it still lists."""
+    base = os.environ.get("LOCALAPPDATA") if os.name == "nt" and not os.environ.get("TETHER_REGISTRY") else None
+    return os.path.join(base, "Tether", "projects.json") if base else None
 
 
 def read_registry():
     """The registry's rows, {} when there is none yet, None when it is there but can't be read right now (every
-    session's `ue` writes it, and on Windows a read that lands on another process's replace fails)."""
+    session's `ue` writes it, and on Windows a read that lands on another process's replace fails). Projects in the
+    old %LOCALAPPDATA% registry (whichever copy this process sees) are included."""
     path = registry_path()
     rows = read_json_retry(path)
     if rows is None:
-        return None if os.path.exists(path) else {}
-    return rows if isinstance(rows, dict) else None
+        if os.path.exists(path):
+            return None
+        rows = {}
+    if not isinstance(rows, dict):
+        return None
+    legacy = legacy_registry_path()
+    old = read_json(legacy) if legacy else None
+    if isinstance(old, dict):
+        for p, t in old.items():
+            if isinstance(t, (int, float)) and t > rows.get(p, 0):
+                rows[p] = t
+    return rows
 
 
 _last_known = []
